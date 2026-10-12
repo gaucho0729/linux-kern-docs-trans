@@ -1,0 +1,798 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>TREE_RCUのデータ構造をめぐるツアー [LWN.net] — Linux Kernel ドキュメント</title>
+<link href="../../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../../" id="documentation_options" src="../../../_static/documentation_options.js"></script>
+<script src="../../../_static/jquery.js"></script>
+<script src="../../../_static/underscore.js"></script>
+<script src="../../../_static/doctools.js"></script>
+<link href="../../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../../search.html" rel="search" title="検索"/>
+<link href="../../../core-api/cachetlb.html" rel="next" title="Cache and TLB Flushing Under Linux"/>
+<link href="../Requirements/Requirements.html" rel="prev" title="A Tour Through RCU’s Requirements"/>
+<link href="../../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="a-tour-through-tree-rcu-s-data-structures-lwn-net">
+<h1>TREE_RCUのデータ構造をめぐるツアー [LWN.net]<a class="headerlink" href="#a-tour-through-tree-rcu-s-data-structures-lwn-net" title="この見出しへのパーマリンク">¶</a></h1>
+<p>2016年12月18日</p>
+<p>この記事はPaul E. McKenneyによって執筆されました</p>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このドキュメントでは、RCUの主要なデータ構造とそれらの関係について説明します。</p>
+</section>
+<section id="data-structure-relationships">
+<h2>データ構造の関係<a class="headerlink" href="#data-structure-relationships" title="この見出しへのパーマリンク">¶</a></h2>
+<p>RCUは実質的に大規模な状態機械であり、そのデータ構造はRCUリーダーが非常に高速に実行できるように、そしてアップデータが要求するRCUグレース期間を効率的かつ極めてスケーラブルな方法で処理できるように、状態を保持しています。RCUアップデータの効率とスケーラビリティは、以下の図に示すように、主に結合木（combining tree）によって提供されます。</p>
+<figure class="align-default">
+<img alt="../../../_images/BigTreeClassicRCU.svg" src="../../../_images/BigTreeClassicRCU.svg"/></figure>
+<p>この図は、包含する <code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> 構造体で、木構造を含みます <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> この木構造の各葉ノードは <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 木構造には最大で16 <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> 構造体が関連付けられており、これにより
+<code class="docutils literal notranslate"><span class="pre">NR_CPUS</span></code> 構造体の数は <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> 構造体があり、それぞれの可能なCPUに対応しています。この構造体は、必要に応じて起動時に調整され、 <code class="docutils literal notranslate"><span class="pre">nr_cpu_ids</span></code> ははるかに少ない <code class="docutils literal notranslate"><span class="pre">NR_CPUs</span></code>です。たとえば、いくつかのLinuxディストリビューションは <code class="docutils literal notranslate"><span class="pre">NR_CPUs=4096</span></code>、これは3段階の木構造をもたらします <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> tree. If the actual hardware has only 16 CPUs, RCU will adjust itself at boot time, resulting in an <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> tree with only a single node.</p>
+<p>この結合木の目的は、クイエスcent状態、dyntick-idle遷移、CPUホットプラグ操作などのCPUごとのイベントを効率的かつスケーラブルに処理することです。クイエスcent状態はCPUごとの <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> 構造で記録され、他のイベントは葉レベルの <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>
+構造で記録されます。これらのすべてのイベントは、木の各レベルで結合され、最終的に木のルート <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>
+構造でグレースペリオドが完了します。グレースペリオドは、すべてのCPU（または、タスクの場合は <code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT_RCU</span></code>、タスク）がクイエスcent状態を通過した後、ルートで完了できます。グレースペリオドが完了すると、その事実が木の根から下へと逆に伝播されます。</p>
+<p>図に示すように、64ビットシステムでは、64の葉を持つ2段階の木構造は1,024のCPUを収容でき、ルートでは64のファンアウト、葉では16のファンアウトで構成されます。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>なぜ葉のファンアウトも64ではないのでしょうか？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>葉レベルの
+<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造に影響を与えるイベントの種類が上位の木よりも多いからです。そのため、葉の <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造が64のファンアウトを持つと、これらの構造の <code class="docutils literal notranslate"><span class="pre">-&gt;structures</span></code> の競合が過剰になります。幅広いシステムでの実験により、葉の <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 木の葉では16のファンアウトがうまく機能することが確認されています。</p>
+<p>もちろん、数百または数千のCPUを持つシステムでの経験が増えると、非葉構造のファンアウトがさらに低減される必要があることが示されるかもしれません。このような低減は、必要と判断されたときに簡単に実施できます。その間、このようなシステムを使用していて非葉構造での競合問題に遭遇している場合は、以下に示すカーネル構成パラメータを使用して必要に応じて非葉構造のファンアウトを低減できます。
+<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> NUMA特性が強いシステム用に構築されたカーネルもまた、調整が必要になるかもしれません。 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> structures, you may use the
+<code class="docutils literal notranslate"><span class="pre">CONFIG_RCU_FANOUT</span></code> kernel configuration parameter to reduce the non-leaf fanout as needed.</p>
+<p>Kernels built for systems with strong NUMA characteristics might also need to adjust <code class="docutils literal notranslate"><span class="pre">CONFIG_RCU_FANOUT</span></code> 構造がハードウェアの境界と一致するようにするため。 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> ただし、これまでこれが必要なことはありませんでした。</p>
+</td>
+</tr>
+</tbody>
+</table>
+<p>あなたのシステムが1,024以上のCPU（または32ビットシステムでは512以上）を搭載している場合、RCUは自動的にツリーに追加のレベルを追加します。たとえば、65,536のCPUを搭載した64ビットシステムを構築するほど馬鹿げたことをする場合、RCUは以下のようにツリーを構成します。 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 以下のようにツリーを構成します：</p>
+<figure class="align-default">
+<img alt="../../../_images/HugeTreeClassicRCU.svg" src="../../../_images/HugeTreeClassicRCU.svg"/></figure>
+<p>RCUは現在、最大4レベルのツリーを許可しており、64ビットシステムでは最大4,194,304のCPUをサポートしますが、32ビットシステムではわずか524,288のCPUに限定されます。一方で、両方を
+<code class="docutils literal notranslate"><span class="pre">CONFIG_RCU_FANOUT</span></code> および <code class="docutils literal notranslate"><span class="pre">CONFIG_RCU_FANOUT_LEAF</span></code> 2に設定できるため、4レベルのツリーを使用した16-CPUのテストが可能です。これは、小型のテストマシンで大規模システムの機能をテストするのに役立ちます。</p>
+<p>この多段階の結合木は、RCUのgrace-period検出が本来グローバルな操作であるにもかかわらず、パーティションの性能とスケーラビリティの利点の多くを実現するようにします。ここでのトリックは、特定の構造体においてクイエスcent状態を報告した最後のCPUだけが次のレベルの構造体へ進むことです。 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>
+構造体へ進む必要があります <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 葉レベルの構造体では、16アクセス中1つのみが木の上位へ進むことになります。内部の構造体ではさらに極端な状況です：64アクセス中1つのみが木の上位へ進むことになります。 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> ほとんどのCPUが木の上位へ進まないため、ロックコンテントションはほぼ一定のままです。システム内のCPU数に関係なく、1つのgrace periodあたり最大64つのクイエスcent状態レポートがルートまで進むことになります <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体ではさらに極端な状況です：64アクセス中1つのみが木の上位へ進むことになります。ほとんどのCPUが木の上位へ進まないため、ロックコンテントションはほぼ一定のままです。システム内のCPU数に関係なく、1つのgrace periodあたり最大64つのクイエスcent状態レポートがルートまで進むことになります <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造により、そのルートにおけるロック競合が許容範囲内に保たれる <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>
+ようにします。</p>
+<p>実際には、結合木は大きなショック吸収器のように働き、システムの負荷レベルに関係なく、すべての木レベルでロック競合を制御し続けることで、負荷を吸収し続けます。</p>
+<p>RCUアップデータは、通常のグレースペリオドを待つためにRCUコールバックを登録することにより、直接的に <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> または間接的に
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> などにより実行されます。RCUコールバックは
+<code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> structures, which are queued on <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> structures while they are waiting for a grace period to elapse, as shown in the following figure:</p>
+<figure class="align-default">
+<img alt="../../../_images/BigTreePreemptRCUBHdyntickCB.svg" src="../../../_images/BigTreePreemptRCUBHdyntickCB.svg"/></figure>
+<p>This figure shows how <code class="docutils literal notranslate"><span class="pre">TREE_RCU</span></code>’s and <code class="docutils literal notranslate"><span class="pre">PREEMPT_RCU</span></code>’s major data structures are related. Lesser data structures will be introduced with the algorithms that make use of them.</p>
+<p>Note that each of the data structures in the above figure has its own synchronization:</p>
+<ol class="arabic simple">
+<li><p>Each <code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> structures has a lock and a mutex, and some fields are protected by the corresponding root <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> structure’s lock.</p></li>
+<li><p>Each <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> structure has a spinlock.</p></li>
+<li><p>The fields in <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> are private to the corresponding CPU, although a few can be read and written by other CPUs.</p></li>
+</ol>
+<p>It is important to note that different data structures can have very different ideas about the state of RCU at any given time. For but one example, awareness of the start or end of a given RCU grace period propagates slowly through the data structures. This slow propagation is absolutely necessary for RCU to have good read-side performance. If this balkanized implementation seems foreign to you, one useful trick is to consider each instance of these data structures to be a different person, each having the usual slightly different view of reality.</p>
+<p>The general role of each of these data structures is as follows:</p>
+<ol class="arabic simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">rcu_state</span></code>: This structure forms the interconnection between the
+<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> structures, tracks grace periods, serves as short-term repository for callbacks orphaned by CPU-hotplug events, maintains <code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code> state, tracks expedited grace-period state, and maintains state used to force quiescent states when grace periods extend too long,</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>: This structure forms the combining tree that propagates quiescent-state information from the leaves to the root, and also propagates grace-period information from the root to the leaves. It provides local copies of the grace-period state in order to allow this information to be accessed in a synchronized manner without suffering the scalability limitations that would otherwise be imposed by global locking. In <code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT_RCU</span></code> kernels, it manages the lists of tasks that have blocked while in their current RCU read-side critical section. In <code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT_RCU</span></code> with
+<code class="docutils literal notranslate"><span class="pre">CONFIG_RCU_BOOST</span></code>, it manages the per-<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>
+priority-boosting kernel threads (kthreads) and state. Finally, it records CPU-hotplug state in order to determine which CPUs should be ignored during a given grace period.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">rcu_data</span></code>: This per-CPU structure is the focus of quiescent-state detection and RCU callback queuing. It also tracks its relationship to the corresponding leaf <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> structure to allow more-efficient propagation of quiescent states up the <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>
+combining tree. Like the <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> この構造体は、ローカルのgrace-period情報をコピーして、対応するCPUからこの情報を無料で同期してアクセスできるようにします。最後に、この構造体は対応するCPUの過去のdyntick-idle状態を記録し、統計情報を追跡します。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">rcu_head</span></code>この構造体はRCUコールバックを表し、RCUユーザーによって割り当てられ管理される唯一の構造体です。この <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code>
+構造体は通常、RCU保護されたデータ構造内に埋め込まれています。</p></li>
+</ol>
+<p>この記事から必要な情報は、RCUのデータ構造間の関係性の一般的な理解だけであれば、これで終わりです。それ以外の場合は、以下の各セクションで、それぞれのデータ構造についてより詳細に説明します。 <code class="docutils literal notranslate"><span class="pre">rcu_state</span></code>, <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>
+および <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> data structures。</p>
+<section id="the-rcu-state-structure">
+<h3>以下の <code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> Structure<a class="headerlink" href="#the-rcu-state-structure" title="この見出しへのパーマリンク">¶</a></h3>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> この構造体はシステム内のRCUの状態を表すベースの構造体です。この構造体は、 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> 構造体間のインターフェースを形成し、grace periodを追跡し、CPUホットプラグイベントと同期するためのロックを含み、grace periodが長すぎる場合にクイエスcent状態を強制するための状態を保持します。</p>
+<p>いくつかの <code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> 構造体のフィールドは、以下のセクションで単独またはグループごとに説明されます。より専門的なフィールドについては、その用途の議論でカバーします。</p>
+<section id="relationship-to-rcu-node-and-rcu-data-structures">
+<h4>rcu_nodeおよびrcu_data構造体との関係<a class="headerlink" href="#relationship-to-rcu-node-and-rcu-data-structures" title="この見出しへのパーマリンク">¶</a></h4>
+<p>この <code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> 構造体の一部は以下のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1   struct rcu_node node[NUM_RCU_NODES];
+2   struct rcu_node *level[NUM_RCU_LVLS + 1];
+3   struct rcu_data __percpu *rda;
+</pre></div>
+</div>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>待ってください！あなたが述べた <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体が木構造を形成していると述べたにもかかわらず、なぜフラットな配列として宣言されているのでしょうか？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>木構造は配列内で配置されています。配列内の最初のノードがヘッドで、次のノード群がヘッドノードの子ノードであり、最後のノード群が葉になります。以下のダイアグラムを参照してください。</p></td>
+</tr>
+</tbody>
+</table>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> treeは以下の図のように <code class="docutils literal notranslate"><span class="pre">-&gt;node[]</span></code> 配列に埋め込まれています:</p>
+<figure class="align-default">
+<img alt="../../../_images/TreeMapping.svg" src="../../../_images/TreeMapping.svg"/></figure>
+<p>このマッピングの興味深い結果として、木構造の幅優先トラバーサルは配列の単純な線形スキャンとして実装され、これは実際には <code class="docutils literal notranslate"><span class="pre">rcu_for_each_node_breadth_first()</span></code>
+マクロが行います。このマクロはgrace periodの開始と終了時に使用されます。</p>
+<p>各 <code class="docutils literal notranslate"><span class="pre">-&gt;level</span></code> 配列のエントリは、木構造の対応するレベルの最初の <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>
+構造体を参照します。例えば、以下のようになります:</p>
+<figure class="align-default">
+<img alt="../../../_images/TreeMappingLevel.svg" src="../../../_images/TreeMappingLevel.svg"/></figure>
+<p>配列のゼロ<sup>番目の要素はルート</sup> 構造体を参照し、最初の要素はルートの最初の子
+<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体を参照し、最後に2番目の要素は最初の葉 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>構造体を参照します。 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 何らかの理由で、木構造を配列形状ではなく木形状で描くと、平面的な表現を簡単に描くことができます:</p>
+<p>最後に、</p>
+<figure class="align-default">
+<img alt="../../../_images/TreeLevel.svg" src="../../../_images/TreeLevel.svg"/></figure>
+<p>フィールドは対応するCPUの <code class="docutils literal notranslate"><span class="pre">-&gt;rda</span></code> に割り当てられたパーセルCPUポインタを参照します。 <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> 何らかの理由で、木構造を配列形状ではなく木形状で描くと、平面的な表現を簡単に描くことができます:</p>
+<p>初期化が完了した後は、これらのフィールドはすべて定数となり、保護の必要がありません。</p>
+</section>
+<section id="grace-period-tracking">
+<h4>Grace-Period Tracking<a class="headerlink" href="#grace-period-tracking" title="この見出しへのパーマリンク">¶</a></h4>
+<p>この <code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> 構造体の一部は以下のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1   unsigned long gp_seq;
+</pre></div>
+</div>
+<p>RCUのグレース・ペリオドは番号付けられており、 <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> フィールドには現在のグレース・ペリオドのシーケンス番号が含まれています。現在のグレース・ペリオドの状態を表す下位2ビットは、未開始の場合はゼロ、進行中である場合は1となります。
+<code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> 言い換えれば、下位2ビットがゼロの場合、RCUはアイドル状態です。下位2ビットに他の値がある場合、何かが壊れている可能性があります。このフィールドはルート構造体の <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;lock</span></code> フィールドによって保護されています。</p>
+<p>ここには <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> 構造体のフィールドがあります。 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code>
+構造体にも同様にフィールドがあります。構造体のフィールドは現在の値を表し、他の構造体のフィールドは分散的にグレース・ペリオドの開始と終了を検出するために比較されます。 <code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> 値は（ルートから葉に向かって木の下に流れる）から <code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> に（木の下から葉に向かって） <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>
+に流れるため、 <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code>.</p>
+</section>
+<section id="miscellaneous">
+<h4>雑項<a class="headerlink" href="#miscellaneous" title="この見出しへのパーマリンク">¶</a></h4>
+<p>この <code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> 構造体の一部は以下のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1   unsigned long gp_max;
+2   char abbr;
+3   char *name;
+</pre></div>
+</div>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;gp_max</span></code> フィールドはジャiffies単位で最も長いグレース・ペリオドの持続時間を追跡します。このフィールドはルート <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>’s <code class="docutils literal notranslate"><span class="pre">-&gt;lock</span></code>.</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;name</span></code> および <code class="docutils literal notranslate"><span class="pre">-&gt;abbr</span></code> 構造体のフィールドはプリエンプティブなRCU（「rcu_preempt」および「p」）と非プリエンプティブなRCU（「rcu_sched」および「s」）を区別します。これらのフィールドは診断およびトレースの目的で使用されます。</p>
+</section>
+</section>
+<section id="the-rcu-node-structure">
+<h3>以下の <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> Structure<a class="headerlink" href="#the-rcu-node-structure" title="この見出しへのパーマリンク">¶</a></h3>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体は、葉からルートへとクイエスcent状態情報を伝播し、ルートから葉へとグレース・ペリオド情報を伝播する結合木を形成します。これにより、グローバルなロックによるスケーラビリティの制限を回避しつつ、同期してこの情報をアクセスできるようにするため、ローカルなグレース・ペリオド状態のコピーを提供します。In <code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT_RCU</span></code> カーネルでは、現在のRCU読み取り側クリティカルセクション内でブロックされたタスクのリストを管理します。In <code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT_RCU</span></code> with <code class="docutils literal notranslate"><span class="pre">CONFIG_RCU_BOOST</span></code>、彼らは優先度の高いカーネルスレッド（kthreads）と状態を管理します。<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 優先度の高いカーネルスレッド（kthreads）と状態を管理します。最後に、彼らは特定のグレース・ペリオドにおいて無視すべきCPUの状態を記録します。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体のフィールドは、次のセクションで個別およびグループごとに説明されます。</p>
+<section id="connection-to-combining-tree">
+<h4>結合木への接続<a class="headerlink" href="#connection-to-combining-tree" title="この見出しへのパーマリンク">¶</a></h4>
+<p>この <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の一部は以下のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1   struct rcu_node *parent;
+2   u8 level;
+3   u8 grpnum;
+4   unsigned long grpmask;
+5   int grplo;
+6   int grphi;
+</pre></div>
+</div>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;parent</span></code> ポインタは木の上位レベルを参照し、 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 木の上位レベルを参照し、 <code class="docutils literal notranslate"><span class="pre">NULL</span></code> ルート <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>。RCUの実装では、このフィールドを重用して、クイエスcent状態を木の上部に押し上げます。
+<code class="docutils literal notranslate"><span class="pre">-&gt;level</span></code> フィールドは木のレベルを示し、ルートはレベルゼロ、その子はレベル1、といった具合です。 <code class="docutils literal notranslate"><span class="pre">-&gt;grpnum</span></code> フィールドはこのノードが親の子ノードの中でどの位置にあるかを示し、この数値は32ビットシステムでは0〜31、64ビットシステムでは0〜63の範囲になります。 <code class="docutils literal notranslate"><span class="pre">-&gt;level</span></code> および <code class="docutils literal notranslate"><span class="pre">-&gt;grpnum</span></code> フィールドは初期化中にのみ使用され、トレースの目的で使用されます。 <code class="docutils literal notranslate"><span class="pre">-&gt;grpmask</span></code> フィールドはビットマスクの対応するものです。 <code class="docutils literal notranslate"><span class="pre">-&gt;grpnum</span></code>、常に1ビットのみが設定されている。このマスクは、この構造体に対応するビットをクリアするために使用される
+<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 親のビットマスク内でこの構造体に対応するビットをクリアする。最後に、 <code class="docutils literal notranslate"><span class="pre">-&gt;grplo</span></code> および <code class="docutils literal notranslate"><span class="pre">-&gt;grphi</span></code> フィールドは、この構造体が処理するCPUの最小および最大の番号をそれぞれ含みます <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体、それぞれ</p>
+<p>これらのすべてのフィールドは定数であり、したがって同期化の必要はありません</p>
+</section>
+<section id="synchronization">
+<h4>同期化<a class="headerlink" href="#synchronization" title="この見出しへのパーマリンク">¶</a></h4>
+<p>この構造体のこのフィールドは <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の一部は以下のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1   raw_spinlock_t lock;
+</pre></div>
+</div>
+<p>このフィールドは、この構造体の他のフィールドを保護するために使用され、ただし明示的に例外がある場合を除きます。ただし、この構造体のすべてのフィールドは、トレース目的でロックなしにアクセスできます。はい、これによりトレースが混乱する可能性がありますが、ヒューゲンズバグで消えてしまうよりはましだと思います</p>
+</section>
+<section id="grace-period-tracking-1">
+<span id="id1"></span><h4>Grace-Period Tracking<a class="headerlink" href="#grace-period-tracking-1" title="この見出しへのパーマリンク">¶</a></h4>
+<p>この <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の一部は以下のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1   unsigned long gp_seq;
+2   unsigned long gp_seq_needed;
+</pre></div>
+</div>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> フィールドは、同じ名前のフィールドの対応する要素です。 <code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> それぞれの対応する要素に1ステップだけ遅れる可能性があります。 <code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> 指定されたフィールドの下位2ビットがゼロの場合、この <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> フィールドはゼロの場合、この <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体がRCUがアイドル状態にあると信じている。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">&gt;gp_seq</span></code> 各フィールドの <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体は各グレース期間の開始と終了時に更新される。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq_needed</span></code> フィールドは、対応する...が見ている最も遠い将来のグレース期間リクエストを記録します。 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体。リクエストは、該当する値の... <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> field equals or exceeds that of the <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq_needed</span></code> フィールドによって保護されています。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>Suppose that this <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> structure doesn’t see a request for a very long time. Won’t wrapping of the <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> field cause problems?</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>No, because if the <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq_needed</span></code> field lags behind the
+<code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> field, the <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq_needed</span></code> field will be updated at the end of the grace period. Modulo-arithmetic comparisons therefore will always get the correct answer, even with wrapping.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="quiescent-state-tracking">
+<h4>Quiescent-State Tracking<a class="headerlink" href="#quiescent-state-tracking" title="この見出しへのパーマリンク">¶</a></h4>
+<p>These fields manage the propagation of quiescent states up the combining tree.</p>
+<p>この <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> structure has fields as follows:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1   unsigned long qsmask;
+2   unsigned long expmask;
+3   unsigned long qsmaskinit;
+4   unsigned long expmaskinit;
+</pre></div>
+</div>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;qsmask</span></code> field tracks which of this <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> structure’s children still need to report quiescent states for the current normal grace period. Such children will have a value of 1 in their corresponding bit. Note that the leaf <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> structures should be thought of as having <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> structures as their children. Similarly, the <code class="docutils literal notranslate"><span class="pre">-&gt;expmask</span></code> field tracks which of this <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>
+structure’s children still need to report quiescent states for the current expedited grace period. An expedited grace period has the same conceptual properties as a normal grace period, but the expedited implementation accepts extreme CPU overhead to obtain much lower grace-period latency, for example, consuming a few tens of microseconds worth of CPU time to reduce grace-period duration from milliseconds to tens of microseconds. The <code class="docutils literal notranslate"><span class="pre">-&gt;qsmaskinit</span></code> field tracks which of this
+<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> structure’s children cover for at least one online CPU. This mask is used to initialize <code class="docutils literal notranslate"><span class="pre">-&gt;qsmask</span></code>, and <code class="docutils literal notranslate"><span class="pre">-&gt;expmaskinit</span></code> is used to initialize <code class="docutils literal notranslate"><span class="pre">-&gt;expmask</span></code> 通常のおよび緊急の優先期間の開始です。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>なぜこれらのビットマスクはロックで保護されているのでしょうか？冗談です、原子操作の概念を聞いたことないのですか？？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>ロックレスの優先期間計算！なんて魅力的な可能性でしょう！しかし、以下のイベントのシーケンスを考慮してください：</p>
+<ol class="arabic simple">
+<li><p>CPU 0は、相当長い間dyntick-idleモードに入っていた。起動時に、現在のRCU優先期間が報告を求めており、スケジューリングクロック割り込みが見つけるフラグを設定する。</p></li>
+<li><p>一方、CPU 1は実行中である。 <code class="docutils literal notranslate"><span class="pre">force_quiescent_state()</span></code>、CPU 0がdyntick idleモードに入っていたことに気づく。これは拡張された静的状態に該当する。</p></li>
+<li><p>CPU 0のスケジューリングクロック割り込みがRCU読み取り側クリティカルセクションの真ん中で発生し、RCUコアが必要なことが判明したため、RCU softirq処理を開始する。</p></li>
+<li><p>CPU 0のsoftirqハンドラが実行され、静的状態を上位に報告するところまで来たところです。 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 木の葉では16のファンアウトがうまく機能することが確認されています。</p></li>
+<li><p>しかし、CPU 1が先に行動し、現在の優先期間を終了し、新しい優先期間を開始する。</p></li>
+<li><p>CPU 0は現在の優先期間ではなく、誤った優先期間の静的状態を報告します。その優先期間がRCU読み取り側クリティカルセクションよりも早く終了する可能性があります。その場合、大変な事態になります。</p></li>
+</ol>
+<p>したがって、ビットのクリアとグレースペリオドのシーケンス番号の更新を調整するためにロックは絶対に必要であり、
+<code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code>.</p>
+</td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="blocked-task-management">
+<h4>Blocked-Task Management<a class="headerlink" href="#blocked-task-management" title="この見出しへのパーマリンク">¶</a></h4>
+<p><code class="docutils literal notranslate"><span class="pre">PREEMPT_RCU</span></code> タスクがRCU read-side critical sectionsの真ん中に preempted されることが許可され、これらのタスクは明示的に追跡される必要があります。RCU read-side処理に関する別記事で、なぜそしてどのように追跡されるのかの詳細が説明されます。現時点では、 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体がそれらを追跡していることを知っておくだけで十分です。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1   struct list_head blkd_tasks;
+2   struct list_head *gp_tasks;
+3   struct list_head *exp_tasks;
+4   bool wait_blkd_tasks;
+</pre></div>
+</div>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;blkd_tasks</span></code> フィールドは、ブロックされたおよびpreemptedされたタスクのリストのリストヘッダーです。RCU read-side critical sections内でタスクがコンテキストスイッチを経るにつれて、その <code class="docutils literal notranslate"><span class="pre">task_struct</span></code> 構造体は（ <code class="docutils literal notranslate"><span class="pre">task_struct</span></code>’s <code class="docutils literal notranslate"><span class="pre">-&gt;rcu_node_entry</span></code> フィールドを介して）
+<code class="docutils literal notranslate"><span class="pre">-&gt;blkd_tasks</span></code> リストの先頭にキューイングされます。これは、コンテキストスイッチが実行されたCPUに対応する <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体のリストです。これらのタスクが後にRCU read-side critical sectionsを退出するとき、それらはリストから自身を削除します。このリストは逆の時間順序で構成されているため、もしタスクのどれかが現在のグレースペリオドをブロックしている場合、すべての後続のタスクも同じグレースペリオドをブロックしている必要があります。したがって、このリストへの単一のポインタで、特定のグレースペリオドをブロックしているすべてのタスクを追跡できます。このポインタは、通常のグレースペリオドには <code class="docutils literal notranslate"><span class="pre">-&gt;gp_tasks</span></code> に、緊急のグレースペリオドには <code class="docutils literal notranslate"><span class="pre">-&gt;exp_tasks</span></code> に保存されます。これら最後の2つのフィールドは <code class="docutils literal notranslate"><span class="pre">NULL</span></code> 飛行中のgrace periodが存在しない、またはgrace periodが完了するのを妨げるブロックされたタスクが存在しない場合。この2つのポインタのいずれかがリストから自身を削除するタスクを参照している場合、そのタスクはリストの次のタスクにポインタを進めるか、またはポインタを <code class="docutils literal notranslate"><span class="pre">-&gt;blkd_tasks</span></code> リストに次のタスクが存在しない場合に設定する必要があります。
+<code class="docutils literal notranslate"><span class="pre">NULL</span></code> リストに次のタスクが存在しない場合。</p>
+<p>たとえば、タスクT1、T2、T3がすべてシステム内の最大番号のCPUにハードアフィニティで割り当てられているとします。タスクT1がRCU読み取り側クリティカルセクションでブロックされると、優先的なgrace periodが開始され、その後タスクT2がRCU読み取り側クリティカルセクションでブロックされると通常のgrace periodが開始され、最終的にタスクT3がRCU読み取り側クリティカルセクションでブロックされた場合、最後の葉 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>
+構造体のブロックタスクリストの状態は以下のようになります:</p>
+<figure class="align-default">
+<img alt="../../../_images/blkd_task.svg" src="../../../_images/blkd_task.svg"/></figure>
+<p>タスクT1は両方のgrace periodをブロックしており、タスクT2は通常のgrace periodのみをブロックし、タスクT3はどちらのgrace periodもブロックしていません。注意点として、これらのタスクは実行再開時にこのリストから即座に自身を削除しません。代わりに、外側の <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code> RCU読み取り側クリティカルセクションを終了するまでリストに残ります。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;wait_blkd_tasks</span></code> フィールドは、現在のgrace periodがブロックされたタスクを待っているかどうかを示します。</p>
+</section>
+<section id="sizing-the-rcu-node-array">
+<h4>サイズの <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 配列<a class="headerlink" href="#sizing-the-rcu-node-array" title="この見出しへのパーマリンク">¶</a></h4>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 配列のサイズは、以下のようないくつかのCプリプロセッサ式によって決定されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 #ifdef CONFIG_RCU_FANOUT
+ 2 #define RCU_FANOUT CONFIG_RCU_FANOUT
+ 3 #else
+ 4 # ifdef CONFIG_64BIT
+ 5 # define RCU_FANOUT 64
+ 6 # else
+ 7 # define RCU_FANOUT 32
+ 8 # endif
+ 9 #endif
+10
+11 #ifdef CONFIG_RCU_FANOUT_LEAF
+12 #define RCU_FANOUT_LEAF CONFIG_RCU_FANOUT_LEAF
+13 #else
+14 # ifdef CONFIG_64BIT
+15 # define RCU_FANOUT_LEAF 64
+16 # else
+17 # define RCU_FANOUT_LEAF 32
+18 # endif
+19 #endif
+20
+21 #define RCU_FANOUT_1        (RCU_FANOUT_LEAF)
+22 #define RCU_FANOUT_2        (RCU_FANOUT_1 * RCU_FANOUT)
+23 #define RCU_FANOUT_3        (RCU_FANOUT_2 * RCU_FANOUT)
+24 #define RCU_FANOUT_4        (RCU_FANOUT_3 * RCU_FANOUT)
+25
+26 #if NR_CPUS &lt;= RCU_FANOUT_1
+27 #  define RCU_NUM_LVLS        1
+28 #  define NUM_RCU_LVL_0        1
+29 #  define NUM_RCU_NODES        NUM_RCU_LVL_0
+30 #  define NUM_RCU_LVL_INIT    { NUM_RCU_LVL_0 }
+31 #  define RCU_NODE_NAME_INIT  { "rcu_node_0" }
+32 #  define RCU_FQS_NAME_INIT   { "rcu_node_fqs_0" }
+33 #  define RCU_EXP_NAME_INIT   { "rcu_node_exp_0" }
+34 #elif NR_CPUS &lt;= RCU_FANOUT_2
+35 #  define RCU_NUM_LVLS        2
+36 #  define NUM_RCU_LVL_0        1
+37 #  define NUM_RCU_LVL_1        DIV_ROUND_UP(NR_CPUS, RCU_FANOUT_1)
+38 #  define NUM_RCU_NODES        (NUM_RCU_LVL_0 + NUM_RCU_LVL_1)
+39 #  define NUM_RCU_LVL_INIT    { NUM_RCU_LVL_0, NUM_RCU_LVL_1 }
+40 #  define RCU_NODE_NAME_INIT  { "rcu_node_0", "rcu_node_1" }
+41 #  define RCU_FQS_NAME_INIT   { "rcu_node_fqs_0", "rcu_node_fqs_1" }
+42 #  define RCU_EXP_NAME_INIT   { "rcu_node_exp_0", "rcu_node_exp_1" }
+43 #elif NR_CPUS &lt;= RCU_FANOUT_3
+44 #  define RCU_NUM_LVLS        3
+45 #  define NUM_RCU_LVL_0        1
+46 #  define NUM_RCU_LVL_1        DIV_ROUND_UP(NR_CPUS, RCU_FANOUT_2)
+47 #  define NUM_RCU_LVL_2        DIV_ROUND_UP(NR_CPUS, RCU_FANOUT_1)
+48 #  define NUM_RCU_NODES        (NUM_RCU_LVL_0 + NUM_RCU_LVL_1 + NUM_RCU_LVL_2)
+49 #  define NUM_RCU_LVL_INIT    { NUM_RCU_LVL_0, NUM_RCU_LVL_1, NUM_RCU_LVL_2 }
+50 #  define RCU_NODE_NAME_INIT  { "rcu_node_0", "rcu_node_1", "rcu_node_2" }
+51 #  define RCU_FQS_NAME_INIT   { "rcu_node_fqs_0", "rcu_node_fqs_1", "rcu_node_fqs_2" }
+52 #  define RCU_EXP_NAME_INIT   { "rcu_node_exp_0", "rcu_node_exp_1", "rcu_node_exp_2" }
+53 #elif NR_CPUS &lt;= RCU_FANOUT_4
+54 #  define RCU_NUM_LVLS        4
+55 #  define NUM_RCU_LVL_0        1
+56 #  define NUM_RCU_LVL_1        DIV_ROUND_UP(NR_CPUS, RCU_FANOUT_3)
+57 #  define NUM_RCU_LVL_2        DIV_ROUND_UP(NR_CPUS, RCU_FANOUT_2)
+58 #  define NUM_RCU_LVL_3        DIV_ROUND_UP(NR_CPUS, RCU_FANOUT_1)
+59 #  define NUM_RCU_NODES        (NUM_RCU_LVL_0 + NUM_RCU_LVL_1 + NUM_RCU_LVL_2 + NUM_RCU_LVL_3)
+60 #  define NUM_RCU_LVL_INIT    { NUM_RCU_LVL_0, NUM_RCU_LVL_1, NUM_RCU_LVL_2, NUM_RCU_LVL_3 }
+61 #  define RCU_NODE_NAME_INIT  { "rcu_node_0", "rcu_node_1", "rcu_node_2", "rcu_node_3" }
+62 #  define RCU_FQS_NAME_INIT   { "rcu_node_fqs_0", "rcu_node_fqs_1", "rcu_node_fqs_2", "rcu_node_fqs_3" }
+63 #  define RCU_EXP_NAME_INIT   { "rcu_node_exp_0", "rcu_node_exp_1", "rcu_node_exp_2", "rcu_node_exp_3" }
+64 #else
+65 # error "CONFIG_RCU_FANOUT insufficient for NR_CPUS"
+66 #endif
+</pre></div>
+</div>
+<p>The maximum number of levels in the <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> structure is currently limited to four, as specified by lines 21-24 and the structure of the subsequent “if” statement. For 32-bit systems, this allows 16*32*32*32=524,288 CPUs, which should be sufficient for the next few years at least. For 64-bit systems, 16*64*64*64=4,194,304 CPUs is allowed, which should see us through the next decade or so. This four-level tree also allows kernels built with <code class="docutils literal notranslate"><span class="pre">CONFIG_RCU_FANOUT=8</span></code>
+to support up to 4096 CPUs, which might be useful in very large systems having eight CPUs per socket (but please note that no one has yet shown any measurable performance degradation due to misaligned socket and
+<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> boundaries). In addition, building kernels with a full four levels of <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> tree permits better testing of RCU’s combining-tree code.</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">RCU_FANOUT</span></code> symbol controls how many children are permitted at each non-leaf level of the <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> tree. If the
+<code class="docutils literal notranslate"><span class="pre">CONFIG_RCU_FANOUT</span></code> Kconfig option is not specified, it is set based on the word size of the system, which is also the Kconfig default.</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">RCU_FANOUT_LEAF</span></code> symbol controls how many CPUs are handled by each leaf <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> structure. Experience has shown that allowing a given leaf <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> structure to handle 64 CPUs, as permitted by the number of bits in the <code class="docutils literal notranslate"><span class="pre">-&gt;qsmask</span></code> 64ビットシステムにおけるフィールドは、リーフに対する過剰な競合を引き起こします <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;lock</span></code>
+フィールド。リーフごとのCPU数 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体は、デフォルト値に基づいて16に制限されます <code class="docutils literal notranslate"><span class="pre">CONFIG_RCU_FANOUT_LEAF</span></code>.
+<code class="docutils literal notranslate"><span class="pre">CONFIG_RCU_FANOUT_LEAF</span></code> 指定されていない場合、選択される値はシステムのワードサイズに基づきます。 <code class="docutils literal notranslate"><span class="pre">CONFIG_RCU_FANOUT</span></code>. 11行〜19行がこの計算を行います。</p>
+<p>21行〜24行は、単一レベル（1つの構造体を含む） <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体）、2レベル、3レベル、4レベル <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> ツリーにそれぞれ対応するファンアウト指定に基づいています <code class="docutils literal notranslate"><span class="pre">RCU_FANOUT</span></code> および <code class="docutils literal notranslate"><span class="pre">RCU_FANOUT_LEAF</span></code>. これらのCPU数は、 <code class="docutils literal notranslate"><span class="pre">RCU_FANOUT_1</span></code>,
+<code class="docutils literal notranslate"><span class="pre">RCU_FANOUT_2</span></code>, <code class="docutils literal notranslate"><span class="pre">RCU_FANOUT_3</span></code>, and <code class="docutils literal notranslate"><span class="pre">RCU_FANOUT_4</span></code> Cプリプロセッサ変数にそれぞれ保持されます</p>
+<p>これらの変数は、Cプリプロセッサ <code class="docutils literal notranslate"><span class="pre">#if</span></code> ステートメント spanning 26行〜66行にわたるステートメントで、各ツリーのレベルごとの必要となる構造体の数を計算します <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の数およびレベル数を計算します。レベル数は、 <code class="docutils literal notranslate"><span class="pre">NUM_RCU_LVLS</span></code>
+Cプリプロセッサ変数に設定されます。構造体の数は
+<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 最上位レベルの構造体数は常に1であり、この値は条件なく
+<code class="docutils literal notranslate"><span class="pre">NUM_RCU_LVL_0</span></code> 28行、36行、45行、55行で設定されます。残りのレベル（存在する場合） <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> ツリーの残りのレベルは、現在のレベルから下のレベル数に応じたファンアウトを考慮して、最大CPU数を割り算し、上向きに丸めて計算されます。この計算は37行、46〜47行、56〜58行で行われます。31〜33行、40〜42行、50〜52行、62〜63行ではlockdepロッククラス名の初期化を行います。最後に、64〜66行では指定されたファンアウトに対して最大CPU数が大きすぎる場合にエラーを出力します。</p>
+</section>
+</section>
+<section id="the-rcu-segcblist-structure">
+<h3>以下の <code class="docutils literal notranslate"><span class="pre">rcu_segcblist</span></code> Structure<a class="headerlink" href="#the-rcu-segcblist-structure" title="この見出しへのパーマリンク">¶</a></h3>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">rcu_segcblist</span></code> 構造体は以下のようないくつものセグメントを持つコールバックリストを保持します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 #define RCU_DONE_TAIL        0
+ 2 #define RCU_WAIT_TAIL        1
+ 3 #define RCU_NEXT_READY_TAIL  2
+ 4 #define RCU_NEXT_TAIL        3
+ 5 #define RCU_CBLIST_NSEGS     4
+ 6
+ 7 struct rcu_segcblist {
+ 8   struct rcu_head *head;
+ 9   struct rcu_head **tails[RCU_CBLIST_NSEGS];
+10   unsigned long gp_seq[RCU_CBLIST_NSEGS];
+11   long len;
+12   long len_lazy;
+13 };
+</pre></div>
+</div>
+<p>セグメントは以下の通りです：</p>
+<ol class="arabic simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">RCU_DONE_TAIL</span></code>：グレースペリオドが終了したコールバック。これらのコールバックは実行準備ができています。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">RCU_WAIT_TAIL</span></code>：現在のグレースペリオドを待っているコールバック。異なるCPUが現在のグレースペリオドについて異なる認識を持つ可能性があるため、 <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> フィールドによって保護されています。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">RCU_NEXT_READY_TAIL</span></code>：次のグレースペリオドの開始を待っているコールバック。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">RCU_NEXT_TAIL</span></code>：まだグレースペリオドに割り当てられていないコールバック。</p></li>
+</ol>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;head</span></code> ポインタは最初のコールバックを参照するか、 <code class="docutils literal notranslate"><span class="pre">NULL</span></code> リストにコールバックが含まれていない場合（これは <em>ではありません</em> 空であると同じです）。リストの各要素は <code class="docutils literal notranslate"><span class="pre">-&gt;tails[]</span></code> 配列は <code class="docutils literal notranslate"><span class="pre">-&gt;next</span></code>
+リストの対応するセグメントの最後のコールバックのポインタ、またはリストの <code class="docutils literal notranslate"><span class="pre">-&gt;head</span></code> そのセグメントとすべての前のセグメントが空の場合、リストのポインタになります。対応するセグメントが空でも、前のセグメントの一部が空でない場合、配列要素は前後の要素と同一です。古いコールバックはリストの先頭に近い位置にあり、新しいコールバックはリストの末尾に追加されます。このポインタと
+<code class="docutils literal notranslate"><span class="pre">-&gt;head</span></code> ポインタ、そして <code class="docutils literal notranslate"><span class="pre">-&gt;tails[]</span></code> 配列、そしてコールバックはこのダイアグラムに示されています:</p>
+<figure class="align-default">
+<img alt="../../../_images/nxtlist.svg" src="../../../_images/nxtlist.svg"/></figure>
+<p>この図では、 <code class="docutils literal notranslate"><span class="pre">-&gt;head</span></code> ポインタはリスト内の最初のRCUコールバックを参照しています。 <code class="docutils literal notranslate"><span class="pre">-&gt;tails[RCU_DONE_TAIL]</span></code> 配列要素は
+<code class="docutils literal notranslate"><span class="pre">-&gt;head</span></code> ポインタ自身を参照しており、どのコールバックも実行準備ができていないことを示しています。 <code class="docutils literal notranslate"><span class="pre">-&gt;tails[RCU_WAIT_TAIL]</span></code> 配列要素はコールバックCB 2の <code class="docutils literal notranslate"><span class="pre">-&gt;next</span></code> ポインタを参照しており、CB 1とCB 2の両方が現在のグレース期間を待っていることを示しています。ただし、正確に現在のグレース期間がどれであるかについての意見の相違が生じる可能性があるため、その点については考慮が必要です。
+<code class="docutils literal notranslate"><span class="pre">-&gt;tails[RCU_NEXT_READY_TAIL]</span></code> 配列要素は同じRCUコールバックを参照しており、 <code class="docutils literal notranslate"><span class="pre">-&gt;tails[RCU_WAIT_TAIL]</span></code> 参照しているため、次のRCUグレース期間を待っているコールバックは存在しないことを示しています。
+<code class="docutils literal notranslate"><span class="pre">-&gt;tails[RCU_NEXT_TAIL]</span></code> 配列要素はCB 4の <code class="docutils literal notranslate"><span class="pre">-&gt;next</span></code>
+ポインタを参照しており、
+<code class="docutils literal notranslate"><span class="pre">-&gt;tails[RCU_NEXT_TAIL]</span></code> 配列要素は常に最後のRCUコールバックの <code class="docutils literal notranslate"><span class="pre">-&gt;next</span></code> ポインタを参照します。ただし、コールバックリストが空の場合、 <code class="docutils literal notranslate"><span class="pre">-&gt;head</span></code> ポインタを参照します。</p>
+<p>RCU配列要素には、追加の重要な特殊ケースがあります。
+<code class="docutils literal notranslate"><span class="pre">-&gt;tails[RCU_NEXT_TAIL]</span></code> 配列要素: これは <code class="docutils literal notranslate"><span class="pre">NULL</span></code> このリストが <em>無効化されている場合です。</em>. リストは、対応するCPUがオフラインになっている場合、または対応するCPUのコールバックがkthreadにオフロードされている場合に無効化されます。これらについては他で説明されています。</p>
+<p>CPUは、 <code class="docutils literal notranslate"><span class="pre">RCU_NEXT_TAIL</span></code> から
+<code class="docutils literal notranslate"><span class="pre">RCU_NEXT_READY_TAIL</span></code> から <code class="docutils literal notranslate"><span class="pre">RCU_WAIT_TAIL</span></code> から
+<code class="docutils literal notranslate"><span class="pre">RCU_DONE_TAIL</span></code> リストセグメントに進みます。グレース期間が進むにつれて、</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq[]</span></code> 配列は、リストセグメントに対応するグレース期間番号を記録します。これにより、異なるCPUが現在のグレース期間について異なる認識を持つことができますが、コールバックの早期実行を回避できます。特に、長時間アイドル状態になるCPUは、再起動後にどのコールバックが実行可能かを判断できます。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;len</span></code> カウンターは、 <code class="docutils literal notranslate"><span class="pre">-&gt;head</span></code>内のコールバック数を示し、 <code class="docutils literal notranslate"><span class="pre">-&gt;len_lazy</span></code> は、メモリを解放するだけであり、実行を安全に遅延させることができるコールバックの数を示します。</p>
+<div class="admonition important">
+<p class="admonition-title">重要です。</p>
+<p>これは <code class="docutils literal notranslate"><span class="pre">-&gt;len</span></code> フィールドであり、この構造体に関連するコールバックが存在するかどうかを決定します。 <code class="docutils literal notranslate"><span class="pre">rcu_segcblist</span></code>
+構造体、 <em>ではありません</em> 、そして <code class="docutils literal notranslate"><span class="pre">-&gt;head</span></code> ポインタです。その理由は、すべての実行準備ができたコールバック（つまり、リストセグメントにあるコールバック）がコールバック実行時間（ <code class="docutils literal notranslate"><span class="pre">RCU_DONE_TAIL</span></code>
+セグメント）がコールバック実行時間（<code class="docutils literal notranslate"><span class="pre">rcu_do_batch</span></code>）で一括して抽出されるため、 <code class="docutils literal notranslate"><span class="pre">-&gt;head</span></code> が、リストに残っている未実行のコールバックがなければNULLに設定される可能性があります。 <code class="docutils literal notranslate"><span class="pre">rcu_segcblist</span></code>。コールバックの実行を遅延させる必要がある場合（たとえば、このCPUで高優先度のプロセスが起動した場合）、残りのコールバックは <code class="docutils literal notranslate"><span class="pre">RCU_DONE_TAIL</span></code> セグメントに戻され、
+<code class="docutils literal notranslate"><span class="pre">-&gt;head</span></code> 、セグメントの開始位置を再び参照します。要するに、ヘッドフィールドは一時的に <code class="docutils literal notranslate"><span class="pre">NULL</span></code> CPUが常にコールバックを保持しているにもかかわらず、このためのポインタをテストするのは不適切です。
+<code class="docutils literal notranslate"><span class="pre">-&gt;head</span></code> pointer for <code class="docutils literal notranslate"><span class="pre">NULL</span></code>.</p>
+</div>
+<p>一方で、 <code class="docutils literal notranslate"><span class="pre">-&gt;len</span></code> および <code class="docutils literal notranslate"><span class="pre">-&gt;len_lazy</span></code> カウントは対応するコールバックが呼び出された後だけ調整されます。これは、
+<code class="docutils literal notranslate"><span class="pre">-&gt;len</span></code> カウントがゼロになるのは、 <code class="docutils literal notranslate"><span class="pre">rcu_segcblist</span></code> 構造体が本当にコールバックを保持していない場合に限ります。もちろん、 <code class="docutils literal notranslate"><span class="pre">-&gt;len</span></code>
+カウントのオフCPUサンプリングには適切な同期の使用が必要です。例えば、メモリバリアなど。この同期は特に <code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code>.</p>
+</section>
+<section id="the-rcu-data-structure">
+<h3>以下の <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> Structure<a class="headerlink" href="#the-rcu-data-structure" title="この見出しへのパーマリンク">¶</a></h3>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> RCUサブシステムの各CPU状態を保持します。この構造体のフィールドは、対応するCPU（およびトレース）からしかアクセスできません（明記されていない限り）。この構造体はクワイエント状態の検出とRCUコールバックのキューイングの焦点です。また、対応する葉との関係も追跡します。 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> structure to allow more-efficient propagation of quiescent states up the <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>
+combining tree. Like the <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> この構造体は、ローカルのgrace-period情報をコピーして、対応するCPUからこの情報を無料で同期してアクセスできるようにします。最後に、この構造体は対応するCPUの過去のdyntick-idle状態を記録し、統計情報を追跡します。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> 構造体のフィールドは、次のセクションで個別およびグループごとに説明されます。</p>
+<section id="connection-to-other-data-structures">
+<h4>Connection to Other Data Structures<a class="headerlink" href="#connection-to-other-data-structures" title="この見出しへのパーマリンク">¶</a></h4>
+<p>この <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> 構造体の一部は以下のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1   int cpu;
+2   struct rcu_node *mynode;
+3   unsigned long grpmask;
+4   bool beenonline;
+</pre></div>
+</div>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;cpu</span></code> フィールドには対応するCPUの番号と、
+<code class="docutils literal notranslate"><span class="pre">-&gt;mynode</span></code> フィールドは対応する <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体を参照します。 <code class="docutils literal notranslate"><span class="pre">-&gt;mynode</span></code> は結合木上でクワイエント状態を伝播するために使用されます。これらの2つのフィールドは定数であり、同期不要です。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;grpmask</span></code> フィールドは、この <code class="docutils literal notranslate"><span class="pre">-&gt;mynode-&gt;qsmask</span></code>
+に対応する <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> 構造体のビットを示し、クワイエント状態を伝播する際にも使用されます。 <code class="docutils literal notranslate"><span class="pre">-&gt;beenonline</span></code> フラグは対応するCPUがオンラインになったときに設定され、これによりデバッグfsトレースはこのフラグが設定されていない構造体をダンプする必要がありません。 <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> Quiescent-State and Grace-Period Tracking</p>
+</section>
+<section id="quiescent-state-and-grace-period-tracking">
+<h4>フィールドは、<a class="headerlink" href="#quiescent-state-and-grace-period-tracking" title="この見出しへのパーマリンク">¶</a></h4>
+<p>この <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> 構造体の一部は以下のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1   unsigned long gp_seq;
+2   unsigned long gp_seq_needed;
+3   bool cpu_no_qs;
+4   bool core_needs_qs;
+5   bool gpwrap;
+</pre></div>
+</div>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> 構造体の同名フィールドと対応します。 <code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> フィールドは、
+<code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq_needed</span></code> 構造体の同名フィールドと対応します。これらはそれぞれ、対応する
+<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> のフィールドより最大1つ遅れますが、 <code class="docutils literal notranslate"><span class="pre">CONFIG_NO_HZ_IDLE</span></code> および
+<code class="docutils literal notranslate"><span class="pre">CONFIG_NO_HZ_FULL</span></code> カーネルでは、dyntick-idleモードのCPUでは任意に遅れることができます（ただし、dyntick-idleモードから抜けたときにカウントは同期されます）。ある <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code>
+構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> の下位2ビットがゼロであれば、この <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> 構造体がRCUがアイドル状態にあると信じている。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>すべてのグレースペリオド番号の複製は混乱を招くだけです。なぜ、単一のグローバルシーケンス番号を保持するだけで済ませないのでしょうか???</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>なぜなら、単一のグローバルシーケンス番号があれば、それを安全にアクセス・更新するための単一のグローバルロックが必要になります。そして、単一のグローバルロックを持たない場合、各ノードごとに数値を慎重に管理する必要があります。以前のクイッククイズの回答から思い出してください、以前にサンプリングされたクワイエント状態を誤ったグレースペリオドに適用すると、その結果は非常に深刻です。</p></td>
+</tr>
+</tbody>
+</table>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;cpu_no_qs</span></code> フラグはCPUがまだクワイエント状態を通過していないことを示し、 <code class="docutils literal notranslate"><span class="pre">-&gt;core_needs_qs</span></code> フラグは、RCUコアが対応するCPUからクイエスcent状態を必要としていることを示しています。この <code class="docutils literal notranslate"><span class="pre">-&gt;gpwrap</span></code> フィールドは、対応するCPUが長時間アイドル状態を維持しているため、 <code class="docutils literal notranslate"><span class="pre">gp_seq</span></code> カウンターがオーバーフローする危険があり、その結果、CPUは次にアイドル状態から抜けた際、カウンターの値を無視する可能性があります。</p>
+</section>
+<section id="rcu-callback-handling">
+<h4>RCU Callback処理<a class="headerlink" href="#rcu-callback-handling" title="この見出しへのパーマリンク">¶</a></h4>
+<p>CPUホットプラグイベントが発生していない場合、RCUコールバックは登録したCPUによって呼び出されます。これは厳密にキャッシュローカル性の最適化であり、コールバックは登録したCPU以外のCPUでも呼び出されることがあります。なぜなら、登録したコールバックを呼び出す前にそのCPUがオフラインになってしまえば、他の選択肢は残されていないからです。</p>
+<p>この <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> 構造体の一部は以下のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1 struct rcu_segcblist cblist;
+2 long qlen_last_fqs_check;
+3 unsigned long n_cbs_invoked;
+4 unsigned long n_nocbs_invoked;
+5 unsigned long n_cbs_orphaned;
+6 unsigned long n_cbs_adopted;
+7 unsigned long n_force_qs_snap;
+8 long blimit;
+</pre></div>
+</div>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;cblist</span></code> 構造体は前述したセグメントされたコールバックリストです。CPUは、別のRCUグレース期間が完了したことを検知した際に、その <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> 構造体でコールバックを進めていきます。CPUはRCUグレース期間の完了を検知するために、自身の <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> フィールドの値が葉の <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の値と異なることに気づきます。各 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>
+構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> フィールドは、各グレース期間の開始と終了時に更新されます。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;qlen_last_fqs_check</span></code> および <code class="docutils literal notranslate"><span class="pre">-&gt;n_force_qs_snap</span></code> がオフラインになった際のクイエスcent状態の強制を調整します。 <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> と関連する友達（関連するコンポーネント）がコールバックリストが極めて長くなる場合に使用されます。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;n_cbs_invoked</span></code>, <code class="docutils literal notranslate"><span class="pre">-&gt;n_cbs_orphaned</span></code>, and <code class="docutils literal notranslate"><span class="pre">-&gt;n_cbs_adopted</span></code>
+フィールドは、このCPUがオフラインになった際に他のCPUに送信されるコールバック数、および他のCPUがオフラインになった際に受信されるコールバック数をカウントします。この <code class="docutils literal notranslate"><span class="pre">-&gt;n_nocbs_invoked</span></code> は、CPUのコールバックがkthreadにオフロードされる際使用されます。</p>
+<p>フィールドは対応するCPUの <code class="docutils literal notranslate"><span class="pre">-&gt;blimit</span></code> カウンターは、ある時点で呼び出されるRCUコールバックの最大数を示します。</p>
+</section>
+<section id="dyntick-idle-handling">
+<h4>Dyntick-Idle処理<a class="headerlink" href="#dyntick-idle-handling" title="この見出しへのパーマリンク">¶</a></h4>
+<p>この <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> 構造体の一部は以下のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1   int dynticks_snap;
+2   unsigned long dynticks_fqs;
+</pre></div>
+</div>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;dynticks_snap</span></code> フィールドは、クイエスcent状態を強制する際に対応するCPUのdyntick-idle状態のスナップショットを取得するために使用され、他のCPUからアクセスされます。最後に、
+<code class="docutils literal notranslate"><span class="pre">-&gt;dynticks_fqs</span></code> フィールドは、このCPUがdyntick-idle状態にあると判定される回数をカウントし、トレースおよびデバッグの目的で使用されます。</p>
+<p>このrcu_data構造体の一部は以下の通り宣言されています：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1   long dynticks_nesting;
+2   long dynticks_nmi_nesting;
+3   atomic_t dynticks;
+4   bool rcu_need_heavy_qs;
+5   bool rcu_urgent_qs;
+</pre></div>
+</div>
+<p>rcu_data構造体のこれらのフィールドは、対応するCPUのper-CPU dyntick-idle状態を保持します。フィールドは、明示的に記述されていない限り、対応するCPU（およびトレース）からのみアクセス可能です。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;dynticks_nesting</span></code> フィールドは、プロセス実行のネスト深度をカウントし、通常の状況ではこのカウンターの値がゼロまたは一になります。NMIs、irqs、トレーサーは
+<code class="docutils literal notranslate"><span class="pre">-&gt;dynticks_nmi_nesting</span></code> フィールド。NMIsはマスクできませんので、この変数の変更はAndy Lutomirskiが提供したアルゴリズムを使用して慎重に行わなければなりません。初期のアイドルからの移行では1を加算し、ネストされた移行では2を加算するため、ネストレベル5は値9で表されます。このカウンターは、プロセスレベルの移行を除き、このCPUがdyntick-idleモードに入るのを許可できない理由の数を数えることができます。 <code class="docutils literal notranslate"><span class="pre">-&gt;dynticks_nmi_nesting</span></code> ただし、非アイドル状態のカーネルコンテキストで実行されている場合、Linuxカーネルは永続的に終了しない割込みハンドラにすら完全に移行でき、逆に割込みハンドラが擬造された割込みから戻ってくることもあり得ます。そのため、このフィールドがゼロから増加するたびに、</p>
+<p>フィールドに大きな正数を設定し、このフィールドがゼロに減少するたびに、
+<code class="docutils literal notranslate"><span class="pre">-&gt;dynticks_nesting</span></code> フィールドにゼロを設定します。誤ネストされた割込みの数がカウンターをオーバーフローしないと仮定すれば、このアプローチは、対応するCPUがプロセスコンテキストからアイドルループに入るたびにこのフィールドを常に修正します。
+<code class="docutils literal notranslate"><span class="pre">-&gt;dynticks_nmi_nesting</span></code> フィールドは、対応するCPUがdyntick-idleモードまたはユーザーモードに移行する際の移行回数をカウントしており、CPUがdyntick-idleモードまたはユーザーモードにあるときはこのカウンターが偶数値、それ以外のときは奇数値になります。ユーザーモードのアダプティブティックサポートには、ユーザーモードへの移行をカウントする必要があります（timers/NO_HZ.txtを参照）。 <code class="docutils literal notranslate"><span class="pre">-&gt;dynticks_nesting</span></code> フィールドは、対応するCPUからRCUコアコードがクワイエントステートを望んでいることを記録しており、RCUコアコードがそれほど強く望んでいるため、重いdyntickカウンター操作を呼び出すことを許容しています。このフラグはRCUのコンテキストスイッチ処理（ <code class="docutils literal notranslate"><span class="pre">-&gt;dynticks_nmi_nesting</span></code> )とcond_reschedコードによってチェックされ、一時的なアイドル期間を提供します。 <code class="docutils literal notranslate"><span class="pre">-&gt;dynticks_nmi_nesting</span></code> フィールドは、対応するCPUからRCUコアコードがクワイエントステートを強く望んでいることを記録しており、他のフィールドはRCUがこのクワイエントステートをどれだけ望んでいるかを示します。このフラグはRCUのコンテキストスイッチパス（</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;dynticks</span></code> )とcond_reschedコードによってチェックされます。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;rcu_need_heavy_qs</span></code> なぜ、対応するCPUが非アイドル状態である理由をカウントする単一のカウンターに、 <code class="docutils literal notranslate"><span class="pre">cond_resched()</span></code> カウンターを統合しないのでしょうか？</p>
+<p>フィールドは対応するCPUの <code class="docutils literal notranslate"><span class="pre">-&gt;rcu_urgent_qs</span></code> これは、永続的に終了しない割込みハンドラや、作り上げた割込みから戻ってくるハンドラが存在する場合に失敗するからです。<code class="docutils literal notranslate"><span class="pre">rcu_note_context_switch</span></code>一部の特殊用途のビルドには追加のフィールドがあり、それらは別途説明されます。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>なぜ、対応するCPUが非アイドル状態である理由をカウントする単一のカウンターに、 <code class="docutils literal notranslate"><span class="pre">-&gt;dynticks_nesting</span></code> および
+<code class="docutils literal notranslate"><span class="pre">-&gt;dynticks_nmi_nesting</span></code> カウンターを統合しないのでしょうか？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>これは、永続的に終了しない割込みハンドラや、作り上げた割込みから戻ってくるハンドラが存在する場合に失敗するからです。</p></td>
+</tr>
+</tbody>
+</table>
+<p>一部の特殊用途のビルドには追加のフィールドがあり、それらは別途説明されます。</p>
+</section>
+</section>
+<section id="the-rcu-head-structure">
+<h3>以下の <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> Structure<a class="headerlink" href="#the-rcu-head-structure" title="この見出しへのパーマリンク">¶</a></h3>
+<p>Each <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> 構造体はRCUコールバックを表します。これらの構造体は通常、非同期のグレース期間を使用するアルゴリズムを持つRCU保護データ構造に埋め込まれています。一方、RCUグレース期間を待機するためにブロックするアルゴリズムを使用する場合、RCUユーザーは構造体を提供する必要がありません。 <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> 構造体。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> structure has fields as follows:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1   struct rcu_head *next;
+2   void (*func)(struct rcu_head *head);
+</pre></div>
+</div>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;next</span></code> フィールドは、 <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> 構造体をリスト内でつなげるために使用され、 <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> フィールドは、 <code class="docutils literal notranslate"><span class="pre">-&gt;func</span></code>
+フィールドはコールバックが呼び出されるときに呼び出される関数へのポインタであり、この関数には
+<code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> 構造体のポインタが渡されます。ただし、 <code class="docutils literal notranslate"><span class="pre">kfree_rcu()</span></code> は <code class="docutils literal notranslate"><span class="pre">-&gt;func</span></code>
+フィールドを使用して、 <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> 構造体が含まれるRCU保護データ構造内のオフセットを記録します。</p>
+<p>これらのフィールドはRCU内部で使用されます。RCUユーザーの視点では、この構造体は不透明な「クッキー」として扱われます。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>コールバック関数が <code class="docutils literal notranslate"><span class="pre">-&gt;func</span></code> 構造体のポインタを渡される場合、この関数が包含するRCU保護データ構造の開始位置をどのように見つけるべきでしょうか？ <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> 実際には、各種類のRCU保護データ構造に別個のコールバック関数があります。したがって、コールバック関数はLinuxカーネル（または他のソフトウェア環境のポインタ操作機能）における</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>マクロを使用して、包含する構造体の開始位置を見つけることができます。 <code class="docutils literal notranslate"><span class="pre">container_of()</span></code> RCU固有のフィールド</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="rcu-specific-fields-in-the-task-struct-structure">
+<h3>の実装は、 <code class="docutils literal notranslate"><span class="pre">task_struct</span></code> Structure<a class="headerlink" href="#rcu-specific-fields-in-the-task-struct-structure" title="この見出しへのパーマリンク">¶</a></h3>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT_RCU</span></code> 構造体にいくつかの追加フィールドを使用します： <code class="docutils literal notranslate"><span class="pre">task_struct</span></code> フィールドはRCU読み込み側クリティカルセクションのネストレベルを記録し、</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 #ifdef CONFIG_PREEMPT_RCU
+ 2   int rcu_read_lock_nesting;
+ 3   union rcu_special rcu_read_unlock_special;
+ 4   struct list_head rcu_node_entry;
+ 5   struct rcu_node *rcu_blocked_node;
+ 6 #endif /* #ifdef CONFIG_PREEMPT_RCU */
+ 7 #ifdef CONFIG_TASKS_RCU
+ 8   unsigned long rcu_tasks_nvcsw;
+ 9   bool rcu_tasks_holdout;
+10   struct list_head rcu_tasks_holdout_list;
+11   int rcu_tasks_idle_cpu;
+12 #endif /* #ifdef CONFIG_TASKS_RCU */
+</pre></div>
+</div>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;rcu_read_lock_nesting</span></code> フィールドは、追加作業が必要な特別な状態をビットマスクで記録します。 <code class="docutils literal notranslate"><span class="pre">-&gt;rcu_read_unlock_special</span></code> フィールドは、プリエンプティブルRCU読み込み側クリティカルセクション内でブロックしているタスクのリストを形成し、
+<code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code> フィールドは、このタスクが属するリストの <code class="docutils literal notranslate"><span class="pre">-&gt;rcu_node_entry</span></code>
+構造体を参照し、
+<code class="docutils literal notranslate"><span class="pre">-&gt;rcu_blocked_node</span></code> の場合には、プリエンプティブルRCU読み込み側クリティカルセクション内でブロックしていないことを示します。 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> フィールドは、現在のタスクRCUグレース期間開始時にこのタスクが経験したボランティアコンテキストスイッチの数を追跡し、 <code class="docutils literal notranslate"><span class="pre">NULL</span></code> は、現在のタスクRCUグレース期間がこのタスクを待っている場合に設定され、</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">-&gt;rcu_tasks_nvcsw</span></code> は、このタスクをホールドアウトリストに登録するためのリスト要素であり、 <code class="docutils literal notranslate"><span class="pre">-&gt;rcu_tasks_holdout</span></code> は、アイドルタスクが実行されているCPUを追跡しますが、タスクが現在実行中である場合にのみ、つまりCPUが現在アイドル状態である場合にのみ有効です。
+<code class="docutils literal notranslate"><span class="pre">-&gt;rcu_tasks_holdout_list</span></code> アクセッサ関数 <code class="docutils literal notranslate"><span class="pre">-&gt;rcu_tasks_idle_cpu</span></code> 次のリストは、</p>
+</section>
+<section id="accessor-functions">
+<h3>関数とマクロを示しています：<a class="headerlink" href="#accessor-functions" title="この見出しへのパーマリンク">¶</a></h3>
+<p>は指定された <code class="docutils literal notranslate"><span class="pre">rcu_get_root()</span></code>,
+<code class="docutils literal notranslate"><span class="pre">rcu_for_each_node_breadth_first</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_for_each_leaf_node()</span></code>
+配列の最初の要素へのポインタを単純に返します。これは</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 static struct rcu_node *rcu_get_root(struct rcu_state *rsp)
+ 2 {
+ 3   return &amp;rsp-&gt;node[0];
+ 4 }
+ 5
+ 6 #define rcu_for_each_node_breadth_first(rsp, rnp) \
+ 7   for ((rnp) = &amp;(rsp)-&gt;node[0]; \
+ 8        (rnp) &lt; &amp;(rsp)-&gt;node[NUM_RCU_NODES]; (rnp)++)
+ 9
+10 #define rcu_for_each_leaf_node(rsp, rnp) \
+11   for ((rnp) = (rsp)-&gt;level[NUM_RCU_LVLS - 1]; \
+12        (rnp) &lt; &amp;(rsp)-&gt;node[NUM_RCU_NODES]; (rnp)++)
+</pre></div>
+</div>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">rcu_get_root()</span></code> のルートです。 <code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;node[]</span></code> 前述のように、 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 何らかの理由で、木構造を配列形状ではなく木形状で描くと、平面的な表現を簡単に描くことができます:</p>
+<p>マクロは <code class="docutils literal notranslate"><span class="pre">rcu_for_each_node_breadth_first()</span></code> 配列内の <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体のレイアウトを活用し、配列を順番に走査することで幅優先探索を行います。同様に、
+<code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;node[]</span></code> マクロは配列の最後の部分のみを走査し、したがって
+<code class="docutils literal notranslate"><span class="pre">rcu_for_each_leaf_node()</span></code> のみを走査します。 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>何を <code class="docutils literal notranslate"><span class="pre">rcu_for_each_leaf_node()</span></code> do if the <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> tree contains only a single node?</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>In the single-node case, <code class="docutils literal notranslate"><span class="pre">rcu_for_each_leaf_node()</span></code> traverses the single node.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="summary">
+<h3>Summary<a class="headerlink" href="#summary" title="この見出しへのパーマリンク">¶</a></h3>
+<p>So the state of RCU is represented by an <code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> structure, which contains a combining tree of <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> structures. Finally, in <code class="docutils literal notranslate"><span class="pre">CONFIG_NO_HZ_IDLE</span></code> kernels, each CPU’s dyntick-idle state is tracked by dynticks-related fields in the <code class="docutils literal notranslate"><span class="pre">rcu_data</span></code> structure. If you made it this far, you are well prepared to read the code walkthroughs in the other articles in this series.</p>
+</section>
+<section id="acknowledgments">
+<h3>Acknowledgments<a class="headerlink" href="#acknowledgments" title="この見出しへのパーマリンク">¶</a></h3>
+<p>I owe thanks to Cyrill Gorcunov, Mathieu Desnoyers, Dhaval Giani, Paul Turner, Abhishek Srivastava, Matt Kowalczyk, and Serge Hallyn for helping me get this document into a more human-readable state.</p>
+</section>
+<section id="legal-statement">
+<h3>Legal Statement<a class="headerlink" href="#legal-statement" title="この見出しへのパーマリンク">¶</a></h3>
+<p>This work represents the view of the author and does not necessarily represent the view of IBM.</p>
+<p>Linux is a registered trademark of Linus Torvalds.</p>
+<p>Other company, product, and service names may be trademarks or service marks of others.</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../../../core-api/index.html">コアAPIドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../../core-api/index.html#core-utilities">Core utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../core-api/index.html#data-structures-and-low-level-utilities">Data structures and low-level utilities</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="../../../core-api/index.html#concurrency-primitives">Concurrency primitives</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../core-api/index.html#low-level-hardware-management">Low-level hardware management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../core-api/index.html#memory-management">Memory management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../core-api/index.html#interfaces-for-kernel-debugging">Interfaces for kernel debugging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../core-api/index.html#everything-else">Everything else</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../../../core-api/index.html">コアAPIドキュメント</a><ul>
+<li><a href="../../index.html">RCU concepts</a><ul>
+<li>前へ: <a href="../Requirements/Requirements.html" title="前章">A Tour Through RCU’s Requirements</a></li>
+<li>次へ: <a href="../../../core-api/cachetlb.html" title="次章">Cache and TLB Flushing Under Linux</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../../_sources/RCU/Design/Data-Structures/Data-Structures.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

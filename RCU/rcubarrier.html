@@ -1,0 +1,387 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>RCU およびロード不可モジュール — Linux Kernel ドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="rcu_dereference.html" rel="next" title="rcu_dereference()の戻り値の適切な扱い"/>
+<link href="lockdep-splat.html" rel="prev" title="Lockdep-RCU スラッシュ"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="rcu-and-unloadable-modules">
+<span id="rcu-barrier"></span><h1>RCUとアンロード可能なモジュール<a class="headerlink" href="#rcu-and-unloadable-modules" title="この見出しへのパーマリンク">¶</a></h1>
+<p>[LWN に最初に掲載されました。2007年1月14日、 <a class="reference external" href="http://lwn.net/Articles/217484/">http://lwn.net/Articles/217484/</a>]</p>
+<p>RCU (read-copy update) は、読み込み専用ロック（その他の用途にも利用される）などの代替として考えられる同期メカニズムであり、デッドロック、優先度逆転、無限の遅延に免疫のある非常に低負荷の読み込み処理を提供します。RCU の読み込み側クリティカルセクションは、 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_read_lock" title="rcu_read_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code></a> および <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_read_unlock" title="rcu_read_unlock"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code></a>、非 CONFIG_PREEMPT カーネルではコードを生成しません。</p>
+<p>これは、RCU ライタが並行して読み込む読者を認識していないことを意味します。したがって、共有データへの RCU 更新は非常に慎重に行う必要があります。すべての既存の読者が完了するまで、データ構造の古いバージョンを保持しておきます。このような読者がこれらの古いバージョンに参照を保持している可能性があるためです。RCU 更新はそのため、コストが高く、RCU は読み込みが主な状況に最も適しています。</p>
+<p>RCU ライタが読者がすべて完了したことをどうやって判断できるでしょうか。読者がまったく痕跡を残さない可能性があるからです。ある <a class="reference internal" href="../core-api/kernel-api.html#c.synchronize_rcu" title="synchronize_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code></a> プリミティブは、すべての既存の読者が完了するまでブロックします。リンクリストから要素 p を削除したいアップデータは、適切なロックを保持しながら次の手順を行います。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>list_del_rcu(p);
+synchronize_rcu();
+kfree(p);
+</pre></div>
+</div>
+<p>しかし、上記のコードは IRQ コンテキストでは使用できません – その <a class="reference internal" href="../core-api/kernel-api.html#c.call_rcu" title="call_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">call_rcu()</span></code></a>
+プリミティブを使用する必要があります。このプリミティブは、RCU 保護されたデータ構造内に配置された rcu_head 構造体へのポインタと、後でその構造体を解放するための関数へのポインタを取ります。IRQ コンテキストからリンクリストの要素 p を削除するコードは次のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>list_del_rcu(p);
+call_rcu(&amp;p-&gt;rcu, p_callback);
+</pre></div>
+</div>
+<p>なぜなら <a class="reference internal" href="../core-api/kernel-api.html#c.call_rcu" title="call_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">call_rcu()</span></code></a> ブロックしない限り、このコードは IRQ コンテキスト内で安全に使用できます。関数 p_callback() は次のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static void p_callback(struct rcu_head *rp)
+{
+        struct pstruct *p = container_of(rp, struct pstruct, rcu);
+
+        kfree(p);
+}
+</pre></div>
+</div>
+<section id="unloading-modules-that-use-call-rcu">
+<h2>call_rcu()を使用するモジュールのアンロード<a class="headerlink" href="#unloading-modules-that-use-call-rcu" title="この見出しへのパーマリンク">¶</a></h2>
+<p>しかし、p_callback がロード不可モジュールで定義されている場合怎么办？</p>
+<p>いくつかの RCU コールバックが待機している間にモジュールをアンロードすると、これらのコールバックを実行している CPU は、後で呼び出されるときに深刻な失望を覚えるでしょう。これは、
+<a class="reference external" href="http://lwn.net/images/ns/kernel/rcu-drop.jpg">http://lwn.net/images/ns/kernel/rcu-drop.jpg</a>.</p>
+<p>我々は、 <a class="reference internal" href="../core-api/kernel-api.html#c.synchronize_rcu" title="synchronize_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code></a> モジュール終了コードパスに配置するかもしれませんが、これは十分ではありません。たとえ <a class="reference internal" href="../core-api/kernel-api.html#c.synchronize_rcu" title="synchronize_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code></a> グレースペリオドが経過するのを待つことはありますが、コールバックが完了するのを待つことはありません。</p>
+<p>複数の連続した <a class="reference internal" href="../core-api/kernel-api.html#c.synchronize_rcu" title="synchronize_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code></a>
+呼び出しを試みるかもしれませんが、それでも確実に動作するとは限りません。非常に重い RCU コールバック負荷がある場合、一部のコールバックが他の処理を進めるための遅延としてdeferredされる可能性があります。リアルタイムカーネルでは、過剰なスケジューリング遅延を避けるためにこのような遅延が必要です。</p>
+</section>
+<section id="id1">
+<h2>rcu_barrier()<a class="headerlink" href="#id1" title="この見出しへのパーマリンク">¶</a></h2>
+<p>代わりに、我々は以下のような原始的な処理が必要です。 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> grace period（猶予期間）が経過するのを待つ代わりに、 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> すべての未処理のRCUコールバックが完了するのを待機します。注意してくださいが <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> これは、 <strong>ではありません</strong> implies
+<a class="reference internal" href="../core-api/kernel-api.html#c.synchronize_rcu" title="synchronize_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code></a>、特に、どこにもRCUコールバックがキューに積まれていない場合、 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> 猶予期間が経過するのを待つことなく、すぐに戻ることができます。</p>
+<p>以下は、使用する擬似コードです： <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> RCUコールバックが新たに投稿されないようにします。</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>実行</p></li>
+<li><p>モジュールのアンロードを許可します。 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a>.</p></li>
+<li><p>また、SRCU用の関数もあります。当然ながら、</p></li>
+</ol>
+</div></blockquote>
+<p>の味付けと <a class="reference internal" href="../core-api/kernel-api.html#c.srcu_barrier" title="srcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">srcu_barrier()</span></code></a> の味付けを一致させる必要があります。もし、あなたのモジュールが複数の <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> の味付けを使用している場合、 <a class="reference internal" href="../core-api/kernel-api.html#c.call_rcu" title="call_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">call_rcu()</span></code></a>の味付けも複数使用する必要があります。例えば、 <a class="reference internal" href="../core-api/kernel-api.html#c.call_rcu" title="call_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">call_rcu()</span></code></a>がsrcu_struct_1で使用され、 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> がsrcu_struct_2で使用されている場合、モジュールのアンロード時に以下の3行のコードが必要です： <a class="reference internal" href="../core-api/kernel-api.html#c.call_rcu" title="call_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">call_rcu()</span></code></a>, <a class="reference internal" href="../core-api/kernel-api.html#c.call_srcu" title="call_srcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">call_srcu()</span></code></a> rcutortureモジュールは、そのexit関数で以下のように <a class="reference internal" href="../core-api/kernel-api.html#c.call_srcu" title="call_srcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">call_srcu()</span></code></a> を使用しています：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1 rcu_barrier();
+2 srcu_barrier(&amp;srcu_struct_1);
+3 srcu_barrier(&amp;srcu_struct_2);
+</pre></div>
+</div>
+<p>行6は、RCUコールバックが再投稿されないようにするグローバル変数を設定します。ほとんどの場合、これは必要ありません。RCUコールバックは、通常、 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> を呼び出すことはほとんどありません。しかし、rcutortureモジュールはこのルールの例外であり、そのためこのグローバル変数を設定する必要があります。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1  static void
+2  rcu_torture_cleanup(void)
+3  {
+4    int i;
+5
+6    fullstop = 1;
+7    if (shuffler_task != NULL) {
+8     VERBOSE_PRINTK_STRING("Stopping rcu_torture_shuffle task");
+9     kthread_stop(shuffler_task);
+10   }
+11   shuffler_task = NULL;
+12
+13   if (writer_task != NULL) {
+14     VERBOSE_PRINTK_STRING("Stopping rcu_torture_writer task");
+15     kthread_stop(writer_task);
+16   }
+17   writer_task = NULL;
+18
+19   if (reader_tasks != NULL) {
+20     for (i = 0; i &lt; nrealreaders; i++) {
+21       if (reader_tasks[i] != NULL) {
+22         VERBOSE_PRINTK_STRING(
+23           "Stopping rcu_torture_reader task");
+24         kthread_stop(reader_tasks[i]);
+25       }
+26       reader_tasks[i] = NULL;
+27     }
+28     kfree(reader_tasks);
+29     reader_tasks = NULL;
+30   }
+31   rcu_torture_current = NULL;
+32
+33   if (fakewriter_tasks != NULL) {
+34     for (i = 0; i &lt; nfakewriters; i++) {
+35       if (fakewriter_tasks[i] != NULL) {
+36         VERBOSE_PRINTK_STRING(
+37           "Stopping rcu_torture_fakewriter task");
+38         kthread_stop(fakewriter_tasks[i]);
+39       }
+40       fakewriter_tasks[i] = NULL;
+41     }
+42     kfree(fakewriter_tasks);
+43     fakewriter_tasks = NULL;
+44   }
+45
+46   if (stats_task != NULL) {
+47     VERBOSE_PRINTK_STRING("Stopping rcu_torture_stats task");
+48     kthread_stop(stats_task);
+49   }
+50   stats_task = NULL;
+51
+52   /* Wait for all RCU callbacks to fire. */
+53   rcu_barrier();
+54
+55   rcu_torture_stats_print(); /* -After- the stats thread is stopped! */
+56
+57   if (cur_ops-&gt;cleanup != NULL)
+58     cur_ops-&gt;cleanup();
+59   if (atomic_read(&amp;n_rcu_torture_error))
+60     rcu_torture_print_module_parms("End of test: FAILURE");
+61   else
+62     rcu_torture_print_module_parms("End of test: SUCCESS");
+63 }
+</pre></div>
+</div>
+<p>行7〜50は、rcutortureモジュールに関連するすべてのカーネルタスクを停止します。したがって、実行が行53に到達すると、もうrcutorture RCUコールバックは投稿されません。行53の <a class="reference internal" href="../core-api/kernel-api.html#c.call_rcu" title="call_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">call_rcu()</span></code></a>呼び出しは、既存のコールバックがすべて完了するのを待機します。</p>
+<p>その後、行55〜62はステータスを表示し、操作固有のクリーンアップを行います。その後、戻り、モジュールアンロード操作を完了させます。 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> さらに、</p>
+<p>が必要な他の状況はありますか？</p>
+<dl class="simple" id="rcubarrier-quiz-1">
+<dt>クイッククイズ #1:</dt><dd><p>クイッククイズ#1の答え <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> あなたのモジュールにはさらに複雑な点があるかもしれません。例えば、あなたのモジュールがタイマーより</p>
+</dd>
+</dl>
+<p><a class="reference internal" href="#answer-rcubarrier-quiz-1"><span class="std std-ref">を呼び出している場合、まずすべてのタイマをキャンセルし、その後</span></a></p>
+<p>を呼び出して、残りのRCUコールバックが完了するのを待つ必要があります。 <a class="reference internal" href="../core-api/kernel-api.html#c.call_rcu" title="call_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">call_rcu()</span></code></a> もちろん、あなたのモジュールが <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> を使用している場合、アンロード前に</p>
+<p>を呼び出す必要があります。同様に、あなたのモジュールが <a class="reference internal" href="../core-api/kernel-api.html#c.call_rcu" title="call_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">call_rcu()</span></code></a>を使用している場合、アンロード前に
+<a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> を呼び出す必要があります。また、同じsrcu_struct構造体上で使用している必要があります。あなたのモジュールが
+<a class="reference internal" href="../core-api/kernel-api.html#c.call_srcu" title="call_srcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">call_srcu()</span></code></a>を使用している場合、アンロード前に <a class="reference internal" href="../core-api/kernel-api.html#c.srcu_barrier" title="srcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">srcu_barrier()</span></code></a> を使用している場合、アンロード前に <a class="reference internal" href="../core-api/kernel-api.html#c.call_rcu" title="call_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">call_rcu()</span></code></a>
+<strong>および</strong> <a class="reference internal" href="../core-api/kernel-api.html#c.call_srcu" title="call_srcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">call_srcu()</span></code></a>を呼び出す必要があります。 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> <strong>および</strong>
+<a class="reference internal" href="../core-api/kernel-api.html#c.srcu_barrier" title="srcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">srcu_barrier()</span></code></a>.</p>
+</section>
+<section id="implementing-rcu-barrier">
+<h2>rcu_barrier()の実装<a class="headerlink" href="#implementing-rcu-barrier" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Dipankar Sarmaの <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> の実装は、RCUコールバックが1つのCPUごとのキューに登録された後で再順序付けされないという特性を利用しています。彼の実装では、RCUコールバックを各CPUごとのコールバックキューに登録し、それらがすべて実行開始するのを待機してから、すべての以前のRCUコールバックが完了していることを保証しています。</p>
+<p>以下のコードは元のコードです <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> 次の通りでした:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1  void rcu_barrier(void)
+2  {
+3    BUG_ON(in_interrupt());
+4    /* Take cpucontrol mutex to protect against CPU hotplug */
+5    mutex_lock(&amp;rcu_barrier_mutex);
+6    init_completion(&amp;rcu_barrier_completion);
+7    atomic_set(&amp;rcu_barrier_cpu_count, 0);
+8    on_each_cpu(rcu_barrier_func, NULL, 0, 1);
+9    wait_for_completion(&amp;rcu_barrier_completion);
+10   mutex_unlock(&amp;rcu_barrier_mutex);
+11 }
+</pre></div>
+</div>
+<p>行3では呼び出し元がプロセスコンテキストにあることを確認し、行5と行10ではrcu_barrier_mutexを使用して、同時に1つのプロセスのみがグローバルな完了フラグとカウンタを使用できるようにしています。これらの変数は行6と行7で初期化されています。行8では各CPUがrcu_barrier_func()を呼び出すよう指定しており、以下に示します。on_each_cpu()の引数リストにある最終的な「1」は、すべてのrcu_barrier_func()呼び出しが完了するのを待つためのものです。行9では完了を待機します。 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> このコードは2008年に再実装され、その後何度も改訂されていますが、依然として一般的なアイデアを示しています。</p>
+<p>このコードは2008年に再実装され、その後何度も改訂されていますが、依然として一般的なアイデアを示しています。</p>
+<p>rcu_barrier_func()は各CPUで実行され、ここで呼び出されます <a class="reference internal" href="../core-api/kernel-api.html#c.call_rcu" title="call_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">call_rcu()</span></code></a>
+RCUコールバックを登録するための処理は以下の通りです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1  static void rcu_barrier_func(void *notused)
+2  {
+3    int cpu = smp_processor_id();
+4    struct rcu_data *rdp = &amp;per_cpu(rcu_data, cpu);
+5    struct rcu_head *head;
+6
+7    head = &amp;rdp-&gt;barrier;
+8    atomic_inc(&amp;rcu_barrier_cpu_count);
+9    call_rcu(head, rcu_barrier_callback);
+10 }
+</pre></div>
+</div>
+<p>行3と行4では、RCUの内部の各CPUごとのrcu_data構造体を取得します。この構造体には、後続の呼び出しに必要なstruct rcu_headが含まれています
+<a class="reference internal" href="../core-api/kernel-api.html#c.call_rcu" title="call_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">call_rcu()</span></code></a>行7ではこのstruct rcu_headへのポインタを取得し、行8ではグローバルカウンタをインクリメントします。このカウンタは後続でコールバックによってデクリメントされます。行9では現在のCPUのキューにrcu_barrier_callback()を登録します</p>
+<p>rcu_barrier_callback()関数は、rcu_barrier_cpu_count変数をアトミックにデクリメントし、ゼロになると完了処理を確定します（以下のように）:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1 static void rcu_barrier_callback(struct rcu_head *notused)
+2 {
+3   if (atomic_dec_and_test(&amp;rcu_barrier_cpu_count))
+4     complete(&amp;rcu_barrier_completion);
+5 }
+</pre></div>
+</div>
+<dl class="simple" id="rcubarrier-quiz-2">
+<dt>クイズ #2:</dt><dd><p>CPU 0のrcu_barrier_func()が即座に実行され（これによりrcu_barrier_cpu_countが1にインクリメントされる）、他のCPUのrcu_barrier_func()呼び出しがフルグレース期間分遅延した場合、これによりどのような結果になるでしょうか？
+<a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> 早期に戻るの？</p>
+</dd>
+</dl>
+<p><a class="reference internal" href="#answer-rcubarrier-quiz-2"><span class="std std-ref">クイズ #2 の答え</span></a></p>
+<p>現在の <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> 実装は、アイドル状態のCPUを妨げることを避ける必要（特にバッテリー駆動のシステムでは）や、リアルタイムシステムで非アイドルCPUを最小限に妨げる必要があるため、より複雑になっています。ただし、上のコードはこれらの概念を示しています。</p>
+</section>
+<section id="rcu-barrier-summary">
+<h2>rcu_barrier()のまとめ<a class="headerlink" href="#rcu-barrier-summary" title="この見出しへのパーマリンク">¶</a></h2>
+<p>以下の <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> プリミティブは、RCUを使用しているコードがコアカーネルに集中しているため、比較的使用されていません。ただし、アンロード可能なモジュールからRCUを使用している場合、 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a>
+モジュールが安全にアンロードされるようにする必要があります。</p>
+</section>
+<section id="answers-to-quick-quizzes">
+<h2>クイッククイズの答え<a class="headerlink" href="#answers-to-quick-quizzes" title="この見出しへのパーマリンク">¶</a></h2>
+<dl id="answer-rcubarrier-quiz-1">
+<dt>クイッククイズ #1:</dt><dd><p>クイッククイズ#1の答え <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> あなたのモジュールにはさらに複雑な点があるかもしれません。例えば、あなたのモジュールがタイマーより</p>
+</dd>
+<dt>答え: 兴味深いことに、rcu_barrier() はもともとモジュールアンロード用に実装されていませんでした。ニキータ・ダニロフはファイルシステムでRCUを使用しており、ファイルシステムアンマウント時に同様の状況が発生しました。</dt><dd><p>ディパーンカール・サルマがコードを書いたことで、ニキータがファイルシステムアンマウントプロセス中にそれを呼び出せるようにしました。 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a>
+その後、私自身がrcutortureを実装する際にRCUモジュールアンロード問題に直面し、それが</p>
+<p>この問題も解決します。 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> この問題も解決します。</p>
+</dd>
+</dl>
+<p><a class="reference internal" href="#rcubarrier-quiz-1"><span class="std std-ref">クイズ #1 に戻る</span></a></p>
+<dl id="answer-rcubarrier-quiz-2">
+<dt>クイズ #2:</dt><dd><p>CPU 0のrcu_barrier_func()が即座に実行され（これによりrcu_barrier_cpu_countが1にインクリメントされる）、他のCPUのrcu_barrier_func()呼び出しがフルグレース期間分遅延した場合、これによりどのような結果になるでしょうか？
+<a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a> 早期に戻るの？</p>
+</dd>
+<dt>回答: これは起こりません。理由は、on_each_cpu()の最後の引数であるwaitフラグが「1」に設定されているためです。このフラグはsmp_call_function()に渡され、さらにsmp_call_function_on_cpu()に渡され、これにより後者はrcu_barrier_func()のクロスCPU呼び出しが完了するまでスピンします。これにより、非CONFIG_PREEMPTカーネルではグレース期間が完了しないことが防がれます。なぜなら、各CPUがグレース期間が完了する前にコンテキストスイッチ（またはその他のクイエント状態）を経る必要がありますからです。しかし、これはCONFIG_PREEMPTカーネルでは役立ちません。</dt><dd><p>したがって、on_each_cpu()はsmp_call_function()呼び出し中にプリエンプションを無効化し、さらにローカルでのrcu_barrier_func()呼び出しにもプリエンプションを無効化します。これによりローカルCPUがコンテキストスイッチできず、再びグレース期間が完了しないことになります。つまり、すべてのCPUがrcu_barrier_func()を実行した後で初めてrcu_barrier_callback()が実行される可能性があり、これによりrcu_barrier_cpu_countが早すぎるゼロになるのを防ぎます。</p>
+<p>現在、-rt実装のRCUはRCUコールバック用に単一のグローバルキューを保持しており、この問題にはなりません。しかし、-rt RCUが最終的に各CPUごとのコールバックキューを持つようになると、状況は変わります。簡単な変更としては、以下を追加するというものです。</p>
+<p>Currently, -rt implementations of RCU keep but a single global queue for RCU callbacks, and thus do not suffer from this problem. However, when the -rt RCU eventually does have per-CPU callback queues, things will have to change. One simple change is to add an <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_read_lock" title="rcu_read_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code></a> 8行目の前 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_barrier" title="rcu_barrier"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_barrier()</span></code></a>
+そして <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_read_unlock" title="rcu_read_unlock"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code></a> この同じ関数の8行目の後。より良い変更案があれば、教えてください！</p>
+</dd>
+</dl>
+<p><a class="reference internal" href="#rcubarrier-quiz-2"><span class="std std-ref">クイッククイズ #2に戻る</span></a></p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#core-utilities">Core utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#data-structures-and-low-level-utilities">Data structures and low-level utilities</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="../core-api/index.html#concurrency-primitives">Concurrency primitives</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#low-level-hardware-management">Low-level hardware management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#memory-management">Memory management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#interfaces-for-kernel-debugging">Interfaces for kernel debugging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#everything-else">Everything else</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../core-api/index.html">コアAPIドキュメント</a><ul>
+<li><a href="index.html">RCU concepts</a><ul>
+<li>前へ: <a href="lockdep-splat.html" title="前章">Lockdep-RCU スラッシュ</a></li>
+<li>次へ: <a href="rcu_dereference.html" title="次章">rcu_dereference()の戻り値の適切な扱い</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/RCU/rcubarrier.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

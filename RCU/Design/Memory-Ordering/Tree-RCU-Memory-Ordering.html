@@ -1,0 +1,534 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>TREE_RCUのグレースペリオドメモリ順序保証の概観 — Linuxカーネルドキュメンテーション</title>
+<link href="../../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../../" id="documentation_options" src="../../../_static/documentation_options.js"></script>
+<script src="../../../_static/jquery.js"></script>
+<script src="../../../_static/underscore.js"></script>
+<script src="../../../_static/doctools.js"></script>
+<link href="../../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../../search.html" rel="search" title="検索"/>
+<link href="../Expedited-Grace-Periods/Expedited-Grace-Periods.html" rel="next" title="TREE_RCUの緊急グレース期間をめぐるツアー"/>
+<link href="../../UP.html" rel="prev" title="単一プロセッサシステムにおけるRCU"/>
+<link href="../../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="a-tour-through-tree-rcu-s-grace-period-memory-ordering">
+<h1>TREE_RCU の グレース・ペリオド メモリ・オーダーのツアー<a class="headerlink" href="#a-tour-through-tree-rcu-s-grace-period-memory-ordering" title="この見出しへのパーマリンク">¶</a></h1>
+<p>2017年8月8日</p>
+<p>この記事はPaul E. McKenneyによって執筆されました</p>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このドキュメントでは、Tree RCUのグレースペリオドメモリ順序保証がどのように提供されるかの視覚的な概要を示します。</p>
+</section>
+<section id="what-is-tree-rcu-s-grace-period-memory-ordering-guarantee">
+<h2>Tree RCUのグレースペリオドメモリ順序保証とは何ですか？<a class="headerlink" href="#what-is-tree-rcu-s-grace-period-memory-ordering-guarantee" title="この見出しへのパーマリンク">¶</a></h2>
+<p>RCUのグレースペリオドは、非アイドル非オフラインコードに対して非常に強いメモリ順序保証を提供します。あるRCUグレースペリオドの終了後に実行されるコードは、そのグレースペリオドの開始前のすべてのアクセス（RCU読み込み側クリティカルセクション内）の効果を必ず見ます。同様に、あるRCUグレースペリッドの開始前に行われるコードは、そのグレースペリオドの終了後のすべてのアクセス（RCU読み込み側クリティカルセクション内）の効果を必ず見ます。</p>
+<p>RCU-sched読み込み側クリティカルセクションは、プリエンプションが無効なコードの任意の領域を含みます。個々のマシン指令は非常に小さなプリエンプション無効コードの領域とみなせるため、
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> as <code class="docutils literal notranslate"><span class="pre">smp_mb()</span></code> 強化版。</p>
+<p>RCUアップデーターは、この保証を2つのフェーズに分けて実行することで利用します。1つ目のフェーズはグレースペリオドの前、2つ目のフェーズはグレースペリオドの後です。最も一般的な使用例では、1つ目のフェーズでリンクされたRCU保護データ構造から要素を削除し、2つ目のフェーズでその要素を解放します。これには、1つ目のフェーズの更新（一般的には削除）前に状態を観測したリーダーが、2つ目のフェーズの更新（一般的には解放）後の状態を観測しない必要があります。</p>
+<p>RCUの実装は、次のセクションで説明するように、ロックベースのクリティカルセクション、メモリバリア、パーセパーセット処理を用いてこの保証を提供します。</p>
+</section>
+<section id="tree-rcu-grace-period-memory-ordering-building-blocks">
+<h2>Tree RCU グレースペリオドメモリ順序構築ブロック<a class="headerlink" href="#tree-rcu-grace-period-memory-ordering-building-blocks" title="この見出しへのパーマリンク">¶</a></h2>
+<p>RCUのグレースペリオドメモリ順序の主役は、 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の
+<code class="docutils literal notranslate"><span class="pre">-&gt;lock</span></code>のクリティカルセクションです。これらのクリティカルセクションは、ロック取得用のアシスタント関数を含む、 <code class="docutils literal notranslate"><span class="pre">raw_spin_lock_rcu_node()</span></code>,
+<code class="docutils literal notranslate"><span class="pre">raw_spin_lock_irq_rcu_node()</span></code>, and <code class="docutils literal notranslate"><span class="pre">raw_spin_lock_irqsave_rcu_node()</span></code>を用います。そのロック解放対応はそれぞれ <code class="docutils literal notranslate"><span class="pre">raw_spin_unlock_rcu_node()</span></code>,
+<code class="docutils literal notranslate"><span class="pre">raw_spin_unlock_irq_rcu_node()</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">raw_spin_unlock_irqrestore_rcu_node()</span></code>です。完全性を保つため、 <code class="docutils literal notranslate"><span class="pre">raw_spin_trylock_rcu_node()</span></code> も提供されています。重要な点は、ロック取得関数（
+<code class="docutils literal notranslate"><span class="pre">raw_spin_trylock_rcu_node()</span></code>を含む）が、ロックの取得成功後に必ず <code class="docutils literal notranslate"><span class="pre">smp_mb__after_unlock_lock()</span></code>
+を呼び出します。</p>
+<p>したがって、任意の <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造、任意のアクセスが上記のロック解放関数のいずれかの前に発生した場合、すべてのCPUは、その後の上記のロック取得関数のいずれかの後のアクセスをその前に発生したものとして扱います。さらに、任意のCPUにおいて上記のロック解放関数のいずれかの前のアクセスは、すべてのCPUにおいて、そのCPUで実行された上記のロック取得関数のいずれかの後のアクセスをその前に発生したものとして扱われます。このロック解放関数とロック取得関数は異なる構造を操作している場合でも、そのように扱われます。 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> Tree RCUは、これらの2つの順序保証を用いて、グレースペリオドに関与したすべてのCPU間で順序ネットワークを形成します。これは、グレースペリオド中にオンラインになったりオフラインになったりしたCPUも含みます。</p>
+<p>以下のリットムテストは、これらのロック取得およびロック解放関数の順序効果を示しています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 int x, y, z;
+ 2
+ 3 void task0(void)
+ 4 {
+ 5   raw_spin_lock_rcu_node(rnp);
+ 6   WRITE_ONCE(x, 1);
+ 7   r1 = READ_ONCE(y);
+ 8   raw_spin_unlock_rcu_node(rnp);
+ 9 }
+10
+11 void task1(void)
+12 {
+13   raw_spin_lock_rcu_node(rnp);
+14   WRITE_ONCE(y, 1);
+15   r2 = READ_ONCE(z);
+16   raw_spin_unlock_rcu_node(rnp);
+17 }
+18
+19 void task2(void)
+20 {
+21   WRITE_ONCE(z, 1);
+22   smp_mb();
+23   r3 = READ_ONCE(x);
+24 }
+25
+26 WARN_ON(r1 == 0 &amp;&amp; r2 == 0 &amp;&amp; r3 == 0);
+</pre></div>
+</div>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">WARN_ON()</span></code> これは「時間の終わり」に評価され、システム全体にすべての変更が伝播した後です。上記の取得関数が提供しない場合、この <code class="docutils literal notranslate"><span class="pre">smp_mb__after_unlock_lock()</span></code> は例えばPowerPCでトリガーされる可能性があります。この <code class="docutils literal notranslate"><span class="pre">WARN_ON()</span></code> 呼び出しはこの <code class="docutils literal notranslate"><span class="pre">smp_mb__after_unlock_lock()</span></code> をトリガーしないようにします。
+<code class="docutils literal notranslate"><span class="pre">WARN_ON()</span></code> このアプローチは、RCUのグレースペリオドメモリ順序保証が、現在のアイドル期間の前後にあるすべてのRCU読み取り側クリティカルセクションに拡張されるように、アイドルCPUも含めて拡張する必要があります。このケースは、強く順序化された</p>
+<p>読み取り-変更-書き込みアトミック操作の呼び出しによって処理されます。これは
+<code class="docutils literal notranslate"><span class="pre">atomic_add_return()</span></code> がアイドルエントリータイム内に呼び出され、 <code class="docutils literal notranslate"><span class="pre">rcu_dynticks_eqs_enter()</span></code> 内に呼び出されます。 <code class="docutils literal notranslate"><span class="pre">rcu_dynticks_eqs_exit()</span></code> アイドル終了時。グレース期間のkthreadが呼び出されます。 <code class="docutils literal notranslate"><span class="pre">rcu_dynticks_snap()</span></code> および
+<code class="docutils literal notranslate"><span class="pre">rcu_dynticks_in_eqs_since()</span></code> （どちらも以下を呼び出します <code class="docutils literal notranslate"><span class="pre">atomic_add_return()</span></code> ゼロの場合) でアイドル状態のCPUを検出します。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>しかし、グレース期間全体をオフライン状態のままにするCPUについてはどうでしょうか？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>このようなCPUはグレース期間の開始時点でオフライン状態にあるため、グレース期間はそれらからクワイエント状態を期待しません。グレース期間の開始とCPUホットプラグ操作の間の競合条件は、CPUの葉によって処理されます。 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;lock</span></code> 上記のように処理されます。</p></td>
+</tr>
+</tbody>
+</table>
+<p>このアプローチは、最後のケースである、ブロックされたタスクを起こすケースにも拡張する必要があります。 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code>。このタスクは、グレース期間が終了したことをまだ認識していないCPUにアフィニティが設定されている可能性があり、そのため、このタスクはまだグレース期間のメモリ順序に適用されていない可能性があります。したがって、 <code class="docutils literal notranslate"><span class="pre">smp_mb()</span></code> 戻り後に
+<code class="docutils literal notranslate"><span class="pre">wait_for_completion()</span></code> の <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> コードパス。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>何？どこ？？？ どこにも見つからないんですけど？ <code class="docutils literal notranslate"><span class="pre">smp_mb()</span></code> 戻り後に
+<code class="docutils literal notranslate"><span class="pre">wait_for_completion()</span></code>!!!</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>それは私がその必要性を認識したからです <code class="docutils literal notranslate"><span class="pre">smp_mb()</span></code> このドキュメンテーションの作成中に作成されたため、v4.14以前にはmainlineに取り込まれる可能性は低いです。Lance Roy、Will Deacon、Peter Zijlstra、Jonathan Cameron氏らが、このメモリバリアが必要な理由を示す複雑な一連のイベントに気づく質問をしてくれたことに感謝します。</p></td>
+</tr>
+</tbody>
+</table>
+<p>Tree RCUのgrace-periodメモリ順序保証は、主に以下の <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;lock</span></code> フィールドに依存しており、その重要性が非常に高いので、次のセクションの図ではこのパターンを省略して表記する必要があります。例えば、以下の関数を考えてみましょう。これは、新規に到着したRCUコールバックを将来のgrace periodに対して順序を保証する複数の関数のうちの一つです： <code class="docutils literal notranslate"><span class="pre">rcu_prepare_for_idle()</span></code> しかし、この議論において重要なのは、</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 static void rcu_prepare_for_idle(void)
+ 2 {
+ 3   bool needwake;
+ 4   struct rcu_data *rdp;
+ 5   struct rcu_dynticks *rdtp = this_cpu_ptr(&amp;rcu_dynticks);
+ 6   struct rcu_node *rnp;
+ 7   struct rcu_state *rsp;
+ 8   int tne;
+ 9
+10   if (IS_ENABLED(CONFIG_RCU_NOCB_CPU_ALL) ||
+11       rcu_is_nocb_cpu(smp_processor_id()))
+12     return;
+13   tne = READ_ONCE(tick_nohz_active);
+14   if (tne != rdtp-&gt;tick_nohz_enabled_snap) {
+15     if (rcu_cpu_has_callbacks(NULL))
+16       invoke_rcu_core();
+17     rdtp-&gt;tick_nohz_enabled_snap = tne;
+18     return;
+19   }
+20   if (!tne)
+21     return;
+22   if (rdtp-&gt;all_lazy &amp;&amp;
+23       rdtp-&gt;nonlazy_posted != rdtp-&gt;nonlazy_posted_snap) {
+24     rdtp-&gt;all_lazy = false;
+25     rdtp-&gt;nonlazy_posted_snap = rdtp-&gt;nonlazy_posted;
+26     invoke_rcu_core();
+27     return;
+28   }
+29   if (rdtp-&gt;last_accelerate == jiffies)
+30     return;
+31   rdtp-&gt;last_accelerate = jiffies;
+32   for_each_rcu_flavor(rsp) {
+33     rdp = this_cpu_ptr(rsp-&gt;rda);
+34     if (rcu_segcblist_pend_cbs(&amp;rdp-&gt;cblist))
+35       continue;
+36     rnp = rdp-&gt;mynode;
+37     raw_spin_lock_rcu_node(rnp);
+38     needwake = rcu_accelerate_cbs(rsp, rnp, rdp);
+39     raw_spin_unlock_rcu_node(rnp);
+40     if (needwake)
+41       rcu_gp_kthread_wake(rsp);
+42   }
+43 }
+</pre></div>
+</div>
+<p>の行37〜39です。そのため、この関数を以下のように省略して表記します： <code class="docutils literal notranslate"><span class="pre">rcu_prepare_for_idle()</span></code> 箱は</p>
+<figure class="align-default">
+<img alt="../../../_images/rcu_node-lock.svg" src="../../../_images/rcu_node-lock.svg"/></figure>
+<p>クリティカルセクションを表し、上部の二重線は追加の <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;lock</span></code> を表します。
+<code class="docutils literal notranslate"><span class="pre">smp_mb__after_unlock_lock()</span></code>.</p>
+<section id="tree-rcu-grace-period-memory-ordering-components">
+<h3>Tree RCU Grace Periodメモリ順序コンポーネント<a class="headerlink" href="#tree-rcu-grace-period-memory-ordering-components" title="この見出しへのパーマリンク">¶</a></h3>
+<p>Tree RCUのgrace-periodメモリ順序保証は、以下のいくつかのRCUコンポーネントによって提供されます：</p>
+<ol class="arabic simple">
+<li><p><a class="reference internal" href="#callback-registry">コールバック登録</a></p></li>
+<li><p><a class="reference internal" href="#grace-period-initialization">grace-period初期化</a></p></li>
+<li><p><a class="reference internal" href="#self-reported-quiescent-states">自己報告クイエスcent状態</a></p></li>
+<li><p><a class="reference internal" href="#dynamic-tick-interface">ダイナミックティックインターフェース</a></p></li>
+<li><p><a class="reference internal" href="#cpu-hotplug-interface">CPUホットプラグインターフェース</a></p></li>
+<li><p><a class="reference internal" href="#forcing-quiescent-states">強制クイエスcent状態</a></p></li>
+<li><p><a class="reference internal" href="#grace-period-cleanup">grace-periodクリーンアップ</a></p></li>
+<li><p><a class="reference internal" href="#callback-invocation">コールバック実行</a></p></li>
+</ol>
+<p>以下の各セクションでは、それぞれのコンポーネントについて詳しく説明します。</p>
+<section id="callback-registry">
+<h4>コールバック登録<a class="headerlink" href="#callback-registry" title="この見出しへのパーマリンク">¶</a></h4>
+<p>RCUのgrace-period保証が何か意味を持つのであれば、任意のインバocationの <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> の前に発生するアクセスは、対応するgrace periodの前に発生しなければなりません。RCUのgrace period保証のこの部分の実装は、以下の図に示されています：</p>
+<figure class="align-default">
+<img alt="../../../_images/TreeRCU-callback-registry.svg" src="../../../_images/TreeRCU-callback-registry.svg"/></figure>
+<p>通常、 <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> はCPUローカルの状態にのみ作用するため、自身や更新の第一段階（RCU保護データ構造から要素の削除など）に対する順序保証を提供しません。単に <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code>
+構造体をCPUごとのリストにエンキューするだけで、このリストがgrace periodと関連付けられるのは、後の <code class="docutils literal notranslate"><span class="pre">rcu_accelerate_cbs()</span></code>呼び出しになってからです。これは上記の図に示されています。</p>
+<p>左側に示されたコードパスの一つは、 <code class="docutils literal notranslate"><span class="pre">rcu_accelerate_cbs()</span></code>
+を <code class="docutils literal notranslate"><span class="pre">note_gp_changes()</span></code>経由で呼び出します。これは、現在のCPUがキューイングされた <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> 構造体で過負荷になっている場合（直接 <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> から呼び出される）か、あるいはより可能性が高い <code class="docutils literal notranslate"><span class="pre">RCU_SOFTIRQ</span></code> ハンドラから呼び出される場合です。中央のコードパスは、 <code class="docutils literal notranslate"><span class="pre">CONFIG_RCU_FAST_NO_HZ=y</span></code>でビルドされたカーネルにのみ存在し、これにより <code class="docutils literal notranslate"><span class="pre">rcu_accelerate_cbs()</span></code> を <code class="docutils literal notranslate"><span class="pre">rcu_prepare_for_idle()</span></code>が呼び出されます。右側のコードパスは、
+<code class="docutils literal notranslate"><span class="pre">CONFIG_HOTPLUG_CPU=y</span></code>でビルドされたカーネルにのみ存在し、これにより <code class="docutils literal notranslate"><span class="pre">rcu_accelerate_cbs()</span></code> を
+<code class="docutils literal notranslate"><span class="pre">rcu_advance_cbs()</span></code>, <code class="docutils literal notranslate"><span class="pre">rcu_migrate_callbacks</span></code>,
+<code class="docutils literal notranslate"><span class="pre">rcutree_migrate_callbacks()</span></code>, and <code class="docutils literal notranslate"><span class="pre">takedown_cpu()</span></code>でビルドされたカーネルにのみ存在し、これは外出したCPUが完全にオフラインになった後、生き残ったCPUで呼び出されます。</p>
+<p>grace-period処理内には、いくつかのコードパスが偶然的に <code class="docutils literal notranslate"><span class="pre">rcu_accelerate_cbs()</span></code>を呼び出します。しかし、いずれにしても、CPUの最近キューイングされた <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> 構造体はCPUのリーダーシップの下で将来のグレースペリオド番号と関連付けられています
+<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;lock</span></code>すべてのケースにおいて、同じ構造体に対する以前のクリティカルセクションに対して完全な順序が保証されています <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>
+構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;lock</span></code>また、現在のタスクまたはCPUの以前のクリティカルセクションに対しても完全な順序が保証されています <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>
+構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;lock</span></code>.</p>
+<p>次のセクションでは、この順序がどのようにして、任意のアクセスが <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> （特にアップデートのフェーズ1を含む）が対応するグレースペリオドの開始前に実行されるかを示します</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>しかし、 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code>?</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>以下の <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> パス <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> に（木の下から葉に向かって） <code class="docutils literal notranslate"><span class="pre">wait_rcu_gp()</span></code>を呼び出すことによって実行されます。いずれにしても、最終的には
+<code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code>.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="grace-period-initialization">
+<h4>grace-period初期化<a class="headerlink" href="#grace-period-initialization" title="この見出しへのパーマリンク">¶</a></h4>
+<p>グレースペリオド初期化はグレースペリオドカーネルスレッドによって実行され、そのスレッドが <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 関数内の
+<code class="docutils literal notranslate"><span class="pre">rcu_gp_init()</span></code> ツリーを複数回スキャンします。これにより、グレースペリオド計算における順序の完全な流れを示すにはこのツリーを複製する必要があります。この説明が混乱している場合は、
+<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> の状態はヘラクレイトスの川のように時間とともに変化します。ただし、この <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 川を扱いやすくするため、グレースペリオドカーネルスレッドのトラバーサルはこのセクションでグレースペリオド初期化のさまざまなフェーズから始めて複数の部分に分けて提示されます</p>
+<p>順序関連の最初のグレースペリオド初期化アクションは、 <code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> グレースペリオド番号カウンターを進めることが含まれます。以下に示します：</p>
+<figure class="align-default">
+<img alt="../../../_images/TreeRCU-gp-init-1.svg" src="../../../_images/TreeRCU-gp-init-1.svg"/></figure>
+<p>実際のインクリメントは <code class="docutils literal notranslate"><span class="pre">smp_store_release()</span></code>を使用して行われ、偽陽性のRCU CPUスタール検出を拒否するのに役立ちます。注意点として、みぞれの <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体のみが操作されます</p>
+<p>最初の <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> ツリーのパスでは、前回のグレースペリオド開始以来オンラインになったCPUまたはオフラインになったCPUに基づいてビットマスクが更新されます。この <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体のオンラインCPU数がゼロに移行していない一般的なケースでは、このパスでは葉 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体のみをスキャンします。ただし、ある葉 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体のオンラインCPU数がゼロから移行した場合、 <code class="docutils literal notranslate"><span class="pre">rcu_init_new_rnp()</span></code> が最初の入力CPUに対して呼び出されます。同様に、ある葉 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体のオンラインCPU数がゼロに移行した場合、
+<code class="docutils literal notranslate"><span class="pre">rcu_cleanup_dead_rnp()</span></code> が最後の出力CPUに対して呼び出されます。以下の図は、左端の
+<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体が最初のCPUをオンラインにした場合、および次の
+<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体がオンラインCPUを持たない（あるいは、代わりに左端の <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体が最後のCPUをオフラインにした場合、次の
+<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体がオンラインCPUを持たない）場合の順序の経路を示します</p>
+<figure class="align-default">
+<img alt="../../../_images/TreeRCU-gp-init-1.svg" src="../../../_images/TreeRCU-gp-init-1.svg"/></figure>
+<p>最終的な <code class="docutils literal notranslate"><span class="pre">rcu_gp_init()</span></code> パスでは、 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> ツリーを幅優先でトラバーサルし、各 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> フィールドを <code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> 構造体から新たに進めた値に設定します。以下の図に示します</p>
+<figure class="align-default">
+<img alt="../../../_images/TreeRCU-gp-init-1.svg" src="../../../_images/TreeRCU-gp-init-1.svg"/></figure>
+<p>この変更は、各CPUの次の呼び出しにも影響を与えます
+<code class="docutils literal notranslate"><span class="pre">__note_gp_changes()</span></code> 次のセクションで説明されているように、新しい猶予期間が開始されたことに気づくことができます。しかし、grace-period kthreadは、各葉のフィールドを設定する前に、ルートで猶予期間を開始したため、各CPUが猶予期間の開始を観測するタイミングは、実際の開始よりも後になります。
+<code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> フィールドを設定する前に、ルートで猶予期間を開始したため、各CPUが猶予期間の開始を観測するタイミングは、実際の開始よりも後になります。
+<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> フィールドを設定する前に、ルートで猶予期間を開始したため、各CPUが猶予期間の開始を観測するタイミングは、実際の開始よりも後になります。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>しかし、猶予期間を開始したCPUについてはどうでしょうか？なぜそのCPUが猶予期間の開始を即座に認識しないのでしょうか？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>ある深い哲学的かつ過度に人間味を帯びた意味では、はい、猶予期間を開始したCPUは即座にその行動を認識しています。しかし、RCUが自己認識を持たないと仮定するならば、このCPUが実際に猶予期間の開始を認識するのは、最初の呼び出し
+<code class="docutils literal notranslate"><span class="pre">__note_gp_changes()</span></code>をした後になります。一方で、このCPUは、最後の <code class="docutils literal notranslate"><span class="pre">__note_gp_changes()</span></code> 通過時に <code class="docutils literal notranslate"><span class="pre">rcu_gp_init()</span></code> を呼び出すため、早期に通知を受けます。 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>
+何らかの理由で、木構造を配列形状ではなく木形状で描くと、平面的な表現を簡単に描くことができます:</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="self-reported-quiescent-states">
+<h4>自己報告クイエスcent状態<a class="headerlink" href="#self-reported-quiescent-states" title="この見出しへのパーマリンク">¶</a></h4>
+<p>猶予期間をブロックする可能性のあるすべてのエンティティがクイエスカント状態を報告した（または後述するセクションで他人の代わりにクイエスカント状態が報告された）場合、猶予期間は終了します。オンラインで非アイドル状態のCPUは、以下のダイアグラムに示すように、自身のクイエスカント状態を報告します。</p>
+<figure class="align-default">
+<img alt="../../../_images/TreeRCU-qs.svg" src="../../../_images/TreeRCU-qs.svg"/></figure>
+<p>これは、猶予期間の終了を示す最後のCPUのクイエスカント状態の報告です。以前のクイエスカント状態は、
+<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造に到達するまで <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> を押し上げるだけで、順序は維持されます。なぜなら、後続のクイエスカント状態がその <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;lock</span></code>.</p>
+<p>を取得するからです。任意の数のイベントが、CPUが <code class="docutils literal notranslate"><span class="pre">note_gp_changes</span></code>
+(または直接 <code class="docutils literal notranslate"><span class="pre">__note_gp_changes()</span></code>を呼び出すことにより、そのCPUはその葉 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> ロックを保持しながら新しい猶予期間の開始を認識します。したがって、このダイアグラムに示されるすべての実行は、猶予期間の開始の後に行われます。さらに、このCPUは、 <code class="docutils literal notranslate"><span class="pre">__note_gp_changes()</span></code> の呼び出し以前に開始されたすべてのRCU読み取り側クリティカルセクションを、猶予期間以前に開始したとみなします。したがって、猶予期間が待機する必要のあるクリティカルセクションです。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>しかし、RCU読み取り側クリティカルセクションが猶予期間の開始（以前の <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> の進展）の後から開始された場合、なぜ猶予期間がそのセクションを待機する必要がありますか？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>確かに、猶予期間はそのようなクリティカルセクションを待機する必要はありません。しかし、待機することは許容されます。さらに、このラズィアプローチは、一括での猶予期間開始よりもはるかにスケーラブルであるため、待機することが重要です。</p></td>
+</tr>
+</tbody>
+</table>
+<p>CPUがコンテキストスイッチを行った場合、クイエスcent状態は
+<code class="docutils literal notranslate"><span class="pre">rcu_note_context_switch()</span></code> 左側で検出されます。一方、CPUがユーザーモードで実行中にスケジューラクロック割込みを受けた場合、クイエスcent状態は <code class="docutils literal notranslate"><span class="pre">rcu_sched_clock_irq()</span></code> 右側で検出されます。いずれの場合も、クイエスcent状態を通ることは、各CPUごとの変数に記録されます。</p>
+<p>次の <code class="docutils literal notranslate"><span class="pre">RCU_SOFTIRQ</span></code> ハンドラがこのCPU上で実行されるとき（例えば、次のスケジューラクロック割込みの後）、 <code class="docutils literal notranslate"><span class="pre">rcu_core()</span></code> が呼び出され、 <code class="docutils literal notranslate"><span class="pre">rcu_check_quiescent_state()</span></code>がクイエスcent状態を認識し、 <code class="docutils literal notranslate"><span class="pre">rcu_report_qs_rdp()</span></code>.
+<code class="docutils literal notranslate"><span class="pre">rcu_report_qs_rdp()</span></code> がクイエスcent状態が現在のグレースペリオドに本当に適用されるかを確認します。確認後、 <code class="docutils literal notranslate"><span class="pre">rcu_report_rnp()</span></code> がツリーを上向きに移動し、 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> のフィールドからビットをクリアし、結果がゼロになったときにツリーを上向きに伝播します。 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;qsmask</span></code>
+注意してください。特定の</p>
+<p>構造体から上向きに移動する traversal は、現在のCPUがその <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体をヘッドとするサブツリーの最後のクイエスcent状態を報告している場合にのみ行われます。重要な点は、CPUのtraversalが特定の <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体で停止した場合、その後別のCPU（あるいは同じCPU）がそのポイントから上向きに移動するtraversalを行い、 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> が最初のCPUのクイエスcent状態が、第二のCPUのtraversalの残り部分よりも先に発生することを保証します。この論理を繰り返し適用すると、すべてのCPUのクイエスcent状態が最後のCPUがルート <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> <code class="docutils literal notranslate"><span class="pre">-&gt;lock</span></code>
+構造体を通過するよりも先に発生することがわかります。この「最後のCPU」は、ルート <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の最後のビットをクリアするCPUです。 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>
+構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;qsmask</span></code> フィールドによって保護されています。</p>
+</section>
+<section id="dynamic-tick-interface">
+<h4>ダイナミックティックインターフェース<a class="headerlink" href="#dynamic-tick-interface" title="この見出しへのパーマリンク">¶</a></h4>
+<p>エネルギー効率の観点から、RCUはアイドルしているCPUを妨害することは禁止されています。そのため、CPUはアイドル状態に入ったり出たりする際、各CPUごとの変数に対する完全に順序付けられた値を返すアトミック操作を通じてRCUに通知する必要があります。順序付けの効果は以下の通りです：</p>
+<figure class="align-default">
+<img alt="../../../_images/TreeRCU-dyntick.svg" src="../../../_images/TreeRCU-dyntick.svg"/></figure>
+<p>RCUのグレースペリオドカーネルスレッドは、対応するCPUの葉 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の
+<code class="docutils literal notranslate"><span class="pre">-&gt;lock</span></code>を保持しながら、各CPUのアイドル状態変数をサンプリングします。</p>
+<p>このプロセスを全体のグレースペリオド実行に組み込むことは、以下の通りです
+<a class="reference external" href="#Forcing%20Quiescent%20States">に記載されています。</a>.</p>
+</section>
+<section id="cpu-hotplug-interface">
+<h4>CPUホットプラグインターフェース<a class="headerlink" href="#cpu-hotplug-interface" title="この見出しへのパーマリンク">¶</a></h4>
+<p>RCUは、オフラインのCPUを妨害することも禁止されています。これらのCPUは完全に電源を切られ、システムから取り除かれる可能性があります。そのため、CPUは、対応するホットプラグ操作の一環として、RCUに自身の状態変化を通知する必要があります。この順序的な効果は以下の通りです。</p>
+<figure class="align-default">
+<img alt="../../../_images/TreeRCU-hotplug.svg" src="../../../_images/TreeRCU-hotplug.svg"/></figure>
+<p>CPUホットプラグ操作はアイドル状態の切り替えに比べて頻度がはるかに低いため、重い処理であり、CPUの葉ノードを取得してこの構造体の
+<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;lock</span></code> を更新します。
+<code class="docutils literal notranslate"><span class="pre">-&gt;qsmaskinitnext</span></code>RCUのグレースペリオドカーネルスレッドはこのマスクをサンプリングして、このグレースペリオド開始以来オフラインになったCPUを検出します。</p>
+<p>このプロセスを全体のグレースペリオド実行に組み込むことは、以下の通りです
+<a class="reference external" href="#Forcing%20Quiescent%20States">に記載されています。</a>.</p>
+</section>
+<section id="forcing-quiescent-states">
+<h4>強制クイエスcent状態<a class="headerlink" href="#forcing-quiescent-states" title="この見出しへのパーマリンク">¶</a></h4>
+<p>上記のように、アイドル状態やオフライン状態のCPUは自身のクイエスcent状態を報告できません。そのため、グレースペリオドカーネルスレッドが代わりに報告を行う必要があります。このプロセスは「クイエスcent状態を強制的に報告する」と呼ばれます。これは数個のジャフィーごとに繰り返され、その順序的な効果は以下の通りです。</p>
+<figure class="align-default">
+<img alt="../../../_images/TreeRCU-gp-fqs.svg" src="../../../_images/TreeRCU-gp-fqs.svg"/></figure>
+<p>クイエスcent状態の強制報告を行うたびに、葉ノードをトラバースすることが保証されています。
+<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 新しいクイエスcent状態が最近アイドル化またはオフラインになったCPUから生じていない場合、葉ノードだけがトラバースされます。しかし、左側に示すように新たにオフラインになったCPUや、右側に示すように新たにアイドル化されたCPUがある場合、対応するクイエスcent状態がルートに向かって駆動されます。自己報告されたクイエスcent状態と同様に、他のCPUから未完了のクイエスcent状態を持つ構造体に到達すると駆動が停止します。 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 他のCPUからクイエスcent状態が未完了である構造体に到達すると停止します。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>最も左のルートへの駆動はルートに到達する前に停止しました
+<code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造であり、その構造に従属するCPUが現在のグレースペリオドを待っている状態にあるためです。このような状況において、ルートに至る最右のドライブがなぜグレースペリオドを終えたのでしょうか？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>良い分析ですね！RCUにバグが存在しない場合、実際には不可能です。しかし、このダイアグラムはすでに複雑すぎて、簡潔さが正確さを上回りました。これは詩的な自由とみなすことも、誤った誘導としてみなすこともできます。その解決は以下の
+<a class="reference external" href="#Putting%20It%20All%20Together">つなぎ合わせたダイアグラム</a>.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="grace-period-cleanup">
+<h4>grace-periodクリーンアップ<a class="headerlink" href="#grace-period-cleanup" title="この見出しへのパーマリンク">¶</a></h4>
+<p>グレースペリオドクリーンアップはまず以下の <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> ツリーを幅優先で進み、すべての <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> フィールドを進み、その後は
+<code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> フィールドを進みます。順序の影響は以下の通りです：</p>
+<figure class="align-default">
+<img alt="../../../_images/TreeRCU-gp-cleanup.svg" src="../../../_images/TreeRCU-gp-cleanup.svg"/></figure>
+<p>ダイアグラムの下部にある楕円から示されるように、グレースペリオドクリーンアップが完了すると、次のグレースペリオドが始まります。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>しかし、グレースペリオドは正確にいつ終了するのでしょうか？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>グレースペリオドの終わりを明確に示す有用な単一のポイントは存在しない。最も早い合理的な候補は、最後のCPUがクイエスcent状態を報告した直後であるが、RCUがこれを認識するまでには数ミリ秒かかる可能性がある。最も遅い合理的な候補は、フィールドが更新された時点で、ただしその時点ですでに一部のCPUが更新の第2段階を完了している可能性もある。 <code class="docutils literal notranslate"><span class="pre">rcu_state</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> 要するに、RCUと作業する場合は、不確実性を受け入れる必要がある。</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="callback-invocation">
+<h4>コールバック実行<a class="headerlink" href="#callback-invocation" title="この見出しへのパーマリンク">¶</a></h4>
+<p>あるCPUの葉 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;gp_seq</span></code> フィールドが更新されると、そのCPUはこのグレースペリオドの終了を待っていたRCUコールバックを呼び出すことができる。これらのコールバックは
+<code class="docutils literal notranslate"><span class="pre">rcu_advance_cbs()</span></code>によって識別され、これは通常
+<code class="docutils literal notranslate"><span class="pre">__note_gp_changes()</span></code>によって呼び出される。以下の図に示すように、この呼び出しはスケジューリングクロック割り込み（<code class="docutils literal notranslate"><span class="pre">rcu_sched_clock_irq()</span></code> の左）またはアイドルエントリ（<code class="docutils literal notranslate"><span class="pre">rcu_cleanup_after_idle()</span></code> の右、ただし <code class="docutils literal notranslate"><span class="pre">CONFIG_RCU_FAST_NO_HZ=y</span></code>でビルドされたカーネルのみ）によってトリガーされる。いずれにしても、 <code class="docutils literal notranslate"><span class="pre">RCU_SOFTIRQ</span></code> が発生し、これにより <code class="docutils literal notranslate"><span class="pre">rcu_do_batch()</span></code> がコールバックを呼び出し、これにより各更新の必要な第2段階の処理（直接的にも間接的にもウェイクアップを通じて）が実行される。</p>
+<figure class="align-default">
+<img alt="../../../_images/TreeRCU-callback-invocation.svg" src="../../../_images/TreeRCU-callback-invocation.svg"/></figure>
+<p>注意点として、コールバックの呼び出しは、CPUがコールバックキューに蓄積された数が過剰であると認識した場合など、さまざまな特殊なコードパスによってもトリガーされる可能性がある。いずれの場合も、CPUはコールバック呼び出し前にその葉 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造体の <code class="docutils literal notranslate"><span class="pre">-&gt;lock</span></code> を取得し、これにより新規に完了したグレースペリオドに対する必要な順序が保持される。</p>
+<p>ただし、コールバック関数が他のCPUと通信する場合（例：ウェイクアップを行う場合）、その関数の責任で順序を維持する必要がある。例えば、コールバック関数が他のCPUで実行されるタスクをウェイクアップする場合、コールバック関数とウェイクアップされるタスクの両方で適切な順序が確保される必要がある。なぜこれが重要かを理解するため、以下の <a class="reference external" href="#Grace-Period%20Cleanup">グレースペリオドクリーンアップ</a> 図の上半分を見てほしい。コールバックは左端の葉 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code>
+構造に対応するCPUで実行され、右端の葉 <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造に対応するCPUで実行されるタスクをウェイクアップする可能性がある。この場合、グレースペリオドのカーネルスレッドはまだ右端の葉に到達していないかもしれない。このため、グレースペリオドのメモリ順序がまだそのCPUに到達していない可能性がある。このような場合でも、コールバック関数とウェイクアップされたタスクは適切な順序を提供しなければならない。</p>
+</section>
+</section>
+<section id="putting-it-all-together">
+<h3>すべてを統合する<a class="headerlink" href="#putting-it-all-together" title="この見出しへのパーマリンク">¶</a></h3>
+<p>組み合わせた図は以下にあります：</p>
+<figure class="align-default">
+<img alt="../../../_images/TreeRCU-gp.svg" src="../../../_images/TreeRCU-gp.svg"/></figure>
+</section>
+<section id="legal-statement">
+<h3>Legal Statement<a class="headerlink" href="#legal-statement" title="この見出しへのパーマリンク">¶</a></h3>
+<p>This work represents the view of the author and does not necessarily represent the view of IBM.</p>
+<p>Linux is a registered trademark of Linus Torvalds.</p>
+<p>Other company, product, and service names may be trademarks or service marks of others.</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../../../core-api/index.html">コアAPIドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../../core-api/index.html#core-utilities">Core utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../core-api/index.html#data-structures-and-low-level-utilities">Data structures and low-level utilities</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="../../../core-api/index.html#concurrency-primitives">Concurrency primitives</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../core-api/index.html#low-level-hardware-management">Low-level hardware management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../core-api/index.html#memory-management">Memory management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../core-api/index.html#interfaces-for-kernel-debugging">Interfaces for kernel debugging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../core-api/index.html#everything-else">Everything else</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../../../core-api/index.html">コアAPIドキュメント</a><ul>
+<li><a href="../../index.html">RCU concepts</a><ul>
+<li>前へ: <a href="../../UP.html" title="前章">単一プロセッサシステムにおけるRCU</a></li>
+<li>次へ: <a href="../Expedited-Grace-Periods/Expedited-Grace-Periods.html" title="次章">TREE_RCUの緊急グレース期間をめぐるツアー</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../../_sources/RCU/Design/Memory-Ordering/Tree-RCU-Memory-Ordering.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

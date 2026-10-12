@@ -1,0 +1,1633 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>RCUの要件を巡るツアー — Linux Kernelドキュメンテーション</title>
+<link href="../../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../../" id="documentation_options" src="../../../_static/documentation_options.js"></script>
+<script src="../../../_static/jquery.js"></script>
+<script src="../../../_static/underscore.js"></script>
+<script src="../../../_static/doctools.js"></script>
+<link href="../../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../../search.html" rel="search" title="検索"/>
+<link href="../Data-Structures/Data-Structures.html" rel="next" title="TREE_RCUのデータ構造をめぐるツアー [LWN.net]"/>
+<link href="../Expedited-Grace-Periods/Expedited-Grace-Periods.html" rel="prev" title="TREE_RCUの緊急グレース期間をめぐるツアー"/>
+<link href="../../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="a-tour-through-rcu-s-requirements">
+<h1>A Tour Through RCU’s Requirements<a class="headerlink" href="#a-tour-through-rcu-s-requirements" title="この見出しへのパーマリンク">¶</a></h1>
+<p>著作権 IBM Corporation, 2015</p>
+<p>著者: Paul E. McKenney</p>
+<p>このドキュメントの初期バージョンは以下の
+<a class="reference external" href="https://lwn.net/">LWN</a> に掲載されました
+<a class="reference external" href="https://lwn.net/Articles/652156/">第1部</a>,
+<a class="reference external" href="https://lwn.net/Articles/652677/">第2部</a>, and
+<a class="reference external" href="https://lwn.net/Articles/653326/">第3部</a>.</p>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Read-copy update (RCU)は、読者とライターの同期メカニズムとしてよく使われます。RCUは、アップデータが読者をブロックしないという点で特異です。これにより、RCUの読み込み側のプリミティブは非常に高速でスケーラブルです。さらに、アップデータは読者と同時に有用な進展を遂げることができます。しかし、RCUの読者とアップデータ間のこの並行性は、RCUの読者が何をしているのかという疑問を引き起こし、その結果、RCUの要件が何なのかという疑問にもつながります。</p>
+<p>このドキュメントでは、RCUの要件をまとめています。これはRCUの非公式な、高レベルの仕様とみなせます。RCUの仕様は主に経験的な性質を持っています。実際、これらの要件について多くの点は苦労して学びました。この状況は多少の混乱を引き起こすかもしれませんが、この学習プロセスはとても楽しく、多くの人々と興味深い新しい方法で技術を応用してくれたことに感謝しています。</p>
+<p>それらを除いて、現在知られているRCUの要件のカテゴリは以下の通りです:</p>
+<ol class="arabic simple">
+<li><p><a class="reference internal" href="#fundamental-requirements">基本的な要件</a></p></li>
+<li><p><a class="reference internal" href="#fundamental-non-requirements">基本的な不要条件</a></p></li>
+<li><p><a class="reference internal" href="#parallelism-facts-of-life">並行性の事実</a></p></li>
+<li><p><a class="reference internal" href="#quality-of-implementation-requirements">実装品質の要件</a></p></li>
+<li><p><a class="reference internal" href="#linux-kernel-complications">Linux Kernelの複雑さ</a></p></li>
+<li><p><a class="reference internal" href="#software-engineering-requirements">ソフトウェア工学の要件</a></p></li>
+<li><p><a class="reference internal" href="#other-rcu-flavors">他のRCUのバリエーション</a></p></li>
+<li><p><a class="reference internal" href="#possible-future-changes">可能となる将来の変更</a></p></li>
+</ol>
+<p>これは以下の <a class="reference external" href="#Summary">要約</a>ですが、各クイズの答えはクイズの直後にすぐに続きます。マウスで大きな白いスペースを選択して答えを確認してください。</p>
+</section>
+<section id="fundamental-requirements">
+<h2>基本的な要件<a class="headerlink" href="#fundamental-requirements" title="この見出しへのパーマリンク">¶</a></h2>
+<p>RCUの基本的な要件は、RCUが持つ厳密な数学的要件に最も近いものです。これらは以下の通りです:</p>
+<ol class="arabic simple">
+<li><p><a class="reference internal" href="#grace-period-guarantee">グレース期間の保証</a></p></li>
+<li><p><a class="reference internal" href="#publish-subscribe-guarantee">パブリッシュ/サブスクライブの保証</a></p></li>
+<li><p><a class="reference internal" href="#memory-barrier-guarantees">メモリバリアの保証</a></p></li>
+<li><p><a class="reference internal" href="#rcu-primitives-guaranteed-to-execute-unconditionally">条件に関係なく実行されるRCUプリミティブの保証</a></p></li>
+<li><p><a class="reference internal" href="#guaranteed-read-to-write-upgrade">保証された読み込みからの書き込みアップグレード</a></p></li>
+</ol>
+<section id="grace-period-guarantee">
+<h3>グレース期間の保証<a class="headerlink" href="#grace-period-guarantee" title="この見出しへのパーマリンク">¶</a></h3>
+<p>RCUのグレース期間の保証は、事前に計画されたという点で特異です。1990年代前半にRCU（当時は「rclock」と呼ばれていました）の開発を始めた当初から、この保証を明確に意識していました。ただし、RCUに関する20年間の経験により、この保証についてより詳細な理解が得られました。</p>
+<p>RCUのグレース期間の保証により、アップデータはすべての既存のRCU読み込み側クリティカルセクションの完了を待つことができます。RCU読み込み側クリティカルセクションは、マーカーで始まり、 <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> マーカーで終わります <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code>これらのマーカーはネストされることがあります。RCUはネストされたセットを1つの大きなRCU読み込み側クリティカルセクションとして扱います。生産用実装では、 <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> および
+<code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code> が非常に軽量であり、実際にはLinuxの生産用実行向けに構築されたカーネルではゼロのオーバーヘッドがあります。
+<code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT=n</span></code>.</p>
+<p>この保証により、読者に対して極めて低いオーバーヘッドで順序を強制することが可能です。例えば：</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 int x, y;
+ 2
+ 3 void thread0(void)
+ 4 {
+ 5   rcu_read_lock();
+ 6   r1 = READ_ONCE(x);
+ 7   r2 = READ_ONCE(y);
+ 8   rcu_read_unlock();
+ 9 }
+10
+11 void thread1(void)
+12 {
+13   WRITE_ONCE(x, 1);
+14   synchronize_rcu();
+15   WRITE_ONCE(y, 1);
+16 }
+</pre></div>
+</div>
+</div></blockquote>
+<p>なぜなら、 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> の行14で既存の読者を待機しているため、 <code class="docutils literal notranslate"><span class="pre">thread0()</span></code> がからゼロの値を読み込む場合、
+<code class="docutils literal notranslate"><span class="pre">x</span></code> が完了する前に <code class="docutils literal notranslate"><span class="pre">thread1()</span></code> がに書き込む必要があります。そのため、そのインスタンスもからゼロの値を読み込む必要があります。 <code class="docutils literal notranslate"><span class="pre">y</span></code>。同様に、 <code class="docutils literal notranslate"><span class="pre">y</span></code>がから1の値を読み込む場合、 <code class="docutils literal notranslate"><span class="pre">thread0()</span></code> が開始する前に <code class="docutils literal notranslate"><span class="pre">y</span></code> が開始しなければならないため、そのインスタンスもから1の値を読み込む必要があります。 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> 。したがって、結果として： <code class="docutils literal notranslate"><span class="pre">x</span></code>は起こり得ません。</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(r1 == 0 &amp;&amp; r2 == 1)
+</pre></div>
+</div>
+</div></blockquote>
+<p>待ってください！あなたはアップデータが読者と並行して有用な進行を遂行できると述べましたが、既存の読者はブロックします</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>!!! 一体誰をだまそうとしているのだろう？？？ <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code>まず、アップデータが読者によってブロックされたくない場合は、後述する</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>を使用できます。次に、
+<code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> または <code class="docutils literal notranslate"><span class="pre">kfree_rcu()</span></code>を使用しても、他のアップデート側コードは読者と並行して実行されます。既存の読者であれ、そうでなかれです。 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code>このシナリオは、</p></td>
+</tr>
+</tbody>
+</table>
+<p>でRCUの最初の使用例の一つに似ています。
+<a class="reference external" href="https://en.wikipedia.org/wiki/DYNIX">DYNIX/ptx</a>が分散型ロックマネージャーの状態をノード障害からの回復に適した状態に移行する際の管理を、以下のように行いました：</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 #define STATE_NORMAL        0
+ 2 #define STATE_WANT_RECOVERY 1
+ 3 #define STATE_RECOVERING    2
+ 4 #define STATE_WANT_NORMAL   3
+ 5
+ 6 int state = STATE_NORMAL;
+ 7
+ 8 void do_something_dlm(void)
+ 9 {
+10   int state_snap;
+11
+12   rcu_read_lock();
+13   state_snap = READ_ONCE(state);
+14   if (state_snap == STATE_NORMAL)
+15     do_something();
+16   else
+17     do_something_carefully();
+18   rcu_read_unlock();
+19 }
+20
+21 void start_recovery(void)
+22 {
+23   WRITE_ONCE(state, STATE_WANT_RECOVERY);
+24   synchronize_rcu();
+25   WRITE_ONCE(state, STATE_RECOVERING);
+26   recovery();
+27   WRITE_ONCE(state, STATE_WANT_NORMAL);
+28   synchronize_rcu();
+29   WRITE_ONCE(state, STATE_NORMAL);
+30 }
+</pre></div>
+</div>
+</div></blockquote>
+<p>のRCU読み込み側クリティカルセクションは、 <code class="docutils literal notranslate"><span class="pre">do_something_dlm()</span></code> と <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> の <code class="docutils literal notranslate"><span class="pre">start_recovery()</span></code> を組み合わせて、
+<code class="docutils literal notranslate"><span class="pre">do_something()</span></code> が <code class="docutils literal notranslate"><span class="pre">recovery()</span></code>と同時に実行されないことを保証しますが、 <code class="docutils literal notranslate"><span class="pre">do_something_dlm()</span></code>.</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>の <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> の行28が必要なのはなぜですか？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>その追加のグレースペリオドがなければ、メモリ再配置によって
+<code class="docutils literal notranslate"><span class="pre">do_something_dlm()</span></code> が <code class="docutils literal notranslate"><span class="pre">do_something()</span></code> と最後の <code class="docutils literal notranslate"><span class="pre">recovery()</span></code>.</p></td>
+</tr>
+</tbody>
+</table>
+<p>の一部と同時に実行される可能性があります。致命的な問題（例：デッドロック）を回避するため、RCU読み込み側クリティカルセクションには、 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code>の呼び出しを含んではいけません。同様に、RCU読み込み側クリティカルセクションには、
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code>.</p>
+<p>の呼び出しの完了を直接または間接的に待つような処理を含んではいけません。RCUのグレースペリオド保証は、それ自体でも有用ですが、
+<a class="reference external" href="https://lwn.net/Articles/573497/">の使用ケースがかなりあるため、</a>を用いてリンクされたデータ構造への読み込み側アクセスを調整できると良いでしょう。このためには、グレースペリオド保証だけでは不十分です。これは以下の関数で確認できます。読者コードは後で見ますが、ここでは読者をロックレスで取得するものと考えてください。 <code class="docutils literal notranslate"><span class="pre">add_gp_buggy()</span></code> を <code class="docutils literal notranslate"><span class="pre">gp</span></code> ポインタ、そして、読み込まれた値が非<code class="docutils literal notranslate"><span class="pre">NULL</span></code>ロックレスにアクセスする <code class="docutils literal notranslate"><span class="pre">-&gt;a</span></code> および <code class="docutils literal notranslate"><span class="pre">-&gt;b</span></code> フィールド。</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 bool add_gp_buggy(int a, int b)
+ 2 {
+ 3   p = kmalloc(sizeof(*p), GFP_KERNEL);
+ 4   if (!p)
+ 5     return -ENOMEM;
+ 6   spin_lock(&amp;gp_lock);
+ 7   if (rcu_access_pointer(gp)) {
+ 8     spin_unlock(&amp;gp_lock);
+ 9     return false;
+10   }
+11   p-&gt;a = a;
+12   p-&gt;b = a;
+13   gp = p; /* ORDERING BUG */
+14   spin_unlock(&amp;gp_lock);
+15   return true;
+16 }
+</pre></div>
+</div>
+</div></blockquote>
+<p>問題は、コンパイラと弱い順序性を持つCPUがこのコードを以下のようにならび替える権利があることです：</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 bool add_gp_buggy_optimized(int a, int b)
+ 2 {
+ 3   p = kmalloc(sizeof(*p), GFP_KERNEL);
+ 4   if (!p)
+ 5     return -ENOMEM;
+ 6   spin_lock(&amp;gp_lock);
+ 7   if (rcu_access_pointer(gp)) {
+ 8     spin_unlock(&amp;gp_lock);
+ 9     return false;
+10   }
+11   gp = p; /* ORDERING BUG */
+12   p-&gt;a = a;
+13   p-&gt;b = a;
+14   spin_unlock(&amp;gp_lock);
+15   return true;
+16 }
+</pre></div>
+</div>
+</div></blockquote>
+<p>RCUリーダーが <code class="docutils literal notranslate"><span class="pre">gp</span></code> 行11を実行した直後に取得すると、 <code class="docutils literal notranslate"><span class="pre">add_gp_buggy_optimized</span></code>
+フィールドにゴミが表示されます。これは、コンパイラとハードウェアの最適化が問題を引き起こす方法の一つに過ぎません。したがって、コンパイラとCPUがこのように並び替えるのを防ぐための方法が必要です。これにより、次のセクションで説明するパブリッシュ・サブスクリプションの保証に移ります。 <code class="docutils literal notranslate"><span class="pre">-&gt;a</span></code> および <code class="docutils literal notranslate"><span class="pre">-&gt;b</span></code> RCUのパブリッシュ・サブスクリプションの保証は、リンクされたデータ構造にデータを挿入してもRCUリーダーの動作を妨げません。アップデーターは</p>
+</section>
+<section id="publish-subscribe-guarantee">
+<h3>パブリッシュ/サブスクライブの保証<a class="headerlink" href="#publish-subscribe-guarantee" title="この見出しへのパーマリンク">¶</a></h3>
+<p>を使用して新しいデータを挿入し、リーダーは
+<code class="docutils literal notranslate"><span class="pre">rcu_assign_pointer()</span></code> を使用してデータにアクセスします（新しいか古いかに関係なく）。以下の例は挿入の様子を示します：
+<code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code> 行13は概念的に単純な代入文に等しいですが、行11と12の二つの代入が行われる前にその代入が行われることを保証します。これはC11の</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 bool add_gp(int a, int b)
+ 2 {
+ 3   p = kmalloc(sizeof(*p), GFP_KERNEL);
+ 4   if (!p)
+ 5     return -ENOMEM;
+ 6   spin_lock(&amp;gp_lock);
+ 7   if (rcu_access_pointer(gp)) {
+ 8     spin_unlock(&amp;gp_lock);
+ 9     return false;
+10   }
+11   p-&gt;a = a;
+12   p-&gt;b = a;
+13   rcu_assign_pointer(gp, p);
+14   spin_unlock(&amp;gp_lock);
+15   return true;
+16 }
+</pre></div>
+</div>
+</div></blockquote>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">rcu_assign_pointer()</span></code> ストア操作に似ています。また、コンパイラの興味深い最適化を複数防ぐこともできます。例えば、 <code class="docutils literal notranslate"><span class="pre">memory_order_release</span></code> を代入直前に一時的な場所として使用するのを防ぎます。
+<code class="docutils literal notranslate"><span class="pre">gp</span></code> しかし、</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>は、 <code class="docutils literal notranslate"><span class="pre">rcu_assign_pointer()</span></code> への二つの代入が並び替えるのを防ぐことはできません。これも問題になることはないでしょうか？ <code class="docutils literal notranslate"><span class="pre">p-&gt;a</span></code> および <code class="docutils literal notranslate"><span class="pre">p-&gt;b</span></code> いいえ、問題になりません。リーダーは、</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>への代入が行われるまで、これらの二つのフィールドのいずれも見ることはできません。 <code class="docutils literal notranslate"><span class="pre">gp</span></code>その時点で両方のフィールドが完全に初期化されているため、割り当ての順序を変更しても問題は起こりません。 <code class="docutils literal notranslate"><span class="pre">p-&gt;a</span></code> および <code class="docutils literal notranslate"><span class="pre">p-&gt;b</span></code>
+問題は起こり得ません。</p></td>
+</tr>
+</tbody>
+</table>
+<p>RCUで保護されたデータへのアクセスを制御するためには、読者に特別な処置を取る必要がないと仮定するのは誘惑的ですが、以下の通りです。
+<code class="docutils literal notranslate"><span class="pre">do_something_gp_buggy()</span></code> 以下:</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 bool do_something_gp_buggy(void)
+ 2 {
+ 3   rcu_read_lock();
+ 4   p = gp;  /* OPTIMIZATIONS GALORE!!! */
+ 5   if (p) {
+ 6     do_something(p-&gt;a, p-&gt;b);
+ 7     rcu_read_unlock();
+ 8     return true;
+ 9   }
+10   rcu_read_unlock();
+11   return false;
+12 }
+</pre></div>
+</div>
+</div></blockquote>
+<p>しかし、この誘惑に打ち勝つ必要があります。なぜなら、コンパイラ（DEC Alpha CPUを含む）がこのコードを混乱させる方法は驚くほど多くあるからです。
+<a class="reference external" href="https://h71000.www7.hp.com/wizard/wiz_2637.html">DEC Alpha CPUs</a>)がこのコードを混乱させる可能性があります。たとえば、コンパイラがレジスタが不足している場合、再取得を行うのではなく、別のコピーを保持するのではなく、以下のようになるかもしれません。 <code class="docutils literal notranslate"><span class="pre">gp</span></code> 以下のようになるかもしれません。 <code class="docutils literal notranslate"><span class="pre">p</span></code> 以下のようになります:</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 bool do_something_gp_buggy_optimized(void)
+ 2 {
+ 3   rcu_read_lock();
+ 4   if (gp) { /* OPTIMIZATIONS GALORE!!! */
+ 5     do_something(gp-&gt;a, gp-&gt;b);
+ 6     rcu_read_unlock();
+ 7     return true;
+ 8   }
+ 9   rcu_read_unlock();
+10   return false;
+11 }
+</pre></div>
+</div>
+</div></blockquote>
+<p>この関数が現在の構造体を新しいものに置き換える一連の更新と同時に実行された場合、取得が <code class="docutils literal notranslate"><span class="pre">gp-&gt;a</span></code> および
+<code class="docutils literal notranslate"><span class="pre">gp-&gt;b</span></code> 異なる構造体から来る可能性があり、これは重大な混乱を引き起こすかもしれません。これを防ぐために（他にも多くの問題を防ぐために）、
+<code class="docutils literal notranslate"><span class="pre">do_something_gp()</span></code> 使用しています。 <code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code> 取得します。 <code class="docutils literal notranslate"><span class="pre">gp</span></code>:</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 bool do_something_gp(void)
+ 2 {
+ 3   rcu_read_lock();
+ 4   p = rcu_dereference(gp);
+ 5   if (p) {
+ 6     do_something(p-&gt;a, p-&gt;b);
+ 7     rcu_read_unlock();
+ 8     return true;
+ 9   }
+10   rcu_read_unlock();
+11   return false;
+12 }
+</pre></div>
+</div>
+</div></blockquote>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code> Linuxカーネルでは、volatileキャストと（DEC Alphaの場合）メモリバリアを使用しています。高品質なC11の``memory_order_consume``実装がいつか現れれば、 <cite>high-quality implementation of C11 ``memory_order_consume`</cite>
+[PDF] &lt;<a class="reference external" href="http://www.rdrop.com/users/paulmck/RCU/consume.2015.07.13a.pdf">http://www.rdrop.com/users/paulmck/RCU/consume.2015.07.13a.pdf</a>&gt;`__ がいつか現れれば、 <code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code> loadとして実装できます。どの実装方法でも、取得されたポインタは
+<code class="docutils literal notranslate"><span class="pre">memory_order_consume</span></code> loadとして実装できます。どの実装方法でも、取得されたポインタは <code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code> …の外側で使用することはできません
+<code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code>、対応するデータ要素の保護がRCUから他の同期メカニズムに移管されている場合を除いて、最も一般的なロックや参照カウントなど <a class="reference external" href="https://www.kernel.org/doc/Documentation/RCU/rcuref.txt">参照カウント</a>.</p>
+<p>要するに、アップデータは <code class="docutils literal notranslate"><span class="pre">rcu_assign_pointer()</span></code> 読者も使用します
+<code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code>、これら2つのRCU API要素は、読者が新たに追加されたデータ要素に対して一貫したビューを持つようにします</p>
+<p>もちろん、RCUで保護されたデータ構造から要素を削除する必要があります。たとえば、以下のプロセスを使用します：</p>
+<ol class="arabic simple">
+<li><p>データ要素を包含する構造から削除します</p></li>
+<li><p>すべての既存のRCU読み込み側クリティカルセクションが完了するのを待機します（なぜなら、新たに削除されたデータ要素への参照を持つ可能性があるのは、既存の読者だけだからです）</p></li>
+<li><p>この時点で、新たに削除されたデータ要素への参照を持つのはアップデータだけなので、安全にデータ要素を回収できます。たとえば、これを <code class="docutils literal notranslate"><span class="pre">kfree()</span></code>.</p></li>
+</ol>
+<p>このプロセスは <code class="docutils literal notranslate"><span class="pre">remove_gp_synchronous()</span></code>:</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 bool remove_gp_synchronous(void)
+ 2 {
+ 3   struct foo *p;
+ 4
+ 5   spin_lock(&amp;gp_lock);
+ 6   p = rcu_access_pointer(gp);
+ 7   if (!p) {
+ 8     spin_unlock(&amp;gp_lock);
+ 9     return false;
+10   }
+11   rcu_assign_pointer(gp, NULL);
+12   spin_unlock(&amp;gp_lock);
+13   synchronize_rcu();
+14   kfree(p);
+15   return true;
+16 }
+</pre></div>
+</div>
+</div></blockquote>
+<p>この関数はシンプルで、13行目が14行目で古いデータ要素を解放する前にグレースペリオドを待機します。この待機により、読者が…の7行目に到達することを保証します <code class="docutils literal notranslate"><span class="pre">do_something_gp()</span></code> …が解放される前に、参照されているデータ要素 <code class="docutils literal notranslate"><span class="pre">p</span></code> が解放されるまで、… <code class="docutils literal notranslate"><span class="pre">rcu_access_pointer()</span></code> 6行目の…は…に似ています <code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code>、ただし：</p>
+<ol class="arabic simple">
+<li><p>…によって返される値 <code class="docutils literal notranslate"><span class="pre">rcu_access_pointer()</span></code> 参照することはできません。…を参照するだけでなく、ポインタ自体にもアクセスしたい場合は、…を使用してください <code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code> …の代わりに
+<code class="docutils literal notranslate"><span class="pre">rcu_access_pointer()</span></code>.</p></li>
+<li><p>…の呼び出し <code class="docutils literal notranslate"><span class="pre">rcu_access_pointer()</span></code> 保護する必要はありません。一方で、 <code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code> …は、RCU読み込み側クリティカルセクション内にあり、またはポインタが変化しないコードセグメント内にあり、例えば、対応する更新側ロックで保護されたコード内にあり</p></li>
+</ol>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>…がない場合、 <code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code> …または…、 <code class="docutils literal notranslate"><span class="pre">rcu_access_pointer()</span></code>、コンパイラがどのような破壊的最適化を活用する可能性があるでしょうか？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>では、…が起こるかを見てみましょう <code class="docutils literal notranslate"><span class="pre">do_something_gp()</span></code> …を使用しなかった場合、 <code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code>、この同じポインタから以前に取得した値を再利用する可能性があります。また、…からポインタを取得する可能性もあります <code class="docutils literal notranslate"><span class="pre">gp</span></code>
+バイト単位で取得することで、…を引き起こします <em>ロードテアリング</em>、結果として、2つの異なるポインタ値のバイト単位でのマッシュアップを引き起こします。また、値の推測最適化を使用する可能性もあります。これは、間違った推測をし、その値を確認するまでに更新がポインタを間違った推測に合わせて変更した場合です。その間、デリファレンスで初期化前のゴミが返された場合、残念ですね！ <code class="docutils literal notranslate"><span class="pre">remove_gp_synchronous()</span></code>、…のすべての変更が…で行われる限り、
+<code class="docutils literal notranslate"><span class="pre">gp</span></code> …で行われる限り、 <code class="docutils literal notranslate"><span class="pre">gp_lock</span></code>、上記の最適化は無害です。一方で、 <code class="docutils literal notranslate"><span class="pre">sparse</span></code> …を定義してからアクセスしないと、…が文句を言い始めます <code class="docutils literal notranslate"><span class="pre">gp</span></code> with <code class="docutils literal notranslate"><span class="pre">__rcu</span></code> …を使用せずにアクセスすると
+<code class="docutils literal notranslate"><span class="pre">rcu_access_pointer()</span></code> または <code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code>.</p></td>
+</tr>
+</tbody>
+</table>
+<p>要するに、RCUのパブリッシュサブスクライブ保証は…の組み合わせによって提供されます <code class="docutils literal notranslate"><span class="pre">rcu_assign_pointer()</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code>この保証により、RCU保護されたリンクデータ構造にデータ要素を安全に追加できるため、RCUリーダーの動作を妨げることなく処理できます。この保証は、 grace-period 保証と組み合わせることで、RCU保護されたリンクデータ構造からデータ要素を削除することも可能になります。これにより、RCUリーダーの動作を妨げることなく処理できます。</p>
+<p>この保証は完全に事前に計画されたわけではありませんでした。DYNIX/ptxは公開用に明示的なメモリバリアを使用していましたが、サブスクリプションには類似するものも、依存順序バリアに類似するものも持っていなかったのです。
+<code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code> dependency-ordering barrier が後に統合されたものにも類似するものはありませんでした。 <code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code> さらに後には <code class="docutils literal notranslate"><span class="pre">READ_ONCE()</span></code>1990年代後半の会議でDEC Alphaアーキテクトたちと出会ったとき、DECがまだ独立した企業だった時代に、これらの操作の必要性が急に明らかになりました。Alphaアーキテクトたちは私に、どんなバリアも必要になることはないと1時間かけて説得しました。その後、私は彼らに、彼らのドキュメンテーションがこの点を明確に述べていないことについて、2時間かけて説得しました。 <em>two</em> 1990年代前半のコンパイラははるかに単純でしたが、2015年にはコンパイラのトリックや落とし穴についての知識は大幅に増えています。要するに、コンパイラは1990年代前半にははるかに単純でしたが、2015年には、省略を考慮するなど考えてもいません。
+<code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code>!</p>
+</section>
+<section id="memory-barrier-guarantees">
+<h3>メモリバリアの保証<a class="headerlink" href="#memory-barrier-guarantees" title="この見出しへのパーマリンク">¶</a></h3>
+<p>前節の単純なリンクデータ構造のシナリオは、複数のCPUを持つシステムにおいてRCUの厳しいメモリ順序保証が必要であることを明確に示しています。</p>
+<ol class="arabic simple">
+<li><p>RCU読み込み側クリティカルセクションが開始される前に開始するCPUは、RCU読み込み側クリティカルセクションが終了する時間と、 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> が戻る時間の間に完全なメモリバリアを実行することを保証されています。この保証がなければ、既存のRCU読み込み側クリティカルセクションが新たに削除された <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> を参照している可能性があります。この保証がなければ、既存のRCU読み込み側クリティカルセクションが新たに削除された <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">foo</span></code> after the
+<code class="docutils literal notranslate"><span class="pre">kfree()</span></code> 14行目の <code class="docutils literal notranslate"><span class="pre">remove_gp_synchronous()</span></code>.</p></li>
+<li><p>各CPUがRCU読み取り側クリティカルセクションを終了するタイミングで終了する場合、
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> 戻り値を返す際には、そのクリティカルセクションの開始時と終了時の間にフルメモリーバリアを実行することが保証されています。この保証がなければ、後続のRCU読み取り側クリティカルセクションが <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> 実行される可能性があり、新たに削除されたデータを発見する可能性があります。
+<code class="docutils literal notranslate"><span class="pre">kfree()</span></code> 14行目の <code class="docutils literal notranslate"><span class="pre">remove_gp_synchronous()</span></code> 後続のRCU読み取り側クリティカルセクションが実行される可能性があり、
+<code class="docutils literal notranslate"><span class="pre">do_something_gp()</span></code> 新たに削除されたデータを発見する可能性があります。 <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">foo</span></code>.</p></li>
+<li><p>タスクが呼び出す場合 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> 特定のCPUに残る場合、そのCPUは、実行中にいつかフルメモリーバリアを実行することを保証されています。この保証により、 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code>the <code class="docutils literal notranslate"><span class="pre">kfree()</span></code> 14行目の <code class="docutils literal notranslate"><span class="pre">remove_gp_synchronous()</span></code> 実際に、11行の削除後に行われます。</p></li>
+<li><p>タスクが呼び出す場合 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> 複数のCPU間で移動します。その後、そのグループ内の各CPUは、その実行中にいつか完全なメモリーバリアを実行することを保証しています。 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code>。この保証は、その <code class="docutils literal notranslate"><span class="pre">kfree()</span></code> 14行目の <code class="docutils literal notranslate"><span class="pre">remove_gp_synchronous()</span></code> 11行目の削除後にも実行されますが、同時に実行しているスレッドが移動する場合にも実行されます。 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> migrates in the meantime.</p></li>
+</ol>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>複数のCPUがいつでも順序を問わずRCU読み込み側のクリティカルセクションを開始できる場合、RCUが特定のRCU読み込み側のクリティカルセクションが特定のインスタンスよりも先に開始しているかどうかを判断する方法はありますか？ <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code>?</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>RCUが特定のRCU読み込み側のクリティカルセクションが特定のインスタンスよりも先に開始しているかどうかを判断できない場合、 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code>RCU読み込み側のクリティカルセクションが先に開始したと仮定しなければなりません。つまり、特定のインスタンスが <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> RCU読み込み側のクリティカルセクションを待機しなくて済むのは、それが先に開始したことを証明できる場合に限ります。 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> started first. A related question is “When <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> コードを生成しない場合、なぜグレースペリオドとの関係が重要なのか？その答えは、コード自体の関係ではなく、 <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code>
+閉じられたRCU読み込み側のクリティカルセクション内のコードと、グレースペリオドの前後のコードとの関係が重要です。この視点を取ると、グレースペリオドよりも先にRCU読み込み側のクリティカルセクションが開始されているとみなされるのは、グレースペリオド前のアクセスがクリティカルセクション内のアクセスの効果を観測する場合で、その場合、クリティカルセクション内のアクセスはグレースペリオド後のアクセスの効果を観測しません。</p>
+<p>2016年後半に数学モデルではこの視点を取り入れており、例えば、 <a class="reference external" href="http://www2.rdrop.com/users/paulmck/scalability/paper/LinuxMM.2016.10.04c.LCE.pdf">2016 LinuxCon EU</a>
+プレゼンテーションのスライド62と63を参照してください。</p>
+</td>
+</tr>
+</tbody>
+</table>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>最初の2つの保証は信じられないほど厳しい順序を必要とします！これらすべてのメモリバリアは <em>本当に</em> 必要ですか？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>はい、本当に必要です。最初の保証が必要な理由を確認するには、以下のイベントシーケンスを考えてください：</p>
+<ol class="arabic simple">
+<li><p>CPU 1: <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code></p></li>
+<li><p>CPU 1: <code class="docutils literal notranslate"><span class="pre">q</span> <span class="pre">=</span> <span class="pre">rcu_dereference(gp);</span> <span class="pre">/*</span> <span class="pre">Very</span> <span class="pre">likely</span> <span class="pre">to</span> <span class="pre">return</span> <span class="pre">p.</span> <span class="pre">*/</span></code></p></li>
+<li><p>CPU 0: <code class="docutils literal notranslate"><span class="pre">list_del_rcu(p);</span></code></p></li>
+<li><p>CPU 0: <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> 開始します。</p></li>
+<li><p>CPU 1: <code class="docutils literal notranslate"><span class="pre">do_something_with(q-&gt;a);</span></code>
+<code class="docutils literal notranslate"><span class="pre">/*</span> <span class="pre">No</span> <span class="pre">smp_mb(),</span> <span class="pre">so</span> <span class="pre">might</span> <span class="pre">happen</span> <span class="pre">after</span> <span class="pre">kfree().</span> <span class="pre">*/</span></code></p></li>
+<li><p>CPU 1: <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code></p></li>
+<li><p>CPU 0: <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> 戻ります。</p></li>
+<li><p>CPU 0: <code class="docutils literal notranslate"><span class="pre">kfree(p);</span></code></p></li>
+</ol>
+<p>したがって、RCU読み込み側のクリティカルセクションの終了とグレースペリオドの終了の間に必ずフルなメモリバリアが必要です。</p>
+<p>第二のルールの必要性を示すイベントシーケンスはほぼ同様です：</p>
+<ol class="arabic simple">
+<li><p>CPU 0: <code class="docutils literal notranslate"><span class="pre">list_del_rcu(p);</span></code></p></li>
+<li><p>CPU 0: <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> 開始します。</p></li>
+<li><p>CPU 1: <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code></p></li>
+<li><p>CPU 1: <code class="docutils literal notranslate"><span class="pre">q</span> <span class="pre">=</span> <span class="pre">rcu_dereference(gp);</span></code>
+<code class="docutils literal notranslate"><span class="pre">/*</span> <span class="pre">Might</span> <span class="pre">return</span> <span class="pre">p</span> <span class="pre">if</span> <span class="pre">no</span> <span class="pre">memory</span> <span class="pre">barrier.</span> <span class="pre">*/</span></code></p></li>
+<li><p>CPU 0: <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> 戻ります。</p></li>
+<li><p>CPU 0: <code class="docutils literal notranslate"><span class="pre">kfree(p);</span></code></p></li>
+<li><p>CPU 1: <code class="docutils literal notranslate"><span class="pre">do_something_with(q-&gt;a);</span> <span class="pre">/*</span> <span class="pre">Boom!!!</span> <span class="pre">*/</span></code></p></li>
+<li><p>CPU 1: <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code></p></li>
+</ol>
+<p>そして、グレースペリオドの開始とRCU読み込み側のクリティカルセクションの開始の間にメモリバリアがなければ、CPU 1がフリーリストにアクセスする可能性があります。</p>
+<p>「as if」ルールは当然適用されるため、適切なメモリバリアが存在しているかのように動作する実装は正しい実装です。ただし、as-ifルールに従っているかを実際に確認するよりも、自分自身にそのように思わせるのははるかに簡単です！</p>
+</td>
+</tr>
+</tbody>
+</table>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>You claim that <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code> 一部のカーネルのビルドではまったくコードを生成しません。これにより、コンパイラが連続するRCU読み込み側のクリティカルセクションを任意に並び替える可能性があります。このような並び替えが発生した場合、あるRCU読み込み側のクリティカルセクションが完了したと確認できたとしても、すべての前のRCU読み込み側のクリティカルセクションが完了していることをどうやって保証できるでしょうか？コンパイラの並び替えによって、その確認が不可能になるのでは？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>以下のケースでは <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code> まったくコードを生成しない場合、RCUはスケジューラ内などの特別な場所でのみクイエスカント状態を推論します。呼び出しコードが
+<code class="docutils literal notranslate"><span class="pre">schedule()</span></code> 共有変数へのアクセスを呼び出し先の <code class="docutils literal notranslate"><span class="pre">schedule()</span></code>呼び出し間に並び替えることを防ぐ必要があります。RCUが特定のRCU読み込み側のクリティカルセクションの終了を検出すると、コンパイラがコードをどれだけ乱しても、すべての前のRCU読み込み側のクリティカルセクションの終了を必ず検出します。ただし、このすべては、コンパイラがスケジューラ呼び出し、割り込みハンドラ、アイドルループ、ユーザーモードコードなどにコードを乱すことができないという前提に基づいています。しかし、あなたのカーネルビルドがそのような乱しを許可している場合、RCUを壊しただけでなく、はるかに多くのものを壊してしまっています！</p></td>
+</tr>
+</tbody>
+</table>
+<p>メモリバリアの要件は、RCUの基本的な要件である「すべての既存の読者に対するグレース期間の待機」を置き換えるものではありません。むしろ、このセクションで述べるメモリバリアは、この基本的な要件を <em>強制するように動作しなければなりません。もちろん、実装方法によってこの要件を強制する方法は異なりますが、強制しなければならないのです。</em> この基本的な要件を</p>
+</section>
+<section id="rcu-primitives-guaranteed-to-execute-unconditionally">
+<h3>条件に関係なく実行されるRCUプリミティブの保証<a class="headerlink" href="#rcu-primitives-guaranteed-to-execute-unconditionally" title="この見出しへのパーマリンク">¶</a></h3>
+<p>条件なしで実行するRCUのプリミティブは一般的なケースで使用されます。これらは呼び出され、役割を果たし、エラーなく返すだけであり、再試行の必要もありません。これはRCUの設計哲学の重要な点です。</p>
+<p>ただし、この哲学は頑なさではなく、実用的なアプローチです。誰かが特定の条件付きRCUプリミティブの正当な理由を提示した場合、それを実装して追加する可能性があります。なぜなら、この保証は逆引きで導き出されたものであり、計画的に設計されたものではないからです。RCUプリミティブの条件なしの性質は最初に実装の偶然であり、後に同期プリミティブの条件付きプリミティブの経験から、この偶然を保証に昇格させたからです。したがって、条件付きプリミティブをRCUに追加する正当な理由は、詳細かつ説得力のあるユースケースに基づく必要があります。</p>
+</section>
+<section id="guaranteed-read-to-write-upgrade">
+<h3>保証された読み込みからの書き込みアップグレード<a class="headerlink" href="#guaranteed-read-to-write-upgrade" title="この見出しへのパーマリンク">¶</a></h3>
+<p>RCUに関しては、常にRCU読み込み側のクリティカルセクション内で更新を行うことが可能です。たとえば、そのRCU読み込み側のクリティカルセクションが特定のデータ要素を検索し、その後、その要素を更新するために更新側のスピンロックを取得する場合でも、そのRCU読み込み側のクリティカルセクション内にとどまることができます。もちろん、呼び出しを行う前にRCU読み込み側のクリティカルセクションを退出する必要があります。 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code>ただし、この不便さは、このドキュメント後述するAPIメンバーや、 <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> および <code class="docutils literal notranslate"><span class="pre">kfree_rcu()</span></code> を用いることで回避できます。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>では、アップグレードトゥライティング操作が他のリーダーを排他する仕組みはどのようなものですか？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>通常のRCU更新と同様に、RCUリーダーを排他しません。</p></td>
+</tr>
+</tbody>
+</table>
+<p>この保証により、読み込み側と更新側のコードで検索コードを共有できるようになり、これは当初から設計されたもので、DYNIX/ptx RCUドキュメンテーションの初期にすでに記載されていました。</p>
+</section>
+</section>
+<section id="fundamental-non-requirements">
+<h2>基本的な不要条件<a class="headerlink" href="#fundamental-non-requirements" title="この見出しへのパーマリンク">¶</a></h2>
+<p>RCUは非常に軽量なリーダーを提供しており、その読み込み側の保証は非常に有用ですが、それに応じて軽量です。そのため、RCUが実際に保証している以上のことを保証していると誤って想定しやすくなります。もちろん、RCUが保証していないことのリストは無限にありますが、以下のセクションでは、混乱を引き起こしたいくつかの非保証について説明します。特に記載がない限り、これらの非保証は意図的に設計されています。</p>
+<ol class="arabic simple">
+<li><p><a class="reference internal" href="#readers-impose-minimal-ordering">リーダーは最小限の順序を課す</a></p></li>
+<li><p><a class="reference internal" href="#readers-do-not-exclude-updaters">リーダーはアップデータを排他しない</a></p></li>
+<li><p><a class="reference internal" href="#updaters-only-wait-for-old-readers">アップデータは古いリーダーのみを待機する</a></p></li>
+<li><p><a class="reference internal" href="#grace-periods-don-t-partition-read-side-critical-sections">グレースペリオドは読み込み側のクリティカルセクションを分割しない</a></p></li>
+<li><p><a class="reference internal" href="#read-side-critical-sections-don-t-partition-grace-periods">読み込み側のクリティカルセクションはグレースペリオドを分割しない</a></p></li>
+</ol>
+<section id="readers-impose-minimal-ordering">
+<h3>リーダーは最小限の順序を課す<a class="headerlink" href="#readers-impose-minimal-ordering" title="この見出しへのパーマリンク">¶</a></h3>
+<p>リーダー側のマーカーなど、 <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> および
+<code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code> は、グレースペリオドAPIなどとの相互作用を通じて、順序保証を一切提供しません。これを確認するには、以下の2つのスレッドを考慮してください：
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code>After</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 void thread0(void)
+ 2 {
+ 3   rcu_read_lock();
+ 4   WRITE_ONCE(x, 1);
+ 5   rcu_read_unlock();
+ 6   rcu_read_lock();
+ 7   WRITE_ONCE(y, 1);
+ 8   rcu_read_unlock();
+ 9 }
+10
+11 void thread1(void)
+12 {
+13   rcu_read_lock();
+14   r1 = READ_ONCE(y);
+15   rcu_read_unlock();
+16   rcu_read_lock();
+17   r2 = READ_ONCE(x);
+18   rcu_read_unlock();
+19 }
+</pre></div>
+</div>
+</div></blockquote>
+<p>が同時に実行されると、かなりの可能性で <code class="docutils literal notranslate"><span class="pre">thread0()</span></code> および <code class="docutils literal notranslate"><span class="pre">thread1()</span></code> が実行される可能性があります</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(r1 == 1 &amp;&amp; r2 == 0)
+</pre></div>
+</div>
+</div></blockquote>
+<p>（つまり、 <code class="docutils literal notranslate"><span class="pre">y</span></code> 以前に割り当てられていたように見える <code class="docutils literal notranslate"><span class="pre">x</span></code>）これは、もし <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code> 順序付けのプロパティが多ければ、このようなことが起こらないはずですが、実際にはそうではありません。そのため、CPUが大幅な再配置を行うことは正当です。これは設計上の意図です：重要な順序制約を導入すると、これらの高速パスAPIの処理が遅くなるためです。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>コンパイラもこのコードを再配置できないのでしょうか？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>いいえ、 <code class="docutils literal notranslate"><span class="pre">READ_ONCE()</span></code> および <code class="docutils literal notranslate"><span class="pre">WRITE_ONCE()</span></code>
+volatile cast が含まれるため、この特定のケースではコンパイラの再配置を防いでいます。</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="readers-do-not-exclude-updaters">
+<h3>リーダーはアップデータを排他しない<a class="headerlink" href="#readers-do-not-exclude-updaters" title="この見出しへのパーマリンク">¶</a></h3>
+<p>どちらも <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> も <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code> 更新を除外します。すべてのことは、グレースペリオドの終了を防ぐことだけです。次の例で説明します：</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 void thread0(void)
+ 2 {
+ 3   rcu_read_lock();
+ 4   r1 = READ_ONCE(y);
+ 5   if (r1) {
+ 6     do_something_with_nonzero_x();
+ 7     r2 = READ_ONCE(x);
+ 8     WARN_ON(!r2); /* BUG!!! */
+ 9   }
+10   rcu_read_unlock();
+11 }
+12
+13 void thread1(void)
+14 {
+15   spin_lock(&amp;my_lock);
+16   WRITE_ONCE(x, 1);
+17   WRITE_ONCE(y, 1);
+18   spin_unlock(&amp;my_lock);
+19 }
+</pre></div>
+</div>
+</div></blockquote>
+<p>もし <code class="docutils literal notranslate"><span class="pre">thread0()</span></code> 関数の <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> 更新を除外していたら、
+<code class="docutils literal notranslate"><span class="pre">thread1()</span></code> 関数の更新を除外していたら、 <code class="docutils literal notranslate"><span class="pre">WARN_ON()</span></code> 決して発火することはありませんでした。しかし、実際には <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> その後のグレースペリオドを除けば、ほとんど何も除外していません。その後のグレースペリオドについては、 <code class="docutils literal notranslate"><span class="pre">thread1()</span></code> これにはありませんので、 <code class="docutils literal notranslate"><span class="pre">WARN_ON()</span></code> 発火することができますし、実際に発火しています</p>
+</section>
+<section id="updaters-only-wait-for-old-readers">
+<h3>アップデータは古いリーダーのみを待機する<a class="headerlink" href="#updaters-only-wait-for-old-readers" title="この見出しへのパーマリンク">¶</a></h3>
+<p>完了後、読者がないと仮定するのは誘惑されるかもしれないが、これは避けるべきである。なぜなら、新しい読者がすぐに開始できるからだ。 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code>
+開始後でも新しい読者が即座に開始できるため、この新しい読者を待つ義務はない。
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> 開始後でも新しい読者が即座に開始できるため、この新しい読者を待つ義務はない。 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> 新しい読者を待つ義務はない。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>もし、すべての読者が完了するまで待機したとしても、更新処理が読者がいないと信頼できる期間はどれだけ続くだろうか？ <a class="reference internal" href="../../../core-api/kernel-api.html#c.synchronize_rcu" title="synchronize_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code></a> すべての読者が完了するまで待機したとしても、更新処理が読者がいないと信頼できる期間はゼロである。 <em>すべての読者が完了するまで待機したとしても、更新処理が読者がいないと信頼できる期間はゼロである。</em> 更新処理が読者がいないと信頼できる期間はゼロである。</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>更新処理が読者がいないと信頼できる期間はゼロである。たとえすべての読者が完了するまで待機したとしても、更新処理が完了した後でも新しい読者が即座に開始する可能性がある。 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> 更新処理が読者がいないと信頼できる期間はゼロである。たとえすべての読者が完了するまで待機したとしても、更新処理が完了した後でも新しい読者が即座に開始する可能性がある。
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> 更新処理が完了した後でも新しい読者が即座に開始する可能性があるため、以下のコードは読者がいないと信頼してはならない。
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> 更新処理が完了した後でも新しい読者が即座に開始する可能性があるため、以下のコードは読者がいないと信頼してはならない。 <em>更新処理が完了した後でも新しい読者が即座に開始する可能性があるため、以下のコードは読者がいないと信頼してはならない。</em> 更新処理が完了した後でも新しい読者が即座に開始する可能性があるため、以下のコードは読者がいないと信頼してはならない。</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="grace-periods-don-t-partition-read-side-critical-sections">
+<h3>グレースペリオドは読み込み側のクリティカルセクションを分割しない<a class="headerlink" href="#grace-periods-don-t-partition-read-side-critical-sections" title="この見出しへのパーマリンク">¶</a></h3>
+<p>RCU読み込み側クリティカルセクションの一部が特定のグレースペリオドの前にあり、別のRCU読み込み側クリティカルセクションの一部が同じグレースペリオドの後にあれば、すべての最初のRCU読み込み側クリティカルセクションがすべての次のRCU読み込み側クリティカルセクションの前にくると考えるのは誘惑されるかもしれない。しかし、これは常に成り立つわけではない。単一のグレースペリオドはRCU読み込み側クリティカルセクションの集合を分割しない。 <code class="docutils literal notranslate"><span class="pre">x</span></code>, <code class="docutils literal notranslate"><span class="pre">y</span></code>, and <code class="docutils literal notranslate"><span class="pre">z</span></code>
+初期状態ではすべてがゼロである。</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 void thread0(void)
+ 2 {
+ 3   rcu_read_lock();
+ 4   WRITE_ONCE(a, 1);
+ 5   WRITE_ONCE(b, 1);
+ 6   rcu_read_unlock();
+ 7 }
+ 8
+ 9 void thread1(void)
+10 {
+11   r1 = READ_ONCE(a);
+12   synchronize_rcu();
+13   WRITE_ONCE(c, 1);
+14 }
+15
+16 void thread2(void)
+17 {
+18   rcu_read_lock();
+19   r2 = READ_ONCE(b);
+20   r3 = READ_ONCE(c);
+21   rcu_read_unlock();
+22 }
+</pre></div>
+</div>
+</div></blockquote>
+<p>結果として、すべてがゼロであることは完全に可能である。</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(r1 == 1 &amp;&amp; r2 == 0 &amp;&amp; r3 == 1)
+</pre></div>
+</div>
+</div></blockquote>
+<p>結果として、すべてがゼロであることは完全に可能である。以下の図はこの状況がどのように起こるかを示しており、各円で囲まれた <code class="docutils literal notranslate"><span class="pre">QS</span></code> はRCUが記録した
+<em>クイエスcent状態</em> 各スレッドごとに、つまり、RCUがそのスレッドが現在のグレースペリオド以前に開始されたRCU読み取り側のクリティカルセクションの途中でないことを知っている状態です:</p>
+<figure class="align-default">
+<img alt="../../../_images/GPpartitionReaders1.svg" src="../../../_images/GPpartitionReaders1.svg"/></figure>
+<p>このようにRCU読み取り側のクリティカルセクションを分割する必要がある場合、2つのグレースペリオドを使用する必要があります。ここで、最初のグレースペリオドは、第二のグレースペリオドが開始する前に終了することがわかっています:</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 void thread0(void)
+ 2 {
+ 3   rcu_read_lock();
+ 4   WRITE_ONCE(a, 1);
+ 5   WRITE_ONCE(b, 1);
+ 6   rcu_read_unlock();
+ 7 }
+ 8
+ 9 void thread1(void)
+10 {
+11   r1 = READ_ONCE(a);
+12   synchronize_rcu();
+13   WRITE_ONCE(c, 1);
+14 }
+15
+16 void thread2(void)
+17 {
+18   r2 = READ_ONCE(c);
+19   synchronize_rcu();
+20   WRITE_ONCE(d, 1);
+21 }
+22
+23 void thread3(void)
+24 {
+25   rcu_read_lock();
+26   r3 = READ_ONCE(b);
+27   r4 = READ_ONCE(d);
+28   rcu_read_unlock();
+29 }
+</pre></div>
+</div>
+</div></blockquote>
+<p>ここでは、もし <code class="docutils literal notranslate"><span class="pre">(r1</span> <span class="pre">==</span> <span class="pre">1)</span></code>、ならば <code class="docutils literal notranslate"><span class="pre">thread0()</span></code>の書き込みを <code class="docutils literal notranslate"><span class="pre">b</span></code> は、の終了前に発生しなければなりません。もしさらに <code class="docutils literal notranslate"><span class="pre">thread1()</span></code>の読み取りを
+<code class="docutils literal notranslate"><span class="pre">(r4</span> <span class="pre">==</span> <span class="pre">1)</span></code>、ならば <code class="docutils literal notranslate"><span class="pre">thread3()</span></code>の読み取りを <code class="docutils literal notranslate"><span class="pre">b</span></code> は...の grace period の開始後に行わなければならない <code class="docutils literal notranslate"><span class="pre">thread2()</span></code>の grace period です。もしもその場合、 <code class="docutils literal notranslate"><span class="pre">(r2</span> <span class="pre">==</span> <span class="pre">1)</span></code>、その場合、...の grace period の終了が <code class="docutils literal notranslate"><span class="pre">thread1()</span></code>の grace period に先行しなければなりません。これは、2つの RCU read-side critical sections が重ならないことを保証し、 <code class="docutils literal notranslate"><span class="pre">thread2()</span></code>。 <code class="docutils literal notranslate"><span class="pre">(r3</span> <span class="pre">==</span> <span class="pre">1)</span></code>その結果、結果は以下の通りです：</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(r1 == 1 &amp;&amp; r2 == 1 &amp;&amp; r3 == 0 &amp;&amp; r4 == 1)
+</pre></div>
+</div>
+</div></blockquote>
+<p>待ってください！あなたはアップデータが読者と並行して有用な進行を遂行できると述べましたが、既存の読者はブロックします</p>
+<p>この非必要性は意図せずとも発生し、RCU とメモリ順序の相互作用を研究する中で明らかになりました。</p>
+</section>
+<section id="read-side-critical-sections-don-t-partition-grace-periods">
+<h3>読み込み側のクリティカルセクションはグレースペリオドを分割しない<a class="headerlink" href="#read-side-critical-sections-don-t-partition-grace-periods" title="この見出しへのパーマリンク">¶</a></h3>
+<p>また、RCU read-side critical section が grace period のペアの間に発生した場合、それらの grace period が重ならないと仮定するのも誘惑的です。しかし、この誘惑は良い結果には繋がりません。以下に示すように、すべての変数が初期値（ゼロ）である場合を例に挙げるとわかります：</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 void thread0(void)
+ 2 {
+ 3   rcu_read_lock();
+ 4   WRITE_ONCE(a, 1);
+ 5   WRITE_ONCE(b, 1);
+ 6   rcu_read_unlock();
+ 7 }
+ 8
+ 9 void thread1(void)
+10 {
+11   r1 = READ_ONCE(a);
+12   synchronize_rcu();
+13   WRITE_ONCE(c, 1);
+14 }
+15
+16 void thread2(void)
+17 {
+18   rcu_read_lock();
+19   WRITE_ONCE(d, 1);
+20   r2 = READ_ONCE(c);
+21   rcu_read_unlock();
+22 }
+23
+24 void thread3(void)
+25 {
+26   r3 = READ_ONCE(d);
+27   synchronize_rcu();
+28   WRITE_ONCE(e, 1);
+29 }
+30
+31 void thread4(void)
+32 {
+33   rcu_read_lock();
+34   r4 = READ_ONCE(b);
+35   r5 = READ_ONCE(e);
+36   rcu_read_unlock();
+37 }
+</pre></div>
+</div>
+</div></blockquote>
+<p>この場合、結果は以下の通りです：</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(r1 == 1 &amp;&amp; r2 == 1 &amp;&amp; r3 == 1 &amp;&amp; r4 == 0 &amp;&amp; r5 == 1)
+</pre></div>
+</div>
+</div></blockquote>
+<p>以下の例のように完全に可能です：</p>
+<figure class="align-default">
+<img alt="../../../_images/ReadersPartitionGP1.svg" src="../../../_images/ReadersPartitionGP1.svg"/></figure>
+<p>RCUの読み込み側クリティカルセクションは、全体のグラースペリオドを重ねない限り、与えられたグラースペリオドのほぼすべてを重ねることができます。その結果、RCUの読み込み側クリティカルセクションは、RCUのグラースペリオドのペアを分割することはできません。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>チェーンの先頭と末尾にあるRCU読み込み側クリティカルセクションを分割するために、RCU読み込み側クリティカルセクションで区切られたグラースペリオドの連続は、理論上は無限に必要になるのでしょうか？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>理論的には無限の数ですが、実際には実装の詳細やタイミングの考慮に敏感な未知の数になります。したがって、実際においてもRCUのユーザーは理論的な答えに従う必要があります。</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="parallelism-facts-of-life">
+<h2>並行性の事実<a class="headerlink" href="#parallelism-facts-of-life" title="この見出しへのパーマリンク">¶</a></h2>
+<p>これらの並行性の現実的な制約はRCUに特有ではありませんが、RCUの実装はこれらに従う必要があります。したがって、繰り返し述べます：</p>
+<ol class="arabic simple">
+<li><p>どのCPUもタスクもいつでも遅延する可能性があり、その遅延を回避するためにプリエンプションや割込みの無効化などを行っても完全に無駄です。これは特にプリエンプション可能なユーザーレベル環境や仮想化環境（あるゲストOSのVCPUsがホストのハイパーバイザによっていつでもプリエンプションされる可能性がある）で顕著ですが、ECCエラー、NMIs、その他のハードウェアイベントによりベアメタル環境でも発生します。20秒以上の遅延はクラッシュを引き起こす可能性がありますが、RCUの実装は64ビットカウンタをインクリメントする際にラップアラウンドを防ぐほどの極めて長い遅延を許容できるアルゴリズムを使用する必要があります。</p></li>
+<li><p>コンパイラとCPUはメモリアクセスを再配置できます。重要な場面ではRCUはコンパイラのディレクティブとメモリバリア指令を使用して順序を保持する必要があります。</p></li>
+<li><p>キャッシュライン内の特定のメモリ場所への競合する書き込みは高コストなキャッシュミスを引き起こします。同時に多くの書き込みが行われたり、頻繁に書き込まれたりするほど、パフォーマンス低下は顕著になります。したがってRCUは、重大なパフォーマンスやスケーラビリティの問題を回避するための十分なローカル性を持つアルゴリズムを使用する必要があります。</p></li>
+<li><p>大まかに言って、どの排他ロックのもとでも1つのCPU分の処理しか実行できません。そのためRCUはスケーラブルなロック設計を使用する必要があります。</p></li>
+<li><p>カウンタは有限であり、特に32ビットシステムではその制限が顕著です。RCUがカウンタを使用する際には、カウンタのラップ（オーバーフロー）を許容するか、あるいはカウンタのラップがシステムが実際に動作する時間よりもはるかに長い時間かかるように設計する必要があります。10年間の稼働時間は現実的ですが、100年間の稼働時間は極めて困難です。後者の例として、RCUのdyntick-idleネスティングカウンタは、割り込みネスティングレベルに54ビットを割り当てています（このカウンタは32ビットシステムでも64ビットです）。このカウンタをオーバーフローさせるには、あるCPUが一度もアイドル状態にならない状態で、2<sup>54</sup> マイクロ秒ごとにハーフ割り込みが発生する場合でも、このカウンタをオーバーフローさせるには570年もの時間がかかります。これは現時点では受け入れ可能な長い時間とされています。</p></li>
+<li><p>Linuxシステムでは、単一のLinuxカーネルが共有メモリ環境で数千のCPUを同時に稼働させることができます。そのため、RCUは高スケーラビリティへの注意を払う必要があります。</p></li>
+</ol>
+<p>この最後の並列性の現実により、RCUは前述の現実に特に注意を払う必要があります。1990年代にはLinuxが数千のCPUを持つシステムにスケーラブルであるという考えは疑いの余地がありました。しかし、これらの要件は1990年代初期でも予想外でないものだったかもしれません。</p>
+</section>
+<section id="quality-of-implementation-requirements">
+<h2>実装品質の要件<a class="headerlink" href="#quality-of-implementation-requirements" title="この見出しへのパーマリンク">¶</a></h2>
+<p>これらのセクションでは実装品質の要件について説明しています。これらの要件を無視したRCUの実装でも使用は可能ですが、産業用生産環境での使用には不適切な制限が生じる可能性があります。実装品質の要件のクラスは以下の通りです：</p>
+<ol class="arabic simple">
+<li><p><a class="reference internal" href="#specialization">専門性</a></p></li>
+<li><p><a class="reference internal" href="#performance-and-scalability">パフォーマンスとスケーラビリティ</a></p></li>
+<li><p><a class="reference internal" href="#forward-progress">前進性</a></p></li>
+<li><p><a class="reference internal" href="#composability">組み合わせ可能性</a></p></li>
+<li><p><a class="reference internal" href="#corner-cases">端末ケース</a></p></li>
+</ol>
+<p>これらのクラスについては以下のセクションで説明します。</p>
+<section id="specialization">
+<h3>専門性<a class="headerlink" href="#specialization" title="この見出しへのパーマリンク">¶</a></h3>
+<p>RCUは常に読み込みが主な状況に主に使用されるように設計されており、これはRCUの読み込み側のプリミティブが最適化されていることを意味します（しばしば更新側のプリミティブの性能を犠牲にしています）。これまでの経験は以下の状況にまとめられています：</p>
+<ol class="arabic simple">
+<li><p>読み込みが主なデータで、古くなり不一致なデータが問題にならない場合：RCUは非常に効果的です！</p></li>
+<li><p>読み込みが主なデータで、データが一貫性を保つ必要がある場合：RCUは良好に動作します。</p></li>
+<li><p>読み書きが混在するデータで、データが一貫性を保つ必要がある場合：RCU <em>可能性がある</em> 問題なく動作する可能性があります。または、そうではないかもしれません。</p></li>
+<li><p>書き込みが主なデータで、データが一貫性を保つ必要がある場合：RCUは通常、この用途に適したツールではありえません。ただし、以下の例外を除いて、RCUは提供できます：</p>
+<ol class="loweralpha simple">
+<li><p>更新に適したメカニズムの存在保証。</p></li>
+<li><p>リアルタイムでの使用に適した待機なしの読み込み側プリミティブ。</p></li>
+</ol>
+</li>
+</ol>
+<p>読み込みが主な状況に焦点を当てることにより、RCUは他の同期プリミティブと互換性を保つ必要があります。たとえば、 <code class="docutils literal notranslate"><span class="pre">add_gp()</span></code> および
+<code class="docutils literal notranslate"><span class="pre">remove_gp_synchronous()</span></code> 以前に説明した例では、RCUを読者を保護し、ロックを用いてアップデータを調整しています。しかし、この必要性はさらに広範な範囲に及んでおり、RCUの読み込み側クリティカルセクション内でさまざまな同期プリミティブが使用可能である必要があります。これにはスピンロック、シーケンスロック、アトミック操作、参照カウンタ、メモリバリアなどが含まれます。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>スリープロックについてはどうでしょうか？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>これらはLinuxカーネルのRCU読み込み側クリティカルセクション内で禁止されています。なぜなら、RCU読み込み側クリティカルセクション内にクワイエントステート（この場合、自発的なコンテキストスイッチ）を置くことは許容されないからです。ただし、ユーザースペースのRCU読み込み側クリティカルセクション内でスリープロックを使用することが可能であり、またLinuxカーネルのスリープ可能なRCU（SRCU）読み込み側クリティカルセクション内で使用することもできます。 <a class="reference external" href="#Sleepable%20RCU">(SRCU)</a> 読み込み側クリティカルセクション内で使用することが可能です。さらに、-rtパッチセットはスピンロックをスリープロックに変換し、対応するクリティカルセクションがプリエンプション可能になるようにします。これにより、これらのスリープロック化されたスピンロック（他のスリープロックとは異なり）は、-rt-LinuxカーネルのRCU読み込み側クリティカルセクション内で取得可能になります。注意点として、 <em>通常のRCU読み込み側クリティカルセクションは、条件付きでスリープロックを取得することが許容されます（例として</em> を参照）。
+<code class="docutils literal notranslate"><span class="pre">mutex_trylock()</span></code>)。ただし、無限に条件付きでそのスリープロックを取得しようとするのは許容されません。重要なのは、このような操作が <code class="docutils literal notranslate"><span class="pre">mutex_trylock()</span></code> ミューテックスを保持して戻るか、ミューテックスが即座に利用不可だった場合にエラーを返すかのいずれかです。いずれの場合も、 <code class="docutils literal notranslate"><span class="pre">mutex_trylock()</span></code> すぐに戻り、スリープせずに処理を終了します。</p></td>
+</tr>
+</tbody>
+</table>
+<p>多くのアルゴリズムがデータの一貫したビューを必要としないという点は意外に思われるかもしれませんが、多くのアルゴリズムはそのモードで動作可能です。ネットワークルーティングがその代表例です。インターネットルーティングアルゴリズムでは更新の伝播に時間がかかるため、更新が特定のシステムに到達するまでに、そのシステムは間違った方向にネットワークトラフィックを送信していることがあります。少数のスレッドがさらに数ミリ秒間間違った方向にトラフィックを送信するだけでも問題ではありません。最悪の場合でも、TCPの再送信によって最終的にデータが正しい場所に届くためです。一般に、コンピュータの外側の状態を追跡する際には、光速の遅延などの理由により、ある程度の不整合を許容する必要があります。</p>
+<p>さらに、外部状態に関する不確実性は多くの場合に内在しています。たとえば、獣医師のペアが猫が生きているかどうかを心拍を確認することで判断するかもしれません。しかし、最後の心拍後、どれだけ待つべきでしょうか？400ミリ秒未満待つのは意味がありません。なぜなら、リラックスした猫が1分間に100回以上死生を繰り返すとみなされるからです。また、人間同様、猫の心臓も一時的に停止することがありますので、正確な待機時間は主観的な判断が必要です。獣医師のペアであれば、一方が最後の心拍後30秒待ってから猫が死んだと判断し、もう一方は1分間待つことを主張するかもしれません。その結果、最後の心拍後の1分間の最後の30秒間、猫の状態について意見が分かれるでしょう。</p>
+<p>興味深いことに、この状況はハードウェアにも適用されます。事態が急を告げるとき、外部サーバーが失敗したかどうかをどう判断するのでしょうか？定期的にメッセージを送り、所定の時間内に応答がない場合に失敗と宣言します。ポリシー決定は短い不一致期間を許容することができ、かつての決定が今やっと実行されるため、数ミリ秒の遅延は通常無視されます。</p>
+<p>ただし、一定の整合性が必須なアルゴリズムもあります。たとえば、ユーザー空間のSystemVセマフォIDを内核のデータ構造に変換する際はRCUで保護されていますが、剛直に削除されたセマフォを更新するのは絶対に禁止されています。Linuxカーネルでは、この整合性の必要性は、RCUの読み込み側クリティカルセクション内で内核データ構造内のスピンロックを取得することで実現され、これは上記の図の緑色のボックスで示されています。多くの他の技術も利用され、Linuxカーネル内で実際に採用されています。</p>
+<p>要するに、RCUは整合性を維持するために必要ではなく、整合性が必要な場合でもRCUと併用する他のメカニズムが利用可能です。RCUの専門性により、その役割を極めて効率的に果たし、他の同期メカニズムと併用可能な能力により、特定のタスクに最適な同期ツールの組み合わせが実現されています。</p>
+</section>
+<section id="performance-and-scalability">
+<h3>パフォーマンスとスケーラビリティ<a class="headerlink" href="#performance-and-scalability" title="この見出しへのパーマリンク">¶</a></h3>
+<p>エネルギー効率は現在のパフォーマンスにおいて極めて重要な要素であり、LinuxカーネルのRCU実装は不要なIDLE CPUの起動を避ける必要があります。この要件が事前に計画されていたとは断言できません。実際、電話会話の中で、バッテリー駆動システムにおけるエネルギー効率の重要性や、LinuxカーネルRCU実装のエネルギー効率の欠点について「率直でオープンな」フィードバックを受けたことがきっかけでした。私の経験上、バッテリー駆動型の埋め込みコミュニティは、不要な起動を極めて不快な行為と見なし、単なるLinuxカーネルメールリストへの投稿すらその怒りを発散するには不十分です。</p>
+<p>メモリ消費量はほとんどの状況で特に重要ではなく、メモリサイズが拡大し、メモリコストが急落するにつれてその重要性はさらに低下しています。しかし、マット・マカールの
+<a class="reference external" href="http://elinux.org/Linux_Tiny-FAQ">bloatwatch</a> の取り組みから学んだように、非プリエンプティブ（<code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT=n</span></code>)カーネルを持つ単一CPUシステムではメモリフットプリントが極めて重要であり、そのため <a class="reference external" href="https://lkml.kernel.org/g/20090113221724.GA15307@linux.vnet.ibm.com">tiny RCU</a>
+が生まれました。その後、ジョシュ・トリプルレットが彼の <a class="reference external" href="https://tiny.wiki.kernel.org/">Linux kernel tinification</a>
+プロジェクトを引き継ぎ、その結果、 <a class="reference external" href="#Sleepable%20RCU">SRCU</a> は必要ないカーネルではオプションとなりました。</p>
+<p>残るパフォーマンス要件は、ほぼすべてが予想通りです。例えば、RCUの読み込み側専用設計に従い、 <code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code> は極めて小さなオーバーヘッドを伴うべきです（例えば、いくつかの小さなコンパイラ最適化の抑制など）。同様に、非プリエンプティブ環境では、 <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> および
+<code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code> は正確にゼロのオーバーヘッドを伴うべきです。</p>
+<p>プリエンプティブ環境では、RCU読み込み側クリティカルセクションがプリエンプションされなかった場合（これは最高優先度のリアルタイムプロセスでは発生する）、 <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> および
+<code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code> は最小限のオーバーヘッドを伴うべきです。特に、アトミック読み込み書き込み操作、メモリバリア命令、プリエンプションの無効化、割込みの無効化、逆方向のブランチは含めないべきです。しかし、RCU読み込み側クリティカルセクションがプリエンプションされた場合、 <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code> はスピンロックを取得したり割込みを無効化したりすることが許容されます。これがなぜRCU読み込み側クリティカルセクションをプリエンプション無効化領域内にネストする方が良いのか、少なくともそのクリティカルセクションがリアルタイム遅延を不適切に低下させないほど短い場合に限ってですが。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> grace-period-waitプリミティブはスループットの最適化に特化しており、そのため、最も長いRCU読み込み側クリティカルセクションの持続時間に加えて、数ミリ秒の遅延を引き起こす可能性があります。一方で、複数の並行実行の
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> バッチ処理の最適化を使用する必要があります。これにより、単一の基盤となるgrace-period-wait操作で満たされることが可能になります。たとえば、Linuxカーネルでは、単一のgrace-period-wait操作が1,000回の個別呼び出しの、これにより、個別呼び出しのオーバーヘッドをほぼゼロにまで平均化します。しかし、grace-period最適化は、リアルタイムスケジューリングや割込み遅延の測定可能な劣化を避けるためにも必要です。 <a class="reference external" href="https://www.usenix.org/conference/2004-usenix-annual-technical-conference/making-rcu-safe-deep-sub-millisecond-response">1,000回の個別呼び出し</a>
+の <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code>、これにより、個別呼び出しのオーバーヘッドをほぼゼロにまで平均化します。しかし、grace-period最適化は、リアルタイムスケジューリングや割込み遅延の測定可能な劣化を避けるためにも必要です。</p>
+<p>ある場合、マルチミリ秒の <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> 遅延は受け入れがたいです。このような場合、 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu_expedited()</span></code> 代わりに使用されることが可能で、小規模なシステムではgrace-period遅延を数十マイクロ秒にまで短縮します。RCU読み込み側のクリティカルセクションが短い場合に限り、現在は特別な遅延要件は存在しません。 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu_expedited()</span></code> 大規模なシステムにおいても、RCU仕様の経験的性質に一致するが、これは変更される可能性がある。ただし、スケーラビリティ要件は確かに存在する：4096コアの上で多数の呼び出しを処理する際には、少なくとも合理的な進展を保つ必要がある。 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu_expedited()</span></code> 短いレイテンシーを提供する代わりに、 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu_expedited()</span></code> 非アイドル状態のオンラインCPUに対してリアルタイムレイテンシーの一定程度の劣化を許容する。ここで「一定程度」とは、スケジューリングクロック割込みに相当するレイテンシーの劣化程度を指す。</p>
+<p>いくつかの状況において、すら
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu_expedited()</span></code>の短縮されたグレースペリオドレイテンシーは受け入れられない。このような状況では、非同期 <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> を代わりに使用できる。 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> 以下のようになります:</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 struct foo {
+ 2   int a;
+ 3   int b;
+ 4   struct rcu_head rh;
+ 5 };
+ 6
+ 7 static void remove_gp_cb(struct rcu_head *rhp)
+ 8 {
+ 9   struct foo *p = container_of(rhp, struct foo, rh);
+10
+11   kfree(p);
+12 }
+13
+14 bool remove_gp_asynchronous(void)
+15 {
+16   struct foo *p;
+17
+18   spin_lock(&amp;gp_lock);
+19   p = rcu_access_pointer(gp);
+20   if (!p) {
+21     spin_unlock(&amp;gp_lock);
+22     return false;
+23   }
+24   rcu_assign_pointer(gp, NULL);
+25   call_rcu(&amp;p-&gt;rh, remove_gp_cb);
+26   spin_unlock(&amp;gp_lock);
+27   return true;
+28 }
+</pre></div>
+</div>
+</div></blockquote>
+<p>の定義 <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">foo</span></code> 最終的に必要となり、1行〜5行に表示されます。この関数 <code class="docutils literal notranslate"><span class="pre">remove_gp_cb()</span></code> は、 <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code>
+25行で呼び出されます。これは次の猶予期間終了後に実行され、 <code class="docutils literal notranslate"><span class="pre">remove_gp_synchronous()</span></code>同じ効果をもたらしますが、更新者が猶予期間が経過するのを待つ必要がないため、
+<code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> 関数は、どちらも法的でない状況で複数の場面で使用できます。 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> も <code class="docutils literal notranslate"><span class="pre">synchronize_rcu_expedited()</span></code> 予備停止コード内など、 <code class="docutils literal notranslate"><span class="pre">local_bh_disable()</span></code>
+コード、割込み停止コード、割込みハンドラ内など。ただし、
+<code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> NMIハンドラ内やアイドル状態、オフラインCPUからでは不正です。コールバック関数（<code class="docutils literal notranslate"><span class="pre">remove_gp_cb()</span></code> この場合）は、Linuxカーネル内のソフトIRQ（ソフトウェア割込み）環境内で実行されます。実際のソフトIRQハンドラ内か、 <code class="docutils literal notranslate"><span class="pre">local_bh_disable()</span></code>保護の下で。Linuxカーネルとユーザー空間の両方で、長時間かかるRCUコールバック関数を書くのは悪手です。長時間かかる操作は、別スレッドに移譲するか（Linuxカーネルではワークキューを使用する）べきです。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>なぜ19行が <code class="docutils literal notranslate"><span class="pre">rcu_access_pointer()</span></code>を使用しているのでしょうか？すべて
+<code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> 25行で構造体に保存しており、これは並行して挿入する操作と悪影響を及ぼします。これにより
+<code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code> が必要になるのでしょうか？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>おそらく <code class="docutils literal notranslate"><span class="pre">-&gt;gp_lock</span></code> line 18で取得したものは、変更を含むすべてを除外します。挿入が行われる可能性のあるものを含む <code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code> 保護することができないため。したがって、挿入はline 25でリリースされる後まで延期されます。その結果、次の文が成立します。 <code class="docutils literal notranslate"><span class="pre">-&gt;gp_lock</span></code> line 25でリリースされる、その結果、次の文が成立します。
+<code class="docutils literal notranslate"><span class="pre">rcu_access_pointer()</span></code> これで十分です。</p></td>
+</tr>
+</tbody>
+</table>
+<p>ただし、すべてのものは <code class="docutils literal notranslate"><span class="pre">remove_gp_cb()</span></code> 行っているのは、データ要素に対して呼び出していること <code class="docutils literal notranslate"><span class="pre">kfree()</span></code> データ要素に対して。これは一般的なイディオムであり、サポートされています
+<code class="docutils literal notranslate"><span class="pre">kfree_rcu()</span></code>、以下のように「fire and forget」操作を実行可能にします：</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 struct foo {
+ 2   int a;
+ 3   int b;
+ 4   struct rcu_head rh;
+ 5 };
+ 6
+ 7 bool remove_gp_faf(void)
+ 8 {
+ 9   struct foo *p;
+10
+11   spin_lock(&amp;gp_lock);
+12   p = rcu_dereference(gp);
+13   if (!p) {
+14     spin_unlock(&amp;gp_lock);
+15     return false;
+16   }
+17   rcu_assign_pointer(gp, NULL);
+18   kfree_rcu(p, rh);
+19   spin_unlock(&amp;gp_lock);
+20   return true;
+21 }
+</pre></div>
+</div>
+</div></blockquote>
+<p>注意してください <code class="docutils literal notranslate"><span class="pre">remove_gp_faf()</span></code> 単に呼び出します <code class="docutils literal notranslate"><span class="pre">kfree_rcu()</span></code> その後のグレースペリオドに一切注意する必要はありません。また、 <code class="docutils literal notranslate"><span class="pre">kfree()</span></code>。呼び出すことは許可されています
+<code class="docutils literal notranslate"><span class="pre">kfree_rcu()</span></code> 、以下の環境と同様の環境から呼び出すことができます <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code>。興味深いことに、DYNIX/ptxは以下の同等のものを持っていた <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code>
+および <code class="docutils literal notranslate"><span class="pre">kfree_rcu()</span></code>、ただし <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code>。これはDYNIX/ptx内でRCUが重用されていなかったためであり、非常に少数の場所で何かが必要な場合、 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> は単純に直接コード化した。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>以前、～と主張されていましたが <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> および <code class="docutils literal notranslate"><span class="pre">kfree_rcu()</span></code>
+アップデータがリーダーによってブロックされずに済むようにしました。しかし、コールバックの呼び出しとメモリの解放（それぞれ）が依然としてグレースペリオドの経過を待つ必要があります。</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>このような定義を採用することは可能ですが、ゴミ収集言語でのアップデートが次のゴミ収集実行まで完了できないという主張は、まったく現実的ではありません。重要な点は、ほとんどの場合、どちらかのアップデータが <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> または <code class="docutils literal notranslate"><span class="pre">kfree_rcu()</span></code> を呼び出したらすぐに次のアップデートに進むことができます <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> または
+<code class="docutils literal notranslate"><span class="pre">kfree_rcu()</span></code>、その後のグレースペリオドを待つ必要はありません。</p></td>
+</tr>
+</tbody>
+</table>
+<p>しかし、アップデータがグレースペリオド終了後のコード実行完了を待つ必要があるが、その間に行える他のタスクがある場合怎么办？ポーリング方式の
+<code class="docutils literal notranslate"><span class="pre">get_state_synchronize_rcu()</span></code> および <code class="docutils literal notranslate"><span class="pre">cond_synchronize_rcu()</span></code> 関数がこの目的に使用されることがあり、以下に示します：</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span> 1 bool remove_gp_poll(void)
+ 2 {
+ 3   struct foo *p;
+ 4   unsigned long s;
+ 5
+ 6   spin_lock(&amp;gp_lock);
+ 7   p = rcu_access_pointer(gp);
+ 8   if (!p) {
+ 9     spin_unlock(&amp;gp_lock);
+10     return false;
+11   }
+12   rcu_assign_pointer(gp, NULL);
+13   spin_unlock(&amp;gp_lock);
+14   s = get_state_synchronize_rcu();
+15   do_something_while_waiting();
+16   cond_synchronize_rcu(s);
+17   kfree(p);
+18   return true;
+19 }
+</pre></div>
+</div>
+</div></blockquote>
+<p>14行目で、 <code class="docutils literal notranslate"><span class="pre">get_state_synchronize_rcu()</span></code> RCUから「クッキー」を取得し、15行目で他のタスクを実行し、最後に16行目で、グレースペリオドが経過していた場合はすぐに戻り、そうでない場合は必要に応じて待機します。～の必要性は最近登場したため、それらが長期的に機能するかどうかはまだ分かりません。 <code class="docutils literal notranslate"><span class="pre">get_state_synchronize_rcu</span></code> および
+<code class="docutils literal notranslate"><span class="pre">cond_synchronize_rcu()</span></code> ～の必要性は</p>
+<p>RCUは、遅延、柔軟性、CPUオーバーヘッドのバランスを取るためのさまざまなツールを提供します。</p>
+</section>
+<section id="forward-progress">
+<h3>前進性<a class="headerlink" href="#forward-progress" title="この見出しへのパーマリンク">¶</a></h3>
+<p>理論上、グレースペリオドの完了とコールバックの呼び出しを遅らせても問題ありません。しかし、実際にはメモリのサイズは有限であり、コールバックが時折ウェイクアップを実行し、十分に遅延させたウェイクアップはシステムの停止と区別がつきにくくなるため、RCUは前進を促進するためのいくつかのメカニズムを提供する必要があります。</p>
+<p>これらのメカニズムは完全に信頼できるものではありませんし、それもできません。たとえば、RCU読み取り側のクリティカルセクション内で無限ループが発生すると、定義上その後のグレースペリオドが決して完了しなくなるという単純な例があります。より複雑な例として、64-CPUのシステムを構築し、起動時に
+<code class="docutils literal notranslate"><span class="pre">CONFIG_RCU_NOCB_CPU=y</span></code> および起動時に <code class="docutils literal notranslate"><span class="pre">rcu_nocbs=1-63</span></code>、CPU 1から63番までのプロセッサがタイトなループで回転し、 <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code>を呼び出します。これらのタイトなループにもかかわらず、 <code class="docutils literal notranslate"><span class="pre">cond_resched()</span></code> (これによりグレースペリオドが完了できるようにする)ことを含んでも、CPU 0は他の63つのプロセッサが登録できるよりも速くコールバックを呼び出すことができません。少なくともシステムがメモリを枯渇するまで、そのようにはなりません。これらの例のいずれも、スパイダーマンの原則が適用されます：権力には責任が伴う。ただし、このレベルの悪用がなければ、RCUはグレースペリオドの迅速な完了とコールバックの迅速な呼び出しを保証する必要があります。</p>
+<p>RCUは、グレースペリオドの迅速な完了を促すために以下の手順を取ります：</p>
+<ol class="arabic simple">
+<li><p>100ミリ秒以内にグレースペリオドが完了しなかった場合、RCUは今後の <code class="docutils literal notranslate"><span class="pre">cond_resched()</span></code> ホールドアウトCPUを用いてRCUの静的状態を提供します。RCUは、それらのCPUの呼び出しを返しますが、対応するCPUの次のスケジューリングクロックの後です。
+<code class="docutils literal notranslate"><span class="pre">need_resched()</span></code> 呼び出しを返します <code class="docutils literal notranslate"><span class="pre">true</span></code>、ただし対応するCPUの次のスケジューリングクロックの後です。</p></li>
+<li><p>カーネル起動パラメータに記載されたCPU <code class="docutils literal notranslate"><span class="pre">nohz_full</span></code> は、スケジューリングクロックの割り込みなしにカーネル内で無限に実行でき、上述の戦略を打ち消します。RCUはしたがって、 <code class="docutils literal notranslate"><span class="pre">need_resched()</span></code> 任意の <code class="docutils literal notranslate"><span class="pre">resched_cpu()</span></code> CPUで呼び出します <code class="docutils literal notranslate"><span class="pre">nohz_full</span></code> CPUが109ミリ秒経過してもリソースを解放していない状態です。</p></li>
+<li><p>カーネルが構築されている場合、 <code class="docutils literal notranslate"><span class="pre">CONFIG_RCU_BOOST=y</span></code>、特定のタスクがRCU読み込み側のクリティカルセクション内で強制的に中断され、500ミリ秒以上リソースを解放していない場合、RCUは優先度の上げを実施します。</p></li>
+<li><p>グレースペリオドが開始して10秒経過してもCPUがリソースを解放していない場合、RCUは <code class="docutils literal notranslate"><span class="pre">resched_cpu()</span></code> on it regardless of its <code class="docutils literal notranslate"><span class="pre">nohz_full</span></code>
+状態です。</p></li>
+</ol>
+<p>上記の値は、特定の設定で動作するシステムのデフォルト値です。 <code class="docutils literal notranslate"><span class="pre">HZ=1000</span></code>。これらは、値が変化するにつれて変化し、 <code class="docutils literal notranslate"><span class="pre">HZ</span></code> varies, and can also be changed using the relevant Kconfig options and kernel boot parameters. RCU currently does not do much sanity checking of these parameters, so please use caution when changing them. Note that these forward-progress measures are provided only for RCU, not for <a class="reference external" href="#Sleepable%20RCU">SRCU</a> または <a class="reference external" href="#Tasks%20RCU">タスク RCU</a>.</p>
+<p>RCUは以下の手順を実行します。 <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> 任意の非RCUタスクが10,000回のコールバックを実行するか、または最後に促進が行われたときより10,000回多くコールバックを実行した場合、<code class="docutils literal notranslate"><span class="pre">rcu_nocbs</span></code> CPUが10,000回のコールバックを実行するか、または最後に促進が行われたときより10,000回多くコールバックを実行した場合、</p>
+<ol class="arabic simple">
+<li><p>グレースペリオドを開始します（既に進行中の場合は開始しません）。</p></li>
+<li><p>グレースペリオド開始後3ミリ秒待機せず、すぐにクワイエント状態の確認を強制します。</p></li>
+<li><p>CPUのコールバックに、Grace Periodの完了番号を即座にタグ付けするのではなく、ハンドラが処理するのを待つのではなく、 <code class="docutils literal notranslate"><span class="pre">RCU_SOFTIRQ</span></code>
+処理を即座に行います。</p></li>
+<li><p>コールバック実行のバッチ制限を解除することで、コールバックの呼び出し速度が向上しますが、リアルタイム応答の品質が低下する代償が生じます。</p></li>
+</ol>
+<p>また、これらは、 <code class="docutils literal notranslate"><span class="pre">HZ=1000</span></code>で実行する際のデフォルト値であり、上書き可能です。また、これらのフォワードプログレスの措置は、RCU専用のものであり、 <a class="reference external" href="#Sleepable%20RCU">SRCU</a> または <a class="reference external" href="#Tasks%20RCU">タスク RCU</a>には適用されません。RCUの場合でも、 <code class="docutils literal notranslate"><span class="pre">rcu_nocbs</span></code> CPUのコールバック呼び出しのフォワードプログレスは、一部のワークロードが <code class="docutils literal notranslate"><span class="pre">rcu_nocbs</span></code> CPUを活用して
+<code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> を比較的頻繁に呼び出す傾向にあるため、十分に発展していません。もし、 <code class="docutils literal notranslate"><span class="pre">rcu_nocbs</span></code> CPUと高い <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> 呼び出し率を必要とするワークロードが現れたら、追加のフォワードプログレスの改善が必要になります。</p>
+</section>
+<section id="composability">
+<h3>組み合わせ可能性<a class="headerlink" href="#composability" title="この見出しへのパーマリンク">¶</a></h3>
+<p>組み合わせ可能性（composability）は近年、マルチコアハードウェアとシングルスレッド環境で設計されたオブジェクト指向技術の衝突が原因で、多くの注目を集めてきました。理論上は、RCUの読み込み側クリティカルセクションは組み合わせ可能であり、実際に深くネストすることも可能です。しかし、実際の組み合わせ可能な構造の実装では、すべての実世界の実装に共通して制限があります。</p>
+<p>RCUの実装で、 <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> および
+<code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code> がコードを生成しない場合、例えばLinuxカーネルのRCUが
+<code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT=n</span></code>の状態で実行されている場合、ネストを任意に深く行うことができます。なぜなら、オーバーヘッドが全くないからです。ただし、すべてのこれらの
+<code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code> がコンパイラに見える場合、コンパイルはメモリや大容量ストレージ、ユーザーの忍耐力のいずれかが尽きるまで続き、最終的に失敗します。コンパイラにネストが見えない場合、例えば再帰的に呼び合う関数がそれぞれの翻訳単位に存在する場合、スタックオーバーフローが発生します。ネストがループの形式を取る場合、例えばテール再帰の姿勢で行われる場合、制御変数がオーバーフローするか、LinuxカーネルではRCU CPUストール警告が発生します。それでも、このクラスのRCU実装は、存在する中で最も組み合わせ可能な構造の一つです。</p>
+<p>ネスト深さを明示的に追跡するRCU実装は、ネスト深さカウンタによって制限されます。例えば、LinuxカーネルのプリエンプティブRCUはネストを <code class="docutils literal notranslate"><span class="pre">INT_MAX</span></code>これは、実用上のほぼすべての目的に十分なはずです。ただし、RCU読み取り側クリティカルセクションの連続するペアの間に、グレースペリオドの待機操作がある場合、他のRCU読み取り側クリティカルセクションで囲まれることはできません。これは、RCU読み取り側クリティカルセクション内でグレースペリオドを待機することは不適切であり、その結果としてデッドロックが発生するか、RCUが暗黙的に外側のRCU読み取り側クリティカルセクションを分割してしまうためです。どちらの状況も、長寿命で安定したカーネルの実現に適していません。</p>
+<p>RCUが合成可能性の制限に限られているのは他にもあります。例えば、多くのトランザクションメモリの実装では、取り消しができない操作（ネットワーク受信操作など）を挟んだ2つのトランザクションの合成を禁止しています。また、ロックベースのクリティカルセクションはデッドロックを回避すれば驚くほど自由に合成可能ですが、これは例外です。</p>
+<p>要するに、RCU読み取り側クリティカルセクションは高度に合成可能ですが、他の合成可能な同期メカニズムと同様に、いくつかの状況では注意が必要です。</p>
+</section>
+<section id="corner-cases">
+<h3>端末ケース<a class="headerlink" href="#corner-cases" title="この見出しへのパーマリンク">¶</a></h3>
+<p>特定のRCUワークロードでは、RCU読み取り側クリティカルセクションの連続したストリームが無限に続く可能性があります。場合によっては、常に少なくとも1つのRCU読み取り側クリティカルセクションが進行中であるという状態が続くこともあります。RCUはこのような状況がグレースペリオドのブロックを引き起こすことを許容できません。すべてのRCU読み取り側クリティカルセクションが有限であれば、グレースペリオドも必ず有限でなければなりません。</p>
+<p>ただし、プリエンプティブRCUの実装では、RCU読み取り側クリティカルセクションが長時間にわたってプリエンプションされる可能性があり、これにより長時間のRCU読み取り側クリティカルセクションが生成されることがあります。このような状況は重負荷システムでのみ発生しますが、リアルタイム優先度を持つシステムは当然のことながらより脆弱です。そのため、RCU優先度の上げ下げ機能が提供されています。ただし、RCU優先度の上げ下げに関する具体的な要件は、経験が蓄積するにつれて変化する可能性があります。</p>
+<p>他のワークロードでは非常に高い更新率を持つ場合があります。このようなワークロードはRCUではなく他の方法を使用すべきだという議論もありますが、RCUがこのようなワークロードを穏やかに処理しなければならないという事実があります。これはまた、グレースペリオドのバッチ処理を推進する要因の一つですが、RCUコールバックのキューに溜まった大量のコールバックをチェックする仕組みの設計にもつながっています。 <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> コードパス。最後に、高い更新率はRCUの読み込み側のクリティカルセクションを遅延させるべきではありませんが、一部の小さな読み込み側の遅延が発生する場合もあります。
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu_expedited()</span></code>～の使用により、
+<code class="docutils literal notranslate"><span class="pre">smp_call_function_single()</span></code>.</p>
+<p>これらの3つの極端なケースは1990年代初期には理解されていましたが、ユーザー側での簡単なテストにより、 <code class="docutils literal notranslate"><span class="pre">close(open(path))</span></code> 1900年代初期にタイトなループで実行されたことで、高い更新率の極端なケースに対する理解が深まりました。このテストはまた、高い更新率に対応するRCUコードの追加を促したのです。たとえば、あるCPUが10,000以上のRCUコールバックがキューイングされていると検出された場合、RCUはより積極的にグレースペリオドを開始し、より積極的にグレースペリオド処理を完了させるように回避行動をとります。この回避行動によりグレースペリオドがより早く完了しますが、RCUのバッチング最適化を制限する代償として、そのグレースペリオドによってCPUのオーバーヘッドが増加します。</p>
+</section>
+</section>
+<section id="software-engineering-requirements">
+<h2>ソフトウェア工学の要件<a class="headerlink" href="#software-engineering-requirements" title="この見出しへのパーマリンク">¶</a></h2>
+<p>マーフィーの法則と『間違いは人間の性である』の間で、ミスや誤用を防ぐ必要があります。</p>
+<ol class="arabic">
+<li><p>必要な場所で忘れてしまうのは非常に簡単です。 <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> 必要な場所で忘れてしまうのは非常に簡単です。そのため、～で構築されたカーネルは、 <code class="docutils literal notranslate"><span class="pre">CONFIG_PROVE_RCU=y</span></code> ～がRCU読み込み側のクリティカルセクションの外で使用された場合、スplatします。 <code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code> 更新側のコードは、
+<code class="docutils literal notranslate"><span class="pre">rcu_dereference_protected()</span></code>を用いることができ、これは <a class="reference external" href="https://lwn.net/Articles/371986/">ロックデップ式の式</a> を用いて保護を提供していることを示します。示された保護が提供されていない場合、ロックデップスplatが発生します。読み手と更新者が共用するコードは
+<code class="docutils literal notranslate"><span class="pre">rcu_dereference_check()</span></code>、またロックデップの式を取るだけでなく、どちらも適用されていない場合にロックデップスラットを出力します <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> 、指定された保護も適用されていない場合です。さらに
+<code class="docutils literal notranslate"><span class="pre">rcu_dereference_raw()</span></code> は、必要な保護が簡単に記述できない（ hopefully 稀な）ケースで使用されます。最後に
+<code class="docutils literal notranslate"><span class="pre">rcu_read_lock_held()</span></code> は、関数がRCU読み込み側のクリティカルセクション内で呼び出されていることを検証するためのものです。トーマス・グレインジャーがいくつかのRCU使用例を審査した直後にこの要件セットを知りました</p></li>
+<li><p>関数は、他のRCU APIを使用する前に、入力時にRCU関連の前提条件を確認したい場合があります。この
+<code class="docutils literal notranslate"><span class="pre">rcu_lockdep_assert()</span></code> は、ロックデップが有効なカーネルで式をアサートし、それ以外の場合は何もしないのでこの作業を行います</p></li>
+<li><p>また、この <code class="docutils literal notranslate"><span class="pre">rcu_assign_pointer()</span></code> および
+<code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code>を忘れるのも簡単です。おそらく（誤って）単純な代入で置き換える可能性があります。このようなエラーを検出するために、RCU保護されたポインタは <code class="docutils literal notranslate"><span class="pre">__rcu</span></code>でタグ付けされ、その後sparseはそのポインタへの単純な代入アクセスについて警告します。この要件を認識させたのはアーナンド・ベルガーマンで、必要な <a class="reference external" href="https://lwn.net/Articles/376011/">パッチシリーズを提供してくれました</a>.</p></li>
+<li><p>ロックデップを有効にしてビルドされたカーネルは <code class="docutils literal notranslate"><span class="pre">CONFIG_DEBUG_OBJECTS_RCU_HEAD=y</span></code> データ要素が渡された場合にロックデップスラットを発生させます <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> 連続して2回、間にグレースペリオドが挟まることなく発生します。(このエラーはダブルフリーに似ています。) 対応する <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> 動的に割り当てられた構造体は自動的に追跡されます。ただし、 <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> スタック上に割り当てられた構造体は初期化する必要があります。
+<code class="docutils literal notranslate"><span class="pre">init_rcu_head_on_stack()</span></code> およびクリーンアップする必要があります。
+<code class="docutils literal notranslate"><span class="pre">destroy_rcu_head_on_stack()</span></code>。同様に、スタック外に静的に割り当てられた <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> 構造体も初期化する必要があります。
+<code class="docutils literal notranslate"><span class="pre">init_rcu_head()</span></code> およびクリーンアップする必要があります。 <code class="docutils literal notranslate"><span class="pre">destroy_rcu_head()</span></code>。マティュー・デスノエイユ氏がこの要件を私に気づかせてくれ、必要な
+<a class="reference external" href="https://lkml.kernel.org/g/20100319013024.GA28456@Krystal">パッチ</a>.</p></li>
+<li><p>RCU読み込み側のクリティカルセクション内で無限ループが発生すると、最終的にRCU CPU停止警告が発生します。'最終的に'の期間は <code class="docutils literal notranslate"><span class="pre">RCU_CPU_STALL_TIMEOUT</span></code>
+<code class="docutils literal notranslate"><span class="pre">Kconfig</span></code> オプション、あるいは代替として
+<code class="docutils literal notranslate"><span class="pre">rcupdate.rcu_cpu_stall_timeout</span></code> boot/sysfsパラメータによって制御されます。ただし、RCUはその特定のRCU読み込み側クリティカルセクションにグレースペリオドが待機している場合でなければ、この警告を生成する義務はありません。</p>
+<p>一部の極端なワークロードでは意図的にRCUグレースペリオドを遅延させる場合があり、そのようなワークロードを実行するシステムは
+<code class="docutils literal notranslate"><span class="pre">rcupdate.rcu_cpu_stall_suppress</span></code> で警告を抑制できます。このカーネルパラメータはまた <code class="docutils literal notranslate"><span class="pre">sysfs</span></code>経由して設定することもできます。 <code class="docutils literal notranslate"><span class="pre">rcu_sysrq_start()</span></code> および
+<code class="docutils literal notranslate"><span class="pre">rcu_sysrq_end()</span></code> さらに、RCU CPU停止警告はsysrqダンプやパニック中に逆効果です。そのため、RCUは長時間のsysrqダンプの前後で呼び出すべき <code class="docutils literal notranslate"><span class="pre">rcu_panic()</span></code> APIメンバを提供しています。RCUはまた、パニックの開始時に自動的に呼び出される</p>
+<p>通知を提供して、さらにRCU CPU停止警告を抑制します。この要件は1990年代前半に初めてCPU停止をデバッグする必要があったとき、明らかになりました。ただし、DYNIX/ptxでの初期実装はLinuxに比べてかなり汎用的でした。</p>
+</li>
+<li><p>RCU読み込み側クリティカルセクションからポインタが漏れていることを検出することは非常に望ましいですが、現在ではこれを実現する良い方法はありません。一つの複雑さは、ポインタが漏れているか、RCUから他の同期メカニズム(例えば参照カウント)に渡されたかを区別する必要があることです。</p></li>
+<li><p>カーネルが構築されている場合、 <code class="docutils literal notranslate"><span class="pre">CONFIG_RCU_TRACE=y</span></code>、RCU関連情報はイベントトレース経由で提供されます。</p></li>
+<li><p>、 <code class="docutils literal notranslate"><span class="pre">rcu_assign_pointer()</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code>
+を用いて典型的なリンクデータ構造を作成するオープンコードは、意外とエラーが発生しやすいです。そのため、RCU保護された <a class="reference external" href="https://lwn.net/Articles/609973/#RCU%20List%20APIs">リンクリスト</a> および、より最近ではRCU保護された <a class="reference external" href="https://lwn.net/Articles/612100/">ハッシュテーブル</a> が利用可能です。LinuxカーネルおよびユーザースペースRCUライブラリには、多くの他の専用のRCU保護データ構造が含まれています。</p></li>
+<li><p>一部のリンク構造はコンパイル時に作成されますが、それでも
+<code class="docutils literal notranslate"><span class="pre">__rcu</span></code> チェックが必要です。 <code class="docutils literal notranslate"><span class="pre">RCU_POINTER_INITIALIZER()</span></code> マクロはこの目的を果たします。</p></li>
+<li><p>単一の外部ポインタ経由で公開されるリンク構造を作成する際には、 <code class="docutils literal notranslate"><span class="pre">rcu_assign_pointer()</span></code> を使用する必要はありません。このタスクおよび割当のための <code class="docutils literal notranslate"><span class="pre">RCU_INIT_POINTER()</span></code> マクロが提供されています <code class="docutils literal notranslate"><span class="pre">NULL</span></code> 実行時のポインタ。</p></li>
+</ol>
+<p>これは硬直的なリストではありません：RCUの診断機能は、実際のRCU使用における使用バグの数と種類に従って継続的に導かれるため、これは硬直的なリストではありません。</p>
+</section>
+<section id="linux-kernel-complications">
+<h2>Linux Kernelの複雑さ<a class="headerlink" href="#linux-kernel-complications" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Linuxカーネルは、RCUを含むさまざまなソフトウェアにとって興味深い環境を提供しています。関連するポイントは以下の通りです：</p>
+<ol class="arabic simple">
+<li><p><a class="reference internal" href="#configuration">設定</a></p></li>
+<li><p><a class="reference internal" href="#firmware-interface">ファームウェアインターフェース</a></p></li>
+<li><p><a class="reference internal" href="#early-boot">早期起動</a></p></li>
+<li><p><a class="reference internal" href="#interrupts-and-nmis">割込みとNMI</a></p></li>
+<li><p><a class="reference internal" href="#loadable-modules">ロード可能なモジュール</a></p></li>
+<li><p><a class="reference internal" href="#hotplug-cpu">ホットプラグCPU</a></p></li>
+<li><p><a class="reference internal" href="#scheduler-and-rcu">スケジューラとRCU</a></p></li>
+<li><p><a class="reference internal" href="#tracing-and-rcu">トレースとRCU</a></p></li>
+<li><p><a class="reference internal" href="#accesses-to-user-memory-and-rcu">ユーザーメモリへのアクセスとRCU</a></p></li>
+<li><p><a class="reference internal" href="#energy-efficiency">エネルギー効率</a></p></li>
+<li><p><a class="reference internal" href="#scheduling-clock-interrupts-and-rcu">スケジューリングクロック割込みとRCU</a></p></li>
+<li><p><a class="reference internal" href="#memory-efficiency">メモリ効率</a></p></li>
+<li><p><a class="reference internal" href="#performance-scalability-response-time-and-reliability">パフォーマンス、スケーラビリティ、応答時間、信頼性</a></p></li>
+</ol>
+<p>このリストはおそらく不完全ですが、Linuxカーネルの主要な複雑さを示しています。以下の各セクションは、上記のトピックの一つをカバーしています。</p>
+<section id="configuration">
+<h3>設定<a class="headerlink" href="#configuration" title="この見出しへのパーマリンク">¶</a></h3>
+<p>RCUの目標は自動設定であり、ほぼ誰もがRCUの <code class="docutils literal notranslate"><span class="pre">Kconfig</span></code> オプションについて心配する必要がありません。そして、ほぼすべてのユーザーにとって、RCUは実際には「オフ・ザ・ボックス」で十分に動作します。</p>
+<p>ただし、一部の専門的な使用ケースは、カーネル起動パラメータと <code class="docutils literal notranslate"><span class="pre">Kconfig</span></code> オプションによって処理されます。残念ながら、 <code class="docutils literal notranslate"><span class="pre">Kconfig</span></code>
+システムは新しい <code class="docutils literal notranslate"><span class="pre">Kconfig</span></code> オプションについてユーザーに明示的に尋ねる必要があります。これにより、ほぼすべてのオプションが別の <code class="docutils literal notranslate"><span class="pre">CONFIG_RCU_EXPERT</span></code>
+<code class="docutils literal notranslate"><span class="pre">Kconfig</span></code> オプションの下に隠されています。</p>
+<p>これらはすべて明らかに見えるかもしれませんが、事実としてリーニャス・トーラルズは最近、この要件を私に再確認する必要があったようです。
+<a class="reference external" href="https://lkml.kernel.org/g/CA+55aFy4wcCwaL4okTs8wXhGZ5h-ibecy_Meg9C4MNQrUnwMcg@mail.gmail.com">思い出させる</a>
+必要があった。</p>
+</section>
+<section id="firmware-interface">
+<h3>ファームウェアインターフェース<a class="headerlink" href="#firmware-interface" title="この見出しへのパーマリンク">¶</a></h3>
+<p>多くの場合、カーネルはファームウェアからシステムに関する情報を取得しますが、場合によっては情報が誤って伝達されることがあります。あるいは、翻訳が正確でも元のメッセージが偽情報であることがあります。</p>
+<p>たとえば、一部のシステムのファームウェアはCPUの数を過剰に報告することがあり、場合によっては大幅に過剰です。RCUがファームウェアを信じていた場合（かつてはそうしていました）、それは過剰なper-CPU kスレッドを生成します。結果として動作するシステムは依然として正しいですが、追加されたkスレッドはメモリを無駄に消費し、一覧に表示される際に混乱を招くことがあります。 <code class="docutils literal notranslate"><span class="pre">ps</span></code>
+RCUは、あるCPUが実際にオンラインになるのを待つ必要があります。その結果、「幽霊CPU」（オンラインになることはない）はいくつかの</p>
+<p>興味深い複雑さを引き起こします。 <a class="reference external" href="https://paulmck.livejournal.com/37494.html">Linuxカーネルの起動プロセスは興味深いプロセスであり、RCUは、</a>.</p>
+</section>
+<section id="early-boot">
+<h3>早期起動<a class="headerlink" href="#early-boot" title="この見出しへのパーマリンク">¶</a></h3>
+<p>が呼び出されるよりも早く使用されます。実際、初期タスクの <code class="docutils literal notranslate"><span class="pre">rcu_init()</span></code> が利用可能になり、起動CPUのper-CPU変数が設定されると、RCUのいくつかのプリミティブが即座に使用できます。読み取り側のプリミティブ（
+<code class="docutils literal notranslate"><span class="pre">task_struct</span></code> ）は非常に早期に正常に動作し、<code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code>,
+<code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code>, <code class="docutils literal notranslate"><span class="pre">rcu_dereference()</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">rcu_access_pointer()</span></code>も同様です。
+<code class="docutils literal notranslate"><span class="pre">rcu_assign_pointer()</span></code>.</p>
+<p>ただし <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> ブート中にいつでも呼び出される可能性がありますが、コールバックはRCUのカーネルスレッドがすべて生成された後、つまり特定のタイミングまで呼び出されない可能性があります。 <code class="docutils literal notranslate"><span class="pre">early_initcall()</span></code> このコールバックの呼び出し遅延は、RCUが完全に初期化されるまでコールバックを呼び出さないためです。完全な初期化は、スケジューラがRCUがカーネルスレッドを生成・実行できる状態まで初期化されるまで待つ必要があります。理論上はコールバックをより早く呼び出すことが可能ですが、これは万能の解決策ではありません。なぜなら、そのコールバックが呼び出せる操作には重大な制限があるからです。</p>
+<p>驚くほど <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> および
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu_expedited()</span></code>非常に早期のブート中に正常に動作します。これは1つのCPUしか存在せず、プリエンプションが無効になっているためです。つまり、コールバック（または関連する関数）自体がクイエスcentな状態であり、グレースペリオドとなるため、早期ブート時の実装は無操作で済むのです。 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> しかし、スケジューラが最初のカーネルスレッドを生成した後は、この早期ブートのトリックは</p>
+<p>（および他のケースでも）失敗します。 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> （および他のケースでも）
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu_expedited()</span></code>) in <code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT=y</span></code> カーネルでは、RCUの読み込み側のクリティカルセクションが preempted される可能性があるためです。これは、その後の処理が <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> 待つ必要があるということを意味します。単に即座に返すだけでは済まないのです。残念ながら、 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> すべてのkthreadsが生成されるまでこの処理は実行できません。これは、ある時間帯にかけて行われるため、
+<code class="docutils literal notranslate"><span class="pre">early_initcalls()</span></code> その時間帯でもRCUは同期グレースペリオドを正しく処理する必要があります。すべてのkthreadsが稼働状態になると、RCUは通常通り動作を始めます。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>RCUは、すべてのkthreadsが生成される前からグレースペリオドをどのように処理できるのでしょうか？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>非常に丁寧に！スケジューラが最初のタスクを生成する時間と、すべてのRCUのkthreadsが生成される時間の間にある「デッドゾーン」期間中は、すべての同期グレースペリオドが急行グレースペリオドメカニズムによって処理されます。実行時においては、この急行メカニズムはワークキューに依存しますが、デッドゾーン期間中は、リクエストしたタスク自体が望ましい急行グレースペリオドを駆動します。デッドゾーンの実行はタスクコンテキスト内で行われるため、すべてが正常に動作します。デッドゾーンが終了すると、急行グレースペリオドは再びワークキューを使用に戻ります。これは、ユーザーのタスクが急行グレースペリオドを駆動している間にPOSIXシグナルを受け取った場合に発生する問題を回避するためです。</p>
+<p>そして、これはスケジューラが最初のkthreadを生成する時間とRCUのkthreadがすべて生成される時間の間、ランダムなタスクにPOSIXシグナルを送信する行為が役に立たないことを意味します。もしもその時間帯にPOSIXシグナルを送信する理由が何かあったとしても、適切な調整が行われます。(もしもその時間帯に無駄にPOSIXシグナルを送信していることが判明した場合、適切でなくても調整が行われます。)</p>
+</td>
+</tr>
+</tbody>
+</table>
+<p>これらのブートタイムの要件は、複数のシステムフリーズの原因として知りました。</p>
+</section>
+<section id="interrupts-and-nmis">
+<h3>割込みとNMI<a class="headerlink" href="#interrupts-and-nmis" title="この見出しへのパーマリンク">¶</a></h3>
+<p>Linuxカーネルには割込みがあります。RCUの読み込み側のクリティカルセクションは、割込みハンドラや割込み無効領域内でも合法であり、 <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code>.</p>
+<p>一部のLinuxカーネルアーキテクチャでは、非アイドルプロセスコンテキストから割込みハンドラに入ることができます。その後、いつまでもそのハンドラから抜けず、静かにプロセスコンテキストに戻るという仕組みがあります。このトリックは、カーネル内からシステムコールを呼び出すために使われることがあります。このような「半分の割込み」があるため、RCUは割込みのネストレベルを数える際、非常に注意する必要があります。この要件は、RCUのdyntick-idleコードをリライトする際、苦労して学びました。</p>
+<p>Linuxカーネルには非マスク可能割込み(NMI)があります。RCUの読み込み側のクリティカルセクションは、NMIハンドラ内で合法です。幸いなことに、RCUの更新側のプリミティブ、例えば <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code>はNMIハンドラ内で禁止されています。</p>
+<p>名前とは関係なく、一部のLinuxカーネルアーキテクチャではネストされたNMIが存在します。RCUはこれを正しく処理しなければなりません。アンドリュー・ルトモリスキがこの要件を私に驚かせてくれました。彼はまた、この要件を満たすアルゴリズムも私を驚かせてくれました。 <a class="reference external" href="https://lkml.kernel.org/r/CALCETrXLq1y7e_dKFPgou-FKHB6Pu-r8+t-6Ds+8=va7anBWDA@mail.gmail.com">私を驚かせた</a>
+この要件；彼はまた、この要件を満たす <a class="reference external" href="https://lkml.kernel.org/r/CALCETrXSY9JpW3uE6H8WYk81sg56qasA2aqmjMPsq5dOtzso=g@mail.gmail.com">アルゴリズム</a>
+を私に驚かせてくれました。</p>
+<p>さらに、NMIハンドラはRCUにとって通常の割込みのように見える中断を受けることがあります。この現象が起こる一つの方法は、コードが直接 <code class="docutils literal notranslate"><span class="pre">rcu_irq_enter()</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_irq_exit()</span></code> をNMIハンドラから呼び出されることです。この驚くべき事実により、現在のコード構造が導かれたのです。この構造は、 <code class="docutils literal notranslate"><span class="pre">rcu_irq_enter()</span></code> を呼び出す
+<code class="docutils literal notranslate"><span class="pre">rcu_nmi_enter()</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_irq_exit()</span></code> を呼び出す <code class="docutils literal notranslate"><span class="pre">rcu_nmi_exit()</span></code>を含んでいます。そして、私はこの要件もまた苦労して学びました。</p>
+</section>
+<section id="loadable-modules">
+<h3>ロード可能なモジュール<a class="headerlink" href="#loadable-modules" title="この見出しへのパーマリンク">¶</a></h3>
+<p>Linuxカーネルにはロード可能なモジュールがあり、これらもアンロードできます。あるモジュールがアンロードされた後、その関数を呼び出す試みはセグメンテーション違反を引き起こします。そのため、モジュールアンロード関数は、ロード可能なモジュール関数への遅延呼び出しをキャンセルしなければなりません。例えば、未処理の <code class="docutils literal notranslate"><span class="pre">mod_timer()</span></code> は <code class="docutils literal notranslate"><span class="pre">del_timer_sync()</span></code> や同様の方法で処理しなければなりません。</p>
+<p>残念なことに、RCUコールバックをキャンセルする方法はありません。一旦呼び出したら <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code>、コールバック関数は最終的に呼び出されるはずですが、システムがまず停止する場合を除きます。モジュールのアンロードリクエストに応じてシステムをクラッシュするのは社会的に責任が問われるため、別の方法で進行中のRCUコールバックを処理する必要があります。</p>
+<p>RCUはそのため、 <code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code>を提供します。これは進行中のすべてのRCUコールバックが呼び出されるのを待つようにします。モジュールが
+<code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code>を使用する場合、その終了関数は将来の呼び出しを防ぐべきであり、 <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code>を呼び出す前に、 <code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code>を呼び出す必要があります。理論上、基盤となるモジュールアンロードコードは <code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code>
+を無条件で呼び出すことも可能ですが、実際にはこれにより受け入れがたい遅延が発生します。</p>
+<p>ニキータ・ダニロフは類似のファイルシステムアンマウント状況においてこの要件を指摘し、ディパーンカール・サルマはこれをRCUに組み込みました。モジュールアンロードの必要性は後になってようやく明らかになりました。
+<code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code> の必要性は、 <code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code> のためのものであり、後になってようやく明らかになりました。</p>
+<div class="admonition important">
+<p class="admonition-title">重要です。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code> 関数は、繰り返し述べますが、
+<em>ではありません</em>を待つ義務はありません。代わりに、すでに投稿されたRCUコールバックのみを待つ必要があります。したがって、システム全体に進行中のRCUコールバックが存在しない場合、
+<code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code> 即座に返す権利がある。コールバックが投稿されていても <code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code> 猶予期間を待つ必要はない。</p>
+</div>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>ちょっと待って！各RCUコールバックは猶予期間が完了するのを待つ必要がありますし、 <code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code> 既存のコールバックが呼び出されるのを待つ必要があります。したがって <code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code> システムのどこかにコールバックが投稿されている場合でも、完全な猶予期間を待つ必要があるのでしょうか？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>全くありません！！！はい、各RCUコールバックは猶予期間が完了するのを待つ必要がありますが、その時間の一部（あるいは完全に）すでに待っている可能性があります。 <code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code> が呼び出されるとき。その場合、 <code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code>
+猶予期間の残りの部分を待つだけでよい。そのため、コールバックが多数投稿されていても
+<code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code> すぐに返す可能性があります。</p>
+<p>したがって、猶予期間だけでなく、すべての既存のコールバックを待つ必要がある場合は、両方を呼び出す必要があります。
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code>遅延が懸念される場合は、常にworkqueuesを使用して並行して呼び出すことができます。</p>
+</td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="hotplug-cpu">
+<h3>ホットプラグCPU<a class="headerlink" href="#hotplug-cpu" title="この見出しへのパーマリンク">¶</a></h3>
+<p>LinuxカーネルはCPUホットプラグをサポートしており、CPUが来たりいったりできます。オフラインのCPUからRCU APIのメンバーを使用するのは当然ながら違法ですが、読み込み側のクリティカルセクションを除きます。 <a class="reference external" href="#Sleepable%20RCU">SRCU</a> この要件はDYNIX/ptxではから最初から存在していましたが、一方で、LinuxカーネルのCPUホットプラグ実装は「興味深い」です。</p>
+<p>LinuxカーネルのCPUホットプラグ実装には、さまざまなカーネルサブシステム（RCUを含む）が特定のCPUホットプラグ操作に適切に対応できるようにする通知処理が含まれています。ほとんどのRCU操作はCPUホットプラグ通知処理から呼び出せます。これには、同期的なグレースペリオド操作（例: <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> および
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu_expedited()</span></code>.</p>
+<p>などの全コールバック待機操作も含まれます。 <code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code> は、CPUホットプラグ操作の一部のフェーズにおいて、CPUホットプラグ操作が終了後にのみ出力CPUのコールバックが呼び出されるため、デッドロックを引き起こす可能性があります。さらに、 <code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code> は実行中にCPUホットプラグ操作をブロックし、CPUホットプラグ通知処理から呼び出された場合に別の種類のデッドロックを引き起こします。</p>
+</section>
+<section id="scheduler-and-rcu">
+<h3>スケジューラとRCU<a class="headerlink" href="#scheduler-and-rcu" title="この見出しへのパーマリンク">¶</a></h3>
+<p>RCUはkthreadを使用しており、これらのkthreadによる過剰なCPU時間の蓄積を避ける必要があります。この要件は驚くことではありませんでしたが、 <code class="docutils literal notranslate"><span class="pre">CONFIG_NO_HZ_FULL=y</span></code> <a class="reference external" href="http://www.rdrop.com/users/paulmck/scalability/paper/BareMetal.2015.01.15b.pdf">で構築された場合、コンテキストスイッチが重いワークロードでRCUがこの要件を破る点は予想外でした [PDF]</a>。RCUはコンテキストスイッチが重い <code class="docutils literal notranslate"><span class="pre">CONFIG_NO_HZ_FULL=y</span></code> ワークロードにおいてもこの要件に大きく近づいており、さらなる改善の余地があります。</p>
+<p>スケジューラのランキューまたはプライオリティインヘリテーションスピンロックを、
+<code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code>を跨いで保持することはもう禁止されていません。 <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code>
+が有効な状態で実行し、スケジューラのロックを取得し、そのロックを <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code>.</p>
+<p>の対応する</p>
+</section>
+<section id="tracing-and-rcu">
+<h3>トレースとRCU<a class="headerlink" href="#tracing-and-rcu" title="この見出しへのパーマリンク">¶</a></h3>
+<p>で保持することも現在は完全に合法です。同様に、RCUのフラーバー統合によりネガティブネスティングの必要性は消えました。割込み無効領域のコードがRCU読み込み側クリティカルセクションとして機能することにより、以前は割込みハンドラのRCU使用によって生じた破壊的再帰の問題は回避されました。 <code class="docutils literal notranslate"><span class="pre">rcu_dereference_raw_check()</span></code> RCUコードにトレーシングを適用することは可能です。しかし、トレーシング自体もRCUを使用しています。このため、</p>
+</section>
+<section id="accesses-to-user-memory-and-rcu">
+<h3>ユーザーメモリへのアクセスとRCU<a class="headerlink" href="#accesses-to-user-memory-and-rcu" title="この見出しへのパーマリンク">¶</a></h3>
+<p>トレーシング用に提供されており、破壊的再帰を回避します。このAPIは一部のアーキテクチャにおいて仮想化で使用され、RCUリーダーがトレーシングが使用できない環境で実行される場合があります。トレーシング関係者は要件を特定し必要な修正を提供したため、この予想外の要件は比較的痛みの少ない修正となりました。 <code class="docutils literal notranslate"><span class="pre">get_user()</span></code> カーネルはユーザー空間メモリにアクセスする必要があります。たとえば、システムコールパラメータで参照されるデータにアクセスする場合です。この</p>
+<p>マクロがこの作業を行います。ただし、ユーザー空間メモリはページアウトされている可能性があり、
+<code class="docutils literal notranslate"><span class="pre">get_user()</span></code> ページフォールトを起こしてブロックし、結果のI/Oが完了するのを待つことになる可能性があります。コンパイラがRCUの読み取り側クリティカルセクションに呼び出しを再配置してしまうのは非常に悪いことになります。 <code class="docutils literal notranslate"><span class="pre">get_user()</span></code> RCUの読み取り側クリティカルセクションに呼び出しを再配置してしまうのは非常に悪いことになります。</p>
+<p>たとえば、ソースコードが次のようだったとします：</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1 rcu_read_lock();
+2 p = rcu_dereference(gp);
+3 v = p-&gt;value;
+4 rcu_read_unlock();
+5 get_user(user_v, user_p);
+6 do_something_with(v, user_v);
+</pre></div>
+</div>
+</div></blockquote>
+<p>コンパイラがこのソースコードを次のようになおしてはならないのです：</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1 rcu_read_lock();
+2 p = rcu_dereference(gp);
+3 get_user(user_v, user_p); // BUG: POSSIBLE PAGE FAULT!!!
+4 v = p-&gt;value;
+5 rcu_read_unlock();
+6 do_something_with(v, user_v);
+</pre></div>
+</div>
+</div></blockquote>
+<p>コンパイラがこの変換をカーネルのビルド中に実行し、かつ、 <code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT=n</span></code> ページフォールトを起こした場合、RCUの読み取り側クリティカルセクションの真ん中にクイエスcent状態が発生します。この不適切なクイエスcent状態により、行4が使用後解放（use-after-free）アクセスになる可能性があり、これはカーネルの保険統計に悪影響を及ぼす可能性があります。類似の例は、 <code class="docutils literal notranslate"><span class="pre">get_user()</span></code> の直前に呼び出される <code class="docutils literal notranslate"><span class="pre">get_user()</span></code> の直前に呼び出される
+<code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code>.</p>
+<p>残念ながら、 <code class="docutils literal notranslate"><span class="pre">get_user()</span></code> は特定の順序保証を提供していません。一部のアーキテクチャでは、下層の <code class="docutils literal notranslate"><span class="pre">asm</span></code> さえマークされていない
+<code class="docutils literal notranslate"><span class="pre">volatile</span></code>、上記のアクセスは <code class="docutils literal notranslate"><span class="pre">volatile</span></code>さえマークされていない
+<code class="docutils literal notranslate"><span class="pre">p-&gt;value</span></code> これはvolatileではありませんので、コンパイラがこれらの2つのアクセスを順序を保つ理由がないためです。</p>
+<p>したがって、Linux-kernelの定義は <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> および
+<code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code> コンパイラのバリアとして機能しなければなりません。少なくとも、ネストされたRCU読み込み側のクリティカルセクション内の外側のインスタンスについては <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code> ネストされたRCU読み込み側のクリティカルセクションのセット内で。</p>
+</section>
+<section id="energy-efficiency">
+<h3>エネルギー効率<a class="headerlink" href="#energy-efficiency" title="この見出しへのパーマリンク">¶</a></h3>
+<p>アイドル状態のCPUを中断することは社会的に受け入れられません。特に、バッテリー駆動の埋め込みシステムを持つ人々にとっては。RCUはエネルギー効率を考慮して、どのCPUがアイドル状態かを検出します。これはエネルギー効率の要件の大きな一部であり、私はこれを知るきっかけとなったのは怒った電話でした。</p>
+<p>RCUはアイドル状態のCPUを中断しないので、アイドル状態のCPUでRCU読み込み側のクリティカルセクションを実行することは違法です。("built with"で構築されたカーネルは、これを試みるとクラッシュします。) The
+<code class="docutils literal notranslate"><span class="pre">CONFIG_PROVE_RCU=y</span></code> マクロと <code class="docutils literal notranslate"><span class="pre">RCU_NONIDLE()</span></code>
+イベントトレーシングはこの制限を回避するために提供されています。さらに、 <code class="docutils literal notranslate"><span class="pre">_rcuidle</span></code> このCPUでRCU読み込み側のクリティカルセクションを実行することが現在許可されているかをテストするために使用できます。私は診断の必要性を一方で、 <code class="docutils literal notranslate"><span class="pre">rcu_is_watching()</span></code> の他方で、アイドルループコードを検討しているときに知りました。Steven Rostedtは <code class="docutils literal notranslate"><span class="pre">RCU_NONIDLE()</span></code> イベントトレーシングを提供しました。これはアイドルループ内でかなり使われています。しかし、 <code class="docutils literal notranslate"><span class="pre">_rcuidle</span></code> 内に配置されたコードにはいくつかの制限があります。 <code class="docutils literal notranslate"><span class="pre">RCU_NONIDLE()</span></code>:</p>
+<ol class="arabic">
+<li><p>ブロッキングは禁止されています。実際には、アイドルタスクがブロッキングを禁止されているため、これは重大な制限ではありません。</p></li>
+<li><p>ネストングループについては、 <code class="docutils literal notranslate"><span class="pre">RCU_NONIDLE()</span></code> ネストは許可されていますが、無限に深くネストすることはできません。ただし、32ビットシステムでも百万レベルのネストが可能であるため、これは重大な制限とは言えません。このネスト制限は、コンパイラがOOM（メモリ不足）になったりスタックオーバーフローが発生するよりもずっと後で達成される可能性があります。</p></li>
+<li><p>コードパスが <code class="docutils literal notranslate"><span class="pre">RCU_NONIDLE()</span></code> その同じ <code class="docutils literal notranslate"><span class="pre">RCU_NONIDLE()</span></code>から抜け出さなければなりません。例えば、以下のコードは極めて不適切です：</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1     RCU_NONIDLE({
+2       do_something();
+3       goto bad_idea;  /* BUG!!! */
+4       do_something_else();});
+5   bad_idea:
+</pre></div>
+</div>
+</div></blockquote>
+<p>の引数の中間で制御を移すことは同様に違法です。理論上は、制御を移す際に入り口と出入口を両方確保すれば可能ですが、実際には厳しく指摘されるレビューのコメントを受ける可能性があります。
+<code class="docutils literal notranslate"><span class="pre">RCU_NONIDLE()</span></code>ユーザースペースで実行中のCPUを中断することは、社会的に不適切です。RCUはそのため、</p>
+</li>
+</ol>
+<p>ユーザースペースの実行を追跡する必要があります。RCUは、時間の2点で状態をサンプリングし、他のCPUがアイドル状態だったか、ユーザースペースで実行していたかを判断できる必要があります。 <code class="docutils literal notranslate"><span class="pre">nohz_full</span></code> これらのエネルギー効率の要件は、理解し実装するのが非常に難しく、例えばRCUのエネルギー効率コードはすでに5回以上のゼロから再設計されており、最後の再設計では <code class="docutils literal notranslate"><span class="pre">nohz_full</span></code> 実際のハードウェアで実エネルギー節約を示すことができました [PDF]</p>
+<p>。前述したように、これらの要件は電話での怒りの電話を通じて多く知りました：Linux-kernelメーリングリストで私を炎上させただけでは、RCUのエネルギー効率バグに対する怒りを完全に発散できなかったようです！ <a class="reference external" href="http://www.rdrop.com/users/paulmck/realtime/paper/AMPenergy.2013.04.19a.pdf">カーネルは、カーネル内での非アイドル実行、ユーザースペース実行、アイドルループの間を切り替えます。カーネルの構成によって、RCUはこれらの状態を異なった方法で処理します：</a>Kconfig</p>
+</section>
+<section id="scheduling-clock-interrupts-and-rcu">
+<h3>スケジューリングクロック割込みとRCU<a class="headerlink" href="#scheduling-clock-interrupts-and-rcu" title="この見出しへのパーマリンク">¶</a></h3>
+<p>In-Kernel</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 24%"/>
+<col style="width: 26%"/>
+<col style="width: 26%"/>
+<col style="width: 24%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">HZ</span></code> Usermode</p></th>
+<th class="head"><p>Idle</p></th>
+<th class="head"><p>スケジューリングクロック割込みに依存できます。</p></th>
+<th class="head"><p>スケジューリングクロック割込みと、ユーザースペースからの割込みの検出に依存できます。</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">HZ_PERIODIC</span></code></p></td>
+<td><p>RCUのdyntick-idle検出に依存できます。</p></td>
+<td><p>スケジューリングクロック割込みに依存できるのは一部のケースです。他のケースでは、カーネル実行時間を制限するか、IPI（Inter-Processor Interrupt）を使用する必要があります。</p></td>
+<td><p>なぜ</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NO_HZ_IDLE</span></code></p></td>
+<td><p>RCUのdyntick-idle検出に依存できます。</p></td>
+<td><p>スケジューリングクロック割込みに依存できるのは一部のケースです。他のケースでは、カーネル実行時間を制限するか、IPI（Inter-Processor Interrupt）を使用する必要があります。</p></td>
+<td><p>なぜ</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NO_HZ_FULL</span></code></p></td>
+<td><p>カーネル内での実行はスケジューリングクロック割込みに依存できないのでしょうか？</p></td>
+<td><p>なぜ</p></td>
+<td><p>なぜ</p></td>
+</tr>
+</tbody>
+</table>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>なぜ <code class="docutils literal notranslate"><span class="pre">NO_HZ_FULL</span></code> カーネル内での実行は <code class="docutils literal notranslate"><span class="pre">HZ_PERIODIC</span></code> および
+<code class="docutils literal notranslate"><span class="pre">NO_HZ_IDLE</span></code> と同じようにスケジューリングクロック割込みに依存できないのでしょうか？</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>パフォーマンス最適化のため、 <code class="docutils literal notranslate"><span class="pre">NO_HZ_FULL</span></code> は、各システムコールの入り口で必ずスケジューリングクロック割込みを再有効化する必要はありません。</p></td>
+</tr>
+</tbody>
+</table>
+<p>ただし、RCUは、どのCPUも現在アイドルループ内にあるかどうかを信頼できるようにしなければなりません。また、 <code class="docutils literal notranslate"><span class="pre">NO_HZ_FULL</span></code>の場合には、そのCPUがユーザースペースで実行しているかどうかも確認する必要があります（前述の通り）。
+<a class="reference external" href="#Energy%20Efficiency">earlier</a>RCUが必要なときにスケジューリングクロック割込みを有効にする必要があるのです：</p>
+<ol class="arabic simple">
+<li><p>CPUがアイドル状態かユーザーモードで実行中であり、RCUがそのCPUを非アイドル状態と認識している場合、スケジューリングクロックのティックは動作している必要があります。そうでない場合、RCU CPUストール警告が発生します。あるいは、最悪の場合、11秒にも及ぶ長いグレース期間になり、CPUを定期的に起こすための無駄なIPIが発生します。</p></li>
+<li><p>CPUがRCU読み取り側クリティカルセクションを実行しているkernelの一部にあり、RCUがそのCPUをアイドル状態と認識している場合、ランダムなメモリ破壊が発生します。 <strong>これはやっちゃダメ！！！</strong>
+lockdepでテストする理由の一つです。lockdepはこのような問題を警告します。</p></li>
+<li><p>CPUがRCU読み取り側クリティカルセクションを実行することを絶対にしないという保証があるkernelの一部にあり、RCUがそのCPUをアイドル状態と認識している場合、問題ありません。このような処理は一部のアーキテクチャで軽量な例外ハンドラとして使用され、その後のRCU読み取り側クリティカルセクションのオーバーヘッドを回避できます。
+<code class="docutils literal notranslate"><span class="pre">rcu_irq_enter()</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_irq_exit()</span></code> 例外処理のエントリとエクスイットのオーバーヘッドを回避しています。一部はさらに進んで、
+<code class="docutils literal notranslate"><span class="pre">irq_enter()</span></code> および <code class="docutils literal notranslate"><span class="pre">irq_exit()</span></code>のすべてを回避しています。ただ、テストを実行する際は必ず
+<code class="docutils literal notranslate"><span class="pre">CONFIG_PROVE_RCU=y</span></code>を含めてください。もしかしたらコードパスがRCU読み取り側クリティカルセクションを実行しないと冗談で言った可能性もあるからです。</p></li>
+<li><p>CPUがスケジューリングクロック割込みが無効な状態でkernelで実行中であり、RCUがそのCPUを非アイドル状態と認識している場合、CPUがRCUの観点から数ジャフィーごとにアイドル状態になったとしても問題ありません。アイドル期間の間隔が1秒程度までなら通常問題ありません。間隔が長すぎるとRCU CPUストール警告が発生します。</p></li>
+<li><p>CPUがアイドル状態かユーザーモードで実行中であり、RCUがそのCPUをアイドル状態と認識している場合、もちろん問題ありません。</p></li>
+<li><p>CPUがkernelで実行中で、kernelコードパスがクイエスcent状態を適切な頻度で通過しており（数ジャフィーごとに1回程度が理想ですが、1秒程度の短時間の例外も通常問題ありません）、スケジューリングクロック割込みが有効であれば、もちろん問題ありません。連続するクイエスcent状態間の間隔が長すぎるとRCU CPUストール警告が発生します。</p></li>
+</ol>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 100%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><strong>クイッククイズ</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>しかし、私のドライバが長時間実行されるハードウェア割込みハンドラを持つ場合、私は <code class="docutils literal notranslate"><span class="pre">schedule()</span></code> をハードウェア割込みハンドラから呼び出すことはできません！</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>答え</strong>:</p></td>
+</tr>
+<tr class="row-even"><td><p>一つのアプローチとして、定期的に <code class="docutils literal notranslate"><span class="pre">rcu_irq_exit();rcu_irq_enter();</span></code> を行うことです。しかし、長時間実行される割込みハンドラは応答時間などの他の問題を引き起こす可能性があるため、割込みハンドラの実行時間を合理的な範囲に保つ努力が必要ではありませんか？</p></td>
+</tr>
+</tbody>
+</table>
+<p>RCUがカーネル実行、ユーザーモード実行、アイドル状態の間の状態遷移を適切に把握し、RCUが必要なときにスケジューリングクロック割り込みが有効になっている限り、あなたが遭遇するバグはRCUの他の部分やカーネルの他の部分に必ずあるでしょう。</p>
+</section>
+<section id="memory-efficiency">
+<h3>メモリ効率<a class="headerlink" href="#memory-efficiency" title="この見出しへのパーマリンク">¶</a></h3>
+<p>小メモリの非リアルタイムシステムはTiny RCUを単純に利用できますが、コードサイズはメモリ効率の一つの側面に過ぎません。もう一つの側面は、 <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> が使用する構造体のサイズです。 <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> および
+<code class="docutils literal notranslate"><span class="pre">kfree_rcu()</span></code>この構造体は単なるポインタのペアしか含んでいませんが、多くのRCU保護データ構造体に現れ、中にはサイズが重要な構造体も含まれています。この <code class="docutils literal notranslate"><span class="pre">page</span></code> 構造体はその点で典型的な例であり、その構造体内に多くの <code class="docutils literal notranslate"><span class="pre">union</span></code> キーワードが出現していることが証拠です。</p>
+<p>メモリ効率の必要性は、RCUがグレースペリオドの経過を待つために待機している <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> 構造体を追跡するために手作りの単方向リストを使用する理由の一つです。また、
+<code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> 構造体にはデバッグ情報、例えば投稿した <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> または <code class="docutils literal notranslate"><span class="pre">kfree_rcu()</span></code> のファイルと行を追跡するフィールドが含まれていません。この情報は今後どこかのデバッグ専用カーネルビルドで出現するかもしれませんが、その間、 <code class="docutils literal notranslate"><span class="pre">-&gt;func</span></code> フィールドがしばしば必要なデバッグ情報を提供します。</p>
+<p>ただし、メモリ効率の必要性は場合によってはさらに極端な措置をもたらします。再び <code class="docutils literal notranslate"><span class="pre">page</span></code> 構造体に戻ると、
+<code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> フィールドはその他の多くの構造体と共有されているため、対応するページのライフタイムのさまざまな時点で使用されます。特定の <a class="reference external" href="https://lkml.kernel.org/g/1439976106-137226-1-git-send-email-kirill.shutemov@linux.intel.com">競合状態を正しく解決するためには、Linuxカーネルのメモリ管理サブシステムがグレースペリオド処理のすべてのフェーズで特定のビットがゼロのままになる必要があります。このビットはちょうど</a>フィールドの最下位ビットにマッピングしています。RCUはこの保証を、 <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> 構造体の
+<code class="docutils literal notranslate"><span class="pre">-&gt;next</span></code> がコールバックをポストするときに提供します。これとは対照的に、 <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> や今後エネルギー効率を目的とした「ラズィ」の変体、例えば <code class="docutils literal notranslate"><span class="pre">kfree_rcu()</span></code> が作成される可能性のあるものでもありません。 <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> ただし、制限があります。RCUは</p>
+<p>構造体が2バイト境界にアライメントされている必要があり、誤ってアライメントされた <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code>
+構造体を
+<code class="docutils literal notranslate"><span class="pre">rcu_head</span></code> ファミリの関数のどれかに渡すと、スプラットが発生します。したがって、 <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> を含む構造体をパッキングする際には注意が必要です。 <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code>なぜ4バイトや8バイトのアライメント要件にしないのか？それはm68kアーキテクチャが2バイトアライメントしか提供しないためで、アライメントの最小公倍数となるからです。</p>
+<p>ポインタの最下位ビットを予約する理由は <code class="docutils literal notranslate"><span class="pre">rcu_head</span></code>
+構造は、「ラズィ」なコールバックを残すためのドアを開けておくことで、その呼び出しを安全に遅延させることができる。呼び出しを遅延させることはエネルギー効率の向上に寄与する可能性があるが、重要なワークロードにおいて非ラズィなコールバックの割合が大幅に減少しない限り、その恩恵は得られない。その間、下位ビットを予約しておくことで、いつかこのオプションが役立つかもしれないという可能性を残しておく。</p>
+</section>
+<section id="performance-scalability-response-time-and-reliability">
+<h3>パフォーマンス、スケーラビリティ、応答時間、信頼性<a class="headerlink" href="#performance-scalability-response-time-and-reliability" title="この見出しへのパーマリンク">¶</a></h3>
+<p>以前の議論を踏まえて <a class="reference external" href="#Performance%20and%20Scalability">拡張して</a>、RCUはLinuxカーネルのネットワーク、セキュリティ、仮想化、スケジューリングなどのパフォーマンスに重要な部分で高負荷のコードパスに広く利用されている。そのため、RCUは特に読み込み側のプリミティブにおいて効率的な実装を必要とする。このため、プリエンプション可能なRCUの実装が <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> インライン化されることが望ましいが、これを実行するには <code class="docutils literal notranslate"><span class="pre">#include</span></code> の問題を解決する必要があります。 <code class="docutils literal notranslate"><span class="pre">task_struct</span></code>
+何らかの理由で、木構造を配列形状ではなく木形状で描くと、平面的な表現を簡単に描くことができます:</p>
+<p>Linuxカーネルは最大4096CPUのハードウェア構成をサポートしており、これはRCUが非常にスケーラブルでなければならないことを意味する。グローバルロックの頻繁な取得やグローバル変数に対するアトミック操作の頻繁な実行を含むアルゴリズムは、RCUの実装では許容できない。そのため、RCUは <code class="docutils literal notranslate"><span class="pre">rcu_node</span></code> 構造を基にした結合木を重用している。RCUは、すべてのCPUがRCUの実行プリミティブを任意の組み合わせで連続して呼び出す場合でも、各操作あたりのオーバーヘッドを極力抑える必要がある。実際には、多くの場合、負荷が増加するにつれて <em>各操作あたりのオーバーヘッドが</em> 減少する必要がある。これは、 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code>, <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code>,
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu_expedited()</span></code>, and <code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code>のバッチ処理最適化を参考にしてください。一般的なルールとして、RCUはLinuxカーネルが投げてくるどんな処理も快く受け入れなければならない。</p>
+<p>Linuxカーネルはリアルタイムワークロードに使用され、特に <a class="reference external" href="https://rt.wiki.kernel.org/index.php/Main_Page">-rtパッチセット</a>と組み合わせて。リアルタイム遅延応答の要件が厳しく、従来のRCU読み込み側クリティカルセクションでのプリエンプション無効化のアプローチは不適切である。 <code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT=y</span></code> で構築されたカーネルは、RCU読み込み側クリティカルセクションがプリエンプション可能であるRCU実装を使用する。この要件は、ユーザーが以前の <a class="reference external" href="https://lwn.net/Articles/107930/">リアルタイムパッチ</a> がニーズを満たさなかったことを明確に示した後、 <a class="reference external" href="https://lkml.kernel.org/g/20050318002026.GA2693@us.ibm.com">RCUの問題</a>
+と組み合わせて、非常に早期の-rtパッチセットバージョンで遭遇した問題から明らかになった。</p>
+<p>さらに、RCUはサブ100マイクロ秒のリアルタイム遅延予算に対応しなければなりません。実際、-rtパッチセットを使用した小型システムでは、Linuxカーネルが全体のカーネル（RCUを含む）に対してサブ20マイクロ秒のリアルタイム遅延を提供しています。したがって、RCUのスケーラビリティと遅延は、このような構成に対して十分である必要があります。私の驚きに、サブ100マイクロ秒のリアルタイム遅延予算は <a class="reference external" href="http://www.rdrop.com/users/paulmck/realtime/paper/bigrt.2013.01.31a.LCA.pdf">最大規模のシステムにも適用されます [PDF]</a>、4096コアのシステムを含むまでです。このリアルタイム要件により、グレースペリオドのkthreadが導入され、複数の競合条件の処理を簡略化することができました。</p>
+<p>RCUは、ユーザーモード（これは一つの使用例です）で実行されるか、カーネル内で実行されるCPUバウンドスレッドのリアルタイム応答の低下を避ける必要があります。
+<code class="docutils literal notranslate"><span class="pre">CONFIG_NO_HZ_FULL=y</span></code>) またはカーネル内で実行されるCPUバウンドループは、RCUからIPIを受けるのを避けるために、数十ミリ秒ごとに少なくとも1回実行する必要があります。 <code class="docutils literal notranslate"><span class="pre">cond_resched()</span></code> RCUからIPIを受けるのを避けるために、数十ミリ秒ごとに少なくとも1回実行する必要があります。</p>
+<p>最後に、RCUが同期プリミティブとしての地位を有することから、RCUの失敗は任意のメモリ破壊を引き起こす可能性があり、そのデバッグは非常に困難です。これはRCUが極めて信頼性を確保しなければならないことを意味し、実際にはRCUには厳しいストレステストスイートが必要です。このストレステストスイートは <code class="docutils literal notranslate"><span class="pre">rcutorture</span></code>.</p>
+<p>～の必要性は <code class="docutils literal notranslate"><span class="pre">rcutorture</span></code> 驚くことではなかったものの、現在のLinuxカーネルの膨大な人気は、興味深い—andおそらく前例のない—検証課題をもたらしています。これを理解するには、今日、アンドロイドスマートフォン、Linuxベースのテレビ、サーバーなどにより、Linuxカーネルのインスタンスが10億を超えていることを覚えておく必要があります。この数は、称賛されるIoTの登場とともに大幅に増加すると予想されます。</p>
+<p>RCUにレースコンディションが存在し、平均して百万年ごとに1回発生する場合、このバグは約3回 <em>日</em> ごとにインストールベースで発生します。RCUはスマートフォンが百万年持つことを誰も期待しないという理由で、ハードウェアのエラー率に隠れることもできます。しかし、この考えに過度の安心感を抱く人は、ほとんどの司法管轄区域では、特定のメカニズム（Linuxカーネルを含む可能性がある）の成功した複数年間のテストが、いくつかの種類の安全性にかかわる認証に十分であることを考慮すべきです。実際、噂によるとLinuxカーネルはすでに安全性にかかわるアプリケーションで生産的に使用されていると聞きます。私自身は、RCUのバグが誰かの命を奪った場合、非常に気分が悪くなるでしょう。それが私が最近検証と検証に注力している理由かもしれません。</p>
+</section>
+</section>
+<section id="other-rcu-flavors">
+<h2>他のRCUのバリエーション<a class="headerlink" href="#other-rcu-flavors" title="この見出しへのパーマリンク">¶</a></h2>
+<p>RCUの驚くべき特徴の一つは、現在5種類以上もの <em>フレーバー</em>、またはAPIファミリが存在することです。さらに、これまでの主なフレーバーは2つの異なる実装を持ち、非プリエンプティブとプリエンプティブの2種類があります。他の4つのフレーバーは以下の通りで、それぞれの要件については別個のセクションで説明します。</p>
+<ol class="arabic simple">
+<li><p><a class="reference internal" href="#bottom-half-flavor-historical">ボトムハーフ フレーバー（歴史的）</a></p></li>
+<li><p><a class="reference internal" href="#sched-flavor-historical">スケジューラ フレーバー（歴史的）</a></p></li>
+<li><p><a class="reference internal" href="#sleepable-rcu">スリープ可能なRCU</a></p></li>
+<li><p><a class="reference internal" href="#tasks-rcu">タスク RCU</a></p></li>
+</ol>
+<section id="bottom-half-flavor-historical">
+<h3>ボトムハーフ フレーバー（歴史的）<a class="headerlink" href="#bottom-half-flavor-historical" title="この見出しへのパーマリンク">¶</a></h3>
+<p>RCU-bhフレーバーは、3つのフレーバーを1つのフレーバーに統合する過程で、他のRCUフレーバーの概念に基づいて表現されています。読み込み側のAPIは維持され続け、softirqの無効化を継続し、lockdepによって記録されます。このセクションの多くは、厳密に歴史的な情報です。</p>
+<p>softirqの無効化（別名「ボトムハーフ」、したがって「_bh」の略称）フレーバーのRCU、または <em>RCU-bh</em>は、Dipankar Sarmaによって開発され、Robert Olssonが研究したネットワークベースのDoS攻撃に耐えられるRCUのフレーバーを提供することを目的としています。これらの攻撃によりシステムに過度なネットワーク負荷がかかるため、一部のCPUがsoftirqの実行から抜けられず、それによりコンテキストスイッチが実行されず、当時のRCU実装ではグレース期間が終了しなくなるという状態が発生しました。その結果、メモリ不足状態となり、システムが停止しました。</p>
+<p>解決策としてRCU-bhが作成され、これは
+<code class="docutils literal notranslate"><span class="pre">local_bh_disable()</span></code> 読み込み側のクリティカルセクションでsoftirqハンドラの無効化と再有効化を行い、softirq処理の種類の切り替えをクイエスcent状態として扱います。これにより、一部のCPUがsoftirqを無限に実行しても、RCU-bhのグレース期間が完了するようになります。これにより、RCU-bhに基づくアルゴリズムがネットワークベースのDoS攻撃に耐えられるようになります。</p>
+<p>通常、 <code class="docutils literal notranslate"><span class="pre">rcu_read_lock_bh()</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock_bh()</span></code> softirqハンドラの無効化と再有効化を実行する際、RCU-bhの読み込み側クリティカルセクション中には、softirqハンドラの開始が遅延されます。この場合、 <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock_bh()</span></code> softirq処理を呼び出しますが、これには相当な時間がかかることがあります。もちろん、このsoftirqのオーバーヘッドは、RCU-bhの読み込み側クリティカルセクションの後のコードに関連付けられるべきだと主張する人もいます <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock_bh()</span></code>しかし、事実として、ほとんどのプロファイリングツールはこのような細かな区別をすることは期待できません。たとえば、ネットワーク負荷が重い時期に、3ミリ秒のRCU-bh読み込み側クリティカルセクションが実行されたとします。この3ミリ秒の間に、少なくとも1つのソフトIRQハンドラの呼び出しが行われる可能性が非常に高く、このような呼び出しは、3ミリ秒の間に遅延され、
+<code class="docutils literal notranslate"><span class="pre">rcu_read_unlock_bh()</span></code>タイミングで実行されます。このことは一見して <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock_bh()</span></code> が非常に遅く実行されているように見えます。</p>
+<p>以下の <a class="reference external" href="https://lwn.net/Articles/609973/#RCU%20Per-Flavor%20API%20Table">RCU-bh API</a>
+は含まれます。 <code class="docutils literal notranslate"><span class="pre">rcu_read_lock_bh()</span></code>, <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock_bh()</span></code>,
+<code class="docutils literal notranslate"><span class="pre">rcu_dereference_bh()</span></code>, <code class="docutils literal notranslate"><span class="pre">rcu_dereference_bh_check()</span></code>,
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu_bh()</span></code>, <code class="docutils literal notranslate"><span class="pre">synchronize_rcu_bh_expedited()</span></code>,
+<code class="docutils literal notranslate"><span class="pre">call_rcu_bh()</span></code>, <code class="docutils literal notranslate"><span class="pre">rcu_barrier_bh()</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">rcu_read_lock_bh_held()</span></code>ただし、更新側のAPIは現在、他のRCUのバリエーション、つまりCONFIG_PREEMPT=nカーネルではRCU-sched、それ以外ではRCU-preemptとしての単なるラッパーになっています。</p>
+</section>
+<section id="sched-flavor-historical">
+<h3>スケジューラ フレーバー（歴史的）<a class="headerlink" href="#sched-flavor-historical" title="この見出しへのパーマリンク">¶</a></h3>
+<p>RCU-schedのバリエーションは、3つのバリエーションを1つのバリエーションに統合する過程で、他のRCUのバリエーションを基盤として表現されています。読み込み側のAPIは維持され、依然としてプリエンプションを無効化し、lockdepによってアカウントされます。したがって、このセクションの多くは厳密に歴史的な情報です。</p>
+<p>プリエンプティブRCU導入以前には、RCUグレース期間を待つことは、すべての既存の割り込みおよびNMIハンドラを待つ副作用がありました。しかし、正当なプリエンプティブRCUの実装として、コードのRCU読み込み側クリティカルセクション外の任意のポイントがクイエスcentステートであるため、この性質を持たない実装もあります。そのため、
+<em>RCU-sched</em> が作成されました。これは「クラシック」RCUに従っており、RCU-schedグレース期間は既存の割り込みおよびNMIハンドラを待つことになります。CONFIG_PREEMPT=nで構築されたカーネルでは、RCUおよびRCU-sched APIの実装は同一ですが、 <code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT=n</span></code>で構築されたカーネルでは
+<code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT=y</span></code> それぞれに対して個別の実装を提供する。</p>
+<p>注意すべきは、 <code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT=y</span></code> カーネルでは、
+<code class="docutils literal notranslate"><span class="pre">rcu_read_lock_sched()</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock_sched()</span></code> プリエンプションを無効化し、再び有効にする。これは、RCU-sched読み取り側クリティカルセクション中にプリエンプションが試行された場合、
+<code class="docutils literal notranslate"><span class="pre">rcu_read_unlock_sched()</span></code> スケジューラに移行し、すべてのレイテンシーとオーバーヘッドを伴う。同様に <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock_bh()</span></code>、これは…のように見えるようにする <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock_sched()</span></code> 実行されていた。ただし、最優先度のタスクは強制的に中断されないため、そのタスクは低オーバーヘッドを享受する <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock_sched()</span></code>
+呼び出し。</p>
+<p>以下の <a class="reference external" href="https://lwn.net/Articles/609973/#RCU%20Per-Flavor%20API%20Table">RCU-sched API</a>
+は含まれます。 <code class="docutils literal notranslate"><span class="pre">rcu_read_lock_sched()</span></code>, <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock_sched()</span></code>,
+<code class="docutils literal notranslate"><span class="pre">rcu_read_lock_sched_notrace()</span></code>, <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock_sched_notrace()</span></code>,
+<code class="docutils literal notranslate"><span class="pre">rcu_dereference_sched()</span></code>, <code class="docutils literal notranslate"><span class="pre">rcu_dereference_sched_check()</span></code>,
+<code class="docutils literal notranslate"><span class="pre">synchronize_sched()</span></code>, <code class="docutils literal notranslate"><span class="pre">synchronize_rcu_sched_expedited()</span></code>,
+<code class="docutils literal notranslate"><span class="pre">call_rcu_sched()</span></code>, <code class="docutils literal notranslate"><span class="pre">rcu_barrier_sched()</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">rcu_read_lock_sched_held()</span></code>。ただし、プリエンプションを無効にするものはすべて、RCU-schedの読み取り側クリティカルセクションをマークし、
+<code class="docutils literal notranslate"><span class="pre">preempt_disable()</span></code> および <code class="docutils literal notranslate"><span class="pre">preempt_enable()</span></code>, <code class="docutils literal notranslate"><span class="pre">local_irq_save()</span></code> および
+<code class="docutils literal notranslate"><span class="pre">local_irq_restore()</span></code>など。</p>
+</section>
+<section id="sleepable-rcu">
+<h3>スリープ可能なRCU<a class="headerlink" href="#sleepable-rcu" title="この見出しへのパーマリンク">¶</a></h3>
+<p>10年以上にわたり、誰かが「RCUの読み込み側クリティカルセクション内でブロックする必要がある」と言っていた場合、その誰かがRCUを理解していないという信頼できるサインでした。畢竟、常にRCUの読み込み側クリティカルセクション内でブロックしているなら、より高コストの同期メカニズムを使用しても問題ありません。しかし、Linuxカーネルの通知機構（notifiers）が登場したことでこの状況は変わりました。その通知機構のRCU読み込み側クリティカルセクションはほぼ常にスリープしないものの、ときどきスリープする必要があるため、これにより <a class="reference external" href="https://lwn.net/Articles/202847/">スリープ可能なRCU</a>（sleepable RCU）が導入されました。
+<em>SRCU</em>.</p>
+<p>SRCUは異なるドメインを定義できます。それぞれのドメインは、構造体のインスタンスで定義され、 <code class="docutils literal notranslate"><span class="pre">srcu_struct</span></code> 構造体へのポインタを各SRCU関数に渡す必要があります。例えば、
+<code class="docutils literal notranslate"><span class="pre">synchronize_srcu(&amp;ss)</span></code>では、 <code class="docutils literal notranslate"><span class="pre">ss</span></code> は構造体です。これらのドメインの主な利点は、あるドメインの遅いSRCUリーダーが、他のドメインのSRCUグレースペリオドを遅らせることがないことです。ただし、これらのドメインの一つの結果として、読み込み側のコードは、 <code class="docutils literal notranslate"><span class="pre">srcu_struct</span></code>
+から「クッキー」を渡す必要があります。例えば、以下の通り: <code class="docutils literal notranslate"><span class="pre">srcu_read_lock()</span></code> に（木の下から葉に向かって） <code class="docutils literal notranslate"><span class="pre">srcu_read_unlock()</span></code>上記のように、SRCUの読み込み側クリティカルセクション内でブロックすることは法的に許可されていますが、大きな力は大きな責任を伴います。あるドメインのSRCU読み込み側クリティカルセクション内で永遠にブロックすると、そのドメインのグレースペリオドも永遠にブロックされてしまいます。もちろん、永遠にブロックする良い方法の一つはデッドロックです。これは、あるドメインのSRCU読み込み側クリティカルセクション内の操作が、直接または間接的にそのドメインのグレースペリオドが終わるのを待つ場合に発生します。例えば、これは自己デッドロックを引き起こします:</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1 int idx;
+2
+3 idx = srcu_read_lock(&amp;ss);
+4 do_something();
+5 srcu_read_unlock(&amp;ss, idx);
+</pre></div>
+</div>
+</div></blockquote>
+<p>ただし、行5で取得したミューテックスが、</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1 int idx;
+2
+3 idx = srcu_read_lock(&amp;ss);
+4 do_something();
+5 synchronize_srcu(&amp;ss);
+6 srcu_read_unlock(&amp;ss, idx);
+</pre></div>
+</div>
+</div></blockquote>
+<p>のドメインで保持されていた場合、
+<code class="docutils literal notranslate"><span class="pre">synchronize_srcu()</span></code> ドメイン <code class="docutils literal notranslate"><span class="pre">ss</span></code>デッドロックは依然として発生する可能性があります。さらに、ライン5が別のドメインで保持されていたミューテックスを取得した場合、
+<code class="docutils literal notranslate"><span class="pre">synchronize_srcu()</span></code> 他のドメインで <code class="docutils literal notranslate"><span class="pre">ss1</span></code>、もしSRCUの読み込み側クリティカルセクションが別のミューテックスを取得した場合、
+<code class="docutils literal notranslate"><span class="pre">ss1</span></code>ドメインSRCUの読み込み側クリティカルセクションが別のミューテックスを取得した場合、 <code class="docutils literal notranslate"><span class="pre">ss</span></code>ドメイン、 <code class="docutils literal notranslate"><span class="pre">synchronize_srcu()</span></code>デッドロックが再び発生する可能性があります。このようなデッドロックのサイクルは、任意に多くの異なるSRCUドメインをまたいで拡張する可能性があります。また、大いなる力には大いなる責任が伴います。</p>
+<p>他のRCUのバリエーションとは異なり、SRCUの読み込み側クリティカルセクションはアイドル状態やオフラインのCPUでも実行できます。この機能には
+<code class="docutils literal notranslate"><span class="pre">srcu_read_lock()</span></code> および <code class="docutils literal notranslate"><span class="pre">srcu_read_unlock()</span></code> メモリーバリアを含む必要があります。これは、SRCUのリーダーがRCUのリーダーよりもやや遅くなることを意味します。また、 <code class="docutils literal notranslate"><span class="pre">smp_mb__after_srcu_read_unlock()</span></code> API、これは、 <code class="docutils literal notranslate"><span class="pre">srcu_read_unlock()</span></code>を組み合わせることで、完全なメモリーバリアを保証します。</p>
+<p>また、他のRCUのバリエーションとは異なり、 <code class="docutils literal notranslate"><span class="pre">synchronize_srcu()</span></code> 可能かもしれません。 <strong>ではありません</strong> CPU-hotplug notifiersから呼び出される可能性があります。これは、SRCU grace periodがタイマーや、一時的に「滞在」している可能性のあるタイマーを活用しているためです。タイマーが外出しているCPUに滞在している場合、タイマーはCPU-hotplugプロセスの後半まで発火しない可能性があります。問題は、notifierがSRCU grace periodを待っている場合、そのgrace periodがタイマーアクセスを待っている場合、そしてそのタイマーが外出しているCPUに滞在している場合、notifierは永遠に目覚めないため、デッドロックが発生します。この状況は当然ながら、 <code class="docutils literal notranslate"><span class="pre">srcu_barrier()</span></code> CPU-hotplug notifiersから呼び出されないことも禁止します。</p>
+<p>SRCUは他のRCUのバリエーションと異なる点として、SRCUの優先的および非優先的なgrace periodは同じメカニズムで実装されています。これは、現在のSRCU実装では、将来のgrace periodを優先的に処理する際、すべての未完了の過去のgrace periodも同時に優先的に処理される副作用をもたらします。(ただし、これは現在の実装の性質であり、今後の実装では必ずしもそうではありません。) さらに、SRCUが指定されたインターバルよりも長い時間、アイドル状態を維持した場合、そのインターバルは <code class="docutils literal notranslate"><span class="pre">srcutree.exp_holdoff</span></code> カーネルのブートパラメータ(デフォルトでは25マイクロ秒)で指定されており、 <code class="docutils literal notranslate"><span class="pre">synchronize_srcu()</span></code> 呼び出しによってアイドル期間が終了した場合、その呼び出しは自動的に優先的に処理されます。</p>
+<p>v4.12以降、SRCUのコールバックはCPUごとに維持されるようになり、以前のカーネルバージョンに存在したロックのボトルネックが解消されました。これにより、ユーザーはより重い負荷をかけることができますが、SRCUは現在はコールバックの洪水に対して特別な対処を行っていません。したがって、CPUごとに毎秒10,000回のSRCUコールバックを投稿しても問題ありませんが、毎秒1,000,000回投稿する場合は、事前にテストを行うことをお勧めします。SRCUはそのような負荷に対処するための調整が必要かもしれません。CPUの速度やメモリのサイズによっては、結果が異なります。 <code class="docutils literal notranslate"><span class="pre">call_srcu()</span></code>SRCU API</p>
+<p>以下の <a class="reference external" href="https://lwn.net/Articles/609973/#RCU%20Per-Flavor%20API%20Table">. また、</a>
+は含まれます。 <code class="docutils literal notranslate"><span class="pre">srcu_read_lock()</span></code>, <code class="docutils literal notranslate"><span class="pre">srcu_read_unlock()</span></code>,
+<code class="docutils literal notranslate"><span class="pre">srcu_dereference()</span></code>, <code class="docutils literal notranslate"><span class="pre">srcu_dereference_check()</span></code>,
+<code class="docutils literal notranslate"><span class="pre">synchronize_srcu()</span></code>, <code class="docutils literal notranslate"><span class="pre">synchronize_srcu_expedited()</span></code>,
+<code class="docutils literal notranslate"><span class="pre">call_srcu()</span></code>, <code class="docutils literal notranslate"><span class="pre">srcu_barrier()</span></code>, and <code class="docutils literal notranslate"><span class="pre">srcu_read_lock_held()</span></code>定義および初期化用のAPIも含まれます。 <code class="docutils literal notranslate"><span class="pre">DEFINE_SRCU()</span></code>, <code class="docutils literal notranslate"><span class="pre">DEFINE_STATIC_SRCU()</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">init_srcu_struct()</span></code> いくつかのトレース形式では、「ジャンプボード」を用いて、さまざまなプローブをインストールするためにバイナリの再構築を処理します。古いジャンプボードを解放できると良いですが、これはRCUの一種の機能として考えられます。ただし、コードのどこでもトレースをインストールする必要があるため、読み込み側のマーカーなどの
+<code class="docutils literal notranslate"><span class="pre">srcu_struct</span></code> 構造体。</p>
+</section>
+<section id="tasks-rcu">
+<h3>タスク RCU<a class="headerlink" href="#tasks-rcu" title="この見出しへのパーマリンク">¶</a></h3>
+<p>を用いることはできません。さらに、ジャンプボード自体にこのようなマーカーを設置するのも不可能です。なぜなら、その後に続く命令 <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> および <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code>が必要だからです。ただし、 <code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code>は
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> 実行がトラマポリンに到達したことを保証できるが、実行がトラマポリンを完全に離れたことを保証できない。さらに悪化すると、ある状況ではトラマポリンの保護はトラマポリンに到達する前のいくつかの命令にまで拡張しなければならない。
+<code class="docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code>トラマポリンに到達する前のいくつかの命令が、トラマポリンのアドレスを計算するためのものであるため、実行が実際にトラマポリンに到達する前に、トラマポリンへの入り込みが事前に決められてしまう。 <em>事前に</em> トラマポリンに到達する前のいくつかの命令が、トラマポリンのアドレスを計算するためのものであるため、実行が実際にトラマポリンに到達する前に、トラマポリンへの入り込みが事前に決められてしまう。</p>
+<p>解決策は、 <a class="reference external" href="https://lwn.net/Articles/607117/">タスク RCU</a>明示的な読み取り側のクリティカルセクションであり、ボランティアのコンテキストスイッチによって区切られている、つまり、 <code class="docutils literal notranslate"><span class="pre">schedule()</span></code>, <code class="docutils literal notranslate"><span class="pre">cond_resched()</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu_tasks()</span></code>への呼び出しによって区切られている。さらに、ユーザースペース実行との移行もタスク-RCU読み取り側のクリティカルセクションを区切る。</p>
+<p>タスク-RCU APIは非常にコンパクトで、
+<code class="docutils literal notranslate"><span class="pre">call_rcu_tasks()</span></code>, <code class="docutils literal notranslate"><span class="pre">synchronize_rcu_tasks()</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">rcu_barrier_tasks()</span></code>カーネルでは、トラマポリンがプリエンプションされないため、これらのAPIは <code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT=n</span></code> にマッピングされる <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code>,
+<code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code>, and <code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code>それぞれ。In
+<code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT=y</span></code> カーネルではトランポリンが強制的に中断され、これらの3つのAPIはボランティアのコンテキストスイッチを検出するための別個の関数によって実装されています。</p>
+</section>
+</section>
+<section id="possible-future-changes">
+<h2>可能となる将来の変更<a class="headerlink" href="#possible-future-changes" title="この見出しへのパーマリンク">¶</a></h2>
+<p>RCUが更新側のスケーラビリティを達成するために使用する工夫の一つは、CPUの数が増えるにつれてグレースペリオドの遅延を増やすことです。この問題が深刻になる場合、追加の遅延を避けるためにグレースペリオドの状態機械を再設計する必要があります。</p>
+<p>RCUはいくつかの場所でCPUホットプラグを無効にしますが、特に操作において最も顕著に見られるかもしれません。
+<code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code> CPUホットプラグノティフィケーションで使用する理由が強い場合、CPUホットプラグを無効にするのを避ける必要があります。
+<code class="docutils literal notranslate"><span class="pre">rcu_barrier()</span></code> これによりいくつかの複雑さが生じるため、非常に良い理由があるべきです。 <em>非常に</em> 良い理由。</p>
+<p>グレースペリオド遅延と他CPUの中断のトレードオフは再検討が必要かもしれません。もちろん、グレースペリオド遅延がゼロで、緊急のグレースペリオド操作中に発生するインタープロセッサ割込みもゼロであることが望ましいです。この理想は達成が難しいかもしれませんが、さらなる改善は十分に可能です。</p>
+<p>RCUのマルチプロセッサ実装では、CPUをグループ化してロック競合を減らしキャッシュローカリティを向上させるための結合ツリーを使用します。しかし、この結合ツリーはNUMAノード間でメモリを分散したり、ソケットやコアなどのハードウェア機能に合わせてCPUグループを配置したりしません。このような分散と配置は現在、不要とされていると考えられています。なぜなら、ホットパスの読み取り側プリミティブは結合ツリーにアクセスしないからです。 <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> 一般的なケースにおいて。あなたのアーキテクチャがこのような分散と整列を必要とする場合、あなたのアーキテクチャは同様に
+<code class="docutils literal notranslate"><span class="pre">rcutree.rcu_fanout_leaf</span></code> ブートパラメータを活用すべきです。このパラメータは、ソケット内のCPU数、NUMAノード、あるいはそれ以外の値に設定できます。CPU数が非常に大きい場合、CPU数の一部を使用してください。CPU数が大きな素数である場合、それは確かに「興味深い」アーキテクチャの選択です！より柔軟な配置が検討されるかもしれませんが、その必要性が <code class="docutils literal notranslate"><span class="pre">rcutree.rcu_fanout_leaf</span></code> 不十分であることが証明されていない限り、かつその不十分さが現実的なシステムレベルのワークロードで厳密に検証された場合に限り、検討されます。</p>
+<p>RCUがCPU番号を再マッピングする必要がある配置は、極めて明確な必要性の証明と、代替案の完全な検討が求められます。</p>
+<p>RCUのさまざまなkthreadは比較的最近の追加です。極端な負荷をより穏やかに処理するための調整が必要である可能性があります。また、RCUのkthreadやsoftirqハンドラによるCPU利用率を、このCPU利用率を引き起こしたコードと関連付ける必要があるかもしれません。例えば、RCUコールバックのオーバーヘッドは発生元の <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> インスタンスに負担を戻すことが可能ですが、おそらく本番環境用カーネルには含まれていません。</p>
+<p>重い負荷下でのグレースペリオドやコールバック呼び出しにおける合理的な前進の保証を提供するための追加作業が必要になるかもしれません。</p>
+</section>
+<section id="summary">
+<h2>Summary<a class="headerlink" href="#summary" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このドキュメントはRCU要件に関する20年以上の期間を提示しています。要件が継続的に変化しているため、これはこの主題に関する最終的な結論ではありませんが、少なくとも重要な一部の要件を示す役割を果たしています。</p>
+</section>
+<section id="acknowledgments">
+<h2>Acknowledgments<a class="headerlink" href="#acknowledgments" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Steven Rostedt、Lai Jiangshan、Ingo Molnar、Oleg Nesterov、Borislav Petkov、Peter Zijlstra、Boqun Feng、Andy Lutomirski氏らがこの記事を人間が読めるようにするための支援に感謝します。Michelle Rankin氏にはこの取り組みへの支援を感謝します。その他の貢献はLinuxカーネルのgitアーカイブで認められています。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../../../core-api/index.html">コアAPIドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../../core-api/index.html#core-utilities">Core utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../core-api/index.html#data-structures-and-low-level-utilities">Data structures and low-level utilities</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="../../../core-api/index.html#concurrency-primitives">Concurrency primitives</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../core-api/index.html#low-level-hardware-management">Low-level hardware management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../core-api/index.html#memory-management">Memory management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../core-api/index.html#interfaces-for-kernel-debugging">Interfaces for kernel debugging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../core-api/index.html#everything-else">Everything else</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../../../core-api/index.html">コアAPIドキュメント</a><ul>
+<li><a href="../../index.html">RCU concepts</a><ul>
+<li>前へ: <a href="../Expedited-Grace-Periods/Expedited-Grace-Periods.html" title="前章">TREE_RCUの緊急グレース期間をめぐるツアー</a></li>
+<li>次へ: <a href="../Data-Structures/Data-Structures.html" title="次章">TREE_RCUのデータ構造をめぐるツアー [LWN.net]</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../../_sources/RCU/Design/Requirements/Requirements.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

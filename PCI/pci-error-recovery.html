@@ -1,0 +1,382 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>7. PCIエラー回復 — Linuxカーネルドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="pcieaer-howto.html" rel="next" title="8. PCI Express高度エラーレポートドライバガイドHOWTO"/>
+<link href="acpi-info.html" rel="prev" title="6. PCIホストブリッジにおけるACPIの考慮事項"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="pci-error-recovery">
+<h1><span class="section-number">7. </span>PCIエラー回復<a class="headerlink" href="#pci-error-recovery" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><ul class="simple">
+<li><p>Linas Vepstas &lt;<a class="reference external" href="mailto:linasvepstas%40gmail.com">linasvepstas<span>@</span>gmail<span>.</span>com</a>&gt;</p></li>
+<li><p>Richard Lary &lt;<a class="reference external" href="mailto:rlary%40us.ibm.com">rlary<span>@</span>us<span>.</span>ibm<span>.</span>com</a>&gt;</p></li>
+<li><p>Mike Mason &lt;<a class="reference external" href="mailto:mmlnx%40us.ibm.com">mmlnx<span>@</span>us<span>.</span>ibm<span>.</span>com</a>&gt;</p></li>
+</ul>
+</dd>
+</dl>
+<p>多くのPCIバス制御器は、バス上でさまざまなハードウェアPCIエラーを検出できます。例えばデータバスやアドレスバスのパリティエラー、SERRおよびPERRエラーなどです。一部の高度なチップセットはこれらのエラーを処理できます。これはPCI-Eチップセットや、IBM Power4、Power5、Power6ベースのpSeriesボックスに搭載されたPCIホストブリッジが含まれます。一般的な対処方法として、影響を受けたデバイスを切断し、すべてのI/Oを停止します。切断の目的はシステムの破壊を防ぐためで、たとえばDMAによる「ワイルドな」アドレスへのアクセスによるシステムメモリの破壊を回避します。通常、再接続メカニズムも提供されており、影響を受けたPCIデバイスをリセットして正常な状態に戻します。リセットフェーズでは、影響を受けたドライバとPCI制御器チップの間で協調が必要です。このドキュメントでは、バス切断をドライバに通知し、エラー回復を行うための汎用APIについて説明します。このAPIは現在、2.6.16以降のカーネルで実装されています。</p>
+<p>報告および回復は複数のステップで行われます。まず、PCIハードウェアエラーによりバスが切断した場合、そのイベントはすぐにすべての影響を受けたドライバに報告されます。これはマルチファンクションカード上の複数のドライバインスタンスにも適用されます。これにより、ドライバがスピンロック内で死lockingを避けることができ、I/O空間レジスタの変化を待つことなく、必要なI/Oを遅延処理できます。また、ドライバが必要なI/Oをdeferする機会も与えます。</p>
+<p>次に、回復は複数の段階で行われます。複数のファンクションを持つデバイスを処理する必要があるため、多くの複雑さが生じます。最初の段階では、各ドライバがどの種類のリセットを希望するかを示すことができます。選択肢は、I/Oの再有効化のシンプルな再起動か、スロットリセットを要求するかです。</p>
+<p>もしあなどのドライバがスロットリセットを要求すれば、それが実行されます。</p>
+<p>リセットおよび/またはI/Oの再有効化後、すべてのドライバに再び通知が送られ、必要なデバイスの設定/構成を行うことができます。これらの処理がすべて完了した後、最終的な「通常操作を再開」イベントが送信されます。</p>
+<p>カーネルベースの実装を選択した最大の理由は、ストレージメディアに接続されたPCIデバイスのバス切断処理を扱う必要があったことです。特に、ルートファイルシステムを保持するデバイスからの切断処理が必要でした。ルートファイルシステムが切断された場合、ユーザー空間のメカニズムは復旧を完了するためには多くの手間をかける必要があります。現在のLinuxファイルシステムのほぼすべては、下位ブロックデバイスからの切断・再接続に対して耐性がありません。対照的に、バスエラーはデバイスドライバで簡単に管理できます。実際、ほとんどのデバイスドライバは類似の復旧手順をすでに処理しており、たとえばSCSIジェネリックレイヤーはSCSIバスエラーおよびSCSIバスリセットの処理にすでに多くのメカニズムを提供しています。</p>
+<section id="detailed-design">
+<h2><span class="section-number">7.1. </span>詳細設計<a class="headerlink" href="#detailed-design" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Ben Herrenschmidtとの公開メールディスカッションに基づく設計および実装の詳細は、2005年4月5日頃にまとめられています。</p>
+<p>エラー回復APIのサポートは、新しいフィールドを介してドライバに構造体形式で公開されます。 <a class="reference internal" href="pci.html#c.pci_driver" title="pci_driver"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span>
+<span class="pre">pci_driver</span></code></a>ドライバがこの構造体を提供しない場合、「非認識」ドライバとされ、実際の回復手順はプラットフォーム依存になります。arch/powerpcの実装ではPCIホットプラグの削除/追加をシミュレートします。</p>
+<p>この構造体の形式は以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct pci_error_handlers
+{
+        int (*error_detected)(struct pci_dev *dev, pci_channel_state_t);
+        int (*mmio_enabled)(struct pci_dev *dev);
+        int (*slot_reset)(struct pci_dev *dev);
+        void (*resume)(struct pci_dev *dev);
+};
+</pre></div>
+</div>
+<p>可能なチャネル状態は以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>typedef enum {
+        pci_channel_io_normal,  /* I/O channel is in normal state */
+        pci_channel_io_frozen,  /* I/O to channel is blocked */
+        pci_channel_io_perm_failure, /* PCI card is dead */
+} pci_channel_state_t;
+</pre></div>
+</div>
+<p>可能な返却値は以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>enum pci_ers_result {
+        PCI_ERS_RESULT_NONE,        /* no result/none/not supported in device driver */
+        PCI_ERS_RESULT_CAN_RECOVER, /* Device driver can recover without slot reset */
+        PCI_ERS_RESULT_NEED_RESET,  /* Device driver wants slot to be reset. */
+        PCI_ERS_RESULT_DISCONNECT,  /* Device has completely failed, is unrecoverable */
+        PCI_ERS_RESULT_RECOVERED,   /* Device driver is fully recovered and operational */
+};
+</pre></div>
+</div>
+<p>ドライバはすべてのコールバックを実装する必要はありませんが、実装する場合はerror_detected()を必ず実装しなければなりません。コールバックが実装されていない場合、対応する機能はサポートされていないとみなされます。たとえば、mmio_enabled()とresume()が実装されていない場合、ドライバは直接的な回復を行わず、スロットリセットを必要とするものとみなされます。通常、ドライバはスロットリセットについて知る必要があります。</p>
+<p>プラットフォームがPCIエラーイベントから回復する際の具体的な手順はプラットフォーム依存しますが、以下の一般的な手順に従います。</p>
+<section id="step-0-error-event">
+<h3><span class="section-number">7.1.1. </span>STEP 0: エラーイベント<a class="headerlink" href="#step-0-error-event" title="この見出しへのパーマリンク">¶</a></h3>
+<p>PCIバスエラーがPCIハードウェアによって検出されます。powerpcでは、スロットが隔離され、すべてのI/Oがブロックされます。すべての読み取りは0xffffffffを返し、すべての書き込みは無視されます。</p>
+</section>
+<section id="step-1-notification">
+<h3><span class="section-number">7.1.2. </span>STEP 1: 通知<a class="headerlink" href="#step-1-notification" title="この見出しへのパーマリンク">¶</a></h3>
+<p>プラットフォームは、エラーに影響を受けたすべてのドライバの各インスタンスに対してerror_detected()コールバックを呼び出します。</p>
+<p>この時点で、デバイスがもうアクセスできなくなる可能性があります（プラットフォームにより異なります。powerpcではスロットが電源投入時に隔離されます）。I/Oの失敗によりドライバーがすでにエラーを「認識」しているかもしれませんが、これは適切な「同期ポイント」です。つまり、ドライバーが未完了の処理（タイマーやなんでも）を完了するのを待つ機会を提供し、セマフォを取得したり、スケジュールを調整したりするなど、デバイスを操作しない限り何でもできます。この関数内で、および関数が戻る後、ドライバーは新しいIOを実行すべきではありません。タスクコンテキストで呼び出されます。これは「静止ポイント」のようなものです。このドキュメントの最後に記載されている割り込みに関する注意点も参照してください。</p>
+<p>このシステムに参加するすべてのドライバーはこの呼び出しを実装しなければなりません。ドライバーは次の結果コードのいずれかを返さなければなりません：</p>
+<blockquote>
+<div><ul class="simple">
+<li><dl class="simple">
+<dt>PCI_ERS_RESULT_CAN_RECOVER</dt><dd><p>ドライバーがハードウェアをIOを叩くことで回復できる可能性があると考える場合、または診断情報を取得する機会を求める場合にこのコードを返します（下記のmmio_enableを参照してください）。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>PCI_ERS_RESULT_NEED_RESET</dt><dd><p>スロットのリセットなしでは回復できないと判断した場合にこのコードを返します。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>PCI_ERS_RESULT_DISCONNECT</dt><dd><p>回復を一切行いたくない場合にこのコードを返します。</p>
+</dd>
+</dl>
+</li>
+</ul>
+</div></blockquote>
+<p>次のステップはドライバーが返す結果コードに依存します。</p>
+<p>すべてのドライバーがPCI_ERS_RESULT_CAN_RECOVERを返した場合、プラットフォームはスロットのIOを再有効化する必要があります（プラットフォームがスロットを隔離しない場合は何も行いません）。回復はSTEP 2（MMIO有効化）に進みます。</p>
+<p>どのドライバーもスロットリセットを要求した場合（PCI_ERS_RESULT_NEED_RESETを返した場合）、回復はSTEP 4（スロットリセット）に進みます。</p>
+<p>プラットフォームがスロットを回復できない場合、次のステップはSTEP 6（永久的な失敗）です。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>現在のpowerpc実装は、デバイスドライバーがこのルーチン内でスケジュールまたはセマフォを取得することを前提としています。現在のpowerpc実装では、すべてのデバイスに通知するため1つのカーネルスレッドを使用しています。そのため、1つのデバイスがスリープまたはスケジュールする場合、すべてのデバイスに影響が出ます。より良い実装には、エラー回復実装内で複雑なマルチスレッドロジックが必要です（例：すべての通知スレッドが「join」するのを待つ）。これは非常に複雑で、実装する価値がないとされています。
+<em>ではありません</em> このドキュメントの最後に記載されている割り込みに関する注意点も参照してください。</p>
+<p>現在のpowerpc実装では、デバイスがこの時点でI/Oを試行するかどうかはあまり気にせず、I/Oは失敗して読み込み時に0xffを返し、書き込みは無視されます。凍結されたアダプターに対してEEH_MAX_FAILSを超えるI/Oが試行された場合、EEHはデバイスドライバーが無限ループに入ったと想定し、syslogにエラーを出力します。その後、デバイスを再び動作させるには再起動が必要です。</p>
+</div>
+</section>
+<section id="step-2-mmio-enabled">
+<h3><span class="section-number">7.1.3. </span>ステップ2: MMIOが有効化される<a class="headerlink" href="#step-2-mmio-enabled" title="この見出しへのパーマリンク">¶</a></h3>
+<p>プラットフォームがデバイスにMMIOを再有効化し（DMAは通常有効化されません）、影響を受けるすべてのデバイスドライバーに対してmmio_enabled()コールバックを呼び出します。</p>
+<p>これは「早期回復」コールバックです。I/Oは再び許可されますが、DMAは許可されません（一部の制限あり）。これはドライバーが操作を再開するためのコールバックではなく、デバイスを覗き見る・操作し、診断情報を取得し、最終的にデバイスローカルリセットなどの操作をトリガーするためのものです。このコールバックは、セグメント内のすべてのドライバーが回復を試みることを合意し、ハードウェアが自動的なリンクリセットを行わない場合に呼び出されます。プラットフォームがスロットリセットやリンクリセットなしにI/Oを再有効化できない場合、このコールバックは呼び出されず、直接ステップ3（リンクリセット）またはステップ4（スロットリセット）に移行します。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>以下の提案が行われています（現在どのプラットフォームも実装していません）：提案：すべてのI/Oはこのコールバック内で同期的に実行されるべきです。これにより発生するエラーは通常のpci_check_whatever() API経由で返されます。このコールバック内で発生したエラーにより、新たなerror_detected()コールバックは発行されません。ただし、このようなエラーはセグメント全体のI/Oを再ブロック化し、他のデバイスの回復を無効化する可能性があり、セグメント全体をリンクリセットまたはスロットリセットのいずれかの状態に強制します。</p>
+</div>
+<dl class="simple">
+<dt>ドライバーは次の結果コードのいずれかを返すべきです：</dt><dd><ul class="simple">
+<li><dl class="simple">
+<dt>PCI_ERS_RESULT_RECOVERED</dt><dd><p>ドライバーがデバイスが完全に機能しており、正常なドライバー操作を再開できると判断した場合に返します。ただし、他のドライバーが失敗し、スロットリセットをトリガーした場合など、ドライバーが実際に進むことを許可される保証はありません。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>PCI_ERS_RESULT_NEED_RESET</dt><dd><p>ドライバーが現在の状態で回復不可能であり、スロットリセットが必要だと判断した場合に返します。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>PCI_ERS_RESULT_DISCONNECT</dt><dd><p>上記と同じです。完全な失敗、リセット後も回復が不可能でドライバーが完全に停止している状態。（より正確に定義する必要があります）</p>
+</dd>
+</dl>
+</li>
+</ul>
+</dd>
+</dl>
+<p>ドライバーが返す結果によって次のステップが決まります。すべてのドライバーがPCI_ERS_RESULT_RECOVEREDを返した場合、プラットフォームはSTEP3（リンクリセット）またはSTEP5（運用再開）に進みます。</p>
+<p>どのドライバーもPCI_ERS_RESULT_NEED_RESETを返した場合、プラットフォームはSTEP4（スロットリセット）に進みます。</p>
+</section>
+<section id="step-3-link-reset">
+<h3><span class="section-number">7.1.4. </span>STEP 3: リンクリセット<a class="headerlink" href="#step-3-link-reset" title="この見出しへのパーマリンク">¶</a></h3>
+<p>プラットフォームがリンクをリセットします。これはPCI-Express固有のステップであり、致命的なエラーが検出された際にリンクをリセットすることで解決できる場合に実行されます。</p>
+</section>
+<section id="step-4-slot-reset">
+<h3><span class="section-number">7.1.5. </span>STEP 4: スロットリセット<a class="headerlink" href="#step-4-slot-reset" title="この見出しへのパーマリンク">¶</a></h3>
+<p>PCI_ERS_RESULT_NEED_RESETの返却値に対応して、プラットフォームはリクエストしているPCIデバイスに対してスロットリセットを行います。プラットフォームがスロットリセットを実行する際の具体的な手順はプラットフォーム依存します。スロットリセットが完了すると、プラットフォームはデバイスのslot_reset()コールバックを呼び出します。</p>
+<p>PowerPCプラットフォームはスロットリセットを2段階に実装しています：ソフトリセット（デフォルト）と fundamentals（オプション）リセット。</p>
+<p>PowerPCソフトリセットはアダプターの#RSTラインをアサートし、その後PCI BARおよびPCI構成ヘッダーを、システム電源投入後にBIOS/システムファームウェア初期化が完了した状態と同等の状態に戻します。ソフトリセットはホットリセットとしても知られています。</p>
+<p>PowerPC fundamentalsリセットはPCI Expressカードのみでサポートされ、デバイスのステートマシン、ハードウェアロジック、ポート状態、構成レジスタが初期状態に戻ります。</p>
+<p>ほとんどのPCIデバイスではソフトリセットで回復が可能です。オプションのfundamentalsリセットは、ソフトリセットでは回復できない少数のPCI Expressデバイスをサポートするために提供されています。</p>
+<p>プラットフォームがPCIホットプラグをサポートしている場合、リセットはスロットの電気的電源をオフ/オンに切り替えることで実行されることがあります。</p>
+<p>プラットフォームはPCI構成空間を「電源投入後の初期状態」に戻す必要があります。「最後の状態」ではなく。スロットリセット後、デバイスドライバーは通常の初期化手順をほぼ常に使用し、異常な構成空間の設定はデバイスの停止、カーネルのパニック、または静的なデータ破損を引き起こす可能性があります。</p>
+<p>このコールはドライバーにハードウェアの再初期化（ファームウェアの再ダウンロードなど）を機会にします。この時点でドライバーはカードが初期状態に戻り、完全に機能していると仮定できます。スロットは解凍され、ドライバーはPCI構成空間、メモリマップドI/O空間、DMAに完全なアクセス権を持ち、割込み（レガシ、MSI、MSI-X）も利用可能です。</p>
+<p>ドライバーはこの時点で通常のI/O処理を再開すべきではありません。すべてのデバイスドライバーがこのコールバックで成功を報告した場合、プラットフォームはresume()を呼び出して処理を完了し、ドライバーが通常のI/O処理を再開できるようにします。</p>
+<p>ドライバーは、リセット後でもデバイスを動作させることができない場合、この関数に対してcritical failureを返すことができます。プラットフォームが以前にソフトリセットを試した場合、現在はハードリセット（電源サイクル）を試みる可能性があり、その後slot_reset()を再度呼び出します。デバイスが依然として回復できない場合、これ以上なにもできません。このような場合、プラットフォームは通常「永久的な失敗」と報告します。この場合、デバイスは「死んだ」とみなされます。</p>
+<p>マルチファンクションカードのドライバーは、どのドライバーインスタンスが「ワンショット」またはグローバルなデバイス初期化を実行するかについて、お互いに調整する必要があります。たとえば、Symbios sym53cxx2ドライバーはPCI機能0のみからデバイス初期化を行います。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+       if (PCI_FUNC(pdev-&gt;devfn) == 0)
++               sym_reset_scsi_bus(np, 0);
+</pre></div>
+</div>
+<dl class="simple">
+<dt>結果コード:</dt><dd><ul class="simple">
+<li><p>PCI_ERS_RESULT_DISCONNECT 上記と同じ。</p></li>
+</ul>
+</dd>
+</dl>
+<p>PCI Expressカードで根本的なリセットが必要な場合、ドライバーはprobe関数でpci_dev構造体のneeds_fresetビットを設定する必要があります。たとえば、QLogic qla2xxxドライバーは特定のPCIカードタイプに対してneeds_fresetビットを設定します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+       /* Set EEH reset type to fundamental if required by hba  */
++       if (IS_QLA24XX(ha) || IS_QLA25XX(ha) || IS_QLA81XX(ha))
++               pdev-&gt;needs_freset = 1;
++
+</pre></div>
+</div>
+<p>プラットフォームはステップ5（再開処理）またはステップ6（永久的な失敗）に進みます。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>現在のpowerpc実装では、ドライバーがPCI_ERS_RESULT_DISCONNECTを返した場合、電源サイクルリセットを試みません。しかし、おそらく試すべきです。</p>
+</div>
+</section>
+<section id="step-5-resume-operations">
+<h3><span class="section-number">7.1.6. </span>ステップ5: 再開処理<a class="headerlink" href="#step-5-resume-operations" title="この見出しへのパーマリンク">¶</a></h3>
+<p>すべてのドライバーが前の3つのコールバックのいずれかからPCI_ERS_RESULT_RECOVEREDを返した場合、プラットフォームは影響を受けたすべてのデバイスドライバーにresume()コールバックを呼び出します。このコールバックの目的は、ドライバーに処理を再開させ、すべてが正常に戻ったことを通知することです。このコールバックは結果コードを返しません。</p>
+<p>この時点で新たなエラーが発生した場合、プラットフォームは新しいエラー回復シーケンスを再開します。</p>
+</section>
+<section id="step-6-permanent-failure">
+<h3><span class="section-number">7.1.7. </span>ステップ6: 永久的な失敗<a class="headerlink" href="#step-6-permanent-failure" title="この見出しへのパーマリンク">¶</a></h3>
+<p>「永久的な失敗」が発生し、プラットフォームがデバイスを回復できなくなった場合、プラットフォームはpci_channel_state_t値としてpci_channel_io_perm_failureを指定してerror_detected()を呼び出します。</p>
+<p>この時点で、ドライバーは最悪の事態を想定すべきです。すべての待機中のI/Oをキャンセルし、新しいI/Oを拒否して上位レイヤーに-EIOを返す必要があります。その後、ドライバーはすべてのメモリをクリーンアップし、カーネル操作から自身を削除する必要があります。システムシャットダウン時に同様の処理を行います。</p>
+<p>プラットフォームは通常、システムオペレータに永続的な故障の発生を何らかの方法で通知します。デバイスがホットプラグ可能である場合、オペレータはおそらくデバイスを外して交換したいでしょう。ただし、注意すべきは、すべての故障が本当に「永続的」であるとは限らないということです。一部は過熱によって、一部は挿し込みが不完全なカードによって引き起こされます。多くのPCIエラーイベントはソフトウェアのバグによって引き起こされます。たとえば、DMAが不正なアドレスに送られるか、プログラミングエラーによる偽の分割トランザクションなどがその例です。詳細については、powerpc/eeh-pci-error-recovery.txtで議論されている内容を参照してください。</p>
+</section>
+<section id="conclusion-general-remarks">
+<h3><span class="section-number">7.1.8. </span>結論；一般的な注意事項<a class="headerlink" href="#conclusion-general-remarks" title="この見出しへのパーマリンク">¶</a></h3>
+<p>コールバックが呼ばれる方法はプラットフォームのポリシーです。スロットリセット機能を持たないプラットフォームは、回復できないドライバー（接続を解除）を無視し、同一セグメントの他のカードが回復できるように試みるかもしれません。ただし、実際のケースでは、セグメントごとに1つのドライバーしか存在しないことが一般的です。</p>
+<p>では、割り込みについての注意点を述べます。割り込みが発生し、デバイスが死んでいたり孤立している場合、問題があります :) 現在のポリシーはこれをプラットフォームのポリシーに依存させることです。つまり、回復APIは以下の点を要求します：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>セグメント内のエラー検出から、スロットリセットコールバックが呼ばれるまで、どのデバイスからも割り込み配信が行われる保証はありません。スロットリセットコールバックが呼ばれた時点で、割り込みが完全に動作しているものと期待されます。</p></li>
+<li><p>割り込み配信が停止している保証はありません。つまり、エラーを検出した後で割り込みを受け取るドライバー、または割り込みハンドラ内でエラーを検出し、適切な割り込み確認（ACK）が行われず、その原因を除去できない場合、単にIRQ_NOTHANDLEDを返すべきです。この状態の処理はプラットフォームに依存します。通常は、エラー処理中にIRQソースをマスクします。プラットフォームは、エラー管理可能なスロットに割り当てられている割り込みを知っていると期待され、エラー処理中にそのIRQ番号を一時的に無効にする必要があります（これは非常に複雑ではありません）。これにより、他のデバイスが共有する割り込みに対して一時的な遅延が生じますが、これ以外の方法は存在しません。高品質なプラットフォームは本来、多数のデバイス間で割り込みを共有しないはずです :)</p></li>
+</ul>
+</div></blockquote>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>powerpcプラットフォームの実装詳細については、以下のファイルで説明されています <a class="reference internal" href="../powerpc/eeh-pci-error-recovery.html"><span class="doc">PCIバスEEHエラー回復</span></a></p>
+<p>この執筆時点では、エラー回復を実装するパッチを含むデバイスドライバーのリストが増加しています。ただし、すべてのパッチがメインラインに含まれているわけではありません。これらは「例」として使用できます：</p>
+<ul class="simple">
+<li><p>drivers/scsi/ipr</p></li>
+<li><p>drivers/scsi/sym53c8xx_2</p></li>
+<li><p>drivers/scsi/qla2xxx</p></li>
+<li><p>drivers/scsi/lpfc</p></li>
+<li><p>drivers/next/bnx2.c</p></li>
+<li><p>drivers/next/e100.c</p></li>
+<li><p>drivers/net/e1000</p></li>
+<li><p>drivers/net/e1000e</p></li>
+<li><p>drivers/net/ixgb</p></li>
+<li><p>drivers/net/ixgbe</p></li>
+<li><p>drivers/net/cxgb3</p></li>
+<li><p>drivers/net/s2io.c</p></li>
+</ul>
+</div>
+</section>
+<section id="the-end">
+<h3><span class="section-number">7.1.9. </span>終わり<a class="headerlink" href="#the-end" title="この見出しへのパーマリンク">¶</a></h3>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linux PCIバスサブシステム</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="pci.html">1. Linux PCIドライバの作成方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pciebus-howto.html">2. PCI ExpressポートバスドライバガイドHOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pci-iov-howto.html">3. PCI Express I/O仮想化HOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="msi-howto.html">4. MSIドライバガイドHOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysfs-pci.html">5. sysfsを通じたPCIデバイスリソースのアクセス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="acpi-info.html">6. PCIホストブリッジにおけるACPIの考慮事項</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">7. PCIエラー回復</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pcieaer-howto.html">8. PCI Express高度エラーレポートドライバガイドHOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="endpoint/index.html">9. PCIエンドポイントフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="boot-interrupts.html">10. ブート割込み</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linux PCIバスサブシステム</a><ul>
+<li>前へ: <a href="acpi-info.html" title="前章"><span class="section-number">6. </span>PCIホストブリッジに関するACPIの考慮事項</a></li>
+<li>次へ: <a href="pcieaer-howto.html" title="次章"><span class="section-number">8. </span>PCI Expressの高度なエラー報告ドライバガイドハウツー</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/PCI/pci-error-recovery.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

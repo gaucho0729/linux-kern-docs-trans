@@ -1,0 +1,513 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>RCU を使って読み取りが主なリンクリストを保護する — Linux Kernel ドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="NMI-RCU.html" rel="next" title="RCUを用いて動的NMIハンドラを保護する"/>
+<link href="stallwarn.html" rel="prev" title="RCUのCPUストール検出機能の使用方法"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="using-rcu-to-protect-read-mostly-linked-lists">
+<span id="list-rcu-doc"></span><h1>RCUを用いた読み込みが主なリンクリストの保護<a class="headerlink" href="#using-rcu-to-protect-read-mostly-linked-lists" title="この見出しへのパーマリンク">¶</a></h1>
+<p>RCU の最も効果的な応用の一つは、読み取りが主なリンクリストを保護することです（<code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">list_head</span></code> list.h に記載されています）。このアプローチの大きな利点は、リストマクロに必要なメモリバリアがすべて含まれていることです。このドキュメントでは、RCU のいくつかの応用例を紹介します。特に重要な応用例から順に説明します。</p>
+<section id="example-1-read-mostly-list-deferred-destruction">
+<h2>例1: 読み込み中心リスト: 延期された破壊<a class="headerlink" href="#example-1-read-mostly-list-deferred-destruction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>カーネル内の RCU リストの一般的な用途の一つは、システム内のすべてのプロセスをロックなしで反復処理することです。 <code class="docutils literal notranslate"><span class="pre">task_struct::tasks</span></code> これはすべてのプロセスをリンクするリストノードを表します。リストは、リストの追加や削除と並行してトラバースできます。</p>
+<p>リストのトラバースは、以下の 2 つのマクロによって行われます。 <code class="docutils literal notranslate"><span class="pre">for_each_process()</span></code> 以下の 2 つのマクロによって定義されています：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#define next_task(p) \
+        list_entry_rcu((p)-&gt;tasks.next, struct task_struct, tasks)
+
+#define for_each_process(p) \
+        for (p = &amp;init_task ; (p = next_task(p)) != &amp;init_task ; )
+</pre></div>
+</div>
+<p>すべてのプロセスのリストをトラバースするコードは通常、以下のように見えます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>rcu_read_lock();
+for_each_process(p) {
+        /* Do something with p */
+}
+rcu_read_unlock();
+</pre></div>
+</div>
+<p>タスクリストからプロセスを削除する簡略化されたコードは以下です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void release_task(struct task_struct *p)
+{
+        write_lock(&amp;tasklist_lock);
+        list_del_rcu(&amp;p-&gt;tasks);
+        write_unlock(&amp;tasklist_lock);
+        call_rcu(&amp;p-&gt;rcu, delayed_put_task_struct);
+}
+</pre></div>
+</div>
+<p>プロセスが終了するとき、 <code class="docutils literal notranslate"><span class="pre">release_task()</span></code> 呼び出します <code class="docutils literal notranslate"><span class="pre">list_del_rcu(&amp;p-&gt;tasks)</span></code> の下で
+<code class="docutils literal notranslate"><span class="pre">tasklist_lock</span></code> ライターロック保護の下で、すべてのタスクリストからタスクを削除します。この <code class="docutils literal notranslate"><span class="pre">tasklist_lock</span></code> リストの同時追加/削除によるリストの破壊を防ぎます。読者で <code class="docutils literal notranslate"><span class="pre">for_each_process()</span></code> は、以下の <code class="docutils literal notranslate"><span class="pre">tasklist_lock</span></code>。リストポインタの変更を読者に認識させないために、 <code class="docutils literal notranslate"><span class="pre">task_struct</span></code> オブジェクトは、1つ以上のグレース期間が経過した後でしか解放されません（ <a class="reference internal" href="../core-api/kernel-api.html#c.call_rcu" title="call_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">call_rcu()</span></code></a>）。この遅延された破壊により、リストをトラバースしている読者は常に有効な <code class="docutils literal notranslate"><span class="pre">p-&gt;tasks.next</span></code>
+ポインタを参照でき、リストのトラバースと同時に削除/解放が行われます。このパターンはまた、 <strong>存在ロック</strong>と呼ばれます。RCU は、すべての既存の読者が終了するまでオブジェクトをメモリにピンします。</p>
+</section>
+<section id="example-2-read-side-action-taken-outside-of-lock-no-in-place-updates">
+<h2>例2: ロック外での読み込み側アクション: 場所内更新なし<a class="headerlink" href="#example-2-read-side-action-taken-outside-of-lock-no-in-place-updates" title="この見出しへのパーマリンク">¶</a></h2>
+<p>最も効果的な応用例は、読者-ライターロックを使用した場合、検索結果に基づいて行動を取る前に読み取り側のロックを解除するケースです。最も有名な例はルーティングテーブルです。ルーティングテーブルはコンピュータ外の機器の状態を追跡しているため、時折古いデータを含むことがあります。したがって、ルートが計算された後は、パケットの送信中にルーティングテーブルを静的保持する必要はありません。畢竟、ルーティングテーブルを静的保持しても、外部インターネットの変化は防げません。実際には外部インターネットの状態が重要です。さらに、ルーティングエントリは通常、追加または削除されることが多いですが、場所を変更するのではなく、直接編集されることが多いです。</p>
+<p>この RCU の使用例は、システムコールの監査サポートに見られます。例えば、読者-ライターロックを使用した実装は以下のようにされます： <code class="docutils literal notranslate"><span class="pre">audit_filter_task()</span></code> 以下のようにされます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static enum audit_state audit_filter_task(struct task_struct *tsk)
+{
+        struct audit_entry *e;
+        enum audit_state   state;
+
+        read_lock(&amp;auditsc_lock);
+        /* Note: audit_filter_mutex held by caller. */
+        list_for_each_entry(e, &amp;audit_tsklist, list) {
+                if (audit_filter_rules(tsk, &amp;e-&gt;rule, NULL, &amp;state)) {
+                        read_unlock(&amp;auditsc_lock);
+                        return state;
+                }
+        }
+        read_unlock(&amp;auditsc_lock);
+        return AUDIT_BUILD_CONTEXT;
+}
+</pre></div>
+</div>
+<p>ここでリストはロックの下で検索されますが、対応する値が返される前にロックは解除されます。この値が処理されるまでに、リストはすでに変更されている可能性があります。これは、監査をオフにしている場合、いくつかの追加のシステムコールを監査しても問題ないため、理にかなっています。</p>
+<p>これは、読み取り側にRCUを簡単に適用できる理由です。以下のようにします：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static enum audit_state audit_filter_task(struct task_struct *tsk)
+{
+        struct audit_entry *e;
+        enum audit_state   state;
+
+        rcu_read_lock();
+        /* Note: audit_filter_mutex held by caller. */
+        list_for_each_entry_rcu(e, &amp;audit_tsklist, list) {
+                if (audit_filter_rules(tsk, &amp;e-&gt;rule, NULL, &amp;state)) {
+                        rcu_read_unlock();
+                        return state;
+                }
+        }
+        rcu_read_unlock();
+        return AUDIT_BUILD_CONTEXT;
+}
+</pre></div>
+</div>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">read_lock()</span></code> および <code class="docutils literal notranslate"><span class="pre">read_unlock()</span></code> 呼び出しはそれぞれ、そして <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_read_lock" title="rcu_read_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code></a>
+および <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_read_unlock" title="rcu_read_unlock"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code></a>の部分で、 <a class="reference internal" href="../core-api/kernel-api.html#c.list_for_each_entry" title="list_for_each_entry"><code class="xref c c-func docutils literal notranslate"><span class="pre">list_for_each_entry()</span></code></a> はそれぞれ、そして <a class="reference internal" href="../core-api/kernel-api.html#c.list_for_each_entry_rcu" title="list_for_each_entry_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">list_for_each_entry_rcu()</span></code></a>の部分で、 <strong>_rcu()</strong> リストトラバーサルプリミティブは、DEC Alpha CPUで必要となる読み取り側のメモリバリアを挿入します。</p>
+<p>更新側の変更も簡単です。削除や挿入の処理にはリーダーライターロックを以下のように使用できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static inline int audit_del_rule(struct audit_rule *rule,
+                                 struct list_head *list)
+{
+        struct audit_entry *e;
+
+        write_lock(&amp;auditsc_lock);
+        list_for_each_entry(e, list, list) {
+                if (!audit_compare_rule(rule, &amp;e-&gt;rule)) {
+                        list_del(&amp;e-&gt;list);
+                        write_unlock(&amp;auditsc_lock);
+                        return 0;
+                }
+        }
+        write_unlock(&amp;auditsc_lock);
+        return -EFAULT;         /* No matching rule */
+}
+
+static inline int audit_add_rule(struct audit_entry *entry,
+                                 struct list_head *list)
+{
+        write_lock(&amp;auditsc_lock);
+        if (entry-&gt;rule.flags &amp; AUDIT_PREPEND) {
+                entry-&gt;rule.flags &amp;= ~AUDIT_PREPEND;
+                list_add(&amp;entry-&gt;list, list);
+        } else {
+                list_add_tail(&amp;entry-&gt;list, list);
+        }
+        write_unlock(&amp;auditsc_lock);
+        return 0;
+}
+</pre></div>
+</div>
+<p>これらの2つの関数のRCUの同等物は以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static inline int audit_del_rule(struct audit_rule *rule,
+                                 struct list_head *list)
+{
+        struct audit_entry *e;
+
+        /* No need to use the _rcu iterator here, since this is the only
+         * deletion routine. */
+        list_for_each_entry(e, list, list) {
+                if (!audit_compare_rule(rule, &amp;e-&gt;rule)) {
+                        list_del_rcu(&amp;e-&gt;list);
+                        call_rcu(&amp;e-&gt;rcu, audit_free_rule);
+                        return 0;
+                }
+        }
+        return -EFAULT;         /* No matching rule */
+}
+
+static inline int audit_add_rule(struct audit_entry *entry,
+                                 struct list_head *list)
+{
+        if (entry-&gt;rule.flags &amp; AUDIT_PREPEND) {
+                entry-&gt;rule.flags &amp;= ~AUDIT_PREPEND;
+                list_add_rcu(&amp;entry-&gt;list, list);
+        } else {
+                list_add_tail_rcu(&amp;entry-&gt;list, list);
+        }
+        return 0;
+}
+</pre></div>
+</div>
+<p>通常、 <code class="docutils literal notranslate"><span class="pre">write_lock()</span></code> および <code class="docutils literal notranslate"><span class="pre">write_unlock()</span></code> はspin_lock()とspin_unlock()に置き換えられますが、この場合、すべての呼び出し元が
+<code class="docutils literal notranslate"><span class="pre">audit_filter_mutex</span></code>を保持しているため、追加のロックは必要ありません。したがって、
+<code class="docutils literal notranslate"><span class="pre">auditsc_lock</span></code> は不要となり、RCUの使用によりライターサイドがリーダーを排他する必要がなくなるためです。</p>
+<p>以下の <a class="reference internal" href="../core-api/kernel-api.html#c.list_del" title="list_del"><code class="xref c c-func docutils literal notranslate"><span class="pre">list_del()</span></code></a>, <a class="reference internal" href="../core-api/kernel-api.html#c.list_add" title="list_add"><code class="xref c c-func docutils literal notranslate"><span class="pre">list_add()</span></code></a>, and <a class="reference internal" href="../core-api/kernel-api.html#c.list_add_tail" title="list_add_tail"><code class="xref c c-func docutils literal notranslate"><span class="pre">list_add_tail()</span></code></a> プリミティブは <a class="reference internal" href="../core-api/kernel-api.html#c.list_del_rcu" title="list_del_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">list_del_rcu()</span></code></a>, <a class="reference internal" href="../core-api/kernel-api.html#c.list_add_rcu" title="list_add_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">list_add_rcu()</span></code></a>, and <a class="reference internal" href="../core-api/kernel-api.html#c.list_add_tail_rcu" title="list_add_tail_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">list_add_tail_rcu()</span></code></a>の部分で、 <strong>_rcu()</strong> リスト操作プリミティブは、弱い順序性を持つCPU（ほとんどのCPU）で必要なメモリバリアを追加します。また、 <a class="reference internal" href="../core-api/kernel-api.html#c.list_del_rcu" title="list_del_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">list_del_rcu()</span></code></a> プリミティブは、それ以外にコンカレンテッドリーダーが劇的に失敗する可能性があるポインタ毒化デバッグ支援コードを省略しています。</p>
+<p>したがって、リーダーが古データを許容できる場合、またエントリが場所を変えていない場合に追加または削除される場合、RCUは非常に簡単に使用できます！</p>
+</section>
+<section id="example-3-handling-in-place-updates">
+<h2>例3: 場所内更新の処理<a class="headerlink" href="#example-3-handling-in-place-updates" title="この見出しへのパーマリンク">¶</a></h2>
+<p>システムコール監査コードは、監査ルールを場所を変えて更新しません。しかし、もし更新する場合、その処理を行うリーダーライターロックコードは以下のようになるかもしれません（のみが更新されるものと仮定）： <code class="docutils literal notranslate"><span class="pre">field_count</span></code> が更新される場合、それ以外の追加フィールドは埋め込まれる必要があります）：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static inline int audit_upd_rule(struct audit_rule *rule,
+                                 struct list_head *list,
+                                 __u32 newaction,
+                                 __u32 newfield_count)
+{
+        struct audit_entry *e;
+        struct audit_entry *ne;
+
+        write_lock(&amp;auditsc_lock);
+        /* Note: audit_filter_mutex held by caller. */
+        list_for_each_entry(e, list, list) {
+                if (!audit_compare_rule(rule, &amp;e-&gt;rule)) {
+                        e-&gt;rule.action = newaction;
+                        e-&gt;rule.field_count = newfield_count;
+                        write_unlock(&amp;auditsc_lock);
+                        return 0;
+                }
+        }
+        write_unlock(&amp;auditsc_lock);
+        return -EFAULT;         /* No matching rule */
+}
+</pre></div>
+</div>
+<p>RCUバージョンはコピーを作成し、コピーを更新し、古いエントリを新しい更新されたエントリで置き換えます。この操作は、コピーを作成して更新を行う間に並行して読み取りを許容するため、RCU（<em>read-copy update</em>）という名前が付けられています。RCUコードは以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static inline int audit_upd_rule(struct audit_rule *rule,
+                                 struct list_head *list,
+                                 __u32 newaction,
+                                 __u32 newfield_count)
+{
+        struct audit_entry *e;
+        struct audit_entry *ne;
+
+        list_for_each_entry(e, list, list) {
+                if (!audit_compare_rule(rule, &amp;e-&gt;rule)) {
+                        ne = kmalloc(sizeof(*entry), GFP_ATOMIC);
+                        if (ne == NULL)
+                                return -ENOMEM;
+                        audit_copy_rule(&amp;ne-&gt;rule, &amp;e-&gt;rule);
+                        ne-&gt;rule.action = newaction;
+                        ne-&gt;rule.field_count = newfield_count;
+                        list_replace_rcu(&amp;e-&gt;list, &amp;ne-&gt;list);
+                        call_rcu(&amp;e-&gt;rcu, audit_free_rule);
+                        return 0;
+                }
+        }
+        return -EFAULT;         /* No matching rule */
+}
+</pre></div>
+</div>
+<p>また、このコードは呼び出し元が <code class="docutils literal notranslate"><span class="pre">audit_filter_mutex</span></code>を保持していることを前提としています。通常、ライターロックはこの種のコードではスピンロックになります。</p>
+<p>このパターンの他の用途は、openswitchドライバの <em>接続トラッキングテーブル</em> コードの <code class="docutils literal notranslate"><span class="pre">ct_limit_set()</span></code>です。このテーブルは接続トラッキングエントリを保持し、最大エントリ数の制限があります。ゾーンごとにこのようなテーブルがあり、したがって各ゾーンごとに <em>制限</em> があります。ゾーンはハッシュチェーン用のRCU管理ハッシュリストを使用してハッシュテーブルを通してその制限にマッピングされます。新しい制限が設定されるとき、新しい制限オブジェクトが割り当てられ、 <code class="docutils literal notranslate"><span class="pre">ct_limit_set()</span></code> が呼ばれて古い制限オブジェクトが新しいオブジェクトで置き換えられます。 <a class="reference internal" href="../core-api/kernel-api.html#c.list_replace_rcu" title="list_replace_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">list_replace_rcu()</span></code></a>古い制限オブジェクトは、クレーム期間の後に使用してから解放されます。 <a class="reference internal" href="../core-api/kernel-api.html#c.kfree_rcu" title="kfree_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">kfree_rcu()</span></code></a>.</p>
+</section>
+<section id="example-4-eliminating-stale-data">
+<h2>例4: 古いデータの除去<a class="headerlink" href="#example-4-eliminating-stale-data" title="この見出しへのパーマリンク">¶</a></h2>
+<p>監査の例では古データを許容していますが、外部状態を追跡するほとんどのアルゴリズムも同様です。Linuxが外部状態の変化を認識するまでに遅延があるため、RCUによって引き起こされる追加の古データは一般的に問題ではありません。</p>
+<p>ただし、古データを許容できない例は多くあります。Linuxカーネルの例としてSystem V IPC（ipc/shm.cのshm_lock関数を参照）があります。このコードは、各エントリのスピンロックの下にある <em>削除</em> フラグを確認し、 <em>削除</em> フラグが設定されている場合、エントリが存在しないかのように装います。この処理が有効なのは、検索関数が各エントリのスピンロックを保持しながら戻る必要があるからです。</p>
+<dl class="simple" id="quick-quiz">
+<dt>クイズ：</dt><dd><p>削除フラグの技術が有効なのはなぜ、検索関数から戻る際には各エントリのロックを保持する必要があるのでしょうか？</p>
+</dd>
+</dl>
+<p><a class="reference internal" href="#quick-quiz-answer"><span class="std std-ref">クイズへの答え</span></a></p>
+<p>システムコール監査モジュールが古データを拒否する必要が生じた場合、一つの方法はaudit_entry構造体に <code class="docutils literal notranslate"><span class="pre">deleted</span></code> フラグと <code class="docutils literal notranslate"><span class="pre">lock</span></code> スピンロックを追加し、 <code class="docutils literal notranslate"><span class="pre">audit_filter_task()</span></code> 以下のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static enum audit_state audit_filter_task(struct task_struct *tsk)
+{
+        struct audit_entry *e;
+        enum audit_state   state;
+
+        rcu_read_lock();
+        list_for_each_entry_rcu(e, &amp;audit_tsklist, list) {
+                if (audit_filter_rules(tsk, &amp;e-&gt;rule, NULL, &amp;state)) {
+                        spin_lock(&amp;e-&gt;lock);
+                        if (e-&gt;deleted) {
+                                spin_unlock(&amp;e-&gt;lock);
+                                rcu_read_unlock();
+                                return AUDIT_BUILD_CONTEXT;
+                        }
+                        rcu_read_unlock();
+                        return state;
+                }
+        }
+        rcu_read_unlock();
+        return AUDIT_BUILD_CONTEXT;
+}
+</pre></div>
+</div>
+<p>audit_entry構造体を修正することです。注意点として、この例はエントリが追加または削除されるものと仮定しており、場所を更新する操作を処理するためには追加のメカニズムが必要です。 <code class="docutils literal notranslate"><span class="pre">audit_upd_rule()</span></code>一つの点として、 <code class="docutils literal notranslate"><span class="pre">audit_upd_rule()</span></code> には追加のメモリバリアが必要で、 <a class="reference internal" href="../core-api/kernel-api.html#c.list_add_rcu" title="list_add_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">list_add_rcu()</span></code></a> が本当に実行される前に <a class="reference internal" href="../core-api/kernel-api.html#c.list_del_rcu" title="list_del_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">list_del_rcu()</span></code></a>.</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">audit_del_rule()</span></code> 関数はスピンロックの下でフラグを設定する必要があります。以下のように: <code class="docutils literal notranslate"><span class="pre">deleted</span></code> flag under the spinlock as follows:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static inline int audit_del_rule(struct audit_rule *rule,
+                                 struct list_head *list)
+{
+        struct audit_entry *e;
+
+        /* No need to use the _rcu iterator here, since this
+         * is the only deletion routine. */
+        list_for_each_entry(e, list, list) {
+                if (!audit_compare_rule(rule, &amp;e-&gt;rule)) {
+                        spin_lock(&amp;e-&gt;lock);
+                        list_del_rcu(&amp;e-&gt;list);
+                        e-&gt;deleted = 1;
+                        spin_unlock(&amp;e-&gt;lock);
+                        call_rcu(&amp;e-&gt;rcu, audit_free_rule);
+                        return 0;
+                }
+        }
+        return -EFAULT;         /* No matching rule */
+}
+</pre></div>
+</div>
+<p>This too assumes that the caller holds <code class="docutils literal notranslate"><span class="pre">audit_filter_mutex</span></code>.</p>
+</section>
+<section id="example-5-skipping-stale-objects">
+<h2>例5: 古いオブジェクトのスキップ<a class="headerlink" href="#example-5-skipping-stale-objects" title="この見出しへのパーマリンク">¶</a></h2>
+<p>This too assumes that the caller holds <code class="docutils literal notranslate"><span class="pre">CLOCK_REALTIME</span></code> For some usecases, reader performance can be improved by skipping stale objects during read-side list traversal if the object in concern is pending destruction after one or more grace periods. One such example can be found in the timerfd subsystem. When a <code class="docutils literal notranslate"><span class="pre">cancel_list</span></code> clock is reprogrammed - for example due to setting of the system time, then all programmed timerfds that depend on this clock get triggered and processes waiting on them to expire are woken up in advance of their scheduled expiry. To facilitate this, all such timers are added to an RCU-managed
+<code class="docutils literal notranslate"><span class="pre">timerfd_setup_cancel()</span></code>:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static void timerfd_setup_cancel(struct timerfd_ctx *ctx, int flags)
+{
+        spin_lock(&amp;ctx-&gt;cancel_lock);
+        if ((ctx-&gt;clockid == CLOCK_REALTIME &amp;&amp;
+            (flags &amp; TFD_TIMER_ABSTIME) &amp;&amp; (flags &amp; TFD_TIMER_CANCEL_ON_SET)) {
+                if (!ctx-&gt;might_cancel) {
+                        ctx-&gt;might_cancel = true;
+                        spin_lock(&amp;cancel_lock);
+                        list_add_rcu(&amp;ctx-&gt;clist, &amp;cancel_list);
+                        spin_unlock(&amp;cancel_lock);
+                }
+        }
+        spin_unlock(&amp;ctx-&gt;cancel_lock);
+}
+</pre></div>
+</div>
+<p>when they are setup in <code class="docutils literal notranslate"><span class="pre">might_cancel</span></code> When a timerfd is freed (fd is closed), then the <code class="docutils literal notranslate"><span class="pre">cancel_list</span></code> flag of the timerfd object is cleared, the object removed from the</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int timerfd_release(struct inode *inode, struct file *file)
+{
+        struct timerfd_ctx *ctx = file-&gt;private_data;
+
+        spin_lock(&amp;ctx-&gt;cancel_lock);
+        if (ctx-&gt;might_cancel) {
+                ctx-&gt;might_cancel = false;
+                spin_lock(&amp;cancel_lock);
+                list_del_rcu(&amp;ctx-&gt;clist);
+                spin_unlock(&amp;cancel_lock);
+        }
+        spin_unlock(&amp;ctx-&gt;cancel_lock);
+
+        hrtimer_cancel(&amp;ctx-&gt;t.tmr);
+        kfree_rcu(ctx, rcu);
+        return 0;
+}
+</pre></div>
+</div>
+<p>もし <code class="docutils literal notranslate"><span class="pre">CLOCK_REALTIME</span></code> and destroyed: <code class="docutils literal notranslate"><span class="pre">timerfd_clock_was_set()</span></code> clock is set, for example by a time server, the hrtimer framework calls
+<code class="docutils literal notranslate"><span class="pre">cancel_list</span></code> which walks the <code class="docutils literal notranslate"><span class="pre">cancel_list</span></code>and wakes up processes waiting on the timerfd. While iterating the <code class="docutils literal notranslate"><span class="pre">might_cancel</span></code> flag is consulted to skip stale objects:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void timerfd_clock_was_set(void)
+{
+        struct timerfd_ctx *ctx;
+        unsigned long flags;
+
+        rcu_read_lock();
+        list_for_each_entry_rcu(ctx, &amp;cancel_list, clist) {
+                if (!ctx-&gt;might_cancel)
+                        continue;
+                spin_lock_irqsave(&amp;ctx-&gt;wqh.lock, flags);
+                if (ctx-&gt;moffs != ktime_mono_to_real(0)) {
+                        ctx-&gt;moffs = KTIME_MAX;
+                        ctx-&gt;ticks++;
+                        wake_up_locked_poll(&amp;ctx-&gt;wqh, EPOLLIN);
+                }
+                spin_unlock_irqrestore(&amp;ctx-&gt;wqh.lock, flags);
+        }
+        rcu_read_unlock();
+}
+</pre></div>
+</div>
+<p>The key point here is, because RCU-traversal of the <code class="docutils literal notranslate"><span class="pre">cancel_list</span></code> リストにオブジェクトが追加または削除されている間、トラバーサル中にリストから削除されたオブジェクトにアクセスしてしまうことがあります。この例では、このようなオブジェクトはフラグを使用してスキップする方が良いことが示されています。</p>
+</section>
+<section id="summary">
+<h2>Summary<a class="headerlink" href="#summary" title="この見出しへのパーマリンク">¶</a></h2>
+<p>古くなったデータを許容できる読み取りが主なリストベースのデータ構造はRCUの使用に最も適しています。最も単純なケースは、データ構造にエントリが追加または削除される（または場所を変えて原子的に行われる修正される）場合ですが、非原子的な場所の修正はコピーを作成して修正し、その後オリジナルをコピーに置き換えることで処理できます。古くなったデータを許容できない場合、 <em>削除</em> フラグを各エントリごとのスピンロックと併用することで、検索関数が新たに削除されたデータを拒否できるようにします。</p>
+<dl id="quick-quiz-answer">
+<dt>クイッククイズの答え:</dt><dd><p>削除フラグの技術が有効なのはなぜ、検索関数から戻る際には各エントリのロックを保持する必要があるのでしょうか？</p>
+<p>検索関数が返す前に各エントリごとのロックを解放してしまうと、呼び出し元は常に古くなったデータを処理することになります。古くなったデータを処理しても問題ない場合、フラグは必要ありません。古くなったデータの処理が問題になる場合は、返却された値を使用するすべてのコードで各エントリごとのロックを保持する必要があります。
+<em>削除</em> flag. 古くなったデータの処理が本当に問題になる場合は、返却された値を使用するすべてのコードで各エントリごとのロックを保持する必要があります。</p>
+</dd>
+</dl>
+<p><a class="reference internal" href="#quick-quiz"><span class="std std-ref">クイッククイズに戻る</span></a></p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#core-utilities">Core utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#data-structures-and-low-level-utilities">Data structures and low-level utilities</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="../core-api/index.html#concurrency-primitives">Concurrency primitives</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#low-level-hardware-management">Low-level hardware management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#memory-management">Memory management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#interfaces-for-kernel-debugging">Interfaces for kernel debugging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#everything-else">Everything else</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../core-api/index.html">コアAPIドキュメント</a><ul>
+<li><a href="index.html">RCU concepts</a><ul>
+<li>前へ: <a href="stallwarn.html" title="前章">RCUのCPUストール検出機能の使用方法</a></li>
+<li>次へ: <a href="NMI-RCU.html" title="次章">RCUを用いて動的NMIハンドラを保護する</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/RCU/listRCU.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

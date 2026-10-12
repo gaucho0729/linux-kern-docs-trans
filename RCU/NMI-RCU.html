@@ -1,0 +1,243 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>RCUを用いて動的NMIハンドラを保護する — Linux Kernelドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="UP.html" rel="next" title="単一プロセッサシステムにおけるRCU"/>
+<link href="listRCU.html" rel="prev" title="RCUを用いた読み込みが主なリンクリストの保護"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="using-rcu-to-protect-dynamic-nmi-handlers">
+<span id="nmi-rcu-doc"></span><h1>RCUを用いて動的NMIハンドラを保護する<a class="headerlink" href="#using-rcu-to-protect-dynamic-nmi-handlers" title="この見出しへのパーマリンク">¶</a></h1>
+<p>RCUは通常、読み取り専用データ構造を保護するために使用されるが、動的でマスク不可な割り込みハンドラや動的IRQハンドラを提供することも可能である。このドキュメントでは、Zwane MwaikamboのNMIタイマーワークを参考に、arch/x86/oprofile/nmi_timer_int.cおよびarch/x86/kernel/traps.cからどのように実装するかを説明する。</p>
+<p>関連するコードの一部は以下にリストアップされており、それぞれに簡単な説明が付いています：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static int dummy_nmi_callback(struct pt_regs *regs, int cpu)
+{
+        return 0;
+}
+</pre></div>
+</div>
+<p>dummy_nmi_callback()関数は、何も実行せずゼロを返す「ダミー」NMIハンドラであり、これによりNMIハンドラがデフォルトのマシン固有の動作を実行できるようにする。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static nmi_callback_t nmi_callback = dummy_nmi_callback;
+</pre></div>
+</div>
+<p>nmi_callback変数は、現在のNMIハンドラへのグローバルな関数ポインタである。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void do_nmi(struct pt_regs * regs, long error_code)
+{
+        int cpu;
+
+        nmi_enter();
+
+        cpu = smp_processor_id();
+        ++nmi_count(cpu);
+
+        if (!rcu_dereference_sched(nmi_callback)(regs, cpu))
+                default_do_nmi(regs);
+
+        nmi_exit();
+}
+</pre></div>
+</div>
+<p>do_nmi()関数は各NMIを処理する。まずハードウェア割り込みと同じようにプリエンプションを無効化し、各CPUごとのNMIカウントをインクリメントする。次にnmi_callback関数ポインタに保存されたNMIハンドラを呼び出す。このハンドラがゼロを返す場合、do_nmi()関数はデフォルトのmachine-specific NMIを処理するdefault_do_nmi()関数を呼び出す。最後にプリエンプションを復元する。</p>
+<p>理論上、 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_dereference_sched" title="rcu_dereference_sched"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_dereference_sched()</span></code></a> は必要ありません。このコードはi386のみで実行されるため、理論上は必要ありません。 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_dereference_sched" title="rcu_dereference_sched"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_dereference_sched()</span></code></a>
+しかし、実際にはAlphaや、積極的な最適化コンパイラを持つシステムで同様の処理を行う人にとって、ドキュメンテーションの補助として役立ちます。</p>
+<dl class="simple">
+<dt>クイズ：</dt><dd><p>なぜ...が必要なのでしょうか？ <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_dereference_sched" title="rcu_dereference_sched"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_dereference_sched()</span></code></a> ポインタで参照されるコードが読み取り専用であるにもかかわらず、Alphaで必要なのでしょうか？</p>
+</dd>
+</dl>
+<p><a class="reference internal" href="#answer-quick-quiz-nmi"><span class="std std-ref">クイズへの答え</span></a></p>
+<p>NMIとRCUに関する議論に戻ります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void set_nmi_callback(nmi_callback_t callback)
+{
+        rcu_assign_pointer(nmi_callback, callback);
+}
+</pre></div>
+</div>
+<p>set_nmi_callback()関数はNMIハンドラを登録します。注意点として、コールバックで使用するデータはset_nmi_callback()関数の呼び出しの前には初期化しておく必要があります。書き込みの順序を保証しないアーキテクチャでは、 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_assign_pointer" title="rcu_assign_pointer"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_assign_pointer()</span></code></a> が、NMIハンドラが初期化された値を確認するための保証を提供します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void unset_nmi_callback(void)
+{
+        rcu_assign_pointer(nmi_callback, dummy_nmi_callback);
+}
+</pre></div>
+</div>
+<p>この関数はNMIハンドラをアンレジストします。ただし、他のCPUで現在実行中のNMIハンドラがある可能性があるため、その実行がすべてのCPUで完了するまで、古いNMIハンドラで使用されるデータ構造を解放することはできません。</p>
+<p>これを実現する方法の一つは <a class="reference internal" href="../core-api/kernel-api.html#c.synchronize_rcu" title="synchronize_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code></a>、以下のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>unset_nmi_callback();
+synchronize_rcu();
+kfree(my_nmi_data);
+</pre></div>
+</div>
+<p>これはv4.20以降、 <a class="reference internal" href="../core-api/kernel-api.html#c.synchronize_rcu" title="synchronize_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code></a> が、すべてのCPUがプリエンプションを無効化したコードセグメントを実行完了するのをブロックするためです。NMIハンドラはプリエンプションを無効化するため、 <a class="reference internal" href="../core-api/kernel-api.html#c.synchronize_rcu" title="synchronize_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code></a> は、すべての進行中のNMIハンドラが終了するまで戻らないことが保証されています。したがって、ハンドラのデータをすぐに解放しても安全です。 <a class="reference internal" href="../core-api/kernel-api.html#c.synchronize_rcu" title="synchronize_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code></a> 戻ります。</p>
+<p>重要な注意点: この機能を動作させるには、対象のアーキテクチャがNMIのエントリとエクスイットそれぞれでnmi_enter()とnmi_exit()を呼び出す必要があります。</p>
+<dl id="answer-quick-quiz-nmi">
+<dt>クイッククイズの答え:</dt><dd><p>なぜ...が必要なのでしょうか？ <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_dereference_sched" title="rcu_dereference_sched"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_dereference_sched()</span></code></a> ポインタで参照されるコードが読み取り専用であるにもかかわらず、Alphaで必要なのでしょうか？</p>
+<p>set_nmi_callback()を呼び出した呼び出し元は、新しいNMIハンドラで使用されるデータを初期化している可能性があります。その場合、 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_dereference_sched" title="rcu_dereference_sched"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_dereference_sched()</span></code></a> would be needed, because otherwise a CPU that received an NMI just after the new handler was set might see the pointer to the new NMI handler, but the old pre-initialized version of the handler’s data.</p>
+<p>この同じ悲しい話は、アグレッシブなポインタ値の推測最適化を持つコンパイラを使用している他のCPUでも発生する可能性があります。</p>
+<p>さらに重要なのは、 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_dereference_sched" title="rcu_dereference_sched"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_dereference_sched()</span></code></a> makes it clear to someone reading the code that the pointer is being protected by RCU-sched.</p>
+</dd>
+</dl>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#core-utilities">Core utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#data-structures-and-low-level-utilities">Data structures and low-level utilities</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="../core-api/index.html#concurrency-primitives">Concurrency primitives</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#low-level-hardware-management">Low-level hardware management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#memory-management">Memory management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#interfaces-for-kernel-debugging">Interfaces for kernel debugging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#everything-else">Everything else</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../core-api/index.html">コアAPIドキュメント</a><ul>
+<li><a href="index.html">RCU concepts</a><ul>
+<li>前へ: <a href="listRCU.html" title="前章">RCUを用いた読み込みが主なリンクリストの保護</a></li>
+<li>次へ: <a href="UP.html" title="次章">単一プロセッサシステムにおけるRCU</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/RCU/NMI-RCU.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

@@ -1,0 +1,284 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>リスト/配列の要素に対する参照カウント設計 — Linux Kernel ドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="torture.html" rel="next" title="RCUのストレステスト実行"/>
+<link href="rculist_nulls.html" rel="prev" title="RCU hlist_nullsを使用したリストとオブジェクトの保護"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="reference-count-design-for-elements-of-lists-arrays-protected-by-rcu">
+<h1>RCUで保護されるリスト/配列要素の参照カウント設計<a class="headerlink" href="#reference-count-design-for-elements-of-lists-arrays-protected-by-rcu" title="この見出しへのパーマリンク">¶</a></h1>
+<p>percpu-ref フィーチャーは、参照カウントとRCUを組み合わせる場合の最初の選択肢となる可能性があります。詳細については、include/linux/percpu-refcount.h を参照してください。ただし、percpu-refがメモリを過剰に消費するという極めて特殊なケースでは、以下の説明を参照してください。</p>
+<hr class="docutils"/>
+<p>伝統的なリーダー/ライタースピンロックまたはセマフォで保護されたリストの要素に対する参照カウントは、シンプルです：</p>
+<p>コード例 A:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1.                                      2.
+add()                                   search_and_reference()
+{                                       {
+    alloc_object                            read_lock(&amp;list_lock);
+    ...                                     search_for_element
+    atomic_set(&amp;el-&gt;rc, 1);                 atomic_inc(&amp;el-&gt;rc);
+    write_lock(&amp;list_lock);                  ...
+    add_element                             read_unlock(&amp;list_lock);
+    ...                                     ...
+    write_unlock(&amp;list_lock);          }
+}
+
+3.                                      4.
+release_referenced()                    delete()
+{                                       {
+    ...                                     write_lock(&amp;list_lock);
+    if(atomic_dec_and_test(&amp;el-&gt;rc))        ...
+        kfree(el);
+    ...                                     remove_element
+}                                           write_unlock(&amp;list_lock);
+                                            ...
+                                            if (atomic_dec_and_test(&amp;el-&gt;rc))
+                                                kfree(el);
+                                            ...
+                                        }
+</pre></div>
+</div>
+<p>このリスト/配列がRCUを使用してロックフリー化され、add()とdelete()内のwrite_lock()をspin_lock()に、search_and_reference()内のread_lock()を <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_read_lock" title="rcu_read_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code></a>、search_and_reference()内のatomic_inc()がすでにリスト/配列から削除された要素を参照している可能性があります。このような場合、以下のようにatomic_inc_not_zero()を使用してください：</p>
+<p>コード例 B:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1.                                      2.
+add()                                   search_and_reference()
+{                                       {
+    alloc_object                            rcu_read_lock();
+    ...                                     search_for_element
+    atomic_set(&amp;el-&gt;rc, 1);                 if (!atomic_inc_not_zero(&amp;el-&gt;rc)) {
+    spin_lock(&amp;list_lock);                      rcu_read_unlock();
+                                                return FAIL;
+    add_element                             }
+    ...                                     ...
+    spin_unlock(&amp;list_lock);                rcu_read_unlock();
+}                                       }
+3.                                      4.
+release_referenced()                    delete()
+{                                       {
+    ...                                     spin_lock(&amp;list_lock);
+    if (atomic_dec_and_test(&amp;el-&gt;rc))       ...
+        call_rcu(&amp;el-&gt;head, el_free);       remove_element
+    ...                                     spin_unlock(&amp;list_lock);
+}                                           ...
+                                            if (atomic_dec_and_test(&amp;el-&gt;rc))
+                                                call_rcu(&amp;el-&gt;head, el_free);
+                                            ...
+                                        }
+</pre></div>
+</div>
+<p>時折、更新（書込み）ストリーム内で要素への参照を取得する必要があります。このような場合、atomic_inc_not_zero()は過剰な処理になる可能性があり、更新側のスピンロックを保持しているため、atomic_inc()を使用する方が適切です。</p>
+<p>search_and_reference()のコードパス内で「FAIL」を扱うのは常に便利ではありません。このような場合、atomic_dec_and_test()をdelete()からel_free()に移動するようにしてください：</p>
+<p>コード例 C:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1.                                      2.
+add()                                   search_and_reference()
+{                                       {
+    alloc_object                            rcu_read_lock();
+    ...                                     search_for_element
+    atomic_set(&amp;el-&gt;rc, 1);                 atomic_inc(&amp;el-&gt;rc);
+    spin_lock(&amp;list_lock);                  ...
+
+    add_element                             rcu_read_unlock();
+    ...                                 }
+    spin_unlock(&amp;list_lock);            4.
+}                                       delete()
+3.                                      {
+release_referenced()                        spin_lock(&amp;list_lock);
+{                                           ...
+    ...                                     remove_element
+    if (atomic_dec_and_test(&amp;el-&gt;rc))       spin_unlock(&amp;list_lock);
+        kfree(el);                          ...
+    ...                                     call_rcu(&amp;el-&gt;head, el_free);
+}                                           ...
+5.                                      }
+void el_free(struct rcu_head *rhp)
+{
+    release_referenced();
+}
+</pre></div>
+</div>
+<p>重要なのは、add()で追加された初期参照は、削除後も grace period（猶予期間）が経過するまで削除されません。これにより、search_and_reference()がこの要素を検出できず、el-&gt;rcの値は増加しません。したがって、el-&gt;rcがゼロになると、この要素を参照しようとする読者はいないため、要素は安全に解放できます。これにより、読者がこの要素を見つけた場合でも、参照カウンタの値を確認することなく参照を取得できることが保証されます。</p>
+<p>コード例 Cに示すRCUベースのパターンは、コード例 Bのパターンと比較して、同時にdelete()が呼び出された場合でもsearch_and_reference()が特定のオブジェクトを検出すればそのオブジェクトへの参照を取得できるという明確な利点があります。同様に、コード例 BとCはコード例 Aと比較して、delete()呼び出しを待機させることなく、search_and_reference()の呼び出しをいくらでも行うことができ、その結果を削除する処理が行われるたびに、最終的に <a class="reference internal" href="../core-api/mm-api.html#c.kfree" title="kfree"><code class="xref c c-func docutils literal notranslate"><span class="pre">kfree()</span></code></a>これは現代のコンピュータシステム、すら小さなシステムでも通常問題にはなりません。</p>
+<p>delete()が待機できる場合、 <a class="reference internal" href="../core-api/kernel-api.html#c.synchronize_rcu" title="synchronize_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code></a> delete()から呼び出せ、以下のようにel_free()をdeleteに統合できます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>4.
+delete()
+{
+    spin_lock(&amp;list_lock);
+    ...
+    remove_element
+    spin_unlock(&amp;list_lock);
+    ...
+    synchronize_rcu();
+    if (atomic_dec_and_test(&amp;el-&gt;rc))
+        kfree(el);
+    ...
+}
+</pre></div>
+</div>
+<p>カーネルにおける追加の例として、リストCのパターンはstruct pidの参照カウントで使用され、リストBのパターンはstruct posix_aclで使用されています。</p>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#core-utilities">Core utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#data-structures-and-low-level-utilities">Data structures and low-level utilities</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="../core-api/index.html#concurrency-primitives">Concurrency primitives</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#low-level-hardware-management">Low-level hardware management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#memory-management">Memory management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#interfaces-for-kernel-debugging">Interfaces for kernel debugging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#everything-else">Everything else</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../core-api/index.html">コアAPIドキュメント</a><ul>
+<li><a href="index.html">RCU concepts</a><ul>
+<li>前へ: <a href="rculist_nulls.html" title="前章">RCU hlist_nullsを使用したリストとオブジェクトの保護</a></li>
+<li>次へ: <a href="torture.html" title="次章">RCUのストレステスト実行</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/RCU/rcuref.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

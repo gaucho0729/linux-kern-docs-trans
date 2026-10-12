@@ -1,0 +1,287 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>RCUのCPUストール検出機能の使用 — Linux Kernelドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="listRCU.html" rel="next" title="RCUを用いた読み込みが主なリンクリストの保護"/>
+<link href="torture.html" rel="prev" title="RCUのストレステスト実行"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="using-rcu-s-cpu-stall-detector">
+<h1>RCUのCPUストール検出機能の使用方法<a class="headerlink" href="#using-rcu-s-cpu-stall-detector" title="この見出しへのパーマリンク">¶</a></h1>
+<p>このドキュメントではまず、RCUのCPUストール検出機能が検出可能な問題の種類について説明し、次に検出機能の動作を微調整するためのカーネルパラメータとKconfigオプションについて説明します。最後に、ストール検出機能の「スplat」フォーマットについて説明します。</p>
+<section id="what-causes-rcu-cpu-stall-warnings">
+<h2>RCU CPUストール警告の原因は？<a class="headerlink" href="#what-causes-rcu-cpu-stall-warnings" title="この見出しへのパーマリンク">¶</a></h2>
+<p>あなたのカーネルがRCU CPUストール警告を出力しました。次に疑うのは「なぜ発生したのか？」です。以下の問題がRCU CPUストール警告を引き起こす可能性があります：</p>
+<ul>
+<li><p>CPUがRCUの読み込み側クリティカルセクション内でループしている場合。</p></li>
+<li><p>CPUが割込みが無効な状態でループしている場合。</p></li>
+<li><p>CPUがプリエンプションが無効な状態でループしている場合。</p></li>
+<li><p>CPUがボトムハーフが無効な状態でループしている場合。</p></li>
+<li><p>!CONFIG_PREEMPTカーネルでは、schedule()を呼び出していない状態でカーネル内をループしているCPUが原因となる可能性があります。カーネル内のループが意図的で望ましい挙動である場合、cond_resched()の呼び出しを追加する必要があります。</p></li>
+<li><p>起動時にコンソール接続が遅すぎて、起動時のコンソールメッセージの出力速度に追いつかない場合。たとえば、115Kbaudのシリアルコンソールは起動時のメッセージ出力速度に比べてはるかに遅く、頻繁にRCU CPUストール警告メッセージを出力します。特にデバッグ情報の追加を行っている場合、この問題が顕著になります。 <a class="reference internal" href="../core-api/printk-basics.html#c.printk" title="printk"><code class="xref c c-func docutils literal notranslate"><span class="pre">printk()</span></code></a>s.</p></li>
+<li><p>RCUのgrace-period kthreadが実行されない原因となる何らかの要因。これにより「All QSes seen」のコンソールログメッセージが表示されることがあります。このメッセージには、kthreadが最後に実行された時間や、どのくらいの頻度で実行されるべきかなどの情報が含まれます。また、以下のコンソールログメッセージも表示されることがあります。 <code class="docutils literal notranslate"><span class="pre">rcu_.*kthread</span> <span class="pre">starved</span> <span class="pre">for</span></code> コンソールログメッセージには追加のデバッグ情報が含まれます。</p></li>
+<li><p>CONFIG_PREEMPTカーネルでCPUにリソースを占有しているリアルタイムタスクが、RCU読み込み側クリティカルセクションの途中で低優先度タスクをプリエンプトしてしまう場合があります。特に、その低優先度タスクが他のCPUで実行できない場合、次のRCU grace periodが完了できず、最終的にシステムがメモリ不足になって停止します。システムがメモリ不足になる過程では、ストール警告メッセージが表示されることがあります。</p></li>
+<li><p>CONFIG_PREEMPT_RTカーネルで、RCU softirqスレッドよりも高い優先度で実行されているCPUにリソースを占有しているリアルタイムタスクが原因となる場合があります。これによりRCUコールバックが永遠に実行されなくなり、CONFIG_PREEMPT_RCUカーネルではRCU grace periodも永遠に完了しなくなります。いずれの場合も、システムは最終的にメモリ不足になって停止します。CONFIG_PREEMPT_RCUの場合、ストール警告メッセージが表示されることがあります。</p>
+<p>rcutree.kthread_prioというカーネルのブートパラメータを使用して、RCUのkthreadのスケジューリング優先度を上げることで、この問題を回避できます。ただし、これを行うとシステムのコンテキストスイッチ率が増加し、パフォーマンスが低下する可能性があるためご注意ください。</p>
+</li>
+<li><p>連続する割り込みペアの間隔よりも長い時間処理を要する割り込みハンドラを持つ周期的な割り込み。これによりRCUのkthreadやsoftirqハンドラが実行されにくくなります。注意点として、高オーバーヘッドのデバッグオプション（例：function_graphトレーサーなど）は、割り込みハンドラの処理時間が通常より大幅に長くなる可能性があり、これによりRCU CPUストール警告が発生する可能性があります。</p></li>
+<li><p>高速なシステムでワークロードをテストし、ストール警告のタイムアウトをわずかに調整してRCU CPUストール警告を回避した後、同じワークロードを遅いシステムで同じタイムアウト値で実行します。注意点として、熱 throttling と on-demand ゲーバーは、単一のシステムが時折高速になり時折遅くなる原因となることがあります！</p></li>
+<li><p>dyntick-idleモードでないCPUにおいて、スケジューラクロック割り込みがシャットダウンするハードウェアまたはソフトウェアの問題。この問題は実際に発生しており、CONFIG_NO_HZ_COMMON=nのカーネルでRCU CPUストール警告を引き起こす可能性が最も高いです。</p></li>
+<li><p>時間ベースのウェイクアップが発生しないハードウェアまたはソフトウェアの問題。この問題は、誤設定またはバグのあるタイマハードウェアから、割り込みまたは例外パス（ハードウェア、ファームウェア、またはソフトウェアを問わず）のバグ、Linuxのタイマサブシステムのバグ、スケジューラのバグ、そしてRCU自身のバグに至るまで幅広い原因を含みます。</p></li>
+<li><p>RCUの実装におけるバグ。</p></li>
+<li><p>ハードウェアの故障。これは非常に可能性が低くても、現実世界で少なくとも1度は発生しています。動作中のシステムでCPUが故障し、応答しなくなったものの即時クラッシュは起こらなかったため、連続するRCU CPUストール警告が発生し、最終的にCPUの故障を認識するまでになりました。</p></li>
+</ul>
+<p>RCU、RCU-sched、RCU-tasksの実装にはCPUストール警告があります。注意点として、SRCUはCPUストール警告を発生しません。RCUは、グラス期間が進行中の場合にのみCPUストールを検出します。グラス期間がない場合、CPUストール警告は発生しません。</p>
+<p>スタールの原因を診断するには、スタックトレースを確認してください。問題の関数は通常、スタックの上部近くに位置しています。単一の長時間のスタールから連続するスタール警告が発生する場合、スタックトレースを比較することでスタールが発生している場所を特定できます。これは、トレースごとに変化しないスタックの上部近くの関数に通常発生します。スタールを確実に再現できる場合は、ftraceは非常に役立ちます。</p>
+<p>RCUのバグは、CONFIG_RCU_TRACEとRCUのイベントトレースを活用してデバッグできます。RCUのイベントトレースに関する情報については、include/trace/events/rcu.hを参照してください。</p>
+</section>
+<section id="fine-tuning-the-rcu-cpu-stall-detector">
+<h2>RCU CPUストール検出機能の微調整<a class="headerlink" href="#fine-tuning-the-rcu-cpu-stall-detector" title="この見出しへのパーマリンク">¶</a></h2>
+<p>rcuupdate.rcu_cpu_stall_suppressモジュールパラメータは、RCUのCPUスタール検出機能を無効にします。この検出機能は、RCUのグレース期間を不適切に遅延させる状況を検出します。このモジュールパラメータはデフォルトでCPUスタール検出を有効にしますが、ブート時のパラメータまたはランタイムでのsysfs経由で上書き可能です。スタール検出機能が「不適切に遅延」とみなす基準は、一連のカーネル構成変数とcppマクロによって制御されます。</p>
+<section id="config-rcu-cpu-stall-timeout">
+<h3>CONFIG_RCU_CPU_STALL_TIMEOUT (設定オプション)<a class="headerlink" href="#config-rcu-cpu-stall-timeout" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>このカーネル構成パラメータは、RCUがグレース期間の開始からスタール警告を発行するまでの時間を定義します。この時間は通常21秒です。</p>
+<p>この構成パラメータは、/sys/module/rcupdate/parameters/rcu_cpu_stall_timeout経由でランタイムに変更可能です。ただし、このパラメータは各サイクルの開始時にのみチェックされるため、40秒のスタールの10秒経過後にこのsysfsパラメータを5に設定しても、次のスタールのタイムアウトを短縮するか、現在のスタールの次の警告のタイミングを短縮するだけです（スタールが十分に長く続く場合）。現在のスタールの次の警告のタイミングには影響を与えません。</p>
+<p>スタール警告メッセージは、/sys/module/rcupdate/parameters/rcu_cpu_stall_suppress経由で完全に有効化または無効化できます。</p>
+</div></blockquote>
+</section>
+<section id="rcu-stall-delay-delta">
+<h3>RCU_STALL_DELAY_DELTA<a class="headerlink" href="#rcu-stall-delay-delta" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>lockdep機能は非常に有用ですが、一部のオーバーヘッドをもたらします。そのため、CONFIG_PROVE_RCUの下では、RCU_STALL_DELAY_DELTAマクロがRCU CPUスタール警告メッセージを発行する前に5秒の余裕を設けます。（これはカーネル構成パラメータではなく、cppマクロです。）</p>
+</div></blockquote>
+</section>
+<section id="rcu-stall-rat-delay">
+<h3>RCU_STALL_RAT_DELAY<a class="headerlink" href="#rcu-stall-rat-delay" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>CPUの停止検出機能は、問題のCPUが自身の警告を出力することを試みます。これは通常、より品質の高いスタックトレースを提供するためです。ただし、問題のCPUがRCU_STALL_RAT_DELAYで指定されたジiffies数内に自身の停止を検出しなかった場合、他のCPUが警告を出力します。この遅延は通常2ジiffiesに設定されています。(これはcppマクロであり、カーネルの設定パラメータではありません。)</p>
+</div></blockquote>
+</section>
+<section id="rcupdate-rcu-task-stall-timeout">
+<h3>rcupdate.rcu_task_stall_timeout<a class="headerlink" href="#rcupdate-rcu-task-stall-timeout" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>このブート/システムファイルシステムパラメータは、RCUタスクの停止警告の間隔を制御します。ゼロまたは負の値はRCUタスクの停止警告を抑制します。正の値は停止警告の間隔を秒単位で設定します。RCUタスクの停止警告は次の行から開始されます：</p>
+<blockquote>
+<div><p>INFO: rcu_tasksがタスクの停止を検出しました：</p>
+</div></blockquote>
+<p>そして、現在のRCUタスクのグレース期間を停止している各タスクに対してsched_show_task()の出力を続けて表示します。</p>
+</div></blockquote>
+</section>
+</section>
+<section id="interpreting-rcu-s-cpu-stall-detector-splats">
+<h2>RCU CPUストール検出機能の「スplat」の解釈<a class="headerlink" href="#interpreting-rcu-s-cpu-stall-detector-splats" title="この見出しへのパーマリンク">¶</a></h2>
+<p>非RCUタスクのバージョンのRCUでは、CPUが停止していると検出すると、次のようないくつかのメッセージが表示されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>INFO: rcu_sched detected stalls on CPUs/tasks:
+2-...: (3 GPs behind) idle=06c/0/0 softirq=1453/1455 fqs=0
+16-...: (0 ticks this GP) idle=81c/0/0 softirq=764/764 fqs=0
+(detected by 32, t=2603 jiffies, g=7075, q=625)
+</pre></div>
+</div>
+<p>このメッセージは、CPU 32がCPU 2とCPU 16の両方が停止を引き起こしていること、そしてその停止がRCU-schedに影響していることを示しています。このメッセージは通常、各CPUのスタックダンプが続きます。注意してください。PREEMPT_RCUのビルドではタスクもCPUも停止を引き起こす可能性があり、タスクはPIDで示されます（例：「P3421」）。RCU_stateの停止がCPUとタスクの両方によって引き起こされる場合もあり、その場合はリストに問題のCPUとタスクがすべて表示されます。</p>
+<p>CPU 2の「(3 GPs behind)」は、このCPUが過去3つのグレース期間にRCUコアとやり取りしていないことを示します。一方、CPU 16の「(0 ticks this GP)」は、このCPUが現在の停止中のグレース期間中にスケジューリングクロック割込みを1回も受けていないことを示します。</p>
+<p>メッセージの「idle=」部分はダイナティックアイドル状態を表示します。最初の「/」前の16進数はダイナティックカウンターの下位12ビットであり、CPUがダイナティックアイドルモードの場合には偶数値、それ以外の場合には奇数値になります。2つの「/」間の16進数はネストレベルを示し、アイドルループ（上記のように表示される場合）では小さな非負数、それ以外では非常に大きな正数になります。</p>
+<p>メッセージの「softirq=」部分は、停止したCPUが実行したRCU softirqハンドラの数を追跡しています。斜線「/」前の数値は、このCPUが最後にグレースペリオドの開始を検出した時点での起動以来の実行数で、現在の（停止中の）グレースペリオドである可能性もあります（例えば、CPUが長時間dyntick-idleモードにいた場合など）。斜線「/」後の数値は、起動以来の現在時刻までの実行数です。この後者の数値が繰り返しの停止警告メッセージで一定に保たれると、RCUのsoftirqハンドラがこのCPUで実行できなくなった可能性があります。これは、停止したCPUが割込みを無効にして回転している場合、または-rtカーネルでは高優先度プロセスがRCUのsoftirqハンドラを食い尽くしている場合に発生します。</p>
+<p>「fqs=」は、このCPUが最後にグレースペリオドの開始を検出した以来、グレースペリットkthreadがこのCPUで行った強制クイエスカントステートのアイドル/オフライン検出の回数を示します。</p>
+<p>「detected by」行は、停止を検出したCPU（この場合CPU 32）、グレースペリオド開始以来経過したjiffies数（この場合2603）、グレースペリオドのシーケンス番号（7075）、および全CPUにおけるRCUコールバックの推定総数（この場合625）を示します。</p>
+<p>CONFIG_RCU_FAST_NO_HZを持つカーネルでは、各CPUについてさらに多くの情報が表示されます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>0: (64628 ticks this GP) idle=dd5/3fffffffffffffff/0 softirq=82/543 last_accelerate: a345/d342 dyntick_enabled: 1
+</pre></div>
+</div>
+<p>「last_accelerate:」は、このCPUがrcu_needs_cpu()からrcu_try_advance_all_cbs()を最後に呼び出したときのjiffiesカウンターの下位16ビット（16進数）を表示します。また、「dyntick_enabled: 1」はdyntick-idle処理が有効であることを示します。</p>
+<p>グレースペリオドが停止警告の表示開始と同時に終了した場合、誤検出の停止警告メッセージが表示されます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>INFO: Stall ended before state dump start
+</pre></div>
+</div>
+<p>これはまれですが、現実ではたまに発生します。また、停止警告とグレースペリオド初期化の相互作用によってゼロjiffyの停止がフラグ付けされる可能性もあります。注意してください。このような誤検出を完全に排除するにはstop_machine()などの手法が必要ですが、このような問題には過剰な処置です。</p>
+<p>すべてのCPUおよびタスクがクイエスカントステートを通過したにもかかわらず、グレースペリオドが終了しなかった場合、停止警告のスラッシュメッセージには以下のような内容が含まれます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>All QSes seen, last rcu_preempt kthread activity 23807 (4297905177-4297881370), jiffies_till_next_fqs=3, root -&gt;qsmask 0x0
+</pre></div>
+</div>
+<p>「23807」は、グレース・ペリオド・カーネルスレッドが最後に実行されてからの経過時間を示しており、これは23,000以上のジャイフィーズ（jiffies）を表します。また、「jiffies_till_next_fqs」は、このカーネルスレッドがどのくらいの頻度で実行されるべきかを示し、強制的にクイエスcent状態をスキャンする間隔（ジャイフィーズ単位）を表します。この場合は3であり、23807に比べてはるかに小さいです。最後に、ルートrcu_node構造体の-&gt;qsmaskフィールドが表示され、通常はゼロになります。</p>
+<p>スタール警告が発生する前に、関連するグレース・ペリオド・カーネルスレッドが実行できなかった場合（上記の「All QSes seen」行の例）、以下の追加行が表示されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kthread starved for 23807 jiffies! g7075 f0x0 RCU_GP_WAIT_FQS(3) -&gt;state=0x1 -&gt;cpu=5
+</pre></div>
+</div>
+<p>CPU時間の不足により、すべてのCPUおよびタスクが必要なクイエスcent状態を通過した後でも、RCU CPU スタール警告が発生することがあります。ここで「g」は現在のグレース・ペリオドのシーケンス番号を示し、「f」はグレース・ペリッド・カーネルスレッドに対する-&gt;gp_flagsコマンドを表します。「RCU_GP_WAIT_FQS」は、カーネルスレッドが短いタイムアウトを待っていることを示し、「state」はtask_struct-&gt;stateフィールドの値を表し、「cpu」はグレース・ペリオド・カーネルスレッドが最後にCPU 5で実行されたことを示します。</p>
+</section>
+<section id="multiple-warnings-from-one-stall">
+<h2>1つのストールからの複数の警告<a class="headerlink" href="#multiple-warnings-from-one-stall" title="この見出しへのパーマリンク">¶</a></h2>
+<p>スタールが十分に長く続く場合、複数のスタール警告メッセージが表示されます。2番目以降のメッセージは、最初のメッセージと開始からの間隔の3倍程度の間隔で表示されるため、最初のメッセージと2番目のメッセージの間隔は、その間隔の3倍になります。</p>
+</section>
+<section id="stall-warnings-for-expedited-grace-periods">
+<h2>早期のグレース期間におけるストール警告<a class="headerlink" href="#stall-warnings-for-expedited-grace-periods" title="この見出しへのパーマリンク">¶</a></h2>
+<p>急行されたグレース・ペリオドがスタールを検出すると、dmesgに以下のようなメッセージが追加されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>INFO: rcu_sched detected expedited stalls on CPUs/tasks: { 7-... } 21119 jiffies s: 73 root: 0x2/.
+</pre></div>
+</div>
+<p>これは、CPU 7 が再スケジューリング IPI に応答しなかったことを示しています。CPU の番号の後に続く3つのドット（「．」）は、CPU がオンライン状態にあることを示しており（そうでなければ最初のドットが「O」になっていました）、緊急グレース期間の開始時にオンライン状態だったことを示しており（そうでなければ2番目のドットが「o」になっていました）、起動後少なくとも1回はオンライン状態だったことを示しています（そうでなければ3番目のドットが「N」になっていました）。『jiffies』の前の数字は、緊急グレース期間が21,119 jiffies 進行していることを示しています。『s:』の後の数字は、緊急グレース期間のシーケンスカウンタが73であることを示しています。この最後の値が奇数であることは、緊急グレース期間が進行中であることを示しています。『root:』の後の数字は、ルート rcu_node 構造体のどの子ノードが現在の緊急グレース期間をブロックしているCPUやタスクを示すビットマスクです。ツリーが複数レベルを持つ場合、その他の rcu_node 構造体の状態には追加の16進数が表示されます。</p>
+<p>通常のグレース期間と同様に、PREEMPT_RCU のビルドもタスクやCPUによって停止される可能性があり、そのタスクはPIDで示されます（例：『P3421』）。</p>
+<p>通常のグレース期間と緊急グレース期間からそれぞれ警告が発生し、同じ実行中にほぼ同時に発生する可能性があります。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#core-utilities">Core utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#data-structures-and-low-level-utilities">Data structures and low-level utilities</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="../core-api/index.html#concurrency-primitives">Concurrency primitives</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#low-level-hardware-management">Low-level hardware management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#memory-management">Memory management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#interfaces-for-kernel-debugging">Interfaces for kernel debugging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/index.html#everything-else">Everything else</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../core-api/index.html">コアAPIドキュメント</a><ul>
+<li><a href="index.html">RCU concepts</a><ul>
+<li>前へ: <a href="torture.html" title="前章">RCUのストレステスト実行</a></li>
+<li>次へ: <a href="listRCU.html" title="次章">RCUを用いた読み込みが主なリンクリストの保護</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/RCU/stallwarn.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>
