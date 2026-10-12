@@ -1,0 +1,506 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>バグ狩り — Linuxカーネルドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="bug-bisect.html" rel="next" title="バグのバイセクティング"/>
+<link href="security-bugs.html" rel="prev" title="セキュリティ関連のバグ"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="bug-hunting">
+<h1>バグ狩り<a class="headerlink" href="#bug-hunting" title="この見出しへのパーマリンク">¶</a></h1>
+<p>カーネルのバグレポートには、以下のようなスタックダンプが含まれることがあります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>------------[ cut here ]------------
+WARNING: CPU: 1 PID: 28102 at kernel/module.c:1108 module_put+0x57/0x70
+Modules linked in: dvb_usb_gp8psk(-) dvb_usb dvb_core nvidia_drm(PO) nvidia_modeset(PO) snd_hda_codec_hdmi snd_hda_intel snd_hda_codec snd_hwdep snd_hda_core snd_pcm snd_timer snd soundcore nvidia(PO) [last unloaded: rc_core]
+CPU: 1 PID: 28102 Comm: rmmod Tainted: P        WC O 4.8.4-build.1 #1
+Hardware name: MSI MS-7309/MS-7309, BIOS V1.12 02/23/2009
+ 00000000 c12ba080 00000000 00000000 c103ed6a c1616014 00000001 00006dc6
+ c1615862 00000454 c109e8a7 c109e8a7 00000009 ffffffff 00000000 f13f6a10
+ f5f5a600 c103ee33 00000009 00000000 00000000 c109e8a7 f80ca4d0 c109f617
+Call Trace:
+ [&lt;c12ba080&gt;] ? dump_stack+0x44/0x64
+ [&lt;c103ed6a&gt;] ? __warn+0xfa/0x120
+ [&lt;c109e8a7&gt;] ? module_put+0x57/0x70
+ [&lt;c109e8a7&gt;] ? module_put+0x57/0x70
+ [&lt;c103ee33&gt;] ? warn_slowpath_null+0x23/0x30
+ [&lt;c109e8a7&gt;] ? module_put+0x57/0x70
+ [&lt;f80ca4d0&gt;] ? gp8psk_fe_set_frontend+0x460/0x460 [dvb_usb_gp8psk]
+ [&lt;c109f617&gt;] ? symbol_put_addr+0x27/0x50
+ [&lt;f80bc9ca&gt;] ? dvb_usb_adapter_frontend_exit+0x3a/0x70 [dvb_usb]
+ [&lt;f80bb3bf&gt;] ? dvb_usb_exit+0x2f/0xd0 [dvb_usb]
+ [&lt;c13d03bc&gt;] ? usb_disable_endpoint+0x7c/0xb0
+ [&lt;f80bb48a&gt;] ? dvb_usb_device_exit+0x2a/0x50 [dvb_usb]
+ [&lt;c13d2882&gt;] ? usb_unbind_interface+0x62/0x250
+ [&lt;c136b514&gt;] ? __pm_runtime_idle+0x44/0x70
+ [&lt;c13620d8&gt;] ? __device_release_driver+0x78/0x120
+ [&lt;c1362907&gt;] ? driver_detach+0x87/0x90
+ [&lt;c1361c48&gt;] ? bus_remove_driver+0x38/0x90
+ [&lt;c13d1c18&gt;] ? usb_deregister+0x58/0xb0
+ [&lt;c109fbb0&gt;] ? SyS_delete_module+0x130/0x1f0
+ [&lt;c1055654&gt;] ? task_work_run+0x64/0x80
+ [&lt;c1000fa5&gt;] ? exit_to_usermode_loop+0x85/0x90
+ [&lt;c10013f0&gt;] ? do_fast_syscall_32+0x80/0x130
+ [&lt;c1549f43&gt;] ? sysenter_past_esp+0x40/0x6a
+---[ end trace 6ebc60ef3981792f ]---
+</pre></div>
+</div>
+<p>このようなスタックトレースは、カーネルのソースコード内でバグが発生した行を特定するための十分な情報を提供します。問題の深刻さに応じて、このトレースには「Oops」という単語が含まれることがあります。 <strong>Oops</strong>、以下のような例があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>BUG: unable to handle kernel NULL pointer dereference at   (null)
+IP: [&lt;c06969d4&gt;] iret_exc+0x7d0/0xa59
+*pdpt = 000000002258a001 *pde = 0000000000000000
+Oops: 0002 [#1] PREEMPT SMP
+...
+</pre></div>
+</div>
+<p>、または他の種類のスタックトレースであっても、バグが発生した行を特定して対処する必要があります。この章では、分析が必要なすべてのスタックトレースに対して「Oops」と呼ぶことにします。 <strong>Oops</strong> If the kernel is compiled with</p>
+<p>、スタックトレースの品質を向上させるためにファイル: <code class="docutils literal notranslate"><span class="pre">CONFIG_DEBUG_INFO</span></code>scripts/decode_stacktrace.sh<cite>リンクされているモジュール</cite>.</p>
+<section id="modules-linked-in">
+<h2>、タインテッド（汚染）されているか、ロード中かアンロード中のモジュールは「(…)」でマークされます。タインテッドフラグの説明はファイル:<a class="headerlink" href="#modules-linked-in" title="この見出しへのパーマリンク">¶</a></h2>
+<p>、ロード中は「+」で、アンロード中は「-」で注釈されます。<cite><a class="reference internal" href="tainted-kernels.html"><span class="doc">汚染されたカーネル</span></a></cite>Oopsメッセージはどこにありますか？</p>
+</section>
+<section id="where-is-the-oops-message-is-located">
+<h2>通常、klogdがカーネルバッファからOopsテキストを読み取り、<a class="headerlink" href="#where-is-the-oops-message-is-located" title="この見出しへのパーマリンク">¶</a></h2>
+<p>を書き込み、通常は <code class="docutils literal notranslate"><span class="pre">syslogd</span></code> (depends on
+<code class="docutils literal notranslate"><span class="pre">/var/log/messages</span></code> )、systemdを搭載したシステムでは、 <code class="docutils literal notranslate"><span class="pre">/etc/syslog.conf</span></code>デーモンによって保存され、 <code class="docutils literal notranslate"><span class="pre">journald</span></code> コマンドを実行してアクセスできます。 <code class="docutils literal notranslate"><span class="pre">journalctl</span></code> Sometimes</p>
+<p>が終了します。その場合、 <code class="docutils literal notranslate"><span class="pre">klogd</span></code> カーネルバッファからデータを読み取り保存できます。または、 <code class="docutils literal notranslate"><span class="pre">dmesg</span> <span class="pre">&gt;</span> <span class="pre">file</span></code> 、ただし、転送を停止するにはブレイクインする必要があります。なぜなら、
+<code class="docutils literal notranslate"><span class="pre">cat</span> <span class="pre">/proc/kmsg</span> <span class="pre">&gt;</span> <span class="pre">file</span></code>は「終わりのないファイル」です。 <code class="docutils literal notranslate"><span class="pre">kmsg</span></code> If the machine has crashed so badly that you cannot enter commands or the disk is not available then you have three options:</p>
+<p>マシンが深刻なクラッシュで動作しなくなり、コマンドを入力できず、ディスクが利用できない場合、以下の3つの選択肢があります:</p>
+<ol class="arabic simple">
+<li><p>画面からテキストを手書きして、マシンが再起動後に打ち直す。手間ではあるが、クラッシュを予期していなかった場合の唯一の選択肢である。代替案として、デジタルカメラで画面を撮影することも可能だが、あまりよろしくないが、何もしないよりましだ。メッセージがコンソールの上部からスクロールしていってしまう場合、解像度を高くして起動することで、より多くのテキストを読むことができるかもしれない。（注意: この方法は「早期」のOopsには効果がない。） <code class="docutils literal notranslate"><span class="pre">vga=791</span></code>) will allow you to read more of the text. (Caveat: This needs <code class="docutils literal notranslate"><span class="pre">vesafb</span></code>、したがって、「早期」のOopsには役立たない。)</p></li>
+<li><p>シリアルコンソールで起動（参照:
+<a class="reference internal" href="serial-console.html#serial-console"><span class="std std-ref"><a class="reference internal" href="serial-console.html"><span class="doc">Linux シリアルコンソール</span></a></span></a>）、2台のマシン間でnull modemを接続し、お気に入りの通信ソフトで出力をキャプチャできます。Minicomはうまく動作します。</p></li>
+<li><p>Kdumpを使用（参照: <a class="reference internal" href="kdump/kdump.html"><span class="doc">Kdump に関するドキュメンテーション - kexec を使用したクラッシュダンプ解決策</span></a>）、Documentation/admin-guide/kdump/gdbmacros.txtにあるdmesg gdbmacroを使用して、古いメモリからカーネルリングバッファを抽出できます。</p></li>
+</ol>
+</section>
+<section id="finding-the-bug-s-location">
+<h2>バグの位置を特定する<a class="headerlink" href="#finding-the-bug-s-location" title="この見出しへのパーマリンク">¶</a></h2>
+<p>バグを報告する際には、バグの位置をカーネルソースファイルに直接示すと効果的です。その方法は2つあります。通常、
+<code class="docutils literal notranslate"><span class="pre">gdb</span></code> を使用するのが簡単ですが、カーネルはデバッグ情報を含むように事前にコンパイルしておく必要があります。</p>
+<section id="gdb">
+<h3>gdb<a class="headerlink" href="#gdb" title="この見出しへのパーマリンク">¶</a></h3>
+<p>GNUデバッガー（<code class="docutils literal notranslate"><span class="pre">gdb</span></code>)は、OOPSから正確なファイルと行番号を特定する最良の方法です。 <code class="docutils literal notranslate"><span class="pre">vmlinux</span></code> ファイル。</p>
+<p>GDBの使用は、デバッグシンボルを含むコンパイルされたカーネルで最も効果的です。 <code class="docutils literal notranslate"><span class="pre">CONFIG_DEBUG_INFO</span></code>。これは、以下を実行することで設定できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ./scripts/config -d COMPILE_TEST -e DEBUG_KERNEL -e DEBUG_INFO
+</pre></div>
+</div>
+<p>コンパイルされたカーネルでは、 <code class="docutils literal notranslate"><span class="pre">CONFIG_DEBUG_INFO</span></code>、OOPSからEIP値を単純にコピーできます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>EIP:    0060:[&lt;c021e50e&gt;]    Not tainted VLI
+</pre></div>
+</div>
+<p>そしてGDBを使用して、その値を人間が読める形式に変換できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ gdb vmlinux
+(gdb) l *0xc021e50e
+</pre></div>
+</div>
+<p>debug symbolsが有効でない場合、OOPSから関数オフセットを使用します： <code class="docutils literal notranslate"><span class="pre">CONFIG_DEBUG_INFO</span></code> そして、</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>EIP is at vt_ioctl+0xda8/0x1482
+</pre></div>
+</div>
+<p>でカーネルを再コンパイルします。 <code class="docutils literal notranslate"><span class="pre">CONFIG_DEBUG_INFO</span></code> enabled:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ./scripts/config -d COMPILE_TEST -e DEBUG_KERNEL -e DEBUG_INFO
+$ make vmlinux
+$ gdb vmlinux
+(gdb) l *vt_ioctl+0xda8
+0x1888 is in vt_ioctl (drivers/tty/vt/vt_ioctl.c:293).
+288   {
+289           struct vc_data *vc = NULL;
+290           int ret = 0;
+291
+292           console_lock();
+293           if (VT_BUSY(vc_num))
+294                   ret = -EBUSY;
+295           else if (vc_num)
+296                   vc = vc_deallocate(vc_num);
+297           console_unlock();
+</pre></div>
+</div>
+<p>、またはより詳細に表示したい場合は：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(gdb) p vt_ioctl
+$1 = {int (struct tty_struct *, unsigned int, unsigned long)} 0xae0 &lt;vt_ioctl&gt;
+(gdb) l *0xae0+0xda8
+</pre></div>
+</div>
+<p>代わりに、オブジェクトファイルを使用できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ make drivers/tty/
+$ gdb drivers/tty/vt/vt_ioctl.o
+(gdb) l *vt_ioctl+0xda8
+</pre></div>
+</div>
+<p>呼び出しトレースがある場合、例えば：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Call Trace:
+ [&lt;ffffffff8802c8e9&gt;] :jbd:log_wait_commit+0xa3/0xf5
+ [&lt;ffffffff810482d9&gt;] autoremove_wake_function+0x0/0x2e
+ [&lt;ffffffff8802770b&gt;] :jbd:journal_stop+0x1be/0x1ee
+ ...
+</pre></div>
+</div>
+<p>これは問題が:jbd:モジュールにある可能性を示しています。このモジュールをgdbでロードし、関連するコードを表示できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ gdb fs/jbd/jbd.ko
+(gdb) l *log_wait_commit+0xa3
+</pre></div>
+</div>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>スタックトレース内の任意の関数呼び出しについても同様の操作が可能です。例えばこの呼び出し：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>[&lt;f80bc9ca&gt;] ? dvb_usb_adapter_frontend_exit+0x3a/0x70 [dvb_usb]
+</pre></div>
+</div>
+<p>上記の呼び出し位置は以下のコマンドで確認できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ gdb drivers/media/usb/dvb-usb/dvb-usb.o
+(gdb) l *dvb_usb_adapter_frontend_exit+0x3a
+</pre></div>
+</div>
+</div>
+</section>
+<section id="objdump">
+<h3>objdump<a class="headerlink" href="#objdump" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルのデバッグには、objdumpを使用し、クラッシュ出力のhexオフセットから有効なコード/アセンブリ行を見つけます。デバッグシンボルがない場合、アセンブリコードのみが表示されますが、カーネルにデバッグシンボルが含まれている場合、Cコードも利用可能です。(デバッグシンボルは、メニュー構成の「カーネルハッキング」メニューで有効化できます。) 例えば：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ objdump -r -S -l --disassemble net/dccp/ipv4.o
+</pre></div>
+</div>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>この操作を行うには、カーネルツリーのトップレベルにいる必要があります。</p>
+</div>
+<p>ソースコードにアクセスできない場合でも、以下の方法で一部のクラッシュダンプをデバッグできます(例: Dave Millerが示すクラッシュダンプ出力)：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>EIP is at  +0x14/0x4c0
+ ...
+Code: 44 24 04 e8 6f 05 00 00 e9 e8 fe ff ff 8d 76 00 8d bc 27 00 00
+00 00 55 57  56 53 81 ec bc 00 00 00 8b ac 24 d0 00 00 00 8b 5d 08
+&lt;8b&gt; 83 3c 01 00 00 89 44  24 14 8b 45 28 85 c0 89 44 24 18 0f 85
+
+Put the bytes into a "foo.s" file like this:
+
+       .text
+       .globl foo
+foo:
+       .byte  .... /* bytes from Code: part of OOPS dump */
+
+Compile it with "gcc -c -o foo.o foo.s" then look at the output of
+"objdump --disassemble foo.o".
+
+Output:
+
+ip_queue_xmit:
+    push       %ebp
+    push       %edi
+    push       %esi
+    push       %ebx
+    sub        $0xbc, %esp
+    mov        0xd0(%esp), %ebp        ! %ebp = arg0 (skb)
+    mov        0x8(%ebp), %ebx         ! %ebx = skb-&gt;sk
+    mov        0x13c(%ebx), %eax       ! %eax = inet_sk(sk)-&gt;opt
+</pre></div>
+</div>
+<p>ファイル：<cite>scripts/decodecode</cite> は、デバッグするCPUアーキテクチャに応じて、この作業を自動化できます。</p>
+</section>
+</section>
+<section id="reporting-the-bug">
+<h2>バグの報告<a class="headerlink" href="#reporting-the-bug" title="この見出しへのパーマリンク">¶</a></h2>
+<p>バグが発生した場所を特定したら、その位置を確認して、自分で修正するか、アップストリームに報告できます。</p>
+<p>アップストリームに報告するには、影響を受けたコードの開発に使用されるメールリストを特定する必要があります。これは、 <code class="docutils literal notranslate"><span class="pre">get_maintainer.pl</span></code> スクリプトを使用することで行えます。</p>
+<p>例えば、gspcaのsonixj.cファイルでバグを見つけた場合、そのメンテナを取得するには：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ./scripts/get_maintainer.pl -f drivers/media/usb/gspca/sonixj.c
+Hans Verkuil &lt;hverkuil@xs4all.nl&gt; (odd fixer:GSPCA USB WEBCAM DRIVER,commit_signer:1/1=100%)
+Mauro Carvalho Chehab &lt;mchehab@kernel.org&gt; (maintainer:MEDIA INPUT INFRASTRUCTURE (V4L/DVB),commit_signer:1/1=100%)
+Tejun Heo &lt;tj@kernel.org&gt; (commit_signer:1/1=100%)
+Bhaktipriya Shridhar &lt;bhaktipriya96@gmail.com&gt; (commit_signer:1/1=100%,authored:1/1=100%,added_lines:4/4=100%,removed_lines:9/9=100%)
+linux-media@vger.kernel.org (open list:GSPCA USB WEBCAM DRIVER)
+linux-kernel@vger.kernel.org (open list)
+</pre></div>
+</div>
+<p>注意してください。これは以下のアドレスを指します：</p>
+<ul class="simple">
+<li><p>最後にソースコードを修正した開発者(これはgitツリー内で行われた場合)。上記の例では、TejunとBhaktipriya(この特定のケースでは、このファイルの開発に関与した開発者はいません)；</p></li>
+<li><p>ドライバメンテナ(Hans Verkuil)；</p></li>
+<li><p>サブシステムメンテナ(Mauro Carvalho Chehab)；</p></li>
+<li><p>ドライバおよび/またはサブシステムメールリスト(<a class="reference external" href="mailto:linux-media%40vger.kernel.org">linux-media<span>@</span>vger<span>.</span>kernel<span>.</span>org</a>);</p></li>
+<li><p>Linuxカーネルメールリスト(<a class="reference external" href="mailto:linux-kernel%40vger.kernel.org">linux-kernel<span>@</span>vger<span>.</span>kernel<span>.</span>org</a>).</p></li>
+</ul>
+<p>通常、バグを修正する最も速い方法は、コードの開発に使用されるメールリスト(linux-media ML)に報告し、ドライバメンテナ(Hans)をCCする方法です。</p>
+<p>誰にレポートを送すべきかまったく分からなかったり、
+<code class="docutils literal notranslate"><span class="pre">get_maintainer.pl</span></code> 何か役に立つ情報を提供しなかった場合は、送ってください。
+<a class="reference external" href="mailto:linux-kernel%40vger.kernel.org">linux-kernel<span>@</span>vger<span>.</span>kernel<span>.</span>org</a>.</p>
+<p>Linuxが人間の力でどれだけ安定するかをサポートしてくださり、ありがとうございます。</p>
+</section>
+<section id="fixing-the-bug">
+<h2>バグの修正<a class="headerlink" href="#fixing-the-bug" title="この見出しへのパーマリンク">¶</a></h2>
+<p>プログラミングが分かれば、バグを報告するだけでなく、解決策も提供することで私たちをサポートできます。オープンソースはあなたの行ったことの共有が目的であり、あなたの知性を認められたいと思いませんか？</p>
+<p>この方法を採用する場合は、修正が完成したらすぐに上流に提出してください。</p>
+<p>以下のガイドを必ずお読みください
+<a class="reference internal" href="../process/submitting-patches.html#submittingpatches"><span class="std std-ref"><a class="reference internal" href="../process/submitting-patches.html"><span class="doc">パッチの送信: コードをカーネルに取り込むためのエッセンシャルガイド</span></a></span></a> コードが受け入れられやすくなるようにしてください。</p>
+</section>
+<hr class="docutils"/>
+<section id="notes-on-oops-tracing-with-klogd">
+<h2>Oopsトレースに関するノート <code class="docutils literal notranslate"><span class="pre">klogd</span></code><a class="headerlink" href="#notes-on-oops-tracing-with-klogd" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Linusと他のカーネル開発者をサポートするため、 <code class="docutils literal notranslate"><span class="pre">klogd</span></code> プロテクションフォールトの処理に特化した機能が大幅に組み込まれています。アドレス解決を完全にサポートするには、少なくとも <code class="docutils literal notranslate"><span class="pre">sysklogd</span></code> パッケージの1.3-pl3バージョンを使用してください。</p>
+<p>プロテクションフォールトが発生した際、 <code class="docutils literal notranslate"><span class="pre">klogd</span></code> デーモンはカーネルログメッセージ内の重要なアドレスをシンボリックな同等物に自動的に変換します。この変換されたカーネルメッセージは、 whichever reporting mechanism <code class="docutils literal notranslate"><span class="pre">klogd</span></code> が使用している経路を通じて転送されます。プロテクションフォールトメッセージはメッセージファイルから簡単に切り出され、カーネル開発者に送信できます。</p>
+<p>2つのアドレス解決タイプが <code class="docutils literal notranslate"><span class="pre">klogd</span></code>によって実行されます。1つ目は静的変換で、2つ目は動的変換です。静的変換はSystem.mapファイルを使用します。静的変換を行うには、 <code class="docutils literal notranslate"><span class="pre">klogd</span></code> デーモンがデーモン初期化時にシステムマップファイルを検索できる必要があります。klogdのmanページを参照してください。 <code class="docutils literal notranslate"><span class="pre">klogd</span></code> mapファイルの検索方法についての情報が記載されています。</p>
+<p>動的アドレス変換は、カーネルロード可能なモジュールが使用されている場合に重要です。カーネルモジュールのメモリはカーネルの動的メモリプールから割り当てられるため、モジュールの開始位置やモジュール内の関数やシンボルの位置は固定ではありません。</p>
+<p>カーネルは、プログラムがロードされたモジュールを確認し、そのメモリ位置を取得するシステムコールをサポートしています。これらのシステムコールを使用して、klogdデーモンはシンボルテーブルを構築し、ロード可能なカーネルモジュール内で発生したプロテクションフォールトをデバッグできます。</p>
+<p>最低限、klogdはプロテクションフォールトを発生させたモジュールの名前を提供します。開発者がロード可能なモジュールからシンボル情報をエクスポートした場合、追加のシンボリック情報が利用できる場合があります。</p>
+<p>カーネルモジュール環境は動的であるため、デーモンが通知を受けるためのメカニズムが必要です <code class="docutils literal notranslate"><span class="pre">klogd</span></code> モジュール環境の変化が発生した際にデーモンを通知します。klogdが現在実行中のデーモンにシンボル情報の再取得を通知するためのコマンドラインオプションが利用可能です。詳しくは <code class="docutils literal notranslate"><span class="pre">klogd</span></code> マニュアルページをご参照ください。</p>
+<p>sysklogdの配布物にパッチが含まれており、このパッチによりパッケージがモジュールがロードまたはアンロードされるたびに自動的にklogdに通知します。このパッチを適用することで、カーネルロード可能なモジュールで発生する保護エラーのデバッグにほぼ無感覚なサポートが得られます。
+<code class="docutils literal notranslate"><span class="pre">modules-2.0.0</span></code> 以下の例は、ロード可能なモジュールで発生する保護エラーの処理例です。</p>
+<p>ロード可能なモジュールで処理される保護エラーの例は以下の通りです。 <code class="docutils literal notranslate"><span class="pre">klogd</span></code>:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Aug 29 09:51:01 blizard kernel: Unable to handle kernel paging request at virtual address f15e97cc
+Aug 29 09:51:01 blizard kernel: current-&gt;tss.cr3 = 0062d000, %cr3 = 0062d000
+Aug 29 09:51:01 blizard kernel: *pde = 00000000
+Aug 29 09:51:01 blizard kernel: Oops: 0002
+Aug 29 09:51:01 blizard kernel: CPU:    0
+Aug 29 09:51:01 blizard kernel: EIP:    0010:[oops:_oops+16/3868]
+Aug 29 09:51:01 blizard kernel: EFLAGS: 00010212
+Aug 29 09:51:01 blizard kernel: eax: 315e97cc   ebx: 003a6f80   ecx: 001be77b   edx: 00237c0c
+Aug 29 09:51:01 blizard kernel: esi: 00000000   edi: bffffdb3   ebp: 00589f90   esp: 00589f8c
+Aug 29 09:51:01 blizard kernel: ds: 0018   es: 0018   fs: 002b   gs: 002b   ss: 0018
+Aug 29 09:51:01 blizard kernel: Process oops_test (pid: 3374, process nr: 21, stackpage=00589000)
+Aug 29 09:51:01 blizard kernel: Stack: 315e97cc 00589f98 0100b0b4 bffffed4 0012e38e 00240c64 003a6f80 00000001
+Aug 29 09:51:01 blizard kernel:        00000000 00237810 bfffff00 0010a7fa 00000003 00000001 00000000 bfffff00
+Aug 29 09:51:01 blizard kernel:        bffffdb3 bffffed4 ffffffda 0000002b 0007002b 0000002b 0000002b 00000036
+Aug 29 09:51:01 blizard kernel: Call Trace: [oops:_oops_ioctl+48/80] [_sys_ioctl+254/272] [_system_call+82/128]
+Aug 29 09:51:01 blizard kernel: Code: c7 00 05 00 00 00 eb 08 90 90 90 90 90 90 90 90 89 ec 5d c3
+</pre></div>
+</div>
+<hr class="docutils"/>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Dr. G.W. Wettstein           Oncology Research Div. Computing Facility
+Roger Maris Cancer Center    INTERNET: greg@wind.rmcc.com
+820 4th St. N.
+Fargo, ND  58122
+Phone: 701-234-7556
+</pre></div>
+</div>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxカーネルユーザーおよび管理者のガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="README.html">Linux カーネルリリース 5.x &lt;http://kernel.org/&gt;</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kernel-parameters.html">カーネルのコマンドラインパラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="devices.html">Linux で割り当てられたデバイス（4.x 以降のバージョン）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysctl/index.html">/proc/sys に関するドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="abi.html">Linux ABI 説明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hw-vuln/index.html">ハードウェアの脆弱性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reporting-bugs.html">バグの報告</a></li>
+<li class="toctree-l2"><a class="reference internal" href="security-bugs.html">セキュリティ関連のバグ</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">バグ狩り</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bug-bisect.html">バグのバイセクティング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tainted-kernels.html">汚染されたカーネル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ramoops.html">Ramoops oops/panic ロガー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dynamic-debug-howto.html">ダイナミックデバッグ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="init.html">「No working init found.」のブートハングメッセージの説明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kdump/index.html">Kdump に関するドキュメンテーション - kexec を使用したクラッシュダンプ解決策</a></li>
+<li class="toctree-l2"><a class="reference internal" href="perf/index.html">パフォーマンスモニタサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pstore-blk.html">pstore ブロック oops/panic ロガー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysfs-rules.html">sysfs 内の情報へのアクセスに関するルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="acpi/index.html">ACPI サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="aoe/index.html">ATA over Ethernet (AoE)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="auxdisplay/index.html">補助ディスプレイサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bcache.html">ブロックレイヤーのキャッシュ（bcache）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="binderfs.html">Android binderfs ファイルシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="binfmt-misc.html">Linux における miscellaneous Binary Formats（binfmt_misc）のカーネルサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blockdev/index.html">Linux RapidIO サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bootconfig.html">ブート構成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="braille-console.html">Linux ブライルコンソール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="btmrvl.html">btmrvl ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cgroup-v1/index.html">Control Groups バージョン 1</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cgroup-v2.html">Control Group v2</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cifs/index.html">CIFS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="clearing-warn-once.html">WARN_ONCE のクリア</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cpu-load.html">CPU ロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cputopology.html">sysfs を通じて CPU テポロジー情報がエクスポートされる仕組み</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dell_rbu.html">Dell Remote BIOS Update ドライバー (dell_rbu)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="device-mapper/index.html">Device Mapper</a></li>
+<li class="toctree-l2"><a class="reference internal" href="edid.html">EDID</a></li>
+<li class="toctree-l2"><a class="reference internal" href="efi-stub.html">EFI ブート ステブ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ext4.html">ext4 一般情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nfs/index.html">NFS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gpio/index.html">gpio</a></li>
+<li class="toctree-l2"><a class="reference internal" href="highuid.html">16 ビット UID から 32 ビット UID への変更に関する注意点</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hw_random.html">i8xx チップセットにおけるランダム数生成器の Linux サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="initrd.html">初期 RAM ディスク (initrd) の使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="iostats.html">I/O 統計項目</a></li>
+<li class="toctree-l2"><a class="reference internal" href="java.html">Java(tm) バイナリーカーネルサポート for Linux v1.03</a></li>
+<li class="toctree-l2"><a class="reference internal" href="jfs.html">IBM のジャーナル化ファイルシステム (JFS) for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kernel-per-CPU-kthreads.html">per-CPU kthread による OS ジャッタリングの軽減</a></li>
+<li class="toctree-l2"><a class="reference internal" href="laptops/index.html">ノートPCドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lcd-panel-cgram.html">パラレルポート LCD/キーパッドパネルサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ldm.html">LDM - ロジカルディスクマネージャー (ダイナミックディスク)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lockup-watchdogs.html">ソフトロックアップ検出器とハードロックアップ検出器 (nmi_watchdog とも呼ばれる)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="LSM/index.html">Linux セキュリティモジュールの使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="md.html">RAID アレイ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="media/index.html">メディアサブシステム管理およびユーザーガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mm/index.html">メモリ管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="module-signing.html">カーネルモジュール署名機能</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mono.html">Mono(tm) バイナリーカーネルサポート for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="namespaces/index.html">ネームスペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="numastat.html">NUMA ポリシー ヒット/ミス統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="parport.html">パラレルポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="perf-security.html">Perf イベントとツールセキュリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pm/index.html">電源管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pnp.html">Linux プラグアンドプレイドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rapidio.html">RapidIO サブシステムガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ras.html">信頼性、可用性、サービス性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rtc.html">リアルタイムクロック (RTC) ドライバー for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="serial-console.html">Linux シリアルコンソール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="svga.html">ビデオモード選択サポート 2.13</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysrq.html">Linux Magic System Request Key Hacks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="thunderbolt.html">USB4 and Thunderbolt</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ufs.html">UFSの使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="unicode.html">Unicodeのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vga-softcursor.html">VGA用ソフトウェアカーソル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="video-output.html">ビデオ出力スイッチャー制御</a></li>
+<li class="toctree-l2"><a class="reference internal" href="wimax/index.html">WiMAXサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfs.html">SGI XFS ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxカーネルユーザーおよび管理者のガイド</a><ul>
+<li>前へ: <a href="security-bugs.html" title="前章">セキュリティ関連のバグ</a></li>
+<li>次へ: <a href="bug-bisect.html" title="次章">バグのバイセクティング</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/admin-guide/bug-hunting.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

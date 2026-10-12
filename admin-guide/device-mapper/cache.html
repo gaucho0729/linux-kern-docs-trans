@@ -1,0 +1,510 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>キャッシュ — The Linux Kernel documentation</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="delay.html" rel="next" title="dm-delay"/>
+<link href="cache-policies.html" rel="prev" title="ポリシーの作成に関するガイドライン"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="cache">
+<h1>キャッシュ<a class="headerlink" href="#cache" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>dm-cache は、Joe Thornber、Heinz Mauelshagen、Mike Snitzer によって書かれたデバイス・マッピングのターゲットです。</p>
+<p>このターゲットは、ブロックデバイス（例：スパインド）のパフォーマンスを向上させるために、その一部のデータをより高速でより小さなデバイス（例：SSD）に動的に移すことを目的としています。</p>
+<p>このデバイス・マッピングのソリューションにより、dm スタックのさまざまなレベルにキャッシュを挿入することが可能になります。例えば、スリムプロビジョニングプールのデータデバイスの上に配置することもできます。仮想メモリシステムとより密接に統合されたキャッシュソリューションは、パフォーマンスがより向上します。</p>
+<p>このターゲットは、スリムプロビジョニングライブラリで使用されているメタデータライブラリを再利用しています。</p>
+<p>どのデータをいつ移すかは、プラグインポリシーモジュールに委ねられています。我々は実験を通じていくつかのポリシーを実装しており、特定のI/Oシナリオ（例：仮想マシンイメージサーバー）用に他のポリシーを提供してくれる他者も期待しています。</p>
+</section>
+<section id="glossary">
+<h2>用語集<a class="headerlink" href="#glossary" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><dl class="simple">
+<dt>移動</dt><dd><p>論理ブロックの主なコピーを一つのデバイスから別のデバイスへ移す行為。</p>
+</dd>
+<dt>促進</dt><dd><p>遅いデバイスから高速デバイスへの移動。</p>
+</dd>
+<dt>降格</dt><dd><p>高速デバイスから遅いデバイスへの移動。</p>
+</dd>
+</dl>
+</div></blockquote>
+<p>元のデバイスは常に論理ブロックのコピーを保持しており、これは古いデータである可能性がありますが、ポリシーに応じてキャッシュデバイス上のコピーと同期されている場合もあります。</p>
+</section>
+<section id="design">
+<h2>設計<a class="headerlink" href="#design" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="sub-devices">
+<h3>サブデバイス<a class="headerlink" href="#sub-devices" title="この見出しへのパーマリンク">¶</a></h3>
+<p>このターゲットは、後に詳しく説明する他のパラメータとともに3つのデバイスを渡して構築されます：</p>
+<ol class="arabic simple">
+<li><p>元のデバイス - 大きく遅いデバイス。</p></li>
+<li><p>キャッシュデバイス - 小さく速いデバイス。</p></li>
+<li><p>小さなメタデータデバイス - キャッシュに含まれるブロック、汚染されたブロック、およびポリシーオブジェクトに使用する追加ヒントを記録します。この情報はキャッシュデバイスに置くこともできますが、分離することでボリュームマネージャーが異なる方法で構成できるようになります（例：追加の堅牢性のためにミラーリング）。このメタデータデバイスは単一のキャッシュデバイスのみに使用できます。</p></li>
+</ol>
+</section>
+<section id="fixed-block-size">
+<h3>固定ブロックサイズ<a class="headerlink" href="#fixed-block-size" title="この見出しへのパーマリンク">¶</a></h3>
+<p>元のデバイスは固定サイズのブロックに分割されます。このブロックサイズはキャッシュを作成する際の設定で指定できます。通常は256KB - 1024KBのブロックサイズを使用しています。ブロックサイズは64セクタ（32KB）から2097152セクタ（1GB）までで、64セクタ（32KB）の倍数である必要があります。</p>
+<p>固定ブロックサイズはターゲットを大幅に簡略化しますが、ある程度の妥協点です。例えば、ブロックの一部が頻繁にアクセスされるにもかかわらず、全体がキャッシュに促進されることがあります。そのため、大きなブロックサイズはキャッシュスペースを浪費します。一方、小さなブロックサイズはメタデータ（コアとディスクの両方）の量を増やすため悪影響です。</p>
+</section>
+<section id="cache-operating-modes">
+<h3>キャッシュ運用モード<a class="headerlink" href="#cache-operating-modes" title="この見出しへのパーマリンク">¶</a></h3>
+<p>キャッシュは3つの運用モードを持っています: writeback、writethrough、および passthrough。</p>
+<p>writebackが選択された場合、キャッシュされているブロックへの書き込みはキャッシュのみに送られ、メタデータでブロックがdirtyとマークされます。</p>
+<p>writethroughが選択された場合、キャッシュされているブロックへの書き込みは、元のデバイスとキャッシュデバイスの両方に到達するまで完了しません。クリーンなブロックはクリーンのまま維持されるべきです。</p>
+<p>passthroughが選択された場合、キャッシュの内容が元のデバイスと整合性があるとは限らない状況で役立ちます。この場合、すべての読み込みは元のデバイスから行われ（キャッシュはヒットしません）、すべての書き込みは元のデバイスに転送されます。さらに、書き込みヒットはキャッシュブロックの無効化を引き起こします。passthroughモードを有効にするには、キャッシュがクリーンである必要があります。passthroughモードは、整合性の心配をせずにキャッシュデバイスをアクティブ化できるようにします。既存の整合性は維持されますが、書き込みによりキャッシュは徐々に冷えていきます。後述の「invalidate_cblocks」メッセージを用いてキャッシュの整合性を確認または確立できる場合、キャッシュデバイスはまだ温かい状態でwritethroughまたはwritebackモードに移行できます。そうでない場合は、移行前のキャッシュ内容は破棄する必要があります。</p>
+<p>キャッシュのデコミッションやサイズ変更時に役立つシンプルなクリーンポリシーが提供されています。すべてのdirtyブロックをクリーン（書き戻し）します。キャッシュのサイズを縮小時、削除する領域にあるすべてのキャッシュブロックがクリーンである必要があります。削除領域にdirtyブロックが残っていると、サイズ変更は失敗します。キャッシュのfastデバイスに使用されるボリュームを縮小する際は、キャッシュがクリーンであることを確認する必要があります。これは特にwritebackモードを使用する場合に重要です。writethroughおよびpassthroughモードはすでにクリーンなキャッシュを維持しています。今後、指定されたしきい値以上の部分的なクリーン処理がサポートされることで、サイズ変更中にキャッシュを温かく保ちながらwritebackモードで運用できるようになります。</p>
+</section>
+<section id="migration-throttling">
+<h3>マイグレーションスロットリング<a class="headerlink" href="#migration-throttling" title="この見出しへのパーマリンク">¶</a></h3>
+<p>元のデバイスとキャッシュデバイス間でのデータマイグレーションには帯域幅が必要です。ユーザーはスロットリングを設定して、特定の時間に発生するマイグレーション量を制限できます。現在は通常のI/Oトラフィックを考慮していません。ピーク時のI/O期間にマイグレーションを避けるためには、この点の改善が求められています。</p>
+<p>一時的に、「migration_threshold &lt;#セクタ&gt;」というメッセージを使用して、マイグレーションされる最大セクタ数を設定できます（デフォルトは2048セクタ（1MB）です）</p>
+</section>
+<section id="updating-on-disk-metadata">
+<h3>ディスク上のメタデータの更新中<a class="headerlink" href="#updating-on-disk-metadata" title="この見出しへのパーマリンク">¶</a></h3>
+<p>FLUSHまたはFUA bioが書き込まれるたびにディスク上のメタデータがコミットされます。このようなリクエストがなければ、1秒ごとにコミットされます。これにより、キャッシュは揮発性の書き込みキャッシュを持つ物理ディスクのように動作します。電源が切れた場合、最近の書き込みが失われる可能性があります。ただし、どんなクラッシュでもメタデータは常に一貫性を保たなければなりません。</p>
+<p>キャッシュブロックの「dirty」状態は頻繁に変化するため、飛ばしで更新することはできません。そのため、ヒントとして扱います。通常の動作では、dmデバイスが停止されるときに書き込まれます。システムがクラッシュした場合、再起動時にすべてのキャッシュブロックがdirtyとみなされます。</p>
+</section>
+<section id="per-block-policy-hints">
+<h3>ブロックごとのポリシーのヒント<a class="headerlink" href="#per-block-policy-hints" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ポリシープラグインはキャッシュブロックごとにデータを保存できます。ポリシーによってこのチャンクのサイズは決まりますが、小さく保つ必要があります。dirtyフラグと同様に、クラッシュ時にこのデータは失われますので、安全なフォールバック値が常に可能であるべきです。</p>
+<p>ポリシーのヒントはパフォーマンスに影響を与えるが、正しさには影響しません。</p>
+</section>
+<section id="policy-messaging">
+<h3>ポリシーのメッセージング<a class="headerlink" href="#policy-messaging" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ポリシーにはそれぞれに特有のチューニングパラメータがあり、これらを取得・設定する汎用的な方法が必要です。デバイスマッパーのメッセージを使用します。cache-policies.txtを参照してください。</p>
+</section>
+<section id="discard-bitset-resolution">
+<h3>Discardビットセットの解像度<a class="headerlink" href="#discard-bitset-resolution" title="この見出しへのパーマリンク">¶</a></h3>
+<p>データのコピーを避けるため、ブロックがdiscardされているかを知ることが重要です。mkfsがブロックデバイス全体をdiscardする例がこれに該当します。ブロックのdiscard状態を追跡するビットセットを保存します。ただし、このビットセットのブロックサイズはキャッシュブロックとは異なる場合があります。これは、元のデバイス全体のdiscard状態を追跡する必要があるためです（dirtyビットセットはキャッシュデバイスの小さな領域のみを対象としています）。</p>
+</section>
+</section>
+<section id="target-interface">
+<h2>ターゲットインターフェース<a class="headerlink" href="#target-interface" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="constructor">
+<h3>コンストラクタ<a class="headerlink" href="#constructor" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>cache &lt;metadata dev&gt; &lt;cache dev&gt; &lt;origin dev&gt; &lt;block size&gt;
+      &lt;#feature args&gt; [&lt;feature arg&gt;]*
+      &lt;policy&gt; &lt;#policy args&gt; [policy args]*
+</pre></div>
+</div>
+</div></blockquote>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 23%"/>
+<col style="width: 77%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>metadata dev</p></td>
+<td><p>永続的なメタデータを保持する高速デバイス</p></td>
+</tr>
+<tr class="row-even"><td><p>cache dev</p></td>
+<td><p>キャッシュされたデータブロックを保持する高速デバイス</p></td>
+</tr>
+<tr class="row-odd"><td><p>origin dev</p></td>
+<td><p>元のデータブロックを保持する遅速デバイス</p></td>
+</tr>
+<tr class="row-even"><td><p>ブロックサイズ</p></td>
+<td><p>キャッシュ単位のセクタサイズ</p></td>
+</tr>
+<tr class="row-odd"><td><p>#feature args</p></td>
+<td><p>渡された機能引数の数</p></td>
+</tr>
+<tr class="row-even"><td><p>feature args</p></td>
+<td><p>writethroughまたはpassthrough（デフォルトはwriteback）</p></td>
+</tr>
+<tr class="row-odd"><td><p>policy</p></td>
+<td><p>使用する置き換えポリシー</p></td>
+</tr>
+<tr class="row-even"><td><p>#policy args</p></td>
+<td><p>ポリシーに渡されるキー/値ペアに対応する偶数の引数</p></td>
+</tr>
+<tr class="row-odd"><td><p>policy args</p></td>
+<td><p>ポリシーに渡されるキー/値ペア。例: ‘sequential_threshold 1024’ 詳細はcache-policies.txtを参照してください。</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>オプション機能引数は以下の通りです:</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 26%"/>
+<col style="width: 74%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>writethrough</p></td>
+<td><p>キャッシュブロックの内容がオリジンブロックの内容と異なることを禁止するライトスルーキャッシング。この引数がない場合、パフォーマンスのためキャッシュブロックの内容を後で書き戻すデフォルトの動作が行われ、これにより対応するオリジンブロックと異なる可能性があります。</p></td>
+</tr>
+<tr class="row-even"><td><p>passthrough</p></td>
+<td><p>さまざまなキャッシュコヒーレンシー状況（例：下位ストレージのスナップショットのロールバックなど）に有用なデグレードモード。読み込みと書き込みは常にオリジンに行います。書き込みがキャッシュされたオリジンブロックに行うと、キャッシュブロックは無効化されます。パステラーモードを有効にするにはキャッシュがクリーンである必要があります。</p></td>
+</tr>
+<tr class="row-odd"><td><p>metadata2</p></td>
+<td><p>メタデータバージョン2を使用します。これはディリィビットを別のbtreeに格納し、キャッシュのシャットダウン速度を向上させます。</p></td>
+</tr>
+<tr class="row-even"><td><p>no_discard_passdown</p></td>
+<td><p>キャッシュからオリジンのデータデバイスへのディスカードの伝達を無効にします。</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>「デフォルト」と呼ばれるポリシーは常に登録されます。これは現在考えられる全体的なパフォーマンスを提供するポリシーの別名です。</p>
+<p>デフォルトポリシーはカーネルによって異なり得るため、特定のポリシーの特性に依存している場合は常に名前で要求してください。</p>
+</section>
+<section id="status">
+<h3>Status<a class="headerlink" href="#status" title="この見出しへのパーマリンク">¶</a></h3>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>&lt;metadata block size&gt; &lt;#used metadata blocks&gt;/&lt;#total metadata blocks&gt;
+&lt;cache block size&gt; &lt;#used cache blocks&gt;/&lt;#total cache blocks&gt;
+&lt;#read hits&gt; &lt;#read misses&gt; &lt;#write hits&gt; &lt;#write misses&gt;
+&lt;#demotions&gt; &lt;#promotions&gt; &lt;#dirty&gt; &lt;#features&gt; &lt;features&gt;*
+&lt;#core args&gt; &lt;core args&gt;* &lt;policy name&gt; &lt;#policy args&gt; &lt;policy args&gt;*
+&lt;cache metadata mode&gt;
+</pre></div>
+</div>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 32%"/>
+<col style="width: 68%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>メタデータブロックサイズ</p></td>
+<td><p>各メタデータブロックの固定ブロックサイズ（セクタ単位）</p></td>
+</tr>
+<tr class="row-even"><td><p>#使用中のメタデータブロック</p></td>
+<td><p>使用されているメタデータブロックの数</p></td>
+</tr>
+<tr class="row-odd"><td><p>#総メタデータブロック数</p></td>
+<td><p>メタデータブロックの総数</p></td>
+</tr>
+<tr class="row-even"><td><p>キャッシュブロックサイズ</p></td>
+<td><p>キャッシュデバイスの設定可能なブロックサイズ（セクタ単位）</p></td>
+</tr>
+<tr class="row-odd"><td><p>#使用中のキャッシュブロック</p></td>
+<td><p>キャッシュに Resident しているブロック数</p></td>
+</tr>
+<tr class="row-even"><td><p>#総キャッシュブロック数</p></td>
+<td><p>キャッシュブロックの総数</p></td>
+</tr>
+<tr class="row-odd"><td><p>#読み込みヒット</p></td>
+<td><p>READ bio がキャッシュにマッピングされた回数</p></td>
+</tr>
+<tr class="row-even"><td><p>#読み込みミス</p></td>
+<td><p>READ bio がオリジンにマッピングされた回数</p></td>
+</tr>
+<tr class="row-odd"><td><p>#書き込みヒット</p></td>
+<td><p>WRITE bio がキャッシュにマッピングされた回数</p></td>
+</tr>
+<tr class="row-even"><td><p>#書き込みミス</p></td>
+<td><p>WRITE bio がオリジンにマッピングされた回数</p></td>
+</tr>
+<tr class="row-odd"><td><p>#デモーション</p></td>
+<td><p>キャッシュからブロックが削除された回数</p></td>
+</tr>
+<tr class="row-even"><td><p>#プロモーション</p></td>
+<td><p>ブロックがキャッシュに移動された回数</p></td>
+</tr>
+<tr class="row-odd"><td><p>#ディリィ</p></td>
+<td><p>オリジンと異なるキャッシュ内のブロック数</p></td>
+</tr>
+<tr class="row-even"><td><p>#feature args</p></td>
+<td><p>続く機能引数の数</p></td>
+</tr>
+<tr class="row-odd"><td><p>feature args</p></td>
+<td><p>‘writethrough’（オプション）</p></td>
+</tr>
+<tr class="row-even"><td><p>#コア引数</p></td>
+<td><p>コア引数の数（偶数でなければならない）</p></td>
+</tr>
+<tr class="row-odd"><td><p>コア引数（例: migration_threshold など、コアの調整に使用するキー/値ペア）</p></td>
+<td><p>キー/値ペア（例: sequential_threshold）</p></td>
+</tr>
+<tr class="row-even"><td><p>ポリシー名</p></td>
+<td><p>ポリシーの名前</p></td>
+</tr>
+<tr class="row-odd"><td><p>#policy args</p></td>
+<td><p>続くポリシー引数の数（偶数でなければなりません）</p></td>
+</tr>
+<tr class="row-even"><td><p>policy args</p></td>
+<td><p>キー/値ペア（例: sequential_threshold）</p></td>
+</tr>
+<tr class="row-odd"><td><p>キャッシュメタデータモード</p></td>
+<td><p>ro（読み取り専用）、rw（読み書き可能）</p>
+<p>読み取り専用モードでも安全でないと判断される深刻な状況では、さらにI/Oが許可されず、ステータスは'Fail'という文字列のみを含みます。この場合、ユーザー空間の回復ツールを使用する必要があります。</p>
+</td>
+</tr>
+<tr class="row-even"><td><p>needs_check（設定されている場合）'-'（設定されていない場合）</p></td>
+<td><p>needs_checkが設定されている場合、'-'が設定されていない場合。メタデータ操作が失敗し、メタデータのスーパーブロックにneeds_checkフラグが設定された場合、メタデータデバイスを非アクティブ化し、チェック/修復する必要があります。'-'はneeds_checkが設定されていないことを示します。</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="messages">
+<h3>メッセージ<a class="headerlink" href="#messages" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ポリシーにはそれぞれ異なる調整パラメータがあり、これらを取得・設定するための汎用的な方法が必要です。デバイスマッパーのメッセージが使用されます。（sysfsインターフェースも可能です。）</p>
+<p>メッセージの形式は:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>&lt;key&gt; &lt;value&gt;
+</pre></div>
+</div>
+<p>E.g.:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dmsetup message my_cache 0 sequential_threshold 1024
+</pre></div>
+</div>
+<p>無効化はキャッシュからエントリを削除することを指し、バックアップせずに実行されます。キャッシュブロックはinvalidate_cblocksメッセージを通じて無効化でき、このメッセージは任意の数のcblock範囲を受け取ります。各cblock範囲の終端値は「終端を越えた」値であり、5-10は5から9までの範囲を表します。今後、より大規模なキャッシュの効率的な無効化をサポートするため、16進数で表現されたcblock範囲を受取る変種メッセージが必要になる可能性があります。invalidate_cblocksを使用する際には、キャッシュがpassthroughモードでなければなりません。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>invalidate_cblocks [&lt;cblock&gt;|&lt;cblock begin&gt;-&lt;cblock end&gt;]*
+</pre></div>
+</div>
+<p>E.g.:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dmsetup message my_cache 0 invalidate_cblocks 2345 3456-4567 5678-6789
+</pre></div>
+</div>
+</section>
+</section>
+<section id="examples">
+<h2>例<a class="headerlink" href="#examples" title="この見出しへのパーマリンク">¶</a></h2>
+<p>テストスイートは以下にあります:</p>
+<p><a class="reference external" href="https://github.com/jthornber/device-mapper-test-suite">https://github.com/jthornber/device-mapper-test-suite</a></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dmsetup create my_cache --table '0 41943040 cache /dev/mapper/metadata \
+        /dev/mapper/ssd /dev/mapper/origin 512 1 writeback default 0'
+dmsetup create my_cache --table '0 41943040 cache /dev/mapper/metadata \
+        /dev/mapper/ssd /dev/mapper/origin 1024 1 writeback \
+        mq 4 sequential_threshold 1024 random_threshold 8'
+</pre></div>
+</div>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxカーネルユーザーおよび管理者のガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../README.html">Linux カーネルリリース 5.x &lt;http://kernel.org/&gt;</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel-parameters.html">カーネルのコマンドラインパラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../devices.html">Linux で割り当てられたデバイス（4.x 以降のバージョン）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sysctl/index.html">/proc/sys に関するドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../abi.html">Linux ABI 説明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hw-vuln/index.html">ハードウェアの脆弱性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../reporting-bugs.html">バグの報告</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../security-bugs.html">セキュリティ関連のバグ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bug-hunting.html">バグ狩り</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bug-bisect.html">バグのバイセクティング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tainted-kernels.html">汚染されたカーネル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ramoops.html">Ramoops oops/panic ロガー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dynamic-debug-howto.html">ダイナミックデバッグ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../init.html">「No working init found.」のブートハングメッセージの説明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kdump/index.html">Kdump に関するドキュメンテーション - kexec を使用したクラッシュダンプ解決策</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../perf/index.html">パフォーマンスモニタサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pstore-blk.html">pstore ブロック oops/panic ロガー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sysfs-rules.html">sysfs 内の情報へのアクセスに関するルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../acpi/index.html">ACPI サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../aoe/index.html">ATA over Ethernet (AoE)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../auxdisplay/index.html">補助ディスプレイサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bcache.html">ブロックレイヤーのキャッシュ（bcache）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../binderfs.html">Android binderfs ファイルシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../binfmt-misc.html">Linux における miscellaneous Binary Formats（binfmt_misc）のカーネルサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../blockdev/index.html">Linux RapidIO サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bootconfig.html">ブート構成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../braille-console.html">Linux ブライルコンソール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../btmrvl.html">btmrvl ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cgroup-v1/index.html">Control Groups バージョン 1</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cgroup-v2.html">Control Group v2</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cifs/index.html">CIFS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../clearing-warn-once.html">WARN_ONCE のクリア</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cpu-load.html">CPU ロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cputopology.html">sysfs を通じて CPU テポロジー情報がエクスポートされる仕組み</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dell_rbu.html">Dell Remote BIOS Update ドライバー (dell_rbu)</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">Device Mapper</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../edid.html">EDID</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../efi-stub.html">EFI ブート ステブ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ext4.html">ext4 一般情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nfs/index.html">NFS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../gpio/index.html">gpio</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../highuid.html">16 ビット UID から 32 ビット UID への変更に関する注意点</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hw_random.html">i8xx チップセットにおけるランダム数生成器の Linux サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../initrd.html">初期 RAM ディスク (initrd) の使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../iostats.html">I/O 統計項目</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../java.html">Java(tm) バイナリーカーネルサポート for Linux v1.03</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../jfs.html">IBM のジャーナル化ファイルシステム (JFS) for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel-per-CPU-kthreads.html">per-CPU kthread による OS ジャッタリングの軽減</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../laptops/index.html">ノートPCドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lcd-panel-cgram.html">パラレルポート LCD/キーパッドパネルサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ldm.html">LDM - ロジカルディスクマネージャー (ダイナミックディスク)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lockup-watchdogs.html">ソフトロックアップ検出器とハードロックアップ検出器 (nmi_watchdog とも呼ばれる)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../LSM/index.html">Linux セキュリティモジュールの使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../md.html">RAID アレイ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../media/index.html">メディアサブシステム管理およびユーザーガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mm/index.html">メモリ管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../module-signing.html">カーネルモジュール署名機能</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mono.html">Mono(tm) バイナリーカーネルサポート for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../namespaces/index.html">ネームスペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../numastat.html">NUMA ポリシー ヒット/ミス統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../parport.html">パラレルポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../perf-security.html">Perf イベントとツールセキュリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pm/index.html">電源管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pnp.html">Linux プラグアンドプレイドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rapidio.html">RapidIO サブシステムガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ras.html">信頼性、可用性、サービス性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rtc.html">リアルタイムクロック (RTC) ドライバー for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../serial-console.html">Linux シリアルコンソール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../svga.html">ビデオモード選択サポート 2.13</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sysrq.html">Linux Magic System Request Key Hacks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../thunderbolt.html">USB4 and Thunderbolt</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ufs.html">UFSの使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../unicode.html">Unicodeのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vga-softcursor.html">VGA用ソフトウェアカーソル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../video-output.html">ビデオ出力スイッチャー制御</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../wimax/index.html">WiMAXサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xfs.html">SGI XFS ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxカーネルユーザーおよび管理者のガイド</a><ul>
+<li><a href="index.html">Device Mapper</a><ul>
+<li>前へ: <a href="cache-policies.html" title="前章">ポリシーの作成に関するガイドライン</a></li>
+<li>次へ: <a href="delay.html" title="次章">dm-delay</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/admin-guide/device-mapper/cache.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

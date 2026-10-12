@@ -1,0 +1,528 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>dm-clone — Linux Kernel ドキュメント</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="dm-crypt.html" rel="next" title="dm-crypt"/>
+<link href="delay.html" rel="prev" title="dm-delay"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="dm-clone">
+<h1>dm-clone<a class="headerlink" href="#dm-clone" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>dm-clone は、既存の読み取り専用ソースデバイスを、書き込み可能な宛先デバイスに1対1で複製するデバイスマッパーターゲットです。このターゲットは、すべてのデータが即座に表示される仮想ブロックデバイスを提供し、読み取りと書き込みを適切にリダイレクトします。</p>
+<p>dm-clone の主な用途は、遠隔地にある高遅延、読み取り専用、アーカイブ型のブロックデバイスを、高速で低遅延なプライマリ型の書き込み可能なデバイスに複製することです。複製されたデバイスは即座に表示/マウント可能で、ソースデバイスのデータを宛先デバイスに複製する作業はユーザーI/Oと並行してバックグラウンドで行われます。</p>
+<p>たとえば、ネットワークストレージプロトコル（NBD、ファイバー・チャネル、iSCSI、AoEなど）を通じてアクセス可能な読み取り専用コピーからアプリケーションのバックアップを復元し、ローカルのSSDまたはNVMeデバイスに移すことで、復元が完了するのを待つことなく即座にデバイスを使用できます。</p>
+<p>複製が完了した後、dm-clone テーブルは完全に削除され、リニアテーブルなどに置き換えることができます（例：宛先デバイスに直接マッピングする）。</p>
+<p>dm-clone ターゲットは、スリムプロビジョニングターゲットが使用するメタデータライブラリを再利用します。</p>
+</section>
+<section id="glossary">
+<h2>用語集<a class="headerlink" href="#glossary" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><dl class="simple">
+<dt>ハイドレーション</dt><dd><p>ソースデバイスの同じ領域からデータを宛先デバイスの領域にコピーするプロセス、つまりソースから宛先への領域のコピー。</p>
+</dd>
+</dl>
+</div></blockquote>
+<p>領域がハイドレーションされると、その領域に関するすべてのI/O操作を宛先デバイスにリダイレクトします。</p>
+</section>
+<section id="design">
+<h2>設計<a class="headerlink" href="#design" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="sub-devices">
+<h3>サブデバイス<a class="headerlink" href="#sub-devices" title="この見出しへのパーマリンク">¶</a></h3>
+<p>このターゲットは、後に詳しく説明する他のパラメータとともに3つのデバイスを渡して構築されます：</p>
+<ol class="arabic simple">
+<li><p>ソースデバイス - 複製される読み取り専用デバイスで、ハイドレーションの元となるデバイス。</p></li>
+<li><p>宛先デバイス - ハイドレーションの対象となるデバイスで、ソースデバイスのクローンになるデバイス。</p></li>
+<li><p>小さなメタデータデバイス - 宛先デバイスで既に有効な領域（ハイドレーション済みの領域またはユーザーI/Oで直接書き込まれた領域）を記録します。</p></li>
+</ol>
+<p>宛先デバイスのサイズは、ソースデバイスのサイズ以上でなければなりません。</p>
+</section>
+<section id="regions">
+<h3>領域<a class="headerlink" href="#regions" title="この見出しへのパーマリンク">¶</a></h3>
+<p>dm-clone は、ソースと宛先デバイスを固定サイズの領域に分割します。領域はハイドレーションの単位であり、ソースから宛先にコピーされる最小のデータ量です。</p>
+<p>dm-clone デバイスを作成する際、領域サイズを設定できます。推奨される領域サイズはファイルシステムのブロックサイズ（通常4KB）と同じです。領域サイズは8セクタ（4KB）から2097152セクタ（1GB）までで、2の累乗である必要があります。</p>
+<p>ハイドレーションされた領域の読み取りと書き込みは、宛先デバイスから処理されます。</p>
+<p>未ヒドレートの領域への読み込みは、ソースデバイスから直接処理されます。</p>
+<p>未ヒドレートの領域への書き込みは、該当領域がヒドレートされるのを待ってから処理され、ヒドレートは即座に開始されます。</p>
+<p>注意：領域サイズに等しいサイズの書き込みリクエストは、ソースデバイスから該当領域をコピーせず、直接宛先デバイスの領域を上書きします。</p>
+</section>
+<section id="discards">
+<h3>Discards<a class="headerlink" href="#discards" title="この見出しへのパーマリンク">¶</a></h3>
+<p>dm-cloneは、ヒドレートされていない範囲へのディスカードリクエストを、そのリクエストでカバーする領域のヒドレートをスキップするヒントと解釈します。つまり、ソースから宛先デバイスへの領域データのコピーをスキップし、メタデータのみを更新します。</p>
+<p>宛先デバイスがディスカードをサポートする場合、dm-cloneはデフォルトでディスカードリクエストをそのデバイスに伝達します。</p>
+</section>
+<section id="background-hydration">
+<h3>バックグラウンドヒドレート<a class="headerlink" href="#background-hydration" title="この見出しへのパーマリンク">¶</a></h3>
+<p>dm-cloneは、ソースデバイスから宛先デバイスへ連続的にデータをコピーし、すべてのデバイスがコピーされるまで続きます。</p>
+<p>ソースデバイスから宛先デバイスへのデータコピーは帯域幅を消費します。ユーザーはスロットルを設定して、一度にコピーされるデータ量を制限できます。さらに、dm-cloneはデバイスへのユーザーI/Oトラフィックを考慮し、I/Oが進行中であるときにバックグラウンドヒドレートを一時停止します。</p>
+<p>メッセージ <cite>hydration_threshold &lt;#regions&gt;</cite> は、コピーされる領域の最大数を設定するためのパラメータで、デフォルトは1領域です。</p>
+<p>dm-cloneは、dm-kcopydを使用してソースデバイスの一部を宛先デバイスにコピーします。デフォルトでは、領域サイズに等しいサイズのコピーリクエストを発行します。メッセージ <cite>hydration_batch_size &lt;#regions&gt;</cite> は、これらのコピーリクエストのサイズを調整するためのパラメータです。ヒドレートバッチサイズを増やすと、dm-cloneが連続する領域をバッチ処理するようになり、この数の領域ごとにデータをコピーします。</p>
+<p>宛先デバイスのヒドレートが完了すると、ユーザー空間にdmイベントが送信されます。</p>
+</section>
+<section id="updating-on-disk-metadata">
+<h3>ディスク上のメタデータの更新中<a class="headerlink" href="#updating-on-disk-metadata" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ディスク上のメタデータは、FLUSHまたはFUA bioが書き込まれるたびにコミットされます。このようなリクエストがなければ、秒単位でコミットされます。これは、dm-cloneデバイスが揮発性のライトキャッシュを持つ物理ディスクのように動作することを意味します。電源が切れた場合、最近の書き込みが失われる可能性があります。ただし、クラッシュに関係なくメタデータは常に一貫しています。</p>
+</section>
+</section>
+<section id="target-interface">
+<h2>ターゲットインターフェース<a class="headerlink" href="#target-interface" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="constructor">
+<h3>コンストラクタ<a class="headerlink" href="#constructor" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>clone &lt;metadata dev&gt; &lt;destination dev&gt; &lt;source dev&gt; &lt;region size&gt;
+      [&lt;#feature args&gt; [&lt;feature arg&gt;]* [&lt;#core args&gt; [&lt;core arg&gt;]*]]
+</pre></div>
+</div>
+</div></blockquote>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 21%"/>
+<col style="width: 79%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>metadata dev</p></td>
+<td><p>永続的なメタデータを保持する高速デバイス</p></td>
+</tr>
+<tr class="row-even"><td><p>destination dev</p></td>
+<td><p>ソースがクローンされる宛先デバイス</p></td>
+</tr>
+<tr class="row-odd"><td><p>source dev</p></td>
+<td><p>読み込み専用で、クローンされるデータを含むデバイス</p></td>
+</tr>
+<tr class="row-even"><td><p>region size</p></td>
+<td><p>領域のサイズ（セクタ数）</p></td>
+</tr>
+<tr class="row-odd"><td><p>#feature args</p></td>
+<td><p>渡された機能引数の数</p></td>
+</tr>
+<tr class="row-even"><td><p>feature args</p></td>
+<td><p>ハイドレーションを無効にするまたはdiscard_passdownを無効にする</p></td>
+</tr>
+<tr class="row-odd"><td><p>#コア引数</p></td>
+<td><p>dm-cloneに渡されるkey/valueペアに対応する偶数の引数</p></td>
+</tr>
+<tr class="row-even"><td><p>コア引数（例: migration_threshold など、コアの調整に使用するキー/値ペア）</p></td>
+<td><p>dm-cloneに渡されるkey/valueペア、例: <cite>ハイドレーション閾値 256</cite></p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>オプション機能引数は以下の通りです:</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 26%"/>
+<col style="width: 74%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>ハイドレーションを無効にする</p></td>
+<td><p>バックグラウンドハイドレーションを無効にしたdm-cloneインスタンスを作成する</p></td>
+</tr>
+<tr class="row-even"><td><p>no_discard_passdown</p></td>
+<td><p>宛先デバイスへのdiscardの伝播を無効にする</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>オプションのコア引数は以下の通り:</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 41%"/>
+<col style="width: 59%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>hydration_threshold &lt;#regions&gt;</p></td>
+<td><p>バックグラウンドハイドレーション中に、ソースから宛先デバイスへコピーされる同時進行中の領域の最大数</p></td>
+</tr>
+<tr class="row-even"><td><p>hydration_batch_size &lt;#regions&gt;</p></td>
+<td><p>バックグラウンドハイドレーション中に、連続する領域をバッチ処理としてまとめることで、この数の領域ごとにソースから宛先デバイスへデータをコピーします</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+</section>
+<section id="status">
+<h3>Status<a class="headerlink" href="#status" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>&lt;metadata block size&gt; &lt;#used metadata blocks&gt;/&lt;#total metadata blocks&gt;
+&lt;region size&gt; &lt;#hydrated regions&gt;/&lt;#total regions&gt; &lt;#hydrating regions&gt;
+&lt;#feature args&gt; &lt;feature args&gt;* &lt;#core args&gt; &lt;core args&gt;*
+&lt;clone metadata mode&gt;
+</pre></div>
+</div>
+</div></blockquote>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 29%"/>
+<col style="width: 71%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>メタデータブロックサイズ</p></td>
+<td><p>各メタデータブロックの固定ブロックサイズ（セクタ単位）</p></td>
+</tr>
+<tr class="row-even"><td><p>#使用中のメタデータブロック</p></td>
+<td><p>使用されているメタデータブロックの数</p></td>
+</tr>
+<tr class="row-odd"><td><p>#総メタデータブロック数</p></td>
+<td><p>メタデータブロックの総数</p></td>
+</tr>
+<tr class="row-even"><td><p>region size</p></td>
+<td><p>デバイスの設定可能な領域サイズ（セクタ単位）</p></td>
+</tr>
+<tr class="row-odd"><td><p>#ハイドレートされた領域</p></td>
+<td><p>ハイドレーションを完了した領域の数</p></td>
+</tr>
+<tr class="row-even"><td><p>#総領域数</p></td>
+<td><p>ハイドレーションが必要な領域の総数</p></td>
+</tr>
+<tr class="row-odd"><td><p>#ハイドレーション中の領域</p></td>
+<td><p>現在ハイドレーション中の領域の数</p></td>
+</tr>
+<tr class="row-even"><td><p>#feature args</p></td>
+<td><p>続く特徴引数の数</p></td>
+</tr>
+<tr class="row-odd"><td><p>feature args</p></td>
+<td><p>特徴引数、例: <cite>ハイドレーションを無効にする</cite></p></td>
+</tr>
+<tr class="row-even"><td><p>#コア引数</p></td>
+<td><p>続くコア引数の偶数</p></td>
+</tr>
+<tr class="row-odd"><td><p>コア引数（例: migration_threshold など、コアの調整に使用するキー/値ペア）</p></td>
+<td><p>コアのチューニング用のkey/valueペア、例:
+<cite>ハイドレーション閾値 256</cite></p></td>
+</tr>
+<tr class="row-even"><td><p>クローンメタデータモード</p></td>
+<td><p>ro（読み取り専用）、rw（読み書き可能）</p>
+<p>重大なケースでは、読み取り専用モードでも安全でないと判断された場合、さらなるI/Oが許可されず、ステータスは文字列‘Fail’のみを含みます。メタデータモードが変更された場合、dmイベントがユーザー空間に送信されます</p>
+</td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+</section>
+<section id="messages">
+<h3>メッセージ<a class="headerlink" href="#messages" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><dl class="simple">
+<dt><cite>ハイドレーションを無効にする</cite></dt><dd><p>宛先デバイスのバックグラウンドハイドレーションを無効にする</p>
+</dd>
+<dt><cite>ハイドレーションを有効にする</cite></dt><dd><p>宛先デバイスのバックグラウンドハイドレーションを有効にする</p>
+</dd>
+<dt><cite>hydration_threshold &lt;#regions&gt;</cite></dt><dd><p>バックグラウンドハイドレーションの閾値を設定する</p>
+</dd>
+<dt><cite>hydration_batch_size &lt;#regions&gt;</cite></dt><dd><p>バックグラウンドハイドレーションのバッチサイズを設定する</p>
+</dd>
+</dl>
+</div></blockquote>
+</section>
+</section>
+<section id="examples">
+<h2>例<a class="headerlink" href="#examples" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="clone-a-device-containing-a-file-system">
+<h3>ファイルシステムを含むデバイスをクローンする<a class="headerlink" href="#clone-a-device-containing-a-file-system" title="この見出しへのパーマリンク">¶</a></h3>
+<ol class="arabic">
+<li><p>dm-cloneデバイスを作成する</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dmsetup create clone --table "0 1048576000 clone $metadata_dev $dest_dev \
+  $source_dev 8 1 no_hydration"
+</pre></div>
+</div>
+</li>
+<li><p>デバイスをマウントし、ファイルシステムをトリムします。dm-cloneはファイルシステムから送信されるdiscardを解釈し、未使用の領域をハイドレートしません</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>mount /dev/mapper/clone /mnt/cloned-fs
+fstrim /mnt/cloned-fs
+</pre></div>
+</div>
+</li>
+<li><p>宛先デバイスのバックグラウンドハイドレーションを有効にする</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dmsetup message clone 0 enable_hydration
+</pre></div>
+</div>
+</li>
+<li><p>ハイドレーションが完了すると、dm-cloneテーブルを線形テーブルに置き換えることができます</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dmsetup suspend clone
+dmsetup load clone --table "0 1048576000 linear $dest_dev 0"
+dmsetup resume clone
+</pre></div>
+</div>
+<p>メタデータデバイスはもはや必要なく、安全に破棄したり他の用途に再利用したりできます</p>
+</li>
+</ol>
+</section>
+</section>
+<section id="known-issues">
+<h2>既知の問題<a class="headerlink" href="#known-issues" title="この見出しへのパーマリンク">¶</a></h2>
+<ol class="arabic simple">
+<li><p>未ハイドレートの領域への読み込みをソースデバイスにリダイレクトします。ソースデバイスの読み取りに高いレイテンシーがあり、ユーザーが同じ領域を繰り返し読み取る場合、この動作はパフォーマンスを低下させる可能性があります。これらの読み込みをヒントとして、関連する領域をより早くハイドレートするようにすべきです。現在は、これらの領域をページキャッシュに保存しているため、ソースデバイスから複数回読み取る必要がないようにしています</p></li>
+<li><p>ハイドレーションが完了後、インコアリソース（ハイドレートされている領域を追跡するビットマップなど）を解放します</p></li>
+<li><p>バックグラウンドでのハイドレーション中に、ソースデバイスの読み込みまたは宛先デバイスへの書き込みに失敗した場合、エラーメッセージを出力しますが、ハイドレーションプロセスは成功するまで無限に続きます。複数の失敗後にバックグラウンドハイドレーションを停止し、ユーザー空間に通知するdmイベントを発行すべきです。</p></li>
+</ol>
+</section>
+<section id="why-not">
+<h2>なぜしないのか？<a class="headerlink" href="#why-not" title="この見出しへのパーマリンク">¶</a></h2>
+<p>dm-cloneを実装する前に、以下の代替案を検討しました：</p>
+<ol class="arabic">
+<li><p>ソースデバイスのサイズに等しいキャッシュサイズでdm-cacheを使用し、新しいクローンポリシーを実装する：</p>
+<ul class="simple">
+<li><p>結果として得られるキャッシュデバイスは、ソースデバイスの1対1のミラーデバイスではなく、そのためクローンが完了した後でもキャッシュデバイスを削除できません。</p></li>
+<li><p>dm-cacheはソースデバイスに書き込みを行うため、ソースデバイスを読み取り専用として扱うという要件を満たしません。</p></li>
+<li><p>キャッシュはクローンとは意味的に異なります。</p></li>
+</ul>
+</li>
+<li><p>ソースデバイスと同等のCOWデバイスを使用してdm-snapshotを使用する：</p>
+<ul class="simple">
+<li><p>dm-snapshotはCOWデバイスにメタデータを保存するため、結果として得られるデバイスはソースデバイスの1対1のミラーデバイスではありません。</p></li>
+<li><p>バックグラウンドコピーのメカニズムがありません。</p></li>
+<li><p>dm-snapshotは、待機中の例外が完了するたびにメタデータをコミットする必要がありますが、クローンの場合はこれほど厳格にしなくてもよく、FLUSHまたはFUA bioが書き込まれるたびに、またはdm-thinやdm-cacheのように定期的にメタデータをコミットすることで十分です。これによりパフォーマンスが大幅に向上します。</p></li>
+</ul>
+</li>
+<li><p>dm-mirrorを使用する：ミラー対象はバックグラウンドでのコピー/ミラーリングメカニズムを持っていますが、すべてのミラーに書き込むため、ソースデバイスを読み取り専用として扱うという要件を満たしません。</p></li>
+<li><p>dm-thinの外部スナップショット機能を使用する。このアプローチはすべての代替案の中で最も有望です。なぜなら、スパースプロビジョニングされたボリュームはソースデバイスの1対1のミラーデバイスであり、未プロビジョニング/未クローンの領域への読み込みと書き込みをdm-cloneと同じように処理するからです。</p>
+<p>それでも：</p>
+<ul class="simple">
+<li><p>バックグラウンドコピーのメカニズムはありませんが、実装することは可能です。</p></li>
+<li><p>最も重要なのは、クローンプロセスの宛先として任意のブロックデバイスをサポートすることであり、スパースプロビジョニングされたボリュームに限定しないことです。スパースプロビジョニングには、スパースボリュームのマッピングを維持するために必要なメタデータオーバーヘッドがあり、これによりパフォーマンスが大幅に低下します。</p></li>
+</ul>
+<p>さらに、デバイスのクローン化はスパースプロビジョニングの使用を強制するものではありません。一方で、スパースプロビジョニングを使用したい場合は、dm-cloneの宛先デバイスとしてスパースLVを使用するだけで済みます。</p>
+</li>
+</ol>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxカーネルユーザーおよび管理者のガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../README.html">Linux カーネルリリース 5.x &lt;http://kernel.org/&gt;</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel-parameters.html">カーネルのコマンドラインパラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../devices.html">Linux で割り当てられたデバイス（4.x 以降のバージョン）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sysctl/index.html">/proc/sys に関するドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../abi.html">Linux ABI 説明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hw-vuln/index.html">ハードウェアの脆弱性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../reporting-bugs.html">バグの報告</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../security-bugs.html">セキュリティ関連のバグ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bug-hunting.html">バグ狩り</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bug-bisect.html">バグのバイセクティング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tainted-kernels.html">汚染されたカーネル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ramoops.html">Ramoops oops/panic ロガー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dynamic-debug-howto.html">ダイナミックデバッグ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../init.html">「No working init found.」のブートハングメッセージの説明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kdump/index.html">Kdump に関するドキュメンテーション - kexec を使用したクラッシュダンプ解決策</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../perf/index.html">パフォーマンスモニタサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pstore-blk.html">pstore ブロック oops/panic ロガー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sysfs-rules.html">sysfs 内の情報へのアクセスに関するルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../acpi/index.html">ACPI サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../aoe/index.html">ATA over Ethernet (AoE)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../auxdisplay/index.html">補助ディスプレイサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bcache.html">ブロックレイヤーのキャッシュ（bcache）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../binderfs.html">Android binderfs ファイルシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../binfmt-misc.html">Linux における miscellaneous Binary Formats（binfmt_misc）のカーネルサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../blockdev/index.html">Linux RapidIO サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bootconfig.html">ブート構成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../braille-console.html">Linux ブライルコンソール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../btmrvl.html">btmrvl ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cgroup-v1/index.html">Control Groups バージョン 1</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cgroup-v2.html">Control Group v2</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cifs/index.html">CIFS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../clearing-warn-once.html">WARN_ONCE のクリア</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cpu-load.html">CPU ロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cputopology.html">sysfs を通じて CPU テポロジー情報がエクスポートされる仕組み</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dell_rbu.html">Dell Remote BIOS Update ドライバー (dell_rbu)</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">Device Mapper</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../edid.html">EDID</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../efi-stub.html">EFI ブート ステブ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ext4.html">ext4 一般情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nfs/index.html">NFS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../gpio/index.html">gpio</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../highuid.html">16 ビット UID から 32 ビット UID への変更に関する注意点</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hw_random.html">i8xx チップセットにおけるランダム数生成器の Linux サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../initrd.html">初期 RAM ディスク (initrd) の使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../iostats.html">I/O 統計項目</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../java.html">Java(tm) バイナリーカーネルサポート for Linux v1.03</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../jfs.html">IBM のジャーナル化ファイルシステム (JFS) for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel-per-CPU-kthreads.html">per-CPU kthread による OS ジャッタリングの軽減</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../laptops/index.html">ノートPCドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lcd-panel-cgram.html">パラレルポート LCD/キーパッドパネルサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ldm.html">LDM - ロジカルディスクマネージャー (ダイナミックディスク)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lockup-watchdogs.html">ソフトロックアップ検出器とハードロックアップ検出器 (nmi_watchdog とも呼ばれる)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../LSM/index.html">Linux セキュリティモジュールの使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../md.html">RAID アレイ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../media/index.html">メディアサブシステム管理およびユーザーガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mm/index.html">メモリ管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../module-signing.html">カーネルモジュール署名機能</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mono.html">Mono(tm) バイナリーカーネルサポート for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../namespaces/index.html">ネームスペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../numastat.html">NUMA ポリシー ヒット/ミス統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../parport.html">パラレルポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../perf-security.html">Perf イベントとツールセキュリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pm/index.html">電源管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pnp.html">Linux プラグアンドプレイドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rapidio.html">RapidIO サブシステムガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ras.html">信頼性、可用性、サービス性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rtc.html">リアルタイムクロック (RTC) ドライバー for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../serial-console.html">Linux シリアルコンソール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../svga.html">ビデオモード選択サポート 2.13</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sysrq.html">Linux Magic System Request Key Hacks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../thunderbolt.html">USB4 and Thunderbolt</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ufs.html">UFSの使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../unicode.html">Unicodeのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vga-softcursor.html">VGA用ソフトウェアカーソル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../video-output.html">ビデオ出力スイッチャー制御</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../wimax/index.html">WiMAXサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xfs.html">SGI XFS ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxカーネルユーザーおよび管理者のガイド</a><ul>
+<li><a href="index.html">Device Mapper</a><ul>
+<li>前へ: <a href="delay.html" title="前章">dm-delay</a></li>
+<li>次へ: <a href="dm-crypt.html" title="次章">dm-crypt</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/admin-guide/device-mapper/dm-clone.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

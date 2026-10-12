@@ -1,0 +1,496 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>スリムプロビジョニング — Linuxカーネルドキュメンテーション</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="unstriped.html" rel="next" title="デバイスマッパーアンストライピングターゲット"/>
+<link href="switch.html" rel="prev" title="dm-switch (スイッチングデバイスマッパーターゲット)"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="thin-provisioning">
+<h1>スリムプロビジョニング (薄プロビジョニング)<a class="headerlink" href="#thin-provisioning" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このドキュメントでは、スリムプロビジョニングとスナップショットを実装するためのデバイス・マッパーのターゲットの一覧について説明しています。</p>
+<p>以前のスナップショット実装と比較して、この実装の主な特徴は、複数の仮想デバイスを同じデータボリュームに格納できる点です。これにより管理が簡素化され、ボリューム間でのデータ共有が可能となり、ディスク使用量を削減できます。</p>
+<p>もう一つの重要な機能は、再帰的なスナップショット（スナップショットのスナップショット…など）の任意の深さへのサポートです。以前のスナップショット実装では、検索テーブルをチェインで接続することでこの機能を実現していましたが、パフォーマンスは深さに比例してO(depth)となりました。この新しい実装では単一のデータ構造を使用して、深さによるパフォーマンス低下を回避しています。ただし、一部のシナリオではフラグメンテーションが問題となる可能性があります。</p>
+<p>メタデータはデータとは別のデバイスに保存され、管理者にはいくつかの柔軟性が与えられます。例えば以下のような用途で:</p>
+<ul class="simple">
+<li><p>メタデータの耐障害性を向上させるため、メタデータをミラーリングされたボリュームに保存し、データをミラーリングされていないボリュームに保存する。</p></li>
+<li><p>パフォーマンスを向上させるため、メタデータをSSDに保存する。</p></li>
+</ul>
+</section>
+<section id="status">
+<h2>Status<a class="headerlink" href="#status" title="この見出しへのパーマリンク">¶</a></h2>
+<p>これらのターゲットは本番環境での使用が安全とされています。ただし、異なる使用ケースではデータボリュームのフラグメンテーションなどによりパフォーマンス特性が異なります。</p>
+<p>このソフトウェアが予期しないパフォーマンスを示している場合は、
+<a class="reference external" href="mailto:dm-devel%40redhat.com">dm-devel<span>@</span>redhat<span>.</span>com</a> に詳細を添えてメールを送信してください。私たちはできるだけ問題を改善いたします。</p>
+<p>メタデータの確認と修復に使用するユーティリティツールは完全に開発され、'thin_check' および 'thin_repair' として利用可能です。パッケージ名はディストリビューションによって異なります（Red Hatディストリビューションでは 'device-mapper-persistent-data' と呼ばれます）。</p>
+</section>
+<section id="cookbook">
+<h2>クックブック<a class="headerlink" href="#cookbook" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このセクションでは、スリムプロビジョニングの簡単な使用例をいくつか紹介します。これらは dmsetup プログラムを使用してデバイス・マッパードライバーを直接制御する方法です。最終ユーザーは、サポートが追加された後は LVM2 などの上位レベルのボリュームマネージャーを使用することを推奨します。</p>
+<section id="pool-device">
+<h3>プールデバイス<a class="headerlink" href="#pool-device" title="この見出しへのパーマリンク">¶</a></h3>
+<p>プールデバイスはメタデータボリュームとデータボリュームを統合します。I/Oはデータボリュームに線形にマッピングされ、メタデータは以下の2つのメカニズムを通じて更新されます:</p>
+<ul class="simple">
+<li><p>スリムターゲットからの関数呼び出し</p></li>
+<li><p>ユーザー空間からのデバイス・マッパーの「メッセージ」で、新しい仮想デバイスの作成など制御を行います。</p></li>
+</ul>
+</section>
+<section id="setting-up-a-fresh-pool-device">
+<h3>新規のプールデバイスの設定<a class="headerlink" href="#setting-up-a-fresh-pool-device" title="この見出しへのパーマリンク">¶</a></h3>
+<p>プールデバイスの設定には有効なメタデータデバイスとデータデバイスが必要です。既存のメタデータデバイスがない場合、最初の4KBをゼロにすることで空のメタデータを示すメタデータデバイスを作成できます。</p>
+<blockquote>
+<div><p>dd if=/dev/zero of=$metadata_dev bs=4096 count=1</p>
+</div></blockquote>
+<p>必要なメタデータの量は、スリムデバイス間で共有されるブロック数（つまりスナップショットを通じて）によって異なります。平均以下の共有が少ない場合は、メタデータデバイスのサイズを平均より大きくする必要があります。</p>
+<p>参考として、メタデータデバイスに使用するバイト数を計算する際には、$data_dev_size / $data_block_size * 48 の値を算出し、その結果が2MB未満の場合は2MBに切り上げることを推奨します。多数のスナップショットを生成し、大量の変更を記録している場合は、この値を増やす必要があるかもしれません。</p>
+<p>サポートされる最大サイズは16GBです。デバイスがこれより大きい場合、警告が表示されますが、余分な領域は使用されません。</p>
+</section>
+<section id="reloading-a-pool-table">
+<h3>プールテーブルの再読み込み<a class="headerlink" href="#reloading-a-pool-table" title="この見出しへのパーマリンク">¶</a></h3>
+<p>プールのテーブルを再読み込みできます。実際には、プールが容量不足で拡張される際にもこの方法が用いられます。(注: 現在、再読み込み時に異なるメタデータデバイスを指定することは禁止されていませんが、以前のディスク上の場所に正確にI/Oをルーティングしない場合、問題が発生します。)</p>
+</section>
+<section id="using-an-existing-pool-device">
+<h3>既存のプールデバイスを使用する<a class="headerlink" href="#using-an-existing-pool-device" title="この見出しへのパーマリンク">¶</a></h3>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dmsetup create pool \
+    --table "0 20971520 thin-pool $metadata_dev $data_dev \
+             $data_block_size $low_water_mark"
+</pre></div>
+</div>
+<p>$data_block_size は、512バイトセクタ単位で割り当てられるディスク領域の最小単位を表し、128（64KB）から2097152（1GB）までの間で、128（64KB）の倍数である必要があります。スリムプールが作成された後は $data_block_size を変更することはできません。スリムプロビジョニングに特に興味がある場合は、1024（512KB）などの値を使用することを推奨します。多数のスナップショットを生成する場合は、128（64KB）などの小さな値を使用することを推奨します。新規に割り当てたデータをゼロに初期化しない場合、256000（128MB）程度の $data_block_size を使用することを推奨します。</p>
+<p>$low_water_mark は $data_block_size ブロック単位で表されます。データデバイスの空き領域がこのレベルを下回ると、dmイベントがトリガーされ、ユーザー空間のデーモンがこれをキャッチしてプールデバイスを拡張する必要があります。このようなイベントは1回だけ送信されます。</p>
+<p>再開されたデバイスの空き領域が low water mark を下回っても、特別なイベントはトリガーされません。ただし、デバイスの再開は常にイベントをトリガーします。ユーザー空間のデーモンはこのイベントを処理する際、空き領域が low water mark を上回っていることを確認する必要があります。</p>
+<p>メタデータデバイスの low water mark はカーネル内で維持され、メタデータデバイスの空き領域がこの値を下回ると dmイベントがトリガーされます。</p>
+</section>
+<section id="updating-on-disk-metadata">
+<h3>ディスク上のメタデータの更新中<a class="headerlink" href="#updating-on-disk-metadata" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ディスク上のメタデータは、FLUSHまたはFUA bioが書かれるたびにコミットされます。このようなリクエストがなければ、1秒ごとにコミットされます。これにより、スリムプロビジョニングターゲットは、揮発性のライトキャッシュを持つ物理ディスクのように動作します。電源が切れた場合、最近の書き込みデータが失われる可能性があります。メタデータは、どんなクラッシュでも常に一貫性を保つ必要があります。</p>
+<p>データ領域が満杯になると、プールは設定に応じてエラーを返すかIOをキューに並べます（参照: error_if_no_space）。メタデータ領域が満杯になったり、メタデータ操作が失敗した場合、プールはIOエラーを返します。プールをオフラインにして修復を行うまで、IOエラーが続きます。修復により1) 一貫性の問題を修正し、2) 修復を強制するフラグをクリアします。プールのメタデータデバイスが修復されると、サイズ変更が可能となり、プールは通常動作に戻ります。注意点として、プールが修復が必要なフラグが立っている場合、データおよびメタデータデバイスのサイズ変更は修復完了までできません。また、プールのメタデータ領域が満杯になると、現在のメタデータトランザクションは中止されます。プールが上位IOレイヤー（例: ファイルシステム）に完了を通知したIOをキャッシュしているため、プールの修復が必要な場合、一貫性チェック（例: fsck）を実施することをお勧めします。</p>
+</section>
+<section id="id1">
+<h3>スリムプロビジョニング (薄プロビジョニング)<a class="headerlink" href="#id1" title="この見出しへのパーマリンク">¶</a></h3>
+<ol class="lowerroman simple">
+<li><p>新しいスリムプロビジョニングボリュームの作成。</p></li>
+</ol>
+<blockquote>
+<div><p>新しいスリムプロビジョニングボリュームを作成するには、アクティブなプールデバイスにメッセージを送信する必要があります。この例では/dev/mapper/poolです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dmsetup message /dev/mapper/pool 0 "create_thin 0"
+</pre></div>
+</div>
+<p>ここで「0」はボリュームの識別子で、24ビットの数値です。「caller」が識別子を割り当てて管理する必要があります。識別子がすでに使用されている場合、メッセージは-EEXISTで失敗します。</p>
+</div></blockquote>
+<ol class="lowerroman simple" start="2">
+<li><p>スリムプロビジョニングボリュームの使用。</p></li>
+</ol>
+<blockquote>
+<div><p>スリムプロビジョネットボリュームは「thin」ターゲットを使用してアクティベートされます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dmsetup create thin --table "0 2097152 thin /dev/mapper/pool 0"
+</pre></div>
+</div>
+<p>最後のパラメータはスリムプデバイスの識別子です。</p>
+</div></blockquote>
+</section>
+<section id="internal-snapshots">
+<h3>内部スナップショット<a class="headerlink" href="#internal-snapshots" title="この見出しへのパーマリンク">¶</a></h3>
+<ol class="lowerroman simple">
+<li><p>内部スナップショットの作成。</p></li>
+</ol>
+<blockquote>
+<div><p>スナップショットはプールに別のメッセージを送ることで作成されます。</p>
+<p>注意: スナップショットする元のデバイスがアクティブな場合、スナップショット作成前にそのデバイスを一時停止する必要があります。これは現在は強制されていないため、ご注意ください！</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dmsetup suspend /dev/mapper/thin
+dmsetup message /dev/mapper/pool 0 "create_snap 1 0"
+dmsetup resume /dev/mapper/thin
+</pre></div>
+</div>
+<p>ここで「1」はボリュームの識別子で、24ビットの数値です。「0」は元のデバイスの識別子です。</p>
+</div></blockquote>
+<ol class="lowerroman simple" start="2">
+<li><p>内部スナップショットの使用。</p></li>
+</ol>
+<blockquote>
+<div><p>作成後、ユーザーは元のデバイスとスナップショットの間の接続を気にする必要はありません。実際、スナップショットは他のスリムプロビジョニングされたデバイスと変わりません。同じ方法でスナップショットを取得することも可能です。どちらか一方のみをアクティブにしても完全に合法です。また、どちらもアクティブ化または削除する際の順序は特に必要ありません。(これは従来のデバイスマッパーのスナップショットとは異なります。)</p>
+<p>他のスリムプロビジョニングされたボリュームと同様に、同じ方法でアクティブ化してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dmsetup create snap --table "0 2097152 thin /dev/mapper/pool 1"
+</pre></div>
+</div>
+</div></blockquote>
+</section>
+<section id="external-snapshots">
+<h3>外部スナップショット<a class="headerlink" href="#external-snapshots" title="この見出しへのパーマリンク">¶</a></h3>
+<p>外部 <strong>読み取り専用</strong> デバイスをスリムプロビジョニングされたボリュームのソースとして使用できます。スリムデバイスの未プロビジョニング領域への読み取りは、ソースデバイスに転送され、書き込みは通常通り新しいブロックの割当が行われます。</p>
+<p>このような用途の一つは、仮想マシンホストがスリムプロビジョニングされたボリューム上でゲストを実行したいが、ベースイメージを他のデバイス（複数の仮想マシン間で共有される可能性がある）に配置したい場合です。</p>
+<p>この技術を使用する際は、ソースデバイスに書き込みを行ってはいけません！もちろん、スリムデバイスに書き込みを行い、スリムボリュームの内部スナップショットを取得することも可能です。</p>
+<ol class="lowerroman simple">
+<li><p>外部デバイスのスナップショットの作成</p></li>
+</ol>
+<blockquote>
+<div><p>これはスリムデバイスの作成と同様です。この段階ではソースデバイスを指定する必要はありません。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dmsetup message /dev/mapper/pool 0 "create_thin 0"
+</pre></div>
+</div>
+</div></blockquote>
+<ol class="lowerroman simple" start="2">
+<li><p>外部デバイスのスナップショットの使用。</p></li>
+</ol>
+<blockquote>
+<div><p>スリムターゲットに追加のパラメータを指定して、ソースデバイスを指定してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dmsetup create snap --table "0 2097152 thin /dev/mapper/pool 0 /dev/image"
+</pre></div>
+</div>
+<p>N.B. このスナップショットのすべての子スナップショット（内部スナップショット）にも同じ追加のソースパラメータが必要です。</p>
+</div></blockquote>
+</section>
+<section id="deactivation">
+<h3>非アクティブ化<a class="headerlink" href="#deactivation" title="この見出しへのパーマリンク">¶</a></h3>
+<p>プールを使用しているすべてのデバイスが非アクティブ化されるまで、プールそのものも非アクティブ化できません。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dmsetup remove thin
+dmsetup remove snap
+dmsetup remove pool
+</pre></div>
+</div>
+</section>
+</section>
+<section id="reference">
+<h2>参照<a class="headerlink" href="#reference" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="thin-pool-target">
+<h3>‘thin-pool’ターゲット<a class="headerlink" href="#thin-pool-target" title="この見出しへのパーマリンク">¶</a></h3>
+<ol class="lowerroman">
+<li><p>コンストラクタ</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>thin-pool &lt;metadata dev&gt; &lt;data dev&gt; &lt;data block size (sectors)&gt; \
+          &lt;low water mark (blocks)&gt; [&lt;number of feature args&gt; [&lt;arg&gt;]*]
+</pre></div>
+</div>
+<p>オプションの機能引数：</p>
+<blockquote>
+<div><dl class="simple">
+<dt>skip_block_zeroing:</dt><dd><p>新規プロビジョニングブロックのゼロイニングをスキップ。</p>
+</dd>
+<dt>ignore_discard:</dt><dd><p>discardサポートを無効化。</p>
+</dd>
+<dt>no_discard_passdown:</dt><dd><p>discardを下位データデバイスに伝播しないが、マッピングのみを削除する。</p>
+</dd>
+<dt>read_only:</dt><dd><p>プールメタデータへの変更を許可しない。このモードは、thin-poolが作成され、最初にフル読み取り/書き込みモードで使用された後からのみ利用可能です。初期のthin-pool作成時に指定することはできません。</p>
+</dd>
+<dt>error_if_no_space:</dt><dd><p>空き容量がない場合、エラーIOを発生させる。</p>
+</dd>
+</dl>
+</div></blockquote>
+<p>データブロックサイズは64KB（128セクタ）から1GB（2097152セクタ）までの間でなければなりません。</p>
+</div></blockquote>
+</li>
+<li><p>Status</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>&lt;transaction id&gt; &lt;used metadata blocks&gt;/&lt;total metadata blocks&gt;
+&lt;used data blocks&gt;/&lt;total data blocks&gt; &lt;held metadata root&gt;
+ro|rw|out_of_data_space [no_]discard_passdown [error|queue]_if_no_space
+needs_check|- metadata_low_watermark
+</pre></div>
+</div>
+<dl>
+<dt>transaction id:</dt><dd><p>ユーザー空間がボリュームマネージャーからのメタデータと同期を取るために使用する64ビットの数値。</p>
+</dd>
+<dt>使用データブロック / 総データブロック</dt><dd><p>空きブロック数がプールの低水位マーカーを下回ると、ユーザー空間にdmイベントが送信されます。このイベントはエッジトリガーで、再起動ごとに一度だけ発生します。ボリュームマネージャーのライタはこのイベントを登録し、その後ターゲットの状態を確認する必要があります。</p>
+</dd>
+<dt>保持されたメタデータルート:</dt><dd><p>ユーザー空間からの読み込みアクセスのために保持されているメタデータルートの位置。'-'は保持されたルートがないことを示します。</p>
+</dd>
+<dt>discard_passdown|no_discard_passdown</dt><dd><p>discardが実際に下位デバイスに渡されているかどうか。テーブルをロードする際この機能が有効になっていても、下位デバイスがこれをサポートしない場合、無効になる可能性があります。</p>
+</dd>
+<dt>ro|rw|out_of_data_space</dt><dd><p>プールが特定のデバイス障害に遭遇すると、読み取り専用メタデータモードに移行します。このモードではプールメタデータ（新しいブロックの割当など）への変更が許可されません。</p>
+<p>読み取り専用モードでも安全でないと判断される深刻な状況では、さらにI/Oが許可されず、ステータスは'Fail'という文字列のみを含みます。この場合、ユーザー空間の回復ツールを使用する必要があります。</p>
+</dd>
+<dt>error_if_no_space|queue_if_no_space</dt><dd><p>プールがデータまたはメタデータ空間を枯渇した場合、データデバイスに宛てられたIOをキューに並べたりエラーを返したりします。デフォルトでは、より多くの空間が追加されるか、「no_space_timeout」が期限切れになるまでIOをキューに並べます。「no_space_timeout」dm-thin-poolモジュールパラメータを使用してこのタイムアウトを変更できます。デフォルトは60秒ですが、0を設定することで無効にできます。</p>
+</dd>
+<dt>needs_check（設定されている場合）'-'（設定されていない場合）</dt><dd><p>メタデータ操作が失敗し、メタデータのスーパーブロックにneeds_checkフラグが設定されました。メタデータデバイスを非アクティブ化し、チェックまたは修復する必要があります。'-'はneeds_checkフラグが設定されていないことを示します。</p>
+</dd>
+<dt>メタデータ低水位マーカー:</dt><dd><p>メタデータ低水位マーカーのブロック数値。カーネルが内部でこの値を設定しますが、ユーザー空間がこの値を知る必要があります、イベントがこのしきい値を越えたことによるものかどうかを判断するためです。</p>
+</dd>
+</dl>
+</li>
+<li><p>メッセージ</p></li>
+</ol>
+<blockquote>
+<div><dl class="simple">
+<dt>create_thin &lt;dev id&gt;</dt><dd><p>新しいスリムプロビジョニングデバイスを作成します。&lt;dev id&gt;は呼び出し元が選ぶ任意の24ビットの一意な識別子です。</p>
+</dd>
+<dt>create_snap &lt;dev id&gt; &lt;origin id&gt;</dt><dd><p>他のスリムプロビジョニングデバイスの新しいスナップショットを作成します。&lt;dev id&gt;は呼び出し元が選ぶ任意の24ビットの一意な識別子です。&lt;origin id&gt;は新しいデバイスがスナップショットとなるスリムプロビジョニングデバイスの識別子です。</p>
+</dd>
+<dt>delete &lt;dev id&gt;</dt><dd><p>スリムデバイスを削除します。これは取り消せません。</p>
+</dd>
+<dt>set_transaction_id &lt;current id&gt; &lt;new id&gt;</dt><dd><p>Userland volume managers, such as LVM, need a way to synchronise their external metadata with the internal metadata of the pool target. The thin-pool target offers to store an arbitrary 64-bit transaction id and return it on the target’s status line. To avoid races you must provide what you think the current transaction id is when you change it with this compare-and-swap message.</p>
+</dd>
+<dt>reserve_metadata_snap</dt><dd><p>Reserve a copy of the data mapping btree for use by userland. This allows userland to inspect the mappings as they were when this message was executed. Use the pool’s status command to get the root block associated with the metadata snapshot.</p>
+</dd>
+<dt>release_metadata_snap</dt><dd><p>Release a previously reserved copy of the data mapping btree.</p>
+</dd>
+</dl>
+</div></blockquote>
+</section>
+<section id="thin-target">
+<h3>‘thin’ target<a class="headerlink" href="#thin-target" title="この見出しへのパーマリンク">¶</a></h3>
+<ol class="lowerroman">
+<li><p>コンストラクタ</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>thin &lt;pool dev&gt; &lt;dev id&gt; [&lt;external origin dev&gt;]
+</pre></div>
+</div>
+<dl class="simple">
+<dt>pool dev:</dt><dd><p>the thin-pool device, e.g. /dev/mapper/my_pool or 253:0</p>
+</dd>
+<dt>dev id:</dt><dd><p>the internal device identifier of the device to be activated.</p>
+</dd>
+<dt>external origin dev:</dt><dd><p>an optional block device outside the pool to be treated as a read-only snapshot origin: reads to unprovisioned areas of the thin target will be mapped to this device.</p>
+</dd>
+</dl>
+</div></blockquote>
+</li>
+</ol>
+<p>The pool doesn’t store any size against the thin devices. If you load a thin target that is smaller than you’ve been using previously, then you’ll have no access to blocks mapped beyond the end. If you load a target that is bigger than before, then extra blocks will be provisioned as and when needed.</p>
+<ol class="lowerroman" start="2">
+<li><p>Status</p>
+<dl class="simple">
+<dt>&lt;nr mapped sectors&gt; &lt;highest mapped sector&gt;</dt><dd><p>If the pool has encountered device errors and failed, the status will just contain the string ‘Fail’. The userspace recovery tools should then be used.</p>
+</dd>
+</dl>
+<p>In the case where &lt;nr mapped sectors&gt; is 0, there is no highest mapped sector and the value of &lt;highest mapped sector&gt; is unspecified.</p>
+</li>
+</ol>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxカーネルユーザーおよび管理者のガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../README.html">Linux カーネルリリース 5.x &lt;http://kernel.org/&gt;</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel-parameters.html">カーネルのコマンドラインパラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../devices.html">Linux で割り当てられたデバイス（4.x 以降のバージョン）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sysctl/index.html">/proc/sys に関するドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../abi.html">Linux ABI 説明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hw-vuln/index.html">ハードウェアの脆弱性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../reporting-bugs.html">バグの報告</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../security-bugs.html">セキュリティ関連のバグ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bug-hunting.html">バグ狩り</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bug-bisect.html">バグのバイセクティング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tainted-kernels.html">汚染されたカーネル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ramoops.html">Ramoops oops/panic ロガー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dynamic-debug-howto.html">ダイナミックデバッグ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../init.html">「No working init found.」のブートハングメッセージの説明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kdump/index.html">Kdump に関するドキュメンテーション - kexec を使用したクラッシュダンプ解決策</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../perf/index.html">パフォーマンスモニタサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pstore-blk.html">pstore ブロック oops/panic ロガー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sysfs-rules.html">sysfs 内の情報へのアクセスに関するルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../acpi/index.html">ACPI サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../aoe/index.html">ATA over Ethernet (AoE)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../auxdisplay/index.html">補助ディスプレイサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bcache.html">ブロックレイヤーのキャッシュ（bcache）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../binderfs.html">Android binderfs ファイルシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../binfmt-misc.html">Linux における miscellaneous Binary Formats（binfmt_misc）のカーネルサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../blockdev/index.html">Linux RapidIO サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bootconfig.html">ブート構成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../braille-console.html">Linux ブライルコンソール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../btmrvl.html">btmrvl ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cgroup-v1/index.html">Control Groups バージョン 1</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cgroup-v2.html">Control Group v2</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cifs/index.html">CIFS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../clearing-warn-once.html">WARN_ONCE のクリア</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cpu-load.html">CPU ロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cputopology.html">sysfs を通じて CPU テポロジー情報がエクスポートされる仕組み</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dell_rbu.html">Dell Remote BIOS Update ドライバー (dell_rbu)</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">Device Mapper</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../edid.html">EDID</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../efi-stub.html">EFI ブート ステブ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ext4.html">ext4 一般情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nfs/index.html">NFS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../gpio/index.html">gpio</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../highuid.html">16 ビット UID から 32 ビット UID への変更に関する注意点</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hw_random.html">i8xx チップセットにおけるランダム数生成器の Linux サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../initrd.html">初期 RAM ディスク (initrd) の使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../iostats.html">I/O 統計項目</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../java.html">Java(tm) バイナリーカーネルサポート for Linux v1.03</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../jfs.html">IBM のジャーナル化ファイルシステム (JFS) for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel-per-CPU-kthreads.html">per-CPU kthread による OS ジャッタリングの軽減</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../laptops/index.html">ノートPCドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lcd-panel-cgram.html">パラレルポート LCD/キーパッドパネルサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ldm.html">LDM - ロジカルディスクマネージャー (ダイナミックディスク)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lockup-watchdogs.html">ソフトロックアップ検出器とハードロックアップ検出器 (nmi_watchdog とも呼ばれる)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../LSM/index.html">Linux セキュリティモジュールの使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../md.html">RAID アレイ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../media/index.html">メディアサブシステム管理およびユーザーガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mm/index.html">メモリ管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../module-signing.html">カーネルモジュール署名機能</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mono.html">Mono(tm) バイナリーカーネルサポート for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../namespaces/index.html">ネームスペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../numastat.html">NUMA ポリシー ヒット/ミス統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../parport.html">パラレルポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../perf-security.html">Perf イベントとツールセキュリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pm/index.html">電源管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pnp.html">Linux プラグアンドプレイドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rapidio.html">RapidIO サブシステムガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ras.html">信頼性、可用性、サービス性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rtc.html">リアルタイムクロック (RTC) ドライバー for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../serial-console.html">Linux シリアルコンソール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../svga.html">ビデオモード選択サポート 2.13</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sysrq.html">Linux Magic System Request Key Hacks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../thunderbolt.html">USB4 and Thunderbolt</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ufs.html">UFSの使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../unicode.html">Unicodeのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vga-softcursor.html">VGA用ソフトウェアカーソル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../video-output.html">ビデオ出力スイッチャー制御</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../wimax/index.html">WiMAXサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xfs.html">SGI XFS ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxカーネルユーザーおよび管理者のガイド</a><ul>
+<li><a href="index.html">Device Mapper</a><ul>
+<li>前へ: <a href="switch.html" title="前章">dm-switch (スイッチングデバイスマッパーターゲット)</a></li>
+<li>次へ: <a href="unstriped.html" title="次章">デバイスマッパーアンストライピングターゲット</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/admin-guide/device-mapper/thin-provisioning.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>
