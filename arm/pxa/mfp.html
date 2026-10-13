@@ -1,0 +1,408 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>MFP設定: PXA2xx/PXA3xxプロセッサ — Linuxカーネルドキュメンテーション</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="../sa1100/index.html" rel="next" title="Intel StrongARM 1100"/>
+<link href="../omap/dss.html" rel="prev" title="OMAP2/3 Display Subsystem"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="mfp-configuration-for-pxa2xx-pxa3xx-processors">
+<h1>PXA2xx/PXA3xxプロセッサ用MFP設定<a class="headerlink" href="#mfp-configuration-for-pxa2xx-pxa3xx-processors" title="この見出しへのパーマリンク">¶</a></h1>
+<blockquote>
+<div><p>Eric Miao &lt;<a class="reference external" href="mailto:eric.miao%40marvell.com">eric<span>.</span>miao<span>@</span>marvell<span>.</span>com</a>&gt;</p>
+</div></blockquote>
+<p>MFPとはマルチファンクションピン（Multi-Function Pin）の略で、PXA3xx以降のPXAシリーズプロセッサに搭載されるピンmux論理を指します。このドキュメントでは、既存のMFP APIについて説明し、ボード/プラットフォームドライバの開発者がこれをどのように利用できるかを解説します。</p>
+<section id="basic-concept">
+<h2>基本的な概念<a class="headerlink" href="#basic-concept" title="この見出しへのパーマリンク">¶</a></h2>
+<p>PXA25xおよびPXA27xのGPIOの代替機能設定とは異なり、PXA3xxから新しいMFPメカニズムが導入され、ピンmux機能をGPIOコントローラーから完全に分離しました。ピンmux設定に加えて、MFPは各ピンの低電力状態、ドライビングストレート、プルアップ/プルダウン、イベント検出の制御も行います。以下に、MFP論理と残りのSoC周辺機器間の内部接続図を示します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+--------+
+|        |--(GPIO19)--+
+|  GPIO  |            |
+|        |--(GPIO...) |
++--------+            |
+                      |       +---------+
++--------+            +------&gt;|         |
+|  PWM2  |--(PWM_OUT)--------&gt;|   MFP   |
++--------+            +------&gt;|         |-------&gt; to external PAD
+                      | +----&gt;|         |
++--------+            | | +--&gt;|         |
+|  SSP2  |---(TXD)----+ | |   +---------+
++--------+              | |
+                        | |
++--------+              | |
+| Keypad |--(MKOUT4)----+ |
++--------+                |
+                          |
++--------+                |
+|  UART2 |---(TXD)--------+
++--------+
+</pre></div>
+</div>
+<p>注：外部ピンはMFP_PIN_GPIO19と名付けられますが、これはGPIO19専用とは限らず、GPIOコントローラーのGPIO19からこのピンをルーティングできるというヒントを示しています。</p>
+<p>PXA25x/PXA27xのGPIO代替機能からこの新しいMFPメカニズムへの変更をよりよく理解するため、いくつかの重要なポイントを以下に示します：</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>PXA3xxのGPIOコントローラーは、PWM、SSP、UARTなどの他の内部コントローラーと同様に専用のコントローラーとなり、128の内部信号を1つまたは複数のMFPを通じて外部にルーティングできます（例：GPIO&lt;0&gt;はMFP_PIN_GPIO0およびMFP_PIN_GPIO0_2のいずれかを通じてルーティング可能です。参照：arch/arm/mach-pxa/mfp-pxa300.h）</p></li>
+<li><p>代替機能設定はこのGPIOコントローラーから削除され、残りの機能は純粋なGPIO専用機能です、つまり：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>GPIO信号レベル制御</p></li>
+<li><p>GPIO方向制御</p></li>
+<li><p>GPIOレベル変化検出</p></li>
+</ul>
+</div></blockquote>
+</li>
+<li><p>各ピンの低電力状態はMFPによって制御されるようになりました。これはPXA2xxのPGSRxレジスタがPXA3xxでは無効になったことを意味します。</p></li>
+<li><p>ウェイクアップ検出はMFPによって制御されるようになりました。PWERはもはやGPIOからウェイクアップを制御しなくなり、睡眠状態に応じてpxa3xx-regs.hで定義されたADxERレジスタがMFPからのウェイクアップを制御します。</p></li>
+</ol>
+</div></blockquote>
+<p>注：このようなMFPとGPIOの明確な分離により、GPIO&lt;xx&gt;とは通常GPIO信号を指し、MFP&lt;xxx&gt;またはピンxxxとは物理的なピン（またはボール）を指します。</p>
+</section>
+<section id="mfp-api-usage">
+<h2>MFP APIの使用方法<a class="headerlink" href="#mfp-api-usage" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ボードコードの作成者向けに、以下のようなガイドラインがあります：</p>
+<ol class="arabic">
+<li><p>board.cファイルで次のヘッダーファイルのうち1つをインクルードしてください：</p>
+<ul class="simple">
+<li><p>#include "mfp-pxa25x.h"</p></li>
+<li><p>#include "mfp-pxa27x.h"</p></li>
+<li><p>#include "mfp-pxa300.h"</p></li>
+<li><p>#include "mfp-pxa320.h"</p></li>
+<li><p>#include "mfp-pxa930.h"</p></li>
+</ul>
+<p>注意: &lt;board&gt;.c ファイルには、使用するプロセッサによっては、ピン設定の定義が衝突する可能性があるため、1つのファイルのみが必要です（例: 同じ名前を持つが、異なるプロセッサでは意味や設定が異なる場合）。例えば、zylonite プラットフォームは PXA300/PXA310 と PXA320 の両方をサポートしており、2つの別個のファイルが導入されています: zylonite_pxa300.c と zylonite_pxa320.c（MFP 設定の違いだけでなく、2つの組み合わせ間の他の違いも処理します）。</p>
+<p>注意: PXA300 と PXA310 のピン設定はほぼ同じです（PXA310 は一部追加のピンをサポートします）。したがって、差分は実際に mfp-pxa300.h 1つのヘッダーファイルでカバーされています。</p>
+</li>
+<li><p>初期ピン設定用の配列を準備します、例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static unsigned long mainstone_pin_config[] __initdata = {
+   /* Chip Select */
+   GPIO15_nCS_1,
+
+   /* LCD - 16bpp Active TFT */
+   GPIOxx_TFT_LCD_16BPP,
+   GPIO16_PWM0_OUT,        /* Backlight */
+
+   /* MMC */
+   GPIO32_MMC_CLK,
+   GPIO112_MMC_CMD,
+   GPIO92_MMC_DAT_0,
+   GPIO109_MMC_DAT_1,
+   GPIO110_MMC_DAT_2,
+   GPIO111_MMC_DAT_3,
+
+   ...
+
+   /* GPIO */
+   GPIO1_GPIO | WAKEUP_ON_EDGE_BOTH,
+};
+</pre></div>
+</div>
+<p>a) ピン設定が pxa{2xx,3xx}_mfp_config() に渡され、実際にレジスタに書き込まれた後は無効となり、廃棄される可能性があります。この場合、'__initdata' を追加することで、ここでのバイト数を節約できます。</p>
+<p>b) あるコンポーネントに対して1つの可能なピン設定しかない場合、簡略化された定義を使用できます。例: PXA25x および PXA27x プロセッサにおける GPIOxx_TFT_LCD_16BPP</p>
+<p>c) ボード設計により、ピンが低電力状態からシステムを wakeup できる場合、以下のいずれかと 'OR' できます:</p>
+<blockquote>
+<div><p>WAKEUP_ON_EDGE_BOTH WAKEUP_ON_EDGE_RISE WAKEUP_ON_EDGE_FALL WAKEUP_ON_LEVEL_HIGH - キーパッド GPIO の有効化に特に使用されます。</p>
+</div></blockquote>
+<p>このピンがシステムを wakeup できる機能を持つことを示し、どのエッジで wakeup するかを指定します。ただし、この設定がシステムを実際に wakeup するかどうかは、set_irq_wake() が対応する GPIO IRQ（GPIO_IRQ(xx) または gpio_to_irq()）とともに呼び出され、最終的に gpio_set_wake() が実際のレジスタ設定に呼ばれるまでではありません。</p>
+<p>d) PXA3xx MFP は各ピンに対してエッジ検出をサポートしていますが、ADxER レジスタ内の特定のビットが設定される場合にのみ内部ロジックがシステムを wakeup します。これは対応する外設機器に正確にマッピングされるため、set_irq_wake() を外設機器の IRQ とともに呼び出すことで wakeup を有効化できます。</p>
+</li>
+</ol>
+</section>
+<section id="mfp-on-pxa3xx">
+<h2>PXA3xx の MFP<a class="headerlink" href="#mfp-on-pxa3xx" title="この見出しへのパーマリンク">¶</a></h2>
+<p>PXA3xx のすべての外部 I/O パッド（特殊用途を除く）には MFP ロジックが1つずつ関連付けられており、MFPR レジスタで制御されます。</p>
+<p>MFPR には以下のビット定義があります（PXA300/PXA310/PXA320 用）:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>31                        16 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+ +-------------------------+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+ |         RESERVED        |PS|PU|PD|  DRIVE |SS|SD|SO|EC|EF|ER|--| AF_SEL |
+ +-------------------------+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+
+ Bit 3:   RESERVED
+ Bit 4:   EDGE_RISE_EN - enable detection of rising edge on this pin
+ Bit 5:   EDGE_FALL_EN - enable detection of falling edge on this pin
+ Bit 6:   EDGE_CLEAR   - disable edge detection on this pin
+ Bit 7:   SLEEP_OE_N   - enable outputs during low power modes
+ Bit 8:   SLEEP_DATA   - output data on the pin during low power modes
+ Bit 9:   SLEEP_SEL    - selection control for low power modes signals
+ Bit 13:  PULLDOWN_EN  - enable the internal pull-down resistor on this pin
+ Bit 14:  PULLUP_EN    - enable the internal pull-up resistor on this pin
+ Bit 15:  PULL_SEL     - pull state controlled by selected alternate function
+                         (0) or by PULL{UP,DOWN}_EN bits (1)
+
+ Bit 0 - 2: AF_SEL - alternate function selection, 8 possibilities, from 0-7
+ Bit 10-12: DRIVE  - drive strength and slew rate
+                       0b000 - fast 1mA
+                       0b001 - fast 2mA
+                       0b002 - fast 3mA
+                       0b003 - fast 4mA
+                       0b004 - slow 6mA
+                       0b005 - fast 6mA
+                       0b006 - slow 10mA
+                       0b007 - fast 10mA
+</pre></div>
+</div>
+</section>
+<section id="mfp-design-for-pxa2xx-pxa3xx">
+<h2>PXA2xx/PXA3xx の MFP デザイン<a class="headerlink" href="#mfp-design-for-pxa2xx-pxa3xx" title="この見出しへのパーマリンク">¶</a></h2>
+<p>PXA2xx と PXA3xx のピンmux処理の違いにより、両シリーズのプロセッサをカバーする統一された MFP API が導入されました。</p>
+<p>この設計の基本的な考え方は、すべての可能なピン設定の定義を導入することです。これらの定義はプロセッサおよびプラットフォームに依存せず、実際のAPIを呼び出してこれらの定義をレジスタ設定に変換し、それらを有効にする方法です。</p>
+<section id="files-involved">
+<h3>関連ファイル<a class="headerlink" href="#files-involved" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><ul class="simple">
+<li><p>arch/arm/mach-pxa/include/mach/mfp.h</p></li>
+</ul>
+<dl class="simple">
+<dt>のために、</dt><dd><ol class="arabic simple">
+<li><p>統一されたピン定義 - すべての設定可能なピン用の列挙定数</p></li>
+<li><p>プロセッサに依存しないMFP設定用のビット定義</p></li>
+</ol>
+</dd>
+</dl>
+<ul class="simple">
+<li><p>arch/arm/mach-pxa/mfp-pxa3xx.h</p></li>
+</ul>
+<p>PXA3xx専用のMFPRレジスタビット定義とPXA3xx共通のピン設定</p>
+<ul class="simple">
+<li><p>arch/arm/mach-pxa/mfp-pxa2xx.h</p></li>
+</ul>
+<p>PXA2xx専用の定義とPXA25x/PXA27x共通のピン設定</p>
+<ul class="simple">
+<li><p>arch/arm/mach-pxa/mfp-pxa25x.h arch/arm/mach-pxa/mfp-pxa27x.h arch/arm/mach-pxa/mfp-pxa300.h arch/arm/mach-pxa/mfp-pxa320.h arch/arm/mach-pxa/mfp-pxa930.h</p></li>
+</ul>
+<p>プロセッサ固有の定義</p>
+<ul class="simple">
+<li><p>arch/arm/mach-pxa/mfp-pxa3xx.c</p></li>
+<li><p>arch/arm/mach-pxa/mfp-pxa2xx.c</p></li>
+</ul>
+<p>実際のプロセッサでピン設定が有効になるようにする実装</p>
+</div></blockquote>
+</section>
+<section id="pin-configuration">
+<h3>ピン設定<a class="headerlink" href="#pin-configuration" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>以下のコメントはmfp.hからコピーされています（最新情報は実際のソースコードをご確認ください）：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span> /*
+  * a possible MFP configuration is represented by a 32-bit integer
+  *
+  * bit  0.. 9 - MFP Pin Number (1024 Pins Maximum)
+  * bit 10..12 - Alternate Function Selection
+  * bit 13..15 - Drive Strength
+  * bit 16..18 - Low Power Mode State
+  * bit 19..20 - Low Power Mode Edge Detection
+  * bit 21..22 - Run Mode Pull State
+  *
+  * to facilitate the definition, the following macros are provided
+  *
+  * MFP_CFG_DEFAULT - default MFP configuration value, with
+  *            alternate function = 0,
+  *            drive strength = fast 3mA (MFP_DS03X)
+  *            low power mode = default
+  *            edge detection = none
+  *
+  * MFP_CFG  - default MFPR value with alternate function
+  * MFP_CFG_DRV      - default MFPR value with alternate function and
+  *            pin drive strength
+  * MFP_CFG_LPM      - default MFPR value with alternate function and
+  *            low power mode
+  * MFP_CFG_X        - default MFPR value with alternate function,
+  *            pin drive strength and low power mode
+  */
+
+Examples of pin configurations are::
+
+  #define GPIO94_SSP3_RXD            MFP_CFG_X(GPIO94, AF1, DS08X, FLOAT)
+
+which reads GPIO94 can be configured as SSP3_RXD, with alternate function
+selection of 1, driving strength of 0b101, and a float state in low power
+modes.
+
+NOTE: this is the default setting of this pin being configured as SSP3_RXD
+which can be modified a bit in board code, though it is not recommended to
+do so, simply because this default setting is usually carefully encoded,
+and is supposed to work in most cases.
+</pre></div>
+</div>
+</div></blockquote>
+</section>
+<section id="register-settings">
+<h3>レジスタ設定<a class="headerlink" href="#register-settings" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>PXA3xxにおけるピン設定のレジスタ設定は実際には非常にシンプルで、ほとんどのビットはMFPR値に直接変換可能です。2セットのMFPR値が計算され、実行時用と低電力モード用の設定を許可します。</p>
+<p>PXA2xxにおける汎用的なピン設定を実際のレジスタ設定に変換するプロセスはやや複雑です：GAFRx、GPDRx、PGSRx、PWER、PKWR、PFER、PRERなどの多くのレジスタが関与します。変換方法についてはmfp-pxa2xx.cをご参照ください。</p>
+</div></blockquote>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">ARMアーキテクチャ</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../arm.html">ARM Linux 2.6 以降</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../booting.html">ARM Linuxの起動</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cluster-pm-race-avoidance.html">クラスタ全体の電源投入/停止レース回避アルゴリズム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firmware.html">ARM用ファームウェア固有操作の登録および呼び出しインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../interrupts.html">割込み</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel_mode_neon.html">カーネルモードNEON</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel_user_helpers.html">カーネル提供のユーザーヘルパー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../memory.html">ARM Linuxにおけるカーネルメモリレイアウト</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mem_alignment.html">メモリアライメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tcm.html">ARM LinuxにおけるTCM（タイトーリーニングメモリ）の処理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../setup.html">ARM Linuxにおけるカーネル初期化パラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../swp_emulation.html">非推奨SWP命令のソフトウェアエミュレーション（CONFIG_SWP_EMULATE）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../uefi.html">統一拡張ファームウェアインターフェース（UEFI）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vlocks.html">Bare-Metal相互排他用のvlocks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../porting.html">移植</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="../index.html#soc-specific-documents">SoC固有のドキュメント</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">ARMアーキテクチャ</a><ul>
+<li>前へ: <a href="../omap/dss.html" title="前章">OMAP2/3 Display Subsystem</a></li>
+<li>次へ: <a href="../sa1100/index.html" title="次章">Intel StrongARM 1100</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/arm/pxa/mfp.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

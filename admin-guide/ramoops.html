@@ -1,0 +1,364 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Ramoops oops/panic ロガー — Linux Kernel ドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="dynamic-debug-howto.html" rel="next" title="ダイナミックデバッグ"/>
+<link href="tainted-kernels.html" rel="prev" title="汚染されたカーネル"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="ramoops-oops-panic-logger">
+<h1>Ramoops oops/panic ロガー<a class="headerlink" href="#ramoops-oops-panic-logger" title="この見出しへのパーマリンク">¶</a></h1>
+<p>Sergiu Iordache &lt;<a class="reference external" href="mailto:sergiu%40chromium.org">sergiu<span>@</span>chromium<span>.</span>org</a>&gt;</p>
+<p>更新日: 2021年2月10日</p>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Ramoops はシステムがクラッシュする前に RAM にログを書き込む oops/panic ロガーです。クラッシュ前に oops と panic を円環バッファにログとして記録します。Ramoops は再起動後にその領域の内容が生き残るよう、永続的な RAM を搭載したシステムが必要です。</p>
+</section>
+<section id="ramoops-concepts">
+<h2>Ramoops の概念<a class="headerlink" href="#ramoops-concepts" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Ramoops は予め定義されたメモリ領域をダンプに使用します。このメモリ領域の開始位置、サイズ、タイプは以下の3つの変数で設定します:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">mem_address</span></code> 開始位置</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mem_size</span></code> サイズ。メモリサイズは2の累乗に丸められます。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mem_type</span></code> メモリタイプを指定します（デフォルトは pgprot_writecombine）。</p></li>
+</ul>
+</div></blockquote>
+<p>通常、 <code class="docutils literal notranslate"><span class="pre">mem_type=0</span></code> のデフォルト値を使用します。これは pstore マッピングを pgprot_writecombine に設定するためです。 <code class="docutils literal notranslate"><span class="pre">mem_type=1</span></code> を設定すると、
+<code class="docutils literal notranslate"><span class="pre">pgprot_noncached</span></code>を使用しようとしますが、これは一部のプラットフォームでのみ動作します。これは pstore がアトミック操作に依存しているためです。ARM では少なくとも pgprot_noncached がメモリを強く順序付けされたマッピングにしますが、強く順序付けされたメモリでのアトミック操作は実装依存であり、多くの ARM プラットフォーム（例: omaps）では動作しません。 <code class="docutils literal notranslate"><span class="pre">mem_type=2</span></code> を設定すると、メモリ領域を通常のメモリとして扱います。これにより、キャッシュが有効になり、パフォーマンスが向上します。</p>
+<p>メモリ領域は <code class="docutils literal notranslate"><span class="pre">record_size</span></code> のチャンク（2の累乗に丸められます）に分割され、各 kmesg ダンプは <code class="docutils literal notranslate"><span class="pre">record_size</span></code> の情報量を記録します。</p>
+<p>kmsgダンプの保存対象を制限するには、 <code class="docutils literal notranslate"><span class="pre">max_reason</span></code> 値を設定します。これはinclude/linux/kmsg_dump.hの
+<code class="docutils literal notranslate"><span class="pre">enum</span> <span class="pre">kmsg_dump_reason</span></code>で定義されています。例えば、OopsとPanicsの両方を保存するには、
+<code class="docutils literal notranslate"><span class="pre">max_reason</span></code> を2（KMSG_DUMP_OOPS）に設定し、Panicsのみを保存するには、
+<code class="docutils literal notranslate"><span class="pre">max_reason</span></code> を1（KMSG_DUMP_PANIC）に設定します。この値を0（KMSG_DUMP_UNDEF）に設定すると、理由フィルタリングは
+<code class="docutils literal notranslate"><span class="pre">printk.always_kmsg_dump</span></code> ブートパラメータで制御されます。未設定の場合はKMSG_DUMP_OOPS、設定されている場合はKMSG_DUMP_MAXになります。</p>
+<p>モジュールはカウンターを使用して複数のダンプを記録しますが、再起動時にカウンターがリセットされるため、再起動後の新しいダンプは古いものに上書きされます。</p>
+<p>Ramoops は永続メモリ領域のソフトウェア ECC 保護もサポートしています。ハードウェアリセットでマシンを再起動させる場合（例: ワッチドッグがトリガーされた場合）には特に役立ちます。このような場合、RAM が多少破損している可能性がありますが、通常は復元可能です。</p>
+</section>
+<section id="setting-the-parameters">
+<h2>パラメータの設定<a class="headerlink" href="#setting-the-parameters" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Ramoops のパラメータを設定する方法はいくつかあります:</p>
+<blockquote>
+<div><p>A. モジュールパラメータを使用します（変数名は前述の変数名と同じです）。デバッグのためには、起動時にメモリの一部を予約して、ramoops に使用する方法もあります。例えば、メモリが 128 MB を超えるマシンの場合、以下のカーネルコマンドラインで、カーネルに最初の 128 MB のメモリのみを使用し、ECC 保護された ramoops レギオンを 128 MB の境界に配置させます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>mem=128M ramoops.mem_address=0x8000000 ramoops.ecc=1
+</pre></div>
+</div>
+<p>B. デバイスツリーのバインディングを使用します。詳しくは
+<code class="docutils literal notranslate"><span class="pre">Documentation/devicetree/bindings/reserved-memory/ramoops.txt</span></code>。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>reserved-memory {
+        #address-cells = &lt;2&gt;;
+        #size-cells = &lt;2&gt;;
+        ranges;
+
+        ramoops@8f000000 {
+                compatible = "ramoops";
+                reg = &lt;0 0x8f000000 0 0x100000&gt;;
+                record-size = &lt;0x4000&gt;;
+                console-size = &lt;0x4000&gt;;
+        };
+};
+</pre></div>
+</div>
+<p>C. プラットフォームデバイスを使用してプラットフォームデータを設定します。パラメータはこのプラットフォームデータを通じて設定できます。その例は以下の通りです:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;linux/pstore_ram.h&gt;</span><span class="cp"></span>
+<span class="p">[...]</span><span class="w"></span>
+
+<span class="k">static</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">ramoops_platform_data</span><span class="w"> </span><span class="n">ramoops_data</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">      </span><span class="p">.</span><span class="n">mem_size</span><span class="w">               </span><span class="o">=</span><span class="w"> </span><span class="o">&lt;</span><span class="p">...</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+<span class="w">      </span><span class="p">.</span><span class="n">mem_address</span><span class="w">            </span><span class="o">=</span><span class="w"> </span><span class="o">&lt;</span><span class="p">...</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+<span class="w">      </span><span class="p">.</span><span class="n">mem_type</span><span class="w">               </span><span class="o">=</span><span class="w"> </span><span class="o">&lt;</span><span class="p">...</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+<span class="w">      </span><span class="p">.</span><span class="n">record_size</span><span class="w">            </span><span class="o">=</span><span class="w"> </span><span class="o">&lt;</span><span class="p">...</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+<span class="w">      </span><span class="p">.</span><span class="n">max_reason</span><span class="w">             </span><span class="o">=</span><span class="w"> </span><span class="o">&lt;</span><span class="p">...</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+<span class="w">      </span><span class="p">.</span><span class="n">ecc</span><span class="w">                    </span><span class="o">=</span><span class="w"> </span><span class="o">&lt;</span><span class="p">...</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+<span class="p">};</span><span class="w"></span>
+
+<span class="k">static</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">platform_device</span><span class="w"> </span><span class="n">ramoops_dev</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">      </span><span class="p">.</span><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">"ramoops"</span><span class="p">,</span><span class="w"></span>
+<span class="w">      </span><span class="p">.</span><span class="n">dev</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">              </span><span class="p">.</span><span class="n">platform_data</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="n">ramoops_data</span><span class="p">,</span><span class="w"></span>
+<span class="w">      </span><span class="p">},</span><span class="w"></span>
+<span class="p">};</span><span class="w"></span>
+
+<span class="p">[...</span><span class="w"> </span><span class="n">inside</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="n">function</span><span class="w"> </span><span class="p">...]</span><span class="w"></span>
+<span class="kt">int</span><span class="w"> </span><span class="n">ret</span><span class="p">;</span><span class="w"></span>
+
+<span class="n">ret</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">platform_device_register</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ramoops_dev</span><span class="p">);</span><span class="w"></span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">ret</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">      </span><span class="n">printk</span><span class="p">(</span><span class="n">KERN_ERR</span><span class="w"> </span><span class="s">"unable to register platform device</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span><span class="w"></span>
+<span class="w">      </span><span class="k">return</span><span class="w"> </span><span class="n">ret</span><span class="p">;</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</pre></div>
+</div>
+</div></blockquote>
+<p>RAMメモリまたは周辺機器のメモリを指定できます。ただし、RAMを指定する場合、アーキテクチャコードの初期段階でmemblock_reserve()を呼び出してメモリを確保する必要があります。例えば:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/memblock.h&gt;
+
+memblock_reserve(ramoops_data.mem_address, ramoops_data.mem_size);
+</pre></div>
+</div>
+</section>
+<section id="dump-format">
+<h2>ダンプ形式<a class="headerlink" href="#dump-format" title="この見出しへのパーマリンク">¶</a></h2>
+<p>データダンプはヘッダーから始まり、現在は以下のように定義されています <code class="docutils literal notranslate"><span class="pre">====</span></code> タイムスタンプと改行コードの後に、実際のデータが続きます。</p>
+</section>
+<section id="reading-the-data">
+<h2>データの読み取り<a class="headerlink" href="#reading-the-data" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ダンプデータは pstore ファイルシステムから読み取れます。これらのファイルの形式は <code class="docutils literal notranslate"><span class="pre">dmesg-ramoops-N</span></code>、ここでNはメモリ内のレコード番号を表します。RAMから保存されたレコードを削除するには、対応するpstoreファイルをアンリンクするだけです。</p>
+</section>
+<section id="persistent-function-tracing">
+<h2>永続的な関数トレース<a class="headerlink" href="#persistent-function-tracing" title="この見出しへのパーマリンク">¶</a></h2>
+<p>永続的な関数トレースは、ソフトウェアやハードウェア関連のハングのデバッグに役立つかもしれません。関数呼び出しチェーンのログは、以下のようなファイルに保存されています。 <code class="docutils literal notranslate"><span class="pre">ftrace-ramoops</span></code>
+ファイルです。使用例はこちらです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># mount -t debugfs debugfs /sys/kernel/debug/
+# echo 1 &gt; /sys/kernel/debug/pstore/record_ftrace
+# reboot -f
+[...]
+# mount -t pstore pstore /mnt/
+# tail /mnt/ftrace-ramoops
+0 ffffffff8101ea64  ffffffff8101bcda  native_apic_mem_read &lt;- disconnect_bsp_APIC+0x6a/0xc0
+0 ffffffff8101ea44  ffffffff8101bcf6  native_apic_mem_write &lt;- disconnect_bsp_APIC+0x86/0xc0
+0 ffffffff81020084  ffffffff8101a4b5  hpet_disable &lt;- native_machine_shutdown+0x75/0x90
+0 ffffffff81005f94  ffffffff8101a4bb  iommu_shutdown_noop &lt;- native_machine_shutdown+0x7b/0x90
+0 ffffffff8101a6a1  ffffffff8101a437  native_machine_emergency_restart &lt;- native_machine_restart+0x37/0x40
+0 ffffffff811f9876  ffffffff8101a73a  acpi_reboot &lt;- native_machine_emergency_restart+0xaa/0x1e0
+0 ffffffff8101a514  ffffffff8101a772  mach_reboot_fixups &lt;- native_machine_emergency_restart+0xe2/0x1e0
+0 ffffffff811d9c54  ffffffff8101a7a0  __const_udelay &lt;- native_machine_emergency_restart+0x110/0x1e0
+0 ffffffff811d9c34  ffffffff811d9c80  __delay &lt;- __const_udelay+0x30/0x40
+0 ffffffff811d9d14  ffffffff811d9c3f  delay_tsc &lt;- __delay+0xf/0x20
+</pre></div>
+</div>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxカーネルユーザーおよび管理者のガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="README.html">Linux カーネルリリース 5.x &lt;http://kernel.org/&gt;</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kernel-parameters.html">カーネルのコマンドラインパラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="devices.html">Linux で割り当てられたデバイス（4.x 以降のバージョン）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysctl/index.html">/proc/sys に関するドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="abi.html">Linux ABI 説明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hw-vuln/index.html">ハードウェアの脆弱性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reporting-bugs.html">バグの報告</a></li>
+<li class="toctree-l2"><a class="reference internal" href="security-bugs.html">セキュリティ関連のバグ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bug-hunting.html">バグ狩り</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bug-bisect.html">バグのバイセクティング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tainted-kernels.html">汚染されたカーネル</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Ramoops oops/panic ロガー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dynamic-debug-howto.html">ダイナミックデバッグ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="init.html">「No working init found.」のブートハングメッセージの説明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kdump/index.html">Kdump に関するドキュメンテーション - kexec を使用したクラッシュダンプ解決策</a></li>
+<li class="toctree-l2"><a class="reference internal" href="perf/index.html">パフォーマンスモニタサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pstore-blk.html">pstore ブロック oops/panic ロガー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysfs-rules.html">sysfs 内の情報へのアクセスに関するルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="acpi/index.html">ACPI サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="aoe/index.html">ATA over Ethernet (AoE)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="auxdisplay/index.html">補助ディスプレイサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bcache.html">ブロックレイヤーのキャッシュ（bcache）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="binderfs.html">Android binderfs ファイルシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="binfmt-misc.html">Linux における miscellaneous Binary Formats（binfmt_misc）のカーネルサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blockdev/index.html">Linux RapidIO サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bootconfig.html">ブート構成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="braille-console.html">Linux ブライルコンソール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="btmrvl.html">btmrvl ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cgroup-v1/index.html">Control Groups バージョン 1</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cgroup-v2.html">Control Group v2</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cifs/index.html">CIFS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="clearing-warn-once.html">WARN_ONCE のクリア</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cpu-load.html">CPU ロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cputopology.html">sysfs を通じて CPU テポロジー情報がエクスポートされる仕組み</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dell_rbu.html">Dell Remote BIOS Update ドライバー (dell_rbu)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="device-mapper/index.html">Device Mapper</a></li>
+<li class="toctree-l2"><a class="reference internal" href="edid.html">EDID</a></li>
+<li class="toctree-l2"><a class="reference internal" href="efi-stub.html">EFI ブート ステブ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ext4.html">ext4 一般情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nfs/index.html">NFS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gpio/index.html">gpio</a></li>
+<li class="toctree-l2"><a class="reference internal" href="highuid.html">16 ビット UID から 32 ビット UID への変更に関する注意点</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hw_random.html">i8xx チップセットにおけるランダム数生成器の Linux サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="initrd.html">初期 RAM ディスク (initrd) の使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="iostats.html">I/O 統計項目</a></li>
+<li class="toctree-l2"><a class="reference internal" href="java.html">Java(tm) バイナリーカーネルサポート for Linux v1.03</a></li>
+<li class="toctree-l2"><a class="reference internal" href="jfs.html">IBM のジャーナル化ファイルシステム (JFS) for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kernel-per-CPU-kthreads.html">per-CPU kthread による OS ジャッタリングの軽減</a></li>
+<li class="toctree-l2"><a class="reference internal" href="laptops/index.html">ノートPCドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lcd-panel-cgram.html">パラレルポート LCD/キーパッドパネルサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ldm.html">LDM - ロジカルディスクマネージャー (ダイナミックディスク)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lockup-watchdogs.html">ソフトロックアップ検出器とハードロックアップ検出器 (nmi_watchdog とも呼ばれる)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="LSM/index.html">Linux セキュリティモジュールの使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="md.html">RAID アレイ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="media/index.html">メディアサブシステム管理およびユーザーガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mm/index.html">メモリ管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="module-signing.html">カーネルモジュール署名機能</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mono.html">Mono(tm) バイナリーカーネルサポート for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="namespaces/index.html">ネームスペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="numastat.html">NUMA ポリシー ヒット/ミス統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="parport.html">パラレルポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="perf-security.html">Perf イベントとツールセキュリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pm/index.html">電源管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pnp.html">Linux プラグアンドプレイドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rapidio.html">RapidIO サブシステムガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ras.html">信頼性、可用性、サービス性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rtc.html">リアルタイムクロック (RTC) ドライバー for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="serial-console.html">Linux シリアルコンソール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="svga.html">ビデオモード選択サポート 2.13</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysrq.html">Linux Magic System Request Key Hacks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="thunderbolt.html">USB4 and Thunderbolt</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ufs.html">UFSの使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="unicode.html">Unicodeのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vga-softcursor.html">VGA用ソフトウェアカーソル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="video-output.html">ビデオ出力スイッチャー制御</a></li>
+<li class="toctree-l2"><a class="reference internal" href="wimax/index.html">WiMAXサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfs.html">SGI XFS ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxカーネルユーザーおよび管理者のガイド</a><ul>
+<li>前へ: <a href="tainted-kernels.html" title="前章">汚染されたカーネル</a></li>
+<li>次へ: <a href="dynamic-debug-howto.html" title="次章">ダイナミックデバッグ</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/admin-guide/ramoops.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

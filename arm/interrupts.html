@@ -1,0 +1,292 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>割込み — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="kernel_mode_neon.html" rel="next" title="カーネルモードNEON"/>
+<link href="firmware.html" rel="prev" title="ARM用ファームウェア固有操作の登録および呼び出しインターフェース"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="interrupts">
+<h1>割込み<a class="headerlink" href="#interrupts" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="simple">
+<dt>2.5.2-rmk5:</dt><dd><p>これは、いくつかの主要なアーキテクチャ固有のサブシステムに大幅な変更を加えた最初のカーネルです。</p>
+</dd>
+</dl>
+<p>まず、MMU TLBの処理方法にかなりの変更が加えられています。各MMU TLBの変体は完全に別々に処理されるようになりました - TLB v3、TLB v4（ライトバッファなし）、TLB v4（ライトバッファあり）、そして最終的にTLB v4（ライトバッファあり、I TLB無効化エントリあり）が含まれます。これらの関数内にはより多くのアセンブリコードが含まれており、今後の柔軟なTLB処理を可能にするためです。</p>
+<p>次に、IRQサブシステム。</p>
+<p>2.5カーネルでは、IRQの処理方法に大幅な変更が行われます。残念ながら、この変更により、irq_desc[]配列にアクセスする機種（基本的にすべての機種）が破損し、現在存在するすべての機種に影響が出ます。</p>
+<p>例を挙げると、AssabetとNeponsetを使用した場合、以下のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>          GPIO25                 IRR:2
+SA1100 ------------&gt; Neponset -----------&gt; SA1111
+                                 IIR:1
+                              -----------&gt; USAR
+                                 IIR:0
+                              -----------&gt; SMC9196
+</pre></div>
+</div>
+<p>現在の仕様では、すべてのSA1111割込みはお互いに排他的です。SA1111から割込みを処理している間、他のSA1111やSMC9196の割込みは処理を待つ必要があります。たとえば、SA1111のIDE PIOベースの割込みは、複数セクタのデータ転送が完了するまで、他のSA1111やSMC9196の割込みをブロックします。これは時間がかかる場合があります。また、SA1111の割込みハンドラでループしているため、SMC9196の割込みを無限にブロックすることも可能です。</p>
+<p>新しいアプローチではいくつかの新しいアイデアが導入されています…</p>
+<p>「親」と「子」の概念を導入します。たとえば、Neponsetハンドラでは、「親」はGPIO25で、「子」はSA1111、SMC9196、USARです。</p>
+<p>また、「IRQチップ」の概念を導入します（主にirqdesc配列のサイズを減らすため）。これは実際の「IC」である必要はありません。実際、SA11x0のIRQは、GPIO0-10用とその他のすべてのIRQ用の2つの「チップ」構造で処理されます。これはさまざまな操作を含むコンテナです（この構造体の名前は今後改善される可能性があります）。この構造体には以下の操作があります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct irqchip {
+        /*
+         * Acknowledge the IRQ.
+         * If this is a level-based IRQ, then it is expected to mask the IRQ
+         * as well.
+         */
+        void (*ack)(unsigned int irq);
+        /*
+         * Mask the IRQ in hardware.
+         */
+        void (*mask)(unsigned int irq);
+        /*
+         * Unmask the IRQ in hardware.
+         */
+        void (*unmask)(unsigned int irq);
+        /*
+         * Re-run the IRQ
+         */
+        void (*rerun)(unsigned int irq);
+        /*
+         * Set the type of the IRQ.
+         */
+        int (*type)(unsigned int irq, unsigned int, type);
+};
+</pre></div>
+</div>
+<dl class="simple">
+<dt>ack</dt><dd><ul class="simple">
+<li><p>必須。do_level_IRQで処理されるIRQの場合、maskと同じ関数を使用する場合があります。</p></li>
+</ul>
+</dd>
+<dt>mask</dt><dd><ul class="simple">
+<li><p>必須。</p></li>
+</ul>
+</dd>
+<dt>unmask</dt><dd><ul class="simple">
+<li><p>必須。</p></li>
+</ul>
+</dd>
+<dt>rerun</dt><dd><ul class="simple">
+<li><p>任意。do_level_IRQですべてのIRQを処理する場合、不要です。可能な限りハードウェアIRQを再トリガーする必要があります。再トリガーができない場合は、ハンドラを直接呼び出すこともできます。</p></li>
+</ul>
+</dd>
+<dt>type</dt><dd><ul class="simple">
+<li><p>任意。IRQのタイプを変更できない場合はnullに設定し、ユーザーがタイプを設定できないことを検出できるようにします。</p></li>
+</ul>
+</dd>
+</dl>
+<p>各IRQに対して、以下の情報を保持しています:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>「disable」深度（ <a class="reference internal" href="../core-api/genericirq.html#c.disable_irq" title="disable_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">disable_irq()</span></code></a>s without <a class="reference internal" href="../core-api/genericirq.html#c.enable_irq" title="enable_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">enable_irq()</span></code></a>s)</p></li>
+<li><p>このIRQに対して行える操作を示すフラグ（有効、プローブ、noautounmask）は以前と同様です</p></li>
+<li><p>IRQの状態（プローブ中、有効、など）</p></li>
+<li><p>チップ</p></li>
+<li><p>各IRQハンドラ</p></li>
+<li><p>irqaction構造体リスト</p></li>
+</ul>
+</div></blockquote>
+<p>ハンドラは、レベル、エッジ、シンプルの3つの標準ハンドラのいずれか、または特別な処理が必要な場合は独自のハンドのラを使用できます。</p>
+<p>「レベル」ハンドラは現在の実装で使用されており、非常にシンプルです。「エッジ」ハンドラは、このようなIRQ実装の欠陥を把握しており、ハードウェアIRQを処理中に有効に保つ必要があります。処理中にIRQが再度発生した場合、キューイングする必要があります。「シンプル」ハンドラは非常に基本的で、ハードウェア操作や状態追跡を行いません。これはSMC9196や上記のUSARなどの用途に適しています。</p>
+<section id="so-what-s-changed">
+<h2>では、変更点は何か？<a class="headerlink" href="#so-what-s-changed" title="この見出しへのパーマリンク">¶</a></h2>
+<ol class="arabic">
+<li><p>マシン実装はirqdesc配列に書き込みを行ってはいけません。</p></li>
+<li><p>irqdesc配列を操作する新しい関数。最初の4つはマシン固有のコードにのみ有用とされています。最後の関数はマシン固有のコードにのみ推奨されますが、絶対に必要であればドライバでも使用可能です。</p>
+<blockquote>
+<div><dl class="simple">
+<dt>set_irq_chip(irq,chip)</dt><dd><p>このIRQのマスク/アンマスク処理方法を設定します</p>
+</dd>
+<dt>set_irq_handler(irq,handler)</dt><dd><p>このIRQのハンドラ（レベル、エッジ、シンプル）を設定します</p>
+</dd>
+<dt>set_irq_chained_handler(irq,handler)</dt><dd><p>このIRQの「チェイン」ハンドラを設定します - 自動的にこのIRQを有効にします（例：NeponsetおよびSA1111ハンドラ）。</p>
+</dd>
+<dt>set_irq_flags(irq,flags)</dt><dd><p>有効/プローブ/noautoenableフラグを設定します。</p>
+</dd>
+<dt>set_irq_type(irq,type)</dt><dd><p>IRQのエッジ（レベル）を有効にします。これはSA1111 INTPOL操作およびset_GPIO_IRQ_edge()関数の代替です。typeは&lt;linux/irq.h&gt;で定義されたIRQ_TYPE_xxxのいずれかです。</p>
+</dd>
+</dl>
+</div></blockquote>
+</li>
+<li><p>set_GPIO_IRQ_edge()は非推奨となり、set_irq_typeで置き換えられます。</p></li>
+<li><p>SA1111 INTPOLへの直接アクセスは非推奨です。set_irq_typeを使用してください。</p></li>
+<li><p>ハンドラは、SA1110 GPIOに直接接続されている場合など、SA1111 IRQステータスを再読み込むたびにSA1110 IRQをアサートする必要があります。</p></li>
+<li><p>自身のIRQ有効/無効制御を持たない子デバイス（例：SMC9196）に対しては、子ハンドラが呼ばれる間、親IRQをマスクまたは確認する必要があります。この場合、子ハンドラは「シンプル」ハンドラ（エッジもしくはレベルタイプではない）でなければなりません。ハンドラが完了した後、親IRQを再有効化し、すべての子デバイスの状態を再確認して保留中のイベントを検出する必要があります。（詳細はNeponset IRQハンドラを参照）</p></li>
+<li><p>fixup_irq()は削除されました <cite>arch/arm/mach-*/include/mach/irq.h</cite></p></li>
+</ol>
+<p>注意点として、この方法ではすべての問題を解決できない可能性があります。一部の問題はハードウェアに依存しています。同一の親信号でレベルベースとエッジベースのIRQを混在させること（例：neponset）は、ソフトウェアベースの解決策でも低IRQラテンシへの完全な対応は難しい領域です。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">ARMアーキテクチャ</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="arm.html">ARM Linux 2.6 以降</a></li>
+<li class="toctree-l2"><a class="reference internal" href="booting.html">ARM Linuxの起動</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cluster-pm-race-avoidance.html">クラスタ全体の電源投入/停止レース回避アルゴリズム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="firmware.html">ARM用ファームウェア固有操作の登録および呼び出しインターフェース</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">割込み</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kernel_mode_neon.html">カーネルモードNEON</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kernel_user_helpers.html">カーネル提供のユーザーヘルパー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="memory.html">ARM Linuxにおけるカーネルメモリレイアウト</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mem_alignment.html">メモリアライメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tcm.html">ARM LinuxにおけるTCM（タイトーリーニングメモリ）の処理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="setup.html">ARM Linuxにおけるカーネル初期化パラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="swp_emulation.html">非推奨SWP命令のソフトウェアエミュレーション（CONFIG_SWP_EMULATE）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="uefi.html">統一拡張ファームウェアインターフェース（UEFI）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vlocks.html">Bare-Metal相互排他用のvlocks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="porting.html">移植</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#soc-specific-documents">SoC固有のドキュメント</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">ARMアーキテクチャ</a><ul>
+<li>前へ: <a href="firmware.html" title="前章">ARM用ファームウェア固有操作の登録および呼び出しインターフェース</a></li>
+<li>次へ: <a href="kernel_mode_neon.html" title="次章">カーネルモードNEON</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/arm/interrupts.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

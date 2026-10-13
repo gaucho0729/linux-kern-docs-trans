@@ -1,0 +1,502 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>クラスタ全体の電源投入/切断競合回避アルゴリズム — Linux Kernel ドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="firmware.html" rel="next" title="ARM用ファームウェア固有操作の登録および呼び出しインターフェース"/>
+<link href="booting.html" rel="prev" title="ARM Linuxの起動"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="cluster-wide-power-up-power-down-race-avoidance-algorithm">
+<h1>クラスタ全体の電源投入/停止レース回避アルゴリズム<a class="headerlink" href="#cluster-wide-power-up-power-down-race-avoidance-algorithm" title="この見出しへのパーマリンク">¶</a></h1>
+<p>このファイルは、CPUとクラスタのセットアップおよび teardown 操作を調整し、ハードウェアのコヒーレンス制御を安全に管理するためのアルゴリズムについて記載しています。</p>
+<p>「理由」セクションではアルゴリズムの目的と必要性を説明し、「基本モデル」では簡略化したシステムの視点で一般的な概念を説明します。他のセクションでは実際に使用されているアルゴリズムの詳細について説明します。</p>
+<section id="rationale">
+<h2>理由<a class="headerlink" href="#rationale" title="この見出しへのパーマリンク">¶</a></h2>
+<p>複数のCPUを備えたシステムでは、システムがアイドル状態にあるときに個々のCPUをオフにできるようにすることが望ましく、電力消費と熱放散を削減できます。</p>
+<p>複数のCPUクラスタを備えたシステムでも、全体をオフにできるようにすることが望ましいです。</p>
+<p>全体をオフ/オンする作業はリスクが伴うため、複数の独立して動作するCPUに影響を与える potentially destructive な操作を実行しながらOSが継続して動作している状態で行うため、何らかの調整が必要です。これにより、クラスタレベルでの重要な操作が本当に安全なタイミングに限ってのみ実行されるようにする必要があります。</p>
+<p>単純なロック機構だけではこの問題を解決できない場合があります。Linuxのスピンロックなどのメカニズムは、クラスタが電源を投入した際に直ちに有効になるコヒーレンスメカニズムに依存している可能性があり、その有効化または無効化自体が非アトミックな操作（例：ハードウェアレジスタの書き込みと大容量キャッシュの無効化）になる可能性があるため、クラスタレベルでの安全な電源オフ/オンを保証するためには他の調整方法が必要です。</p>
+<p>このドキュメントで提示されるメカニズムは、必要な調整を実行するためのコヒーレントメモリベースのプロトコルです。軽量性を重視しつつ、必要な安全性を提供することを目指しています。</p>
+</section>
+<section id="basic-model">
+<h2>基本モデル<a class="headerlink" href="#basic-model" title="この見出しへのパーマリンク">¶</a></h2>
+<p>各クラスタおよびCPUには以下の状態が割り当てられます：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>DOWN</p></li>
+<li><p>COMING_UP</p></li>
+<li><p>UP</p></li>
+<li><p>GOING_DOWN</p></li>
+</ul>
+</div></blockquote>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>    +---------&gt; UP ----------+
+    |                        v
+
+COMING_UP                GOING_DOWN
+
+    ^                        |
+    +--------- DOWN &lt;--------+
+</pre></div>
+</div>
+<dl class="simple">
+<dt>DOWN:</dt><dd><p>CPUまたはクラスタはコヒーレントではなく、電源がオフまたはスリープ状態にあるか、または電源オフまたはスリープ状態に準備されている状態です。</p>
+</dd>
+<dt>COMING_UP:</dt><dd><p>CPUまたはクラスタはUP状態への移行をコミットしています。初期化およびコヒーレンスの有効化プロセスの途中である可能性があります。</p>
+</dd>
+<dt>UP:</dt><dd><p>CPUまたはクラスタはハードウェアレベルでアクティブかつコヒーレントな状態です。この状態のCPUは、カーネルによって積極的に使用されているとは限りません。</p>
+</dd>
+<dt>GOING_DOWN:</dt><dd><p>CPUまたはクラスタはDOWN状態への移行をコミットしています。 teardown およびコヒーレンスの終了プロセスの途中である可能性があります。</p>
+</dd>
+</dl>
+<p>各CPUは、常にこれらの状態のいずれかが割り当てられています。CPUの状態については、「CPU state（CPU状態）」セクションで説明しています。</p>
+<p>クラスタにも状態が割り当てられますが、複数のCPUが同時に状態を変更する際の競合状態を避けるため、状態値を「クラスタ状態」と「インバウンド状態」の2つの部分に分割し、追加の状態を導入する必要があります。クラスタレベルの状態については、「Cluster state（クラスタ状態）」セクションで説明しています。</p>
+<p>この議論においてCPU状態とクラスタ状態を区別するため、状態名には <cite>CPU_</cite> というプレフィックスを付与し、クラスタ状態には <cite>CLUSTER_</cite> または <cite>INBOUND_</cite> というプレフィックスを付与します。</p>
+</section>
+<section id="cpu-state">
+<h2>CPU状態<a class="headerlink" href="#cpu-state" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このアルゴリズムでは、マルチコアプロセッサの各コアを「CPU」と呼びます。CPUは単一スレッドと仮定されているため、ある時点でCPUは1つの動作しか行えません。</p>
+<p>これは、CPUが基本モデルに近い動作をします。</p>
+<p>このアルゴリズムでは、システム内の各CPUに対して以下の状態を定義しています:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>CPU_DOWN</p></li>
+<li><p>CPU_COMING_UP</p></li>
+<li><p>CPU_UP</p></li>
+<li><p>CPU_GOING_DOWN</p></li>
+</ul>
+</div></blockquote>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span> cluster setup and
+CPU setup complete          policy decision
+      +-----------&gt; CPU_UP ------------+
+      |                                v
+
+CPU_COMING_UP                   CPU_GOING_DOWN
+
+      ^                                |
+      +----------- CPU_DOWN &lt;----------+
+ policy decision           CPU teardown complete
+or hardware event
+</pre></div>
+</div>
+<p>4つの状態の定義は基本モデルの状態に非常に近いです。</p>
+<p>状態間の移行は以下の通りです。</p>
+<p>トリガーイベント（自動的）とは、外部イベントが発生する必要なく、ローカルな進展によってのみ次の状態に移行可能な状態です。</p>
+<dl>
+<dt>CPU_DOWN:</dt><dd><p>CPUが電源オフ準備完了状態（CPU_DOWN）に到達すると、通常、WFI指令やファームウェア呼び出しを通じて自身で電源をオフにしたり、スリープ状態に移行します。</p>
+<dl class="simple">
+<dt>次の状態:</dt><dd><p>CPU_COMING_UP</p>
+</dd>
+<dt>条件:</dt><dd><p>none</p>
+</dd>
+<dt>トリガーイベント:</dt><dd><ol class="loweralpha simple">
+<li><p>他のCPUのポリシーデCISIONによって発生する明示的なハードウェア電源起動操作;</p></li>
+<li><p>割り込みなどのハードウェアイベント。</p></li>
+</ol>
+</dd>
+</dl>
+</dd>
+<dt>CPU_COMING_UP:</dt><dd><p>クラスタがセットアップされ、コヒーレントになるまで、CPUはハードウェアコヒーレンスに参加できません。クラスタが準備されていない場合、CPUはクラスタがセットアップされるまでCPU_COMING_UP状態に待機します。</p>
+<dl class="simple">
+<dt>次の状態:</dt><dd><p>CPU_UP</p>
+</dd>
+<dt>条件:</dt><dd><p>CPUの親クラスタがCLUSTER_UP状態である必要があります。</p>
+</dd>
+<dt>トリガーイベント:</dt><dd><p>親クラスタがCLUSTER_UP状態に移行する。</p>
+</dd>
+</dl>
+<p>CLUSTER_UP状態についての説明は、「Cluster state（クラスタ状態）」セクションを参照してください。</p>
+</dd>
+<dt>CPU_UP:</dt><dd><p>CPUがCPU_UP状態に到達すると、CPUがローカルコヒーレンスに参加できるようになります。</p>
+<p>これは、カーネルのCPU再開コードにジャンプすることで実現されます。</p>
+<p>この状態の定義は基本モデルの定義とやや異なります: CPU_UPはCPUが整合性を保っていることを意味せず、CPUがカーネルの再開が安全であることを意味します。カーネルは再開手順の残りの処理を担当するため、残りのステップはレース回避アルゴリズムの一部として表示されません。</p>
+<p>CPUは明示的なポリシー決定が行われるまでこの状態にとどまります。</p>
+<dl class="simple">
+<dt>次の状態:</dt><dd><p>CPU_GOING_DOWN</p>
+</dd>
+<dt>条件:</dt><dd><p>none</p>
+</dd>
+<dt>トリガーイベント:</dt><dd><p>明示的なポリシー決定</p>
+</dd>
+</dl>
+</dd>
+<dt>CPU_GOING_DOWN:</dt><dd><p>この状態にある間、CPUは整合性を失い、そのために必要なすべての操作（データキャッシュのクリーンアップなど）も含めて終了します。</p>
+<dl class="simple">
+<dt>次の状態:</dt><dd><p>CPU_DOWN</p>
+</dd>
+<dt>条件:</dt><dd><p>ローカルCPUの teardown 完了</p>
+</dd>
+<dt>トリガーイベント:</dt><dd><p>(自発的)</p>
+</dd>
+</dl>
+</dd>
+</dl>
+</section>
+<section id="cluster-state">
+<h2>クラスタ状態<a class="headerlink" href="#cluster-state" title="この見出しへのパーマリンク">¶</a></h2>
+<p>クラスタとは、いくつかの共有リソースを持つ接続されたCPUのグループです。クラスタは複数のCPUを含むため、同時に複数の処理を行えることがあります。これはいくつかの影響があります。特に、あるCPUが起動している間に、他のCPUがクラスタを終了している場合があります。</p>
+<p>この議論において、「送出側」はクラスタ状態をクラスタを終了しているCPUから見た視点を指し、「受信側」はクラスタを起動しているCPUから見た視点を指します。</p>
+<p>このような状況での安全な協調を可能にするため、クラスタを起動しているCPUがクラスタを終了しているCPUとは関係なく、自身の状態を独立して通知できる必要があります。そのため、クラスタ状態は2つの部分に分かれています:</p>
+<blockquote>
+<div><p>「クラスタ」状態: クラスタのグローバルな状態、または送出側の状態:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>CLUSTER_DOWN</p></li>
+<li><p>CLUSTER_UP</p></li>
+<li><p>CLUSTER_GOING_DOWN</p></li>
+</ul>
+</div></blockquote>
+<p>「受信側」状態: 受信側のクラスタ状態。</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>INBOUND_NOT_COMING_UP</p></li>
+<li><p>INBOUND_COMING_UP</p></li>
+</ul>
+</div></blockquote>
+<p>これらの状態の組み合わせにより、クラスタ全体として6つの可能な状態が生じます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>                          CLUSTER_UP
+        +==========&gt; INBOUND_NOT_COMING_UP -------------+
+        #                                               |
+                                                        |
+   CLUSTER_UP     &lt;----+                                |
+INBOUND_COMING_UP      |                                v
+
+        ^             CLUSTER_GOING_DOWN       CLUSTER_GOING_DOWN
+        #              INBOUND_COMING_UP &lt;=== INBOUND_NOT_COMING_UP
+
+  CLUSTER_DOWN         |                                |
+INBOUND_COMING_UP &lt;----+                                |
+                                                        |
+        ^                                               |
+        +===========     CLUSTER_DOWN      &lt;------------+
+                     INBOUND_NOT_COMING_UP
+</pre></div>
+</div>
+<p>移行 —–&gt; は送出側のCPUのみが行える操作であり、クラスタ状態の変更に限定されます。</p>
+<p>移行 ===##&gt; は受信側のCPUのみが行える操作であり、受信側状態の変更に限定されます。ただし、送出側でさらに移行が不可能な場合（つまり、送出側CPUがクラスタをCLUSTER_DOWN状態にした場合）を除きます。</p>
+<p>レース回避アルゴリズムは、クラスタ内のどのCPUがこれらの役割を担うかを特定する方法を提供していません。これは事前に他の手段で決定する必要があります。詳しくは「Last man and first man selection」セクションを参照してください。</p>
+<p>CLUSTER_DOWN/INBOUND_NOT_COMING_UPは、クラスタが実際に電源を切る唯一の状態です。</p>
+<p>インバウンドCPUとアウトバウンドCPUの並列性は、CLUSTER_GOING_DOWN/INBOUND_NOT_COMING_UP（基本モデルのGOING_DOWNに該当）からCLUSTER_DOWN/INBOUND_COMING_UP（基本モデルのCOMING_UPに該当）への2つの異なる経路の存在によって観測されます。2番目の経路はクラスタの停止を完全に回避します。</p>
+<p>CLUSTER_UP/INBOUND_COMING_UPは基本モデルのUPに相当します。最終的な遷移先のCLUSTER_UP/INBOUND_NOT_COMING_UPは単純で、次のサイクルに備えるステートマシンのリセットに過ぎません。</p>
+<p>許可された遷移の詳細は以下の通りです。</p>
+<p>各ケースにおける次の状態は記載されています</p>
+<blockquote>
+<div><p>&lt;クラスタ状態&gt;/&lt;インバウンド状態&gt; (&lt;遷移元&gt;)</p>
+</div></blockquote>
+<p>ここで&lt;遷移元&gt;は、遷移が可能な側（インバウンド側またはアウトバウンド側）を示します。</p>
+</div></blockquote>
+<dl class="simple">
+<dt>CLUSTER_DOWN/INBOUND_NOT_COMING_UP:</dt><dd><dl class="simple">
+<dt>次の状態:</dt><dd><p>CLUSTER_DOWN/INBOUND_COMING_UP (インバウンド)</p>
+</dd>
+<dt>条件:</dt><dd><p>none</p>
+</dd>
+<dt>トリガーイベント:</dt><dd><ol class="loweralpha simple">
+<li><p>他のCPUのポリシーデCISIONによって発生する明示的なハードウェア電源起動操作;</p></li>
+<li><p>割り込みなどのハードウェアイベント。</p></li>
+</ol>
+</dd>
+</dl>
+</dd>
+</dl>
+<p>CLUSTER_DOWN/INBOUND_COMING_UP:</p>
+<blockquote>
+<div><p>この状態では、インバウンドCPUがクラスタを設定し、クラスタレベルでのハードウェア整合性の有効化や、この目的を達成するために必要な他の操作（キャッシュ無効化など）を行います。</p>
+<p>この状態の目的は、他のクラスタ内のCPUが整合性を安全に取得できるように、十分なクラスタレベルの設定を行うことです。</p>
+<dl class="simple">
+<dt>次の状態:</dt><dd><p>CLUSTER_UP/INBOUND_COMING_UP (インバウンド)</p>
+</dd>
+<dt>条件:</dt><dd><p>クラスタレベルの設定とハードウェア整合性が完了</p>
+</dd>
+<dt>トリガーイベント:</dt><dd><p>(自発的)</p>
+</dd>
+</dl>
+</div></blockquote>
+<p>CLUSTER_UP/INBOUND_COMING_UP:</p>
+<blockquote>
+<div><p>クラスタレベルの設定が完了し、クラスタのハードウェア整合性が有効になっています。他のクラスタ内のCPUは整合性を安全に取得できます。</p>
+<p>これは一時的な状態で、すぐにCLUSTER_UP/INBOUND_NOT_COMING_UPへ移行します。クラスタ内の他のCPUはこの2つの状態を同等とみなすべきです。</p>
+<dl class="simple">
+<dt>次の状態:</dt><dd><p>CLUSTER_UP/INBOUND_NOT_COMING_UP (インバウンド)</p>
+</dd>
+<dt>条件:</dt><dd><p>none</p>
+</dd>
+<dt>トリガーイベント:</dt><dd><p>(自発的)</p>
+</dd>
+</dl>
+</div></blockquote>
+<p>CLUSTER_UP/INBOUND_NOT_COMING_UP:</p>
+<blockquote>
+<div><p>クラスタレベルの設定が完了し、クラスタのハードウェア整合性が有効になっています。他のクラスタ内のCPUは整合性を安全に取得できます。</p>
+<p>クラスタはポリシー決定が行われるまでこの状態を維持します。</p>
+<dl class="simple">
+<dt>次の状態:</dt><dd><p>CLUSTER_GOING_DOWN/INBOUND_NOT_COMING_UP (アウトバウンド)</p>
+</dd>
+<dt>条件:</dt><dd><p>none</p>
+</dd>
+<dt>トリガーイベント:</dt><dd><p>クラスタの電源を切るポリシー決定</p>
+</dd>
+</dl>
+</div></blockquote>
+<p>CLUSTER_GOING_DOWN/INBOUND_NOT_COMING_UP:</p>
+<blockquote>
+<div><p>アウトバウンドCPUがクラスタを停止しています。選択されたCPUは、クラスタ内のすべてのCPUがCPU_DOWN状態になるまでこの状態に待機する必要があります。</p>
+<p>すべてのCPUがCPU_DOWN状態になった後、クラスタを停止できます（例: データキャッシュのクリーンアップやクラスタレベルの整合性の終了など）。</p>
+<p>無駄な不要なクラスタ停止操作を避けるため、アウトバウンドはインバウンドクラスタ状態を確認し、INBOUND_COMING_UPへの非同期遷移を検出するか、個々のCPUがCPU_COMING_UPまたはCPU_UP状態に入ったことを確認する必要があります。</p>
+<p>次の状態:</p>
+<dl class="simple">
+<dt>クラスタダウン/インバウンドが上がらない (アウトバウンド)</dt><dd><dl class="simple">
+<dt>条件:</dt><dd><p>クラスタが解体され、電源を切る準備ができています</p>
+</dd>
+<dt>トリガーイベント:</dt><dd><p>(自発的)</p>
+</dd>
+</dl>
+</dd>
+<dt>クラスタダウン中/インバウンドが上がっている (インバウンド)</dt><dd><dl class="simple">
+<dt>条件:</dt><dd><p>none</p>
+</dd>
+<dt>トリガーイベント:</dt><dd><ol class="loweralpha simple">
+<li><p>他のCPUのポリシーデCISIONによって発生する明示的なハードウェア電源起動操作;</p></li>
+<li><p>割り込みなどのハードウェアイベント。</p></li>
+</ol>
+</dd>
+</dl>
+</dd>
+</dl>
+</div></blockquote>
+<p>クラスタダウン中/インバウンドが上がっている:</p>
+<blockquote>
+<div><p>クラスタは（またはすでに）解体されており、一方で別のCPUが同時にはじめてクラスタを再構築しようとしています。</p>
+<p>アウトバウンドCPUがこの状態を観測した場合、2つの選択肢があります:</p>
+<blockquote>
+<div><ol class="loweralpha simple">
+<li><p>解体を中断し、クラスタをCLUSTER_UP状態に戻す;</p></li>
+<li><p>クラスタの解体を完了し、CLUSTER_DOWN状態にします。インバウンドCPUはそこからクラスタを再構築します。</p></li>
+</ol>
+</div></blockquote>
+<p>選択肢(a)は、クラスタが実際に電源を切られるのではなく、不要な解体とセットアップ操作を回避することで、一部のレイテンシーを削減します。</p>
+<p>次の状態:</p>
+<dl class="simple">
+<dt>クラスタアップ/インバウンドが上がっている (アウトバウンド)</dt><dd><dl class="simple">
+<dt>条件:</dt><dd><p>クラスタレベルの設定とハードウェア整合性が完了</p>
+</dd>
+<dt>トリガーイベント:</dt><dd><p>(自発的)</p>
+</dd>
+</dl>
+</dd>
+<dt>クラスタダウン/インバウンドが上がっている (アウトバウンド)</dt><dd><dl class="simple">
+<dt>条件:</dt><dd><p>クラスタが解体され、電源を切る準備ができています</p>
+</dd>
+<dt>トリガーイベント:</dt><dd><p>(自発的)</p>
+</dd>
+</dl>
+</dd>
+</dl>
+</div></blockquote>
+</section>
+<section id="last-man-and-first-man-selection">
+<h2>ラストマンとファーストマンの選定<a class="headerlink" href="#last-man-and-first-man-selection" title="この見出しへのパーマリンク">¶</a></h2>
+<p>アウトバウンド側でクラスタの解体操作を行うCPUは一般的に「ラストマン」と呼ばれます。</p>
+<p>インバウンド側でクラスタのセットアップを行うCPUは一般的に「ファーストマン」と呼ばれます。</p>
+<p>上記で記載されたレース回避アルゴリズムは、どのCPUがこれらの役割を果たすかを決定するメカニズムを提供していません。</p>
+<p>ラストマン:</p>
+<p>クラスタをシャットダウンする際、関与するすべてのCPUは最初にLinuxを実行しており、したがって一貫性があります。そのため、CPUが非一貫性になる前に、通常のスピンロックを使用してラストマンを選定できます。</p>
+<p>ファーストマン:</p>
+<p>CPUは外部のウェイクアップイベントに応じて非同期に起動する可能性があるため、1つのCPUだけがファーストマンの役割を果たしてクラスタレベルの初期化を行うことを保証する動的メカニズムが必要です。他のCPUはこの初期化が完了するのを待ってから進む必要があります。</p>
+<p>クラスタレベルの初期化には、バスファブリック内の一貫性制御を設定するなどのアクションが含まれる可能性があります。</p>
+<p>現在のmcpm_head.Sでの実装は、この仲裁を行うための別の相互排他メカニズムを使用しています。このメカニズムはvlocks.txtで詳細に記載されています。</p>
+</section>
+<section id="features-and-limitations">
+<h2>機能と制限<a class="headerlink" href="#features-and-limitations" title="この見出しへのパーマリンク">¶</a></h2>
+<p>実装:</p>
+<blockquote>
+<div><p>現在のARMベースの実装は、arch/arm/common/mcpm_head.S（低レベルのインバウンドCPU操作）とarch/arm/common/mcpm_entry.c（その他すべて）に分かれています:</p>
+<p>__mcpm_cpu_going_down()は、CPUがCPU_GOING_DOWN状態に移行することを通知します。</p>
+<p>__mcpm_cpu_down()は、CPUがCPU_DOWN状態に移行することを通知します。</p>
+<p>CPUはmcpm_head.S内の低レベルの電源投入コードを通じてCPU_COMING_UP状態に移行し、その後CPU_UP状態に移行します。これはCPU固有の設定コードを含む可能性がありますが、現在の実装ではそうしていません。</p>
+<p>__mcpm_outbound_enter_critical()および__mcpm_outbound_leave_critical()は、CLUSTER_UPからCLUSTER_GOING_DOWNへの移行、およびそこからCLUSTER_DOWNまたはCLUSTER_UPへの移行（クラスタ電源停止が中止された場合）を処理します。</p>
+<p>これらの関数は、クラスタレベルでの安全な移行に必要なCPU間の連携を考慮するため、__mcpm_cpu_*()関数よりも複雑です。</p>
+<p>クラスタはmcpm_head.S内の低レベル電源投入コードを通じてCLUSTER_DOWNからCLUSTER_UPへ移行します。これはプラットフォーム固有の設定コードを含み、mcpm_sync_initを通じて登録されたplatform-specific power_up_setup関数によって提供されます。</p>
+</div></blockquote>
+<p>深層のトポロジー:</p>
+<blockquote>
+<div><p>現在の記述および実装では、CPUトポロジーに2レベル以上を含む構成はサポートされていません（つまり、クラスタのクラスタはサポートされていません）。このアルゴリズムは、追加のトポロジーレベルに対応させるために、クラスタレベルの状態を複製し、中間（外側のものでない）クラスタレベルの遷移ルールを修正することで拡張可能です。</p>
+</div></blockquote>
+</section>
+<section id="colophon">
+<h2>Colophon<a class="headerlink" href="#colophon" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Dave MartinがLinaro Limitedのために最初に作成・ドキュメンテーションを行い、Nicolas PitreおよびAchin Guptaとの協力により作成されました。</p>
+<p>Copyright (C) 2012-2013 Linaro Limited GNU General Public License Version 2の条項の下で配布されます。linux/COPYINGに記載されている通りです。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">ARMアーキテクチャ</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="arm.html">ARM Linux 2.6 以降</a></li>
+<li class="toctree-l2"><a class="reference internal" href="booting.html">ARM Linuxの起動</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">クラスタ全体の電源投入/停止レース回避アルゴリズム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="firmware.html">ARM用ファームウェア固有操作の登録および呼び出しインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="interrupts.html">割込み</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kernel_mode_neon.html">カーネルモードNEON</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kernel_user_helpers.html">カーネル提供のユーザーヘルパー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="memory.html">ARM Linuxにおけるカーネルメモリレイアウト</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mem_alignment.html">メモリアライメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tcm.html">ARM LinuxにおけるTCM（タイトーリーニングメモリ）の処理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="setup.html">ARM Linuxにおけるカーネル初期化パラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="swp_emulation.html">非推奨SWP命令のソフトウェアエミュレーション（CONFIG_SWP_EMULATE）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="uefi.html">統一拡張ファームウェアインターフェース（UEFI）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vlocks.html">Bare-Metal相互排他用のvlocks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="porting.html">移植</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#soc-specific-documents">SoC固有のドキュメント</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">ARMアーキテクチャ</a><ul>
+<li>前へ: <a href="booting.html" title="前章">ARM Linuxの起動</a></li>
+<li>次へ: <a href="firmware.html" title="次章">ARM用ファームウェア固有操作の登録および呼び出しインターフェース</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/arm/cluster-pm-race-avoidance.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

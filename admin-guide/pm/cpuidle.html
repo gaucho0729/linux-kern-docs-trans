@@ -1,0 +1,419 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>CPUアイドルタイム管理 — Linuxカーネルドキュメンテーション</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="intel_idle.html" rel="next" title="intel_idle CPUアイドル時間管理ドライバー"/>
+<link href="working-state.html" rel="prev" title="作業状態電源管理"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="cpu-idle-time-management">
+<h1>CPUアイドル時間管理<a class="headerlink" href="#cpu-idle-time-management" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著作権</dt>
+<dd class="field-odd"><p>© 2018 Intel Corporation</p>
+</dd>
+<dt class="field-even">著者</dt>
+<dd class="field-even"><p>Rafael J. Wysocki &lt;<a class="reference external" href="mailto:rafael.j.wysocki%40intel.com">rafael<span>.</span>j<span>.</span>wysocki<span>@</span>intel<span>.</span>com</a>&gt;</p>
+</dd>
+</dl>
+<section id="concepts">
+<h2>概念<a class="headerlink" href="#concepts" title="この見出しへのパーマリンク">¶</a></h2>
+<p>現代のプロセッサは、通常、プログラムの実行が一時停止し、その属する命令がメモリからフェッチされず、実行されない状態に移行できる。このような状態はプロセッサの状態です。 <em>アイドル</em> プロセッサの状態です。</p>
+<p>プロセッサのアイドル状態では一部のハードウェアが使用されないため、その状態に移行することでプロセッサの消費電力が削減され、結果としてエネルギー節約の機会となります。</p>
+<p>CPUアイドルタイム管理は、プロセッサのアイドル状態をこの目的に利用することを目的としたエネルギー効率性機能です。</p>
+<section id="logical-cpus">
+<h3>論理CPU<a class="headerlink" href="#logical-cpus" title="この見出しへのパーマリンク">¶</a></h3>
+<p>CPUアイドルタイム管理は、CPUスケジューラが見ているCPUを対象としています。 <em>CPUスケジューラ</em> その視点では、CPUは <em>論理的な</em> 単位です。つまり、それらは別個の物理的なエンティティである必要はなく、ソフトウェアに対して個々のシングルコアプロセッサとして現れるインターフェースである可能性があります。言い換えれば、CPUはメモリから1つのプログラムの命令をフェッチし、実行するように見えるエンティティですが、物理的にそうはならない場合もあります。一般的に、3つの異なるケースが考えられます。</p>
+<p>まず、全体のプロセッサが一度に1つの命令シーケンス（1つのプログラム）のみを実行できる場合、それはCPUです。その場合、ハードウェアにアイドル状態への移行を要求されたら、それは全体のプロセッサに適用されます。</p>
+<p>第二に、プロセッサがマルチコアの場合、各コアは一度に少なくとも1つのプログラムを実行できます。コア同士が完全に独立している必要はなく（例えば、キャッシュを共有する可能性があります）、それでもほとんどの場合、物理的に互いに並行して動作します。したがって、各コアが1つのプログラムのみを実行する場合、それらのプログラムはほぼ同時にほぼ独立して動作します。その場合、すべてのコアはCPUとみなされ、ハードウェアにアイドル状態への移行を要求されたら、最初にその要求をしたコアに適用されます。ただし、コアが属するより大きな単位（例えば、「パッケージ」や「クラスター」）にも適用される可能性があります（実際には、コアを含むすべてのより大きな単位の階層にも適用される可能性があります）。つまり、より大きな単位内のすべてのコア（1つを除く）が「コアレベル」でアイドル状態に置かれた場合、残りのコアがプロセッサにアイドル状態への移行を要求すると、それによって全体のより大きな単位がアイドル状態に置かれる可能性があり、その単位内の他のコアにも影響を与えるかもしれません。</p>
+<p>最後に、マルチコアプロセッサの各コアは、同一の時間枠内で複数のプログラムを実行できる可能性があります（つまり、各コアはメモリ内の複数の場所から命令をフェッチして同一の時間枠内で実行できるかもしれませんが、これらは必ずしも完全に並列で実行されるわけではありません）。その場合、ソフトウェアに対してコアは「バンドル」として現れ、それぞれが複数の個別シングルコア「プロセッサ」からなるものとして参照されます。 <em>ハードウェアスレッド</em>
+（Intelハードウェアでは「ハイパースレッド」と呼ばれます）。これらはそれぞれ1つの命令シーケンスを実行できます。このハードウェアスレッドはCPUアイドル時間管理の観点からCPUとみなされ、1つがアイドル状態にプロセッサを移行させると、そのハードウェアスレッド（またはCPU）が停止されますが、他のハードウェアスレッドが同じコア内でアイドル状態を要求していない限り、それ以上の動作は起こりません。その状況では、コアが個別にアイドル状態に移行するか、それと含まれるより大きな単位全体がアイドル状態に移行するか（そのより大きな単位内の他のコアがすでにアイドル状態である場合）を判断します。</p>
+</section>
+<section id="idle-cpus">
+<h3>アイドルCPU<a class="headerlink" href="#idle-cpus" title="この見出しへのパーマリンク">¶</a></h3>
+<p>論理CPU（以下では「CPU」と簡潔に呼ばれます）は、それらに実行すべきタスクが特別な「アイドル」タスク以外にない場合、Linuxカーネルによって
+<em>アイドル</em> とみなされます。</p>
+<p>タスクはCPUスケジューラが作成する作業の表現です。各タスクは実行すべき命令シーケンス（コード）、そのコードを実行中に操作するデータ、およびタスクのコードをCPUで実行するたびにプロセッサにロードする必要のあるコンテキスト情報から構成されます。CPUスケジューラはシステム内のCPUを割り当てることで作業を配分します。</p>
+<p>タスクはさまざまな状態にあり、特に、 <em>実行可能</em> 状態にある場合があります（特定の条件がなければ、CPUが利用可能であればそのコードを実行できる状態です。たとえば、イベントの待機や類似の状態でない場合）。タスクが実行可能になると、CPUスケジューラはそのタスクを利用可能なCPUの1つに割り当て、割り当てられた実行可能なタスクがなくなった場合、CPUはそのタスクのコンテキストをロードしてコードを実行します（最後に実行した命令の次の命令から開始し、他のCPUによって実行された可能性があります）。[1つのCPUに複数の実行可能なタスクが同時に割り当てられている場合、それらは優先順位付けとタイムシェアリングにより、時間とともに進捗を確保します。]</p>
+<p>特別な「idle」タスクは、指定されたCPUに他の実行可能なタスクが存在しない場合に実行可能になり、そのCPUはアイドル状態とみなされます。言い換えれば、Linuxではアイドル状態のCPUは「idle」タスクのコードを実行します。 <em>the idle loop</em>そのコードは、省電力のため、プロセッサがサポートするアイドル状態に移行させることでエネルギーを節約します。ただし、プロセッサがアイドル状態をサポートしていない、または次のウェイクアップイベントまでの間にアイドル状態に十分な時間が確保できない、または利用可能なアイドル状態を使用することができない厳しいレイテンシー制約がある場合、CPUは新しいタスクが割り当てられるまで、ほぼ無駄な指令をループして実行します。</p>
+</section>
+</section>
+<section id="the-idle-loop">
+<span id="idle-loop"></span><h2>The Idle Loop<a class="headerlink" href="#the-idle-loop" title="この見出しへのパーマリンク">¶</a></h2>
+<p>アイドルループのコードは、それぞれの反復において2つの主要なステップを実行します。まず、CPUアイドル時間管理サブシステムに所属するコードモジュールである <em>governor</em> を呼び出して、CPUがハードウェアに移行させるアイドル状態を選択します。次に、別のコードモジュールを <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> から呼び出します <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> サブシステム、called the <em>ドライバ</em>, 実際にプロセッサハードウェアに、ガバナーが選択したアイドル状態に移行させるための指示を出す。</p>
+<p>ガバナーの役割は、現在の状況に最も適したアイドル状態を見つけることです。このため、論理CPUからハードウェアに要求可能なアイドル状態は、プラットフォームやプロセッサアーキテクチャに依存しない抽象的な形で表現され、一次元（線形）配列として整理されています。この配列は、 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code>
+カーネルが実行しているプラットフォームに適合したドライバーが初期化時に準備・提供することにより、可能になります。これは <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ガバニョールは、基盤となるハードウェアに依存せず、Linuxカーネルが実行できるあらゆるプラットフォームで動作するようにする。</p>
+<p>その配列に存在する各アイドル状態は、ガバニョールが考慮すべき2つのパラメータを特徴としています。 <em>target residency</em> および（最悪の場合）
+<em>exit latency</em>ターゲット・レジデンシーは、ハードウェアが指定された状態に滞在する必要時間（その状態に入るのにかかる時間も含む）であり、その時間によってより多くのエネルギーを節約できるため、浅いアイドル状態に移行するよりもエネルギーを節約できるようにする必要があります。[アイドル状態の「深さ」は、プロセッサがその状態にあるときに消費する電力と大体一致します。] 一方、エクスイット・レイテンシーは、CPUがアイドル状態に入った後、その状態から目覚めた後に最初の命令を実行し始めるまでにかかる最大時間です。注意点として、通常、エクスイット・レイテンシーは、ハードウェアがその状態に入る途中で目覚めた場合でも、順序よく終了させるためにその状態に完全に移行する必要があるため、その時間も含まれます。</p>
+<p>ガバナーの決定に影響を与える情報は2種類あります。まず、ガバナーは次のタイマーイベントまでの時間を知っています。この時間は正確に把握できます。なぜなら、カーネルがタイマーアクセスを制御しており、タイマーアクセスがいつトリガーされるかを正確に把握できるからです。この時間は、指定されたCPUに依存するハードウェアがアイドル状態に滞在できる最大時間であり、その状態に入る時間と出る時間も含みます。ただし、CPUは、タイマーアクセスがトリガーされる前にいつでもノンタイマーアクセスによって目覚めることもあり、そのタイミングは一般的に予測できません。ガバナーは、CPUが目覚めた後に実際にアイドル状態で過ごした時間を確認し（この時間は今後を指します）、その情報をタイマーアクセスまでの時間と組み合わせて、今後のアイドル時間の推定に利用します。 <em>アイドル・デュレーション</em> 今後）を用いて、今後のアイドル時間の推定に利用します。ガバナーがどのようにこの情報を利用するかは、実装されたアルゴリズムによって異なり、これが複数のガバナーが存在する主な理由です。
+<code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> サブシステム。</p>
+<p>4 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ガバナーが利用可能です <code class="docutils literal notranslate"><span class="pre">menu</span></code>, <a class="reference internal" href="#teo-gov">TEO</a>,
+<code class="docutils literal notranslate"><span class="pre">ladder</span></code> および <code class="docutils literal notranslate"><span class="pre">haltpoll</span></code>デフォルトで使用されるガバナーは、カーネルの設定により異なり、特にアイドル・ループによってタイマーアクセスが停止可能かどうかに依存します。 <a class="reference internal" href="#idle-cpus-and-tick">停止可能かどうか</a>利用可能なガバナーは、 <code class="file docutils literal notranslate"><span class="pre">available_governors</span></code>から読み取れます。また、ガバナーはランタイム中に変更可能です。現在カーネルで使用されているガバナーの名前は、 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ファイルから読み取れます。 <code class="file docutils literal notranslate"><span class="pre">current_governor_ro</span></code> または
+<code class="file docutils literal notranslate"><span class="pre">current_governor</span></code> 以下に記載されたファイル <code class="file docutils literal notranslate"><span class="pre">/sys/devices/system/cpu/cpuidle/</span></code>
+の <code class="docutils literal notranslate"><span class="pre">sysfs</span></code>.</p>
+<p>一方、ドライバの使用は、カーネルが動作しているプラットフォームにより通常決まりますが、複数のマッチするドライバを持つプラットフォームもあります。たとえば、Intelプラットフォームの大多数で動作可能なドライバは2つあります。 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ドライバ <code class="docutils literal notranslate"><span class="pre">intel_idle</span></code> および <code class="docutils literal notranslate"><span class="pre">acpi_idle</span></code>、ハードコードされたアイドル状態情報を持つものと、システムのACPIテーブルからその情報を読み取るものの2種類があります。それでも、これらのケースにおいても、システム起動時のドライバーを選択した後で後から変更することはできません。したがって、どちらのドライバーを使用するかの決定は早期に行う必要があります（インテルプラットフォームでは、 <code class="docutils literal notranslate"><span class="pre">acpi_idle</span></code> が無効化されている場合や、プロセッサを認識できない場合に使用されます）。 <code class="docutils literal notranslate"><span class="pre">intel_idle</span></code> 現在のドライバーの名前は、 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code>
+から読み取ることができます。 <code class="file docutils literal notranslate"><span class="pre">current_driver</span></code>
+以下に記載されたファイル <code class="file docutils literal notranslate"><span class="pre">/sys/devices/system/cpu/cpuidle/</span></code> の <code class="docutils literal notranslate"><span class="pre">sysfs</span></code>.</p>
+</section>
+<section id="idle-cpus-and-tick">
+<span id="idle-cpus-and-the-scheduler-tick"></span><h2>アイドルCPUとスケジューラ・ティック<a class="headerlink" href="#idle-cpus-and-tick" title="この見出しへのパーマリンク">¶</a></h2>
+<p>スケジューラ・ティックは、CPUスケジューラの時間共有戦略を実装するために定期的にトリガーされるタイマです。もちろん、複数の実行可能なタスクが1つのCPUに同時に割り当てられている場合、それらが特定の時間枠内で合理的な進捗を遂げるようにするには、利用可能なCPU時間の共有が必須です。つまり、概ね各タスクにCPU時間のスライスを割り当て、そのスライスが使い果たされたら、CPUを別のタスクの実行に切り替える必要があります。ただし、現在実行中のタスクがCPUを譲るのを望まない場合もあるため、スケジューラ・ティックはその切り替えを強制します。これはスケジューラ・ティックの唯一の役割ではありませんが、主な目的です。</p>
+<p>スケジューラ・ティックは、CPUアイドル時間管理の観点から問題です。なぜなら、定期的に比較的頻繁にトリガーされるからです（カーネルの設定により、ティック周期の長さは1msから10msの間です）。したがって、ティックがアイドルCPUでトリガーされる場合、それらがハードウェアにアイドル状態への移行を依頼する際、目標残存時間よりもティック周期の長さを上回る値を指定するのは意味がありません。さらに、その場合、どのCPUのアイドル時間もティック周期の長さを越えることはなく、アイドル状態への移行と退出に伴うエネルギー消費は無駄になります。</p>
+<p>幸いなことに、アイドルCPUでタイクをトリガーする必要は実際にはありません。なぜなら、（定義上）それらのCPUは、特別な「アイドル」タスクを除いて、他のタスクを実行する必要がないからです。言い換えれば、CPUスケジューラの観点からすれば、それらのCPU上でCPU時間を利用するユーザーはアイドルループだけです。アイドルCPUの時間は複数の実行可能なタスク間で共有する必要がないため、与えられたCPUがアイドル状態にある場合、タイクを使用する主な理由は消えてしまいます。したがって、原則としてアイドルCPUではスケジューラのタイクを完全に停止することが可能ですが、常にその労力を費やす必要があるとは限りません。</p>
+<p>スケジューラのタイクをアイドルループで停止するかどうかが意味があるかどうかは、ガバナが期待していることによります。まず、タイクの範囲内で他の（タイク以外の）タイマがトリガーされる可能性がある場合、タイクを停止することは時間の無駄になります。ただし、その場合タイマハードウェアを再設定する必要がない可能性もあります。次に、タイクの範囲内でガバナが非タイマのウェイクアップを期待している場合、タイクを停止する必要はありませんし、むしろ有害かもしれません。なぜなら、その場合ガバナは、予期されるウェイクアップまでの時間内でのターゲットリジデンシーを持つアイドル状態を選択するため、その状態は相対的に浅いものになります。このため、ガバナは短時間でのウェイクアップを期待しているにもかかわらず、深いアイドル状態を選択することはできません。一方で、ウェイクアップが本当に短時間後に発生する場合、タイクを停止することは時間の無駄になり、その場合タイマハードウェアを再設定する必要がありますが、これはコストが高くなります。逆に、タイクを停止しウェイクアップが近々に起こらない場合、ハードウェアはガバナが選択した浅いアイドル状態で無限に時間を過ごすことになり、エネルギーの浪費になります。したがって、タイクの範囲内でガバットがどんなウェイクアップを期待している場合でも、タイクをトリガーさせることが望ましいです。ただし、それ以外の場合は、ガバナが相対的に深いアイドル状態を選択するため、タイクを停止すべきです。</p>
+<p>いずれにしても、ガバナは期待していることを知っているため、スケジューラのタイクを停止するかどうかの決定はガバナに任されています。それでも、タイクがすでに前のループのいずれかで停止されている場合、それをそのままにしておくのが良いです。ガバナはその状態を考慮する必要があります。</p>
+<p>カーネルは、アイドルループでスケジューラのタイクを停止することを完全に無効にする設定が可能です。これは、ビルド時の設定を通じて（""をアンセットして） <code class="docutils literal notranslate"><span class="pre">CONFIG_NO_HZ_IDLE</span></code> 設定オプション) またはコマンドラインで渡すことで
+<code class="docutils literal notranslate"><span class="pre">nohz=off</span></code> それを指定します。どちらの場合も、スケジューラのティックの停止が無効化されているため、アイドルループコードはガバナーの決定を無視し、ティックは停止されることはありません。</p>
+<p>アイドル状態のCPUでスケジューラのティックを停止できるように設定されたカーネルを実行するシステムは <em>tickless</em> システムと呼ばれ、これらはティックを停止できないカーネルを実行するシステムよりもエネルギー効率が高いと一般的に見なされています。指定されたシステムがticklessの場合、デフォルトで <code class="docutils literal notranslate"><span class="pre">menu</span></code> governorを使用し、ticklessでない場合、そのデフォルトの
+<code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> governorは <code class="docutils literal notranslate"><span class="pre">ladder</span></code>.</p>
+</section>
+<section id="the-menu-governor">
+<span id="menu-gov"></span><h2>以下の <code class="docutils literal notranslate"><span class="pre">menu</span></code> Governor<a class="headerlink" href="#the-menu-governor" title="この見出しへのパーマリンク">¶</a></h2>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">menu</span></code> governorはticklessシステムのデフォルトの <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> governorです。これは非常に複雑ですが、設計の基本的な原則は単純です。つまり、CPUがアイドル状態を選択するよう呼び出されたとき（つまり、CPUがプロセッサハードウェアにアイドル状態をエントリするよう依頼するアイドル状態）、そのCPUがアイドル時間の予測を行い、その予測値をアイドル状態の選択に使用します。</p>
+<p>まず、スケジューラのティックが停止されていると仮定して、最も近いタイマーエベントまでの時間を取得します。この時間は、以下の説明では <em>sleep length</em> と呼ばれ、次のCPUのウェイクアップまでの時間の上界です。これはsleep length範囲を決定するために使用され、その範囲はsleep length補正係数を取得するために必要です。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">menu</span></code> governorはsleep length補正係数の2つの配列を保持しています。一つは、以前にこのCPUで実行されていたタスクが一部のI/O操作を完了するのを待っている場合に使用され、もう一つはそのような状況でない場合に使用されます。各配列には、異なるsleep length範囲に対応する複数の補正係数値が含まれており、配列内の各範囲は前の範囲よりも約10倍広く設定されています。</p>
+<p>指定されたsleep length範囲（CPUのアイドル状態を選択する前に決定された）の補正係数は、CPUが再び起動された後、更新されます。sleep lengthが観測されたアイドル時間に近いほど、補正係数は1に近づきます（0から1の範囲内でなければなりません）。sleep lengthは、その値が属する範囲の補正係数をかけ算することで、予測されるアイドル時間の最初の近似値を得ます。</p>
+<p>次に、ガバナは単純なパターン認識アルゴリズムを使用してアイドル時間の予測を改善します。具体的には、最後に観測された8つのアイドル時間の値を保存し、次回のアイドル時間の予測を行う際にはそれらの平均値と分散を計算します。分散が小さい（400平方ミリ秒未満）場合、または平均値に対して分散が小さい（平均値が標準偏差の6倍以上である場合）、平均値を「典型的な間隔」値とみなします。その他の場合、保存された観測値の中で最も長いものを除き、残りの値で再計算を行います。このプロセスを繰り返し、分散が小さい（上記の意味で）場合、平均値を「典型的な間隔」値とします。この操作は、「典型的な間隔」が決定されるか、または無視されるデータポイントが多すぎるまで続きます。その際、「典型的な間隔」は「無限大」（最大の符号なし整数値）とみなされます。このように計算された「典型的な間隔」は、修正係数をかけたスリープ長と比較され、そのうち小さい方を予測されたアイドル時間とします。</p>
+<p>次に、ガバナは「インタラクティブな」ワークロードをサポートするための追加遅延制限を計算します。選択されたアイドル状態のエクスイット遅延が予測されたアイドル時間と比較して同等である場合、その状態に滞在する時間は非常に短く、その状態に入ることで節約できるエネルギーは相対的に小さくなるため、その状態に入る・出るに伴うオーバーヘッドを回避する方が良いと推測されます。したがって、より浅い状態を選択する方が良い可能性が高いです。この追加遅延制限の最初の近似値は予測されたアイドル時間そのものですが、さらにその値を、以前にそのCPUで実行されていたタスク数に応じた値で割ります。この割り算結果は、電源管理の品質保証（PM QoS）から来る遅延制限と比較され、 <a class="reference internal" href="#cpu-pm-qos">PM QoS</a>、フレームワークと比較して、小さい方をアイドル状態のエクスイット遅延の閾値として採用します。</p>
+<p>これでガバナはアイドル状態のリストを走査し、そのうちの一つを選択できる状態になりました。このため、各状態のターゲットリジデンシーを予測されたアイドル時間と比較し、その状態のエクスイット遅延を計算された遅延制限と比較します。予測されたアイドル時間に最も近いがその下にあるターゲットリジデンシーと、遅延制限を超えないエクスイット遅延を持つ状態を選択します。</p>
+<p>最終ステップでは、スケジューラのティックを停止しなかった場合、ガバナは依然としてアイドル状態の選択をさらに調整する必要がある <a class="reference internal" href="#idle-cpus-and-tick">スケジューラのティックを停止</a>. これは、その予測されるアイドル時間よりもティック周期が短く、かつ以前のアイドルループでのティックがすでに停止されていない場合に発生する。この場合、前回の計算で使用されたスリープ長は、次のタイマーイベントまでの実際の時間と一致しない可能性があり、そのスリープ長が本当にその時間よりも大きい場合、ガバナは適切なターゲット・レジデンシーを持つより浅いアイドル状態を選択する必要がある</p>
+</section>
+<section id="the-timer-events-oriented-teo-governor">
+<span id="teo-gov"></span><h2>タイマーエベント指向（TEO）ガバナ<a class="headerlink" href="#the-timer-events-oriented-teo-governor" title="この見出しへのパーマリンク">¶</a></h2>
+<p>タイマーエベント指向（TEO）ガバナは、ティックレスシステム用の代替ガバナである <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ティックレスシステム用のガバナ <code class="docutils literal notranslate"><span class="pre">menu</span></code> <a class="reference internal" href="#menu-gov">前者</a>: これは常に、与えられた条件に合った最も深いアイドル状態を検索することを試みるが、問題解決のアプローチは異なる</p>
+<p>まず、スリープ長補正係数を使用せず、代わりに観測されたアイドル時間値を利用可能なアイドル状態と関連付けて、その情報をもとに次のCPUアイドル間隔に最も合致するアイドル状態を選択する。次に、過去にそのCPUで実行されていたタスクが現在I/O操作を待っている場合でも、それらを一切考慮しない（それらが再び実行可能になる際に同じCPUで実行される保証はないからである）。パターン検出コードはタイマーウェイクアップを考慮しない。また、この目的には、スケジューラのティックを除いた現在の時刻までの最も近いタイマーまでのアイドル時間値が現在の時刻より小さいもののみを使用する</p>
+<p>ケースのように、最初のステップは、 <code class="docutils literal notranslate"><span class="pre">menu</span></code> governor <a class="reference internal" href="#menu-gov">ケース</a>、を取得することである。これはスケジューラのティックが停止されていると仮定した場合の、最も近いタイマーエベントまでの時間であり（これは次のCPUウェイクアップまでの時間の上界でもある）。この値は、ドライバが提供する各アイドル状態に対して維持される3つのメトリクスに基づいて、アイドル状態を事前に選択するために使用される <em>sleep length</em>、 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ドライバ: <code class="docutils literal notranslate"><span class="pre">hits</span></code>, <code class="docutils literal notranslate"><span class="pre">misses</span></code> および <code class="docutils literal notranslate"><span class="pre">early_hits</span></code>.</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">hits</span></code> および <code class="docutils literal notranslate"><span class="pre">misses</span></code> メトリクスは、アイドル状態が「スリープ長」と一致した場合に観測された（ウェイクアップ後）アイドル時間に一致する可能性を測定する。これらは、アイドル状態のターゲット・レジデンシーがスリープ長以下であり、次のアイドル状態のターゲット・レジデンシーがスリープ長より大きい場合（つまり、それらのアイドル状態が「スリープ長」と一致する場合）に、CPUウェイクアップごとに減少する。 <code class="docutils literal notranslate"><span class="pre">hits</span></code> 条件が満たされ、指定されたアイドル状態のターゲットリジディンシーが観測されたアイドル時間以下であり、次のアイドル状態のターゲットリジディンシーが観測されたアイドル時間より大きい場合、メトリックが増加します（つまり、指定されたアイドル状態がスリープ時間と観測されたアイドル時間の両方と一致するときに増加します）。この逆に、 <code class="docutils literal notranslate"><span class="pre">misses</span></code> 指定されたアイドル状態がスリープ時間と一致し、観測されたアイドル時間がそのターゲットリジディンシーより短すぎる場合、メトリックが増加します。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">early_hits</span></code> このメトリックは、指定されたアイドル状態がスリープ時間と一致しない場合でも、観測された（ wakeup 後）アイドル時間が「一致」する可能性を測る指標です。CPUの起動ごとに減少し、そのアイドル状態が観測された（wakeup 後）アイドル時間と「一致」し、次のアイドル状態のターゲットリジディンシーがスリープ時間以下である場合（つまり、スリープ時間と一致するアイドル状態が指定されたアイドル状態より深い場合）に増加します。</p>
+<p>ガバナーは、ドライバが提供するアイドル状態のリストを順に走査し、 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> スリープ時間以下である最後（最も深い）アイドル状態を見つけます。その後、 <code class="docutils literal notranslate"><span class="pre">hits</span></code> および <code class="docutils literal notranslate"><span class="pre">misses</span></code> そのアイドル状態のメトリックを比較し、 <code class="docutils literal notranslate"><span class="pre">hits</span></code> 一つが大きい（つまり、そのアイドル状態がCPUの再起動後の観測されたアイドル時間に一致する可能性が高い）場合、もし <code class="docutils literal notranslate"><span class="pre">misses</span></code> 一つが大きい場合、ガバナーは最大メトリックを持つ浅いアイドル状態を予選して選択します。複数の浅いアイドル状態があり、それらが等しいメトリックを持つ場合でも最大値であるならば、最も浅いアイドル状態が予選して選択されます。[PM QoSフレームワークからのウェイクアップ遅延制約が、目標のスリープ時間内での最も深いアイドル状態に到達する前に発生する場合、その制約内で終了遅延が許容される最も深いアイドル状態が、メトリックを参照せずに予選して選択されます。] <code class="docutils literal notranslate"><span class="pre">early_hits</span></code> メトリック（または複数の浅いアイドル状態があり、それらが等しいメトリックを持つ場合でも最大値であるならば、最も浅いアイドル状態が予選して選択されます）。 <code class="docutils literal notranslate"><span class="pre">early_hits</span></code>
+PM QoSフレームワークからのウェイクアップ遅延制約がある場合 <a class="reference internal" href="#cpu-pm-qos">PM QoSフレームワーク</a> が、目標のスリープ時間内での最も深いアイドル状態に到達する前に発生する場合、その制約内で終了遅延が許容される最も深いアイドル状態が、メトリックを参照せずに予選して選択されます。 <code class="docutils literal notranslate"><span class="pre">hits</span></code>,
+<code class="docutils literal notranslate"><span class="pre">misses</span></code> および <code class="docutils literal notranslate"><span class="pre">early_hits</span></code> メトリック。]</p>
+<p>次に、ガバナが最も最近観測されたアイドル時間の値をいくつか考慮し、そのうち少なくとも半分以上が選択されたアイドル状態のターゲット・レジデンシー以上である場合、そのアイドル状態が最終的な依頼候補として選ばれます。そうでない場合は、選択されたアイドル状態のターゲット・レジデンシー以下の最も最近のアイドル時間値の平均を計算し、ガバナが選択されたアイドル状態よりも浅いアイドル状態を検索して、その平均内にターゲット・レジデンシーを持つ最も深い状態を選びます。そのアイドル状態が最終的な依頼候補として選ばれます。</p>
+<p>それでも、この時点でガバナが選択されたアイドル状態の選択を精査する必要があるかもしれません。 <a class="reference internal" href="#idle-cpus-and-tick">スケジューラのティックを停止</a>これは、これまで選択されたアイドル状態のターゲット・レジデンシーがティック期間よりも小さく、かつ前のアイドルループのイテレーションでティックが停止されていない場合に一般的に発生します。 <code class="docutils literal notranslate"><span class="pre">menu</span></code> governor
+<a class="reference internal" href="#menu-gov">ケース</a>その場合、前の計算で使用されたスリープ長は、最も近いタイマーイベントまでの実際の時間を反映していない可能性があり、それが本当にその時間より大きい場合、ターゲット・レジデンシーが適切な浅い状態を選択する必要があります。</p>
+</section>
+<section id="representation-of-idle-states">
+<span id="idle-states-representation"></span><h2>アイドル状態の表現<a class="headerlink" href="#representation-of-idle-states" title="この見出しへのパーマリンク">¶</a></h2>
+<p>CPUアイドル時間管理の目的で、プロセッサがサポートするすべての物理的なアイドル状態を、1次元配列の
+<code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">cpuidle_state</span></code> オブジェクトとして表現する必要があります。それぞれのオブジェクトは、個々の論理CPUがプロセッサハードウェアに特定のプロパティを持つアイドル状態に入るよう依頼できるようにします。プロセッサにユニットの階層構造がある場合、1つのオブ�ェクトが、階層構造の異なるレベルにあるユニットがサポートするアイドル状態の組み合わせをカバーできます。 <code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">cpuidle_state</span></code> その場合、 <a class="reference internal" href="#idle-loop">ターゲット・レジデンシーおよびエクスイット・レイテンシーのパラメータ</a>は、最も深いレベル（つまり、他のすべてのユニットを含むユニットのアイドル状態）のプロパティを反映する必要があります。</p>
+<p>たとえば、2つのコアを持つ大きなユニット（「モジュール」と呼ばれる）を持つプロセッサを想定し、1つのコアが「コア」レベルで特定のアイドル状態（例えば「X」）に入るよう依頼すると、他のコアがすでに「X」のアイドル状態にいる場合、モジュールが自身の特定のアイドル状態（例えば「MX」）に入るよう試みるかもしれません。言い換えれば、「コア」レベルで「X」のアイドル状態を依頼することで、ハードウェアは「モジュール」レベルで「MX」のアイドル状態にまで深く進入する許可を得ますが、必ずしもそのように動作するとは限りません（依頼したコアが単独でその状態に入る可能性があります）。その場合、 <code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">cpuidle_state</span></code> アイドル状態「X」を表すオブジェクトは、モジュールのアイドル状態「MX」に滞在する最小時間を含む（その状態に入るのに必要な時間も含む）必要があります。なぜなら、ハードウェアがその状態に入る場合、CPUがエネルギーを節約するためには、この最小時間のアイドル状態を維持する必要があるからです。同様に、このオブジェクトのエクスイットラテンシー（退出遅延）パラメータは、モジュールのアイドル状態「MX」の退出時間（通常はその入力時間も含む）をカバーしなければなりません。なぜなら、ウェイクアップ信号からCPUが最初の新しい命令を実行し始めるまでの最大遅延がこの値だからです（モジュール全体が動作を開始した時点で、モジュール内の両コアが常に命令を実行できると仮定します）。</p>
+<p>ただし、内部のユニット階層の各レベル間で直接的な連携が行われないプロセッサもあります。このような場合、コアレベルでのアイドル状態の要求は、モジュールレベルに自動的に影響を及ぼしません。たとえば、何も影響を与えず、 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ドライバーが階層全体の処理を責任をもって行います。この場合、アイドル状態オブジェクトの定義はすべてドライバーが自由に決定しますが、最終的にプロセッサハードウェアが進入するアイドル状態の物理的特性は、ガバナーがアイドル状態選択に使用するパラメータに常に従う必要があります（たとえば、そのアイドル状態の実際のエクスイットラテンシーは、ガバナーが選択したアイドル状態オブジェクトのエクスイットラテンシーパラメータを超えてはなりません）。</p>
+<p>上記のターゲットレジデンシーおよびエクスイットラテンシーのアイドル状態パラメータに加えて、アイドル状態を表すオブジェクトには、アイドル状態の特性を記述するいくつかの他のパラメータと、ハードウェアにその状態に入るよう依頼するための関数へのポインタが含まれています。また、それぞれの
+<code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">cpuidle_state</span></code> オブジェクトには、該当するアイドル状態の使用統計を含む
+<code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">cpuidle_state_usage</span></code> オブジェクトが対応しています。この情報は、カーネルが <code class="docutils literal notranslate"><span class="pre">sysfs</span></code>.</p>
+<p>システム内のそれぞれのCPUに対して、 <code class="file docutils literal notranslate"><span class="pre">/sys/devices/system/cpu/cpu&lt;N&gt;/cpuidle/</span></code>
+ディレクトリが存在します。このディレクトリの番号は、初期化時に割り当てられます。このディレクトリには、 <code class="docutils literal notranslate"><span class="pre">sysfs</span></code>というサブディレクトリが含まれ、 <code class="docutils literal notranslate"><span class="pre">&lt;N&gt;</span></code> という番号が、該当するCPUに初期化時に割り当てられます。このディレクトリには、 <code class="file docutils literal notranslate"><span class="pre">state0</span></code>, <code class="file docutils literal notranslate"><span class="pre">state1</span></code> というサブディレクトリが含まれ、それぞれのサブディレクトリは1つのアイドル状態オブジェクトに対応し、名前の数字が大きいほど（有効な）アイドル状態の深さが深いことを示します。それぞれのディレクトリには、そのアイドル状態オブジェクトのプロパティを表す複数のファイル（属性）が含まれており、以下のように定義されます：</p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">above</span></code></dt><dd><p>このアイドル状態が要求された総回数。ただし、観測されたアイドル時間は目標の滞在時間に十分に短いため、一致しませんでした。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">below</span></code></dt><dd><p>このアイドル状態が要求された総回数。ただし、観測されたアイドル時間に合致するには、より深いアイドル状態の方が適切だったかもしれません。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">desc</span></code></dt><dd><p>アイドル状態の説明。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">disable</span></code></dt><dd><p>このアイドル状態が無効化されているかどうか。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">default_status</span></code></dt><dd><p>この状態のデフォルトの状態、「有効」か「無効」か。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">latency</span></code></dt><dd><p>アイドル状態の終了遅延（マイクロ秒）。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">name</span></code></dt><dd><p>アイドル状態の名前。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">power</span></code></dt><dd><p>このアイドル状態におけるハードウェアの消費電力（指定されている場合はミリワット、それ以外は0）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">residency</span></code></dt><dd><p>待機状態の目標待機時間（マイクロ秒）です。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">time</span></code></dt><dd><p>指定されたCPUがこの待機状態に費やす総時間（カーネルが測定する）（マイクロ秒）です。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">usage</span></code></dt><dd><p>指定されたCPUがハードウェアにこの待機状態に移行するよう要求した総回数です。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">rejected</span></code></dt><dd><p>指定されたCPUでこの待機状態への移行要求が拒否された総回数です。</p>
+</dd>
+</dl>
+<p>以下の <code class="file docutils literal notranslate"><span class="pre">desc</span></code> および <code class="file docutils literal notranslate"><span class="pre">name</span></code> ファイルにはどちらも文字列が含まれています。違いは、名前がより簡潔である一方、説明は長く、空白や特殊文字を含む可能性があることです。上記の他のファイルには整数値が含まれています。</p>
+<p>以下の <code class="file docutils literal notranslate"><span class="pre">disable</span></code> 属性は書き換え可能な唯一のものです。この属性が1を含む場合、指定されたCPUではこの待機状態が無効化され、そのCPUに対してガバナーが選択することはありません。ドライバはそのCPUに対してハードウェアにこの待機状態に移行するよう要求することもありません。 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code>
+ただし、あるCPUで待機状態を無効化しても、他のCPUがそれを要求することを防ぐことはできません。したがって、すべてのCPUで無効化する必要があります。[注意：ガバナーが実装されているため、待機状態を無効化すると、その無効化された待機状態よりも深い待機状態の選択もガバナーが行わないようになります。] <code class="docutils literal notranslate"><span class="pre">ladder</span></code>
+ガバナーが実装されているため、待機状態を無効化すると、そのガバナーが無効化された待機状態よりも深い待機状態を選択することもできなくなります。</p>
+<p>もし <code class="file docutils literal notranslate"><span class="pre">disable</span></code> この属性が0を含む場合、指定されたCPUではこの待機状態が有効ですが、システム内の他の一部またはすべてのCPUで無効化されている可能性もあります。この属性に1を書き込むと、指定されたCPUではこの待機状態が無効になります。0を書き込むと、ガバナーが指定されたCPUに対してこの待機状態を考慮に入れ、ドライバがそれを要求できるようになります。ただし、ドライバ内でこの状態がグローバルに無効化されている場合（その場合、まったく使用できません）。</p>
+<p>以下の <code class="file docutils literal notranslate"><span class="pre">power</span></code> 属性が特にアイドル状態のオブジェクトにおいては、プロセッサの階層構造における異なるレベルでのアイドル状態の組み合わせを表す場合に十分に明確に定義されていないため、複雑なハードウェアのアイドル状態電力数値を取得するのは一般的に困難であり、 <code class="file docutils literal notranslate"><span class="pre">power</span></code> 0（利用不可）を含むことが多く、0でない数値を含む場合でもその数値は正確でなく、何か意味のある用途には信頼できません。</p>
+<p>ファイル内の <code class="file docutils literal notranslate"><span class="pre">time</span></code> 数値は、指定されたCPUが指定されたアイドル状態で実際に費やした時間よりも大きい可能性があります。これはカーネルが測定しており、ハードウェアがこのアイドル状態に入らずに浅い状態に移行した（あるいは全くアイドル状態に入らなかった）ケースをカバーしないからです。カーネルは、ハードウェアにアイドル状態への移行を依頼した時間とCPUの再起動までの時間スパンのみを測定でき、その間ハードウェアで実際に何が起こったかは言えません。さらに、このアイドル状態オブジェクトがプロセッサの階層構造における異なるレベルのアイドル状態の組み合わせを表す場合、カーネルはどのケースにおいてもハードウェアが階層のどの深さまで進んだかを特定できません。このような理由から、ハードウェアがサポートするさまざまなアイドル状態で費やした時間を見つける唯一確実な方法は、ハードウェアにその機能が存在する場合、アイドル状態の滞在時間カウンターを使用することです。</p>
+<p>アイドル状態に入ろうと試みる際に受信した割込みは、アイドル状態の移行要求を拒否する原因となり、その場合、 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ドライバがこの状況を示すエラーコードを返すことがあります。この <code class="file docutils literal notranslate"><span class="pre">usage</span></code>
+および <code class="file docutils literal notranslate"><span class="pre">rejected</span></code> ファイルは、指定されたアイドル状態が成功裏に実行されたか拒否されたかの回数をそれぞれ報告します。</p>
+</section>
+<section id="power-management-quality-of-service-for-cpus">
+<span id="cpu-pm-qos"></span><h2>CPUの電源管理品質保証（Power Management Quality of Service）<a class="headerlink" href="#power-management-quality-of-service-for-cpus" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Linuxカーネル内の電源管理品質保証（PM QoS）フレームワークは、カーネルコードとユーザー空間プロセスがカーネルのエネルギー効率機能に制約を設定し、パフォーマンスが必要なレベル以下に低下しないようにするための仕組みを提供します。</p>
+<p>CPUのアイドル時間管理は、PM QoSによって2つの方法で影響を受けることがあります。それはグローバルなCPUラテンシ制限を通じたものと、個々のCPUに対する再起動ラテンシ制約を通じたものです。カーネルコード（例：デバイスドライバ）は、PM QoSフレームワークが提供する特別な内部インターフェースを活用してこれら2つの制限を設定できます。ユーザー空間は、 <code class="file docutils literal notranslate"><span class="pre">cpu_dma_latency</span></code> 特殊なデバイスファイルを <code class="file docutils literal notranslate"><span class="pre">/dev/</span></code> バイナリ値（符号付き32ビット整数として解釈される）を書き込み、CPUの再開遅延制限をユーザー空間から変更するには、符号付き32ビット整数を表す文字列を書き込むことができます。 <code class="file docutils literal notranslate"><span class="pre">power/pm_qos_resume_latency_us</span></code> 以下に記載されたファイル
+<code class="file docutils literal notranslate"><span class="pre">/sys/devices/system/cpu/cpu&lt;N&gt;/</span></code> の <code class="docutils literal notranslate"><span class="pre">sysfs</span></code>ここでCPU番号はシステム初期化時に割り当てられます。
+<code class="docutils literal notranslate"><span class="pre">&lt;N&gt;</span></code> 負の値はどちらの場合も拒否され、どちらの場合も書き込まれた整数値はマイクロ秒単位のPM QoS制限として解釈されます。</p>
+<p>要求された値は自動的に新しい制限として適用されません。これは、他のユーザーが以前に要求した制限よりも緩い（この場合、より大きい）可能性があるためです。そのため、PM QoSフレームワークは、グローバルCPU遅延制限および各個別CPUについてこれまでにされた要求をリストとして保持し、それらを集約して有効な（この場合、最小値）値を新しい制限として適用します。</p>
+<p>実際、 <code class="file docutils literal notranslate"><span class="pre">cpu_dma_latency</span></code> 特殊なデバイスファイルは、新しいPM QoSリクエストが作成され、CPU遅延制限リクエストのグローバルな優先順位リストに追加されるようにします。このファイルディスクリプタは、「open」操作から得られたものであり、そのリクエストを表します。その後、このファイルディスクリプタが書き込みに使用される場合、書き込まれる数値は、そのファイルディスクリプタで表されるPM QoSリクエストとして新しいリクエストされた制限値として関連付けられます。次に、優先順位リストのメカニズムが使用され、リクエスト全体の新しい有効値が決定され、その有効値が新しいCPU遅延制限として設定されます。したがって、新しい制限値を要求しても、有効な「リスト」値がその影響を受ける場合に限り、実際の制限値が変更されます。これは、リスト内のリクエスト値の最小値である場合に該当します。</p>
+<p>特殊なデバイスファイルを開いて得られた
+<code class="file docutils literal notranslate"><span class="pre">cpu_dma_latency</span></code> ファイルディスクリプタを保持しているプロセスは、そのファイルディスクリプタに関連するPM QoSリクエストを制御しますが、これは特定のPM QoSリクエストのみを制御します。</p>
+<p>特殊なデバイスファイルを <code class="file docutils literal notranslate"><span class="pre">cpu_dma_latency</span></code> 閉じること、より正確には、開く際のファイルディスクリプタを閉じることで、そのファイルディスクリプタに関連するPM QoSリクエストがグローバルな優先順位リストから削除され、破棄されます。このような場合、優先順位リストのメカニズムが再び使用され、リスト全体の新しい有効値が決定され、その値が新しい制限値になります。</p>
+<p>一方、各CPUに対しては、再開遅延PM QoSリクエストが1つずつ関連付けられています。 <code class="file docutils literal notranslate"><span class="pre">power/pm_qos_resume_latency_us</span></code> 以下に記載されたファイル
+<code class="file docutils literal notranslate"><span class="pre">/sys/devices/system/cpu/cpu&lt;N&gt;/</span></code> の <code class="docutils literal notranslate"><span class="pre">sysfs</span></code> このPM QoSリクエストは、どのユーザースペースプロセスが実行しても更新されます。言い換えれば、このPM QoSリクエストは全体のユーザースペースで共有されるため、関連するファイルへのアクセスは仲裁が必要で、混乱を避ける必要があります。[実際には、このメカニズムの正当な用途は、プロセスを特定のCPUに固定し、そのインターフェースを通じて再起動遅延制約を制御することに限られるかもしれません。]
+<code class="docutils literal notranslate"><span class="pre">sysfs</span></code> しかし、これは依然としてリクエストに過ぎません。これは、CPUの再起動遅延制約を設定する際の有効な値を決定する優先順位リストのエントリであり、このリストがどのように更新されても、そのCPUの再起動遅延制約として設定される有効な値を決定します（このリストには、カーネルコードから来る他のリクエストも含まれる可能性があります）。</p>
+<p>CPUアイドル時間ガバナは、そのCPUで選択可能なアイドルステートのエクスイット遅延の上限として、グローバル（有効）CPU遅延制限と、そのCPUの有効な再起動遅延制約の最小値を考慮する必要があります。選択するアイドルステートのエクスイット遅延がこの制限を超えてはなりません。</p>
+</section>
+<section id="idle-states-control-via-kernel-command-line">
+<h2>カーネルコマンドラインを介したアイドルステート制御<a class="headerlink" href="#idle-states-control-via-kernel-command-line" title="この見出しへのパーマリンク">¶</a></h2>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">sysfs</span></code> インターフェースにより、個々のCPUごとに個々のアイドルステートを
+<a class="reference internal" href="#idle-states-representation">無効化できるほか、</a>カーネルコマンドラインパラメータがCPUアイドル時間管理に影響を与えます。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">cpuidle.off=1</span></code> カーネルコマンドラインオプションは、CPUアイドル時間管理を完全に無効化できます。これはアイドルCPUでのアイドルループの実行を防ぐわけではありませんが、CPUアイドル時間ガバナとドライバの呼び出しを防ぎます。このオプションをカーネルコマンドラインに追加すると、アイドルループは、CPUアーキテクチャサポートコードを通じて、アイドルCPUでアイドルステートに移行するようハードウェアに依頼します。このデフォルトメカニズムは、アーキテクチャ（つまり、CPUインストラクションセット）を実装するすべてのプロセッサの最低共通分母となるため、非常に粗くエネルギー効率が低く、生産環境での使用は推奨されません。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">cpuidle.governor=</span></code> カーネルコマンドラインスイッチにより、 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code>
+ガバナを指定することができ、その名前と一致する文字列を追加する必要があります（例： <code class="docutils literal notranslate"><span class="pre">cpuidle.governor=menu</span></code>)。このガバナがデフォルトのガバナの代わりに使用されます。この方法で、デフォルトのガバナを使用するシステムでも、 <code class="docutils literal notranslate"><span class="pre">menu</span></code> ガバナを強制的に使用できるため、例えば、 <code class="docutils literal notranslate"><span class="pre">ladder</span></code> ガバナを使用するシステムで、</p>
+<p>以下の他のカーネルコマンドラインパラメータは、 <em>x86</em> アーキテクチャと一部はIntelプロセッサにのみ影響します。</p>
+<p>以下の <em>x86</em> アーキテクチャサポートコードは、CPUアイドル時間管理に関連する3つのカーネルコマンドラインオプションを認識します: <code class="docutils literal notranslate"><span class="pre">idle=poll</span></code>, <code class="docutils literal notranslate"><span class="pre">idle=halt</span></code>, and <code class="docutils literal notranslate"><span class="pre">idle=nomwait</span></code>これらの中の最初の2つはドライバを完全に無効化し、これにより全体のサブシステムが無効化され、アイドルループがアーキテクチャサポートコードを呼び出してアイドルCPUを処理します。どのように処理するかは、カーネルコマンドラインに追加された2つのパラメータのうちどちらかに依存します。この場合、アーキテクチャサポートコードはCPUの <code class="docutils literal notranslate"><span class="pre">acpi_idle</span></code> および
+<code class="docutils literal notranslate"><span class="pre">intel_idle</span></code> 指令（通常はプログラムの実行を停止し、ハードウェアが浅いアイドル状態に移行を試みる）を使用してこの目的を達成します。また、
+<code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> が使用される場合、アイドルCPUはほぼ「軽量」な指令のタイトループを実行します。[注意: 一部のケースでは、
+<code class="docutils literal notranslate"><span class="pre">idle=halt</span></code> の使用は劇的な影響を及ぼす可能性があります。なぜなら、アイドルCPUがほぼすべてのエネルギーを節約できなくなるだけでなく、他の影響も生じる可能性があるからです。例えばIntelハードウェアでは、P-states（ <code class="docutils literal notranslate"><span class="pre">HLT</span></code>
+）の使用を防ぎ、パッケージ内のCPUの数が少なくとも1つアイドル状態にあることを要求するため、シングルスレッド計算性能やエネルギー効率にも悪影響を及ぼす可能性があります。したがって、パフォーマンス向上のためにはこのオプションを使用するのはあまり良い考えではありません。] <code class="docutils literal notranslate"><span class="pre">idle=poll</span></code> オプションは <code class="docutils literal notranslate"><span class="pre">idle=poll</span></code> ドライバを無効化し、 <a class="reference internal" href="cpufreq.html"><span class="doc">CPUパフォーマンススケーリング</span></a>が使用されるようにします（システムのACPIテーブルに必要なすべての情報が存在する限り）。ただし、</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">idle=nomwait</span></code> の指令を使用してハードウェアにアイドル状態に移行を依頼することは許可されません。 <code class="docutils literal notranslate"><span class="pre">intel_idle</span></code> アーキテクチャレベルのカーネルコマンドラインオプションに加えて、個々の
+<code class="docutils literal notranslate"><span class="pre">acpi_idle</span></code> ドライバに影響を与えるパラメータがあり、これらはカーネルコマンドラインを通じて渡すことができます。具体的には、
+<code class="docutils literal notranslate"><span class="pre">MWAIT</span></code> パラメータ（</p>
+<p>は、アイドル状態のインデックスであり、 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code>
+のディレクトリ名にも使用される）により、それぞれの <code class="docutils literal notranslate"><span class="pre">intel_idle.max_cstate=&lt;n&gt;</span></code> および <code class="docutils literal notranslate"><span class="pre">processor.max_cstate=&lt;n&gt;</span></code> ドライバが、アイドル状態 <code class="docutils literal notranslate"><span class="pre">&lt;n&gt;</span></code> よりも深いアイドル状態をすべて無視するようになります。この場合、それらのアイドル状態を要求したり、ガバナーに公開したりすることはありません。[2つのドライバの動作は、 <code class="docutils literal notranslate"><span class="pre">sysfs</span></code> (参照：
+<a class="reference internal" href="#idle-states-representation">アイドル状態の表現</a>が
+<code class="docutils literal notranslate"><span class="pre">intel_idle</span></code> および <code class="docutils literal notranslate"><span class="pre">acpi_idle</span></code> に等しい場合、異なります。 <code class="docutils literal notranslate"><span class="pre">&lt;n&gt;</span></code>をカーネルコマンドラインに追加すると、 <code class="docutils literal notranslate"><span class="pre">&lt;n&gt;</span></code> ドライバを無効化し、 <code class="docutils literal notranslate"><span class="pre">0</span></code>が使用可能になります。一方、
+<code class="docutils literal notranslate"><span class="pre">intel_idle.max_cstate=0</span></code> は
+<code class="docutils literal notranslate"><span class="pre">intel_idle</span></code> に等しいです。また、 <code class="docutils literal notranslate"><span class="pre">acpi_idle</span></code> ドライバは
+<code class="docutils literal notranslate"><span class="pre">processor.max_cstate=0</span></code> モジュールがロードされるときにモジュールパラメータとして渡すことができます。] <code class="docutils literal notranslate"><span class="pre">processor.max_cstate=1</span></code>モジュールに属する <code class="docutils literal notranslate"><span class="pre">acpi_idle</span></code> ドライバは、 <code class="docutils literal notranslate"><span class="pre">processor</span></code> カーネルモジュールであり、別途ロード可能で、 <code class="docutils literal notranslate"><span class="pre">max_cstate=&lt;n&gt;</span></code> はそのモジュールパラメータとして渡すことができます。]</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxカーネルユーザーおよび管理者のガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../README.html">Linux カーネルリリース 5.x &lt;http://kernel.org/&gt;</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel-parameters.html">カーネルのコマンドラインパラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../devices.html">Linux で割り当てられたデバイス（4.x 以降のバージョン）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sysctl/index.html">/proc/sys に関するドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../abi.html">Linux ABI 説明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hw-vuln/index.html">ハードウェアの脆弱性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../reporting-bugs.html">バグの報告</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../security-bugs.html">セキュリティ関連のバグ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bug-hunting.html">バグ狩り</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bug-bisect.html">バグのバイセクティング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tainted-kernels.html">汚染されたカーネル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ramoops.html">Ramoops oops/panic ロガー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dynamic-debug-howto.html">ダイナミックデバッグ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../init.html">「No working init found.」のブートハングメッセージの説明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kdump/index.html">Kdump に関するドキュメンテーション - kexec を使用したクラッシュダンプ解決策</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../perf/index.html">パフォーマンスモニタサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pstore-blk.html">pstore ブロック oops/panic ロガー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sysfs-rules.html">sysfs 内の情報へのアクセスに関するルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../acpi/index.html">ACPI サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../aoe/index.html">ATA over Ethernet (AoE)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../auxdisplay/index.html">補助ディスプレイサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bcache.html">ブロックレイヤーのキャッシュ（bcache）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../binderfs.html">Android binderfs ファイルシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../binfmt-misc.html">Linux における miscellaneous Binary Formats（binfmt_misc）のカーネルサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../blockdev/index.html">Linux RapidIO サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bootconfig.html">ブート構成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../braille-console.html">Linux ブライルコンソール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../btmrvl.html">btmrvl ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cgroup-v1/index.html">Control Groups バージョン 1</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cgroup-v2.html">Control Group v2</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cifs/index.html">CIFS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../clearing-warn-once.html">WARN_ONCE のクリア</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cpu-load.html">CPU ロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cputopology.html">sysfs を通じて CPU テポロジー情報がエクスポートされる仕組み</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dell_rbu.html">Dell Remote BIOS Update ドライバー (dell_rbu)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device-mapper/index.html">Device Mapper</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../edid.html">EDID</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../efi-stub.html">EFI ブート ステブ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ext4.html">ext4 一般情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nfs/index.html">NFS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../gpio/index.html">gpio</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../highuid.html">16 ビット UID から 32 ビット UID への変更に関する注意点</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hw_random.html">i8xx チップセットにおけるランダム数生成器の Linux サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../initrd.html">初期 RAM ディスク (initrd) の使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../iostats.html">I/O 統計項目</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../java.html">Java(tm) バイナリーカーネルサポート for Linux v1.03</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../jfs.html">IBM のジャーナル化ファイルシステム (JFS) for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel-per-CPU-kthreads.html">per-CPU kthread による OS ジャッタリングの軽減</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../laptops/index.html">ノートPCドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lcd-panel-cgram.html">パラレルポート LCD/キーパッドパネルサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ldm.html">LDM - ロジカルディスクマネージャー (ダイナミックディスク)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lockup-watchdogs.html">ソフトロックアップ検出器とハードロックアップ検出器 (nmi_watchdog とも呼ばれる)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../LSM/index.html">Linux セキュリティモジュールの使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../md.html">RAID アレイ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../media/index.html">メディアサブシステム管理およびユーザーガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mm/index.html">メモリ管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../module-signing.html">カーネルモジュール署名機能</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mono.html">Mono(tm) バイナリーカーネルサポート for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../namespaces/index.html">ネームスペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../numastat.html">NUMA ポリシー ヒット/ミス統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../parport.html">パラレルポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../perf-security.html">Perf イベントとツールセキュリティ</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">電源管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pnp.html">Linux プラグアンドプレイドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rapidio.html">RapidIO サブシステムガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ras.html">信頼性、可用性、サービス性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rtc.html">リアルタイムクロック (RTC) ドライバー for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../serial-console.html">Linux シリアルコンソール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../svga.html">ビデオモード選択サポート 2.13</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sysrq.html">Linux Magic System Request Key Hacks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../thunderbolt.html">USB4 and Thunderbolt</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ufs.html">UFSの使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../unicode.html">Unicodeのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vga-softcursor.html">VGA用ソフトウェアカーソル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../video-output.html">ビデオ出力スイッチャー制御</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../wimax/index.html">WiMAXサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xfs.html">SGI XFS ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxカーネルユーザーおよび管理者のガイド</a><ul>
+<li><a href="index.html">電源管理</a><ul>
+<li><a href="working-state.html">作業状態電源管理</a><ul>
+<li>前へ: <a href="working-state.html" title="前章">作業状態電源管理</a></li>
+<li>次へ: <a href="intel_idle.html" title="次章"><code class="docutils literal notranslate"><span class="pre">intel_idle</span></code> CPUアイドル時間管理ドライバー</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/admin-guide/pm/cpuidle.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

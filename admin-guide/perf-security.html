@@ -1,0 +1,384 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Perf events and tool security — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="pm/index.html" rel="next" title="電源管理"/>
+<link href="parport.html" rel="prev" title="パラレルポート"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="perf-events-and-tool-security">
+<span id="perf-security"></span><h1>Perf イベントとツールセキュリティ<a class="headerlink" href="#perf-events-and-tool-security" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="overview">
+<h2>概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Linux用パフォーマンスカウンタの使用 (perf_events) <a class="footnote-reference brackets" href="#id29" id="id1">1</a> , <a class="footnote-reference brackets" href="#id30" id="id2">2</a> , <a class="footnote-reference brackets" href="#id31" id="id3">3</a>
+モニタリングされるプロセスがアクセスする機密データの漏洩リスクを相当なものにする可能性があります。これは、perf_eventsシステムコールAPIの直接的な使用のシナリオにおいても発生する可能性があります。 <a class="footnote-reference brackets" href="#id30" id="id4">2</a> およびPerfツールのユーザーモードユーティリティ（Perf）によって生成されたデータファイル <a class="footnote-reference brackets" href="#id31" id="id5">3</a> , <a class="footnote-reference brackets" href="#id32" id="id6">4</a> リスクは、perf_eventsパフォーマンスモニタリングユニット（PMU）が収集・公開するデータの性質に依存します <a class="footnote-reference brackets" href="#id30" id="id7">2</a> Perfによる収集と公開を通じてパフォーマンス分析が行われます。収集されたシステムおよびパフォーマンスデータはいくつかのカテゴリに分類される可能性があります：</p>
+<ol class="arabic simple">
+<li><p>システムハードウェアおよびソフトウェアの構成データ、例えば：CPUモデルとそのキャッシュの構成、利用可能なメモリ量とそのトポロジー、使用中のカーネルおよびPerfのバージョン、実験時間などを含むパフォーマンスモニタリングの設定、イベントの構成、Perfコマンドラインパラメータなど</p></li>
+<li><p>ユーザーおよびカーネルモジュールのパスとそのロードアドレスおよびサイズ、プロセスおよびスレッド名とそのプロセスID（PID）およびスレッドID（TID）、キャプチャされたハードウェアおよびソフトウェアイベントのタイムスタンプ。</p></li>
+<li><p>カーネルソフトウェアカウンターの内容（例：コンテキストスイッチ、ページフォールト、CPUの移動など）、アーキテクチャハードウェアパフォーマンスカウンター（PMC） <a class="footnote-reference brackets" href="#id36" id="id8">8</a> およびマシン固有レジスタ（MSR） <a class="footnote-reference brackets" href="#id37" id="id9">9</a> が、システムのさまざまなモニタリング対象部分（例：メモリコントローラー（IMC）、インターコネクト（QPI/UPI）や周辺機器（PCIe）のアンコアカウンターなど）の実行メトリクスを提供し、直接的な実行コンテキスト状態への属性付けは行わない。</p></li>
+<li><p>アーキテクチャ実行コンテキストレジスタ（例：x86_64におけるRIP、RSP、RBP）の内容、プロセスのユーザー空間およびカーネル空間メモリアドレスとデータ、このカテゴリからデータを取得する各種アーキテクチャMSRの内容。</p></li>
+</ol>
+<p>第4カテゴリに属するデータは、敏感なプロセスデータを含む可能性があります。PMUが一部のモニタリングモードで実行コンテキストレジスタの値やプロセスメモリからのデータをキャプチャする場合、そのようなモニタリングモードへのアクセスは適切に制御およびセキュリティ確保が必要です。したがって、perf_eventsパフォーマンスモニタリングおよび観測操作はセキュリティアクセス制御管理の対象です。 <a class="footnote-reference brackets" href="#id33" id="id10">5</a> .</p>
+</section>
+<section id="perf-events-access-control">
+<h2>perf_events アクセス制御<a class="headerlink" href="#perf-events-access-control" title="この見出しへのパーマリンク">¶</a></h2>
+<p>セキュリティチェックを実行するため、Linux実装はプロセスを二つのカテゴリに分類します <a class="footnote-reference brackets" href="#id34" id="id11">6</a> a) 特権プロセス（有効ユーザーIDが0で、スーパーユーザーやrootと呼ばれるもの）および b) 無権限プロセス（有効UIDがゼロでないもの）。特権プロセスはすべてのカーネルセキュリティ許可チェックをバイパスするため、perf_eventsパフォーマンスモニタリングは特権プロセスに対してアクセス、スコープ、リソース制限なしに完全に利用可能である。</p>
+<p>無権限プロセスは、プロセスの資格情報に基づいた完全なセキュリティ許可チェックが適用される。 <a class="footnote-reference brackets" href="#id33" id="id12">5</a> （通常は：有効UID、有効GID、および補助グループリスト）。</p>
+<p>Linuxは、スーパーユーザーに通常関連付けられる特権を、個別の単位として知られるcapabilitiesに分離している。 <a class="footnote-reference brackets" href="#id34" id="id13">6</a> 、これらは、無権限ユーザーのプロセスやファイルに対して、スレッドごとに独立して有効または無効にできる。</p>
+<p>CAP_PERFMON特権が有効な無権限プロセスは、perf_eventsパフォーマンスモニタリングおよび観測操作に関して特権プロセスとして扱われ、これによりカーネル内のスコープ許可チェックをバイパスする。 <em>スコープ</em> CAP_PERFMONは、パフォーマンスモニタリングおよび観測操作における最小特権の原則（POSIX 1003.1e: 2.2.2.39）を実装し、システム内のセキュアなパフォーマンスモニタリングおよび観測を提供する。 <a class="footnote-reference brackets" href="#id41" id="id14">13</a> バックワードコンパチビリティのため、perf_eventsモニタリングおよび観測操作へのアクセスはCAP_SYS_ADMIN特権プロセスでも開かれているが、セキュアなモニタリングおよび観測用途ではCAP_PERFMON特権の使用が推奨される。システム監査レコード</p>
+<p>が、perf_eventsシステムコールAPIを使用するプロセスのCAP_PERFMONおよびCAP_SYS_ADMIN特権の取得を拒否した記録を含む場合、CAP_PERFMON特権のみを提供することが、二重アクセス拒否ログに関連するセキュアな解決策として推奨される。 <a class="footnote-reference brackets" href="#id42" id="id15">14</a> perf_eventsシステムコールを使用する無権限プロセスも、PTRACE_MODE_READ_REALCREDS ptraceアクセスモードチェックに該当する。</p>
+<p>その結果がモニタリングが許可されるかどうかを決定するため、CAP_SYS_PTRACE特権が付与された無権限プロセスは、このチェックを通過できる。 <a class="footnote-reference brackets" href="#id35" id="id16">7</a> 他の無権限プロセスに付与される特権は、後述のパフォーマンス分析に必要な追加データのキャプチャを可能にする。例えば、CAP_SYSLOG特権は、/proc/kallsymsファイルからカーネル領域メモリアドレスを読み取る機能を提供する。</p>
+<p>特権プロセスのグループ</p>
+</section>
+<section id="privileged-perf-users-groups">
+<h2>Privileged Perf users groups<a class="headerlink" href="#privileged-perf-users-groups" title="この見出しへのパーマリンク">¶</a></h2>
+<p>能力のメカニズム、特権を持つ能力無視ファイル <a class="footnote-reference brackets" href="#id34" id="id17">6</a> およびファイルシステムのACL <a class="footnote-reference brackets" href="#id38" id="id18">10</a> を用いることで、特権を持つPerfユーザーを専用グループとして作成し、パフォーマンスモニタリングおよび観測をスコープ制限なしで実行できるようにすることが可能です。特権を持つPerfユーザーのグループを作成するための以下の手順を実施してください。</p>
+<ol class="arabic simple">
+<li><p>特権を持つPerfユーザーを構成するperf_usersグループを作成し、Perfツールの実行可能ファイルにperf_usersグループを割り当て、システム内のperf_usersグループに所属していないユーザーへのアクセスを制限します:</p></li>
+</ol>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># groupadd perf_users
+# ls -alhF
+-rwxr-xr-x  2 root root  11M Oct 19 15:12 perf
+# chgrp perf_users perf
+# ls -alhF
+-rwxr-xr-x  2 root perf_users  11M Oct 19 15:12 perf
+# chmod o-rwx perf
+# ls -alhF
+-rwxr-x---  2 root perf_users  11M Oct 19 15:12 perf
+</pre></div>
+</div>
+<ol class="arabic simple" start="2">
+<li><p>Perfツールの実行可能ファイルに必要な能力を割り当て、perf_usersグループのメンバーにモニタリングおよび観測の特権を付与します <a class="footnote-reference brackets" href="#id34" id="id19">6</a> :</p></li>
+</ol>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># setcap "cap_perfmon,cap_sys_ptrace,cap_syslog=ep" perf
+# setcap -v "cap_perfmon,cap_sys_ptrace,cap_syslog=ep" perf
+perf: OK
+# getcap perf
+perf = cap_sys_ptrace,cap_syslog,cap_perfmon+ep
+</pre></div>
+</div>
+<p>インストールされているlibcapがまだ「cap_perfmon」をサポートしていない場合、「38」を使用してください。つまり:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># setcap "38,cap_ipc_lock,cap_sys_ptrace,cap_syslog=ep" perf
+</pre></div>
+</div>
+<p>「perf top」などのツールで「cap_ipc_lock」を混在させる必要がある場合があります。代替として「perf top -m N」を使用し、perf ring bufferに使用するメモリを減らすことができます。以下でメモリ割当のセクションを参照してください。</p>
+<p>CAP_PERFMONをサポートしていないlibcapを使用すると、cap_get_flag(caps, 38, CAP_EFFECTIVE, &amp;val)が失敗し、デフォルトイベントが「cycles:u」になります。その場合、明示的に「cycles」イベントを指定してください。つまり:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># perf top -e cycles
+</pre></div>
+</div>
+<p>CAP_PERFMONを持つperfバイナリを使用して、カーネルおよびユーザーのサンプルを取得します。</p>
+<p>結果として、perf_usersグループのメンバーは、設定されたPerfツール実行可能ファイルの機能を使用して、実行時にperf_eventsサブシステムのスコープチェックを通過し、パフォーマンスモニタリングおよび観測を実行できるようになります。</p>
+<p>この特定のアクセス制御管理は、CAP_SETPCAP、CAP_SETFCAPを持つスーパーユーザーやrootプロセスにのみ利用可能です <a class="footnote-reference brackets" href="#id34" id="id20">6</a>
+能力。</p>
+</section>
+<section id="unprivileged-users">
+<h2>非特権ユーザー<a class="headerlink" href="#unprivileged-users" title="この見出しへのパーマリンク">¶</a></h2>
+<p>perf_events <em>スコープ</em> および <em>access</em> 非特権プロセスに対する制御はperf_event_paranoid設定によって制御されます <a class="footnote-reference brackets" href="#id30" id="id21">2</a> 設定:</p>
+<dl class="simple">
+<dt>-1:</dt><dd><p>制限を課さない <em>スコープ</em> および <em>access</em> perf_eventsパフォーマンスモニタリングの使用に。各ユーザーごとのCPUごとのperf_event_mlock_kbロック制限は、パフォーマンスデータを保存するメモリバッファの割当時に無視されます。これは最も不安全なモードで、モニタされる対象が最大になり、パフォーマンスイベントに関する特定の制限が課されません <a class="footnote-reference brackets" href="#id30" id="id22">2</a>
+リソース <em>スコープ</em> パフォーマンスモニタリング用に割り当てられる <em>メモリ</em> には、プロセス単位およびシステム全体のパフォーマンスモニタリングを含みますが、raw tracepointsおよびftrace関数tracepointsのモニタリングは含まれません。CPUおよびシステムイベントは、ユーザー空間またはカーネル空間で実行されているときにモニタリングおよびキャプチャされ、後で分析できます。各ユーザーごとのCPUごとのperf_event_mlock_kbロック制限は課されますが、CAP_IPC_LOCKを持つ非特権プロセスでは無視されます</p>
+</dd>
+<dt>&gt;=0:</dt><dd><p><em>スコープ</em> 能力。
+<a class="footnote-reference brackets" href="#id34" id="id23">6</a> capability.</p>
+</dd>
+<dt>&gt;=1:</dt><dd><p><em>スコープ</em> プロセス単位のパフォーマンスモニタリングのみを含み、システム全体のパフォーマンスモニタリングは含まれません。CPUおよびシステムイベントは、ユーザー空間またはカーネル空間で実行中に発生した場合でもモニタリングおよびキャプチャが可能で、後続の分析に利用できます。ユーザーごとのCPUごとのperf_event_mlock_kbロック制限が適用されますが、CAP_IPC_LOCK能力を持つ非特権プロセスでは無視されます。</p>
+</dd>
+<dt>&gt;=2:</dt><dd><p><em>スコープ</em> プロセス単位のパフォーマンスモニタリングのみを含みます。CPUおよびシステムイベントは、ユーザー空間での実行中に発生した場合にのみモニタリングおよびキャプチャが可能で、後続の分析に利用できます。ユーザーごとのCPUごとのperf_event_mlock_kbロック制限が適用されますが、CAP_IPC_LOCK能力を持つ非特権プロセスでは無視されます。</p>
+</dd>
+</dl>
+</section>
+<section id="resource-control">
+<h2>リソース制御<a class="headerlink" href="#resource-control" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="open-file-descriptors">
+<h3>オープンファイルディスクリプタ<a class="headerlink" href="#open-file-descriptors" title="この見出しへのパーマリンク">¶</a></h3>
+<p>perf_eventsシステムコールAPI <a class="footnote-reference brackets" href="#id30" id="id24">2</a> 設定されたPMUイベントごとにファイルディスクリプタを割り当てます。オープンファイルディスクリプタは、プロセス単位で計測されるリソースであり、RLIMIT_NOFILEで制御されます。 <a class="footnote-reference brackets" href="#id39" id="id25">11</a> limit (ulimit -n) は通常、ログインシェルプロセスから導出されます。大規模なサーバー環境で多数のイベントを長期間モニタリングする場合、この制限に達してしまう可能性があり、必要なモニタリング設定が妨げられることがあります。RLIMIT_NOFILEの制限は、limits.confファイルの内容を変更することでユーザーごとに増やすことができます。 <a class="footnote-reference brackets" href="#id40" id="id26">12</a> . 通常、Perfサンプリングセッション（perf record）には、モニタリングイベント数とモニタリングCPU数の積以上となるオープンperf_eventファイルディスクリプタが必要です。</p>
+</section>
+<section id="memory-allocation">
+<h3>メモリ割当<a class="headerlink" href="#memory-allocation" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ユーザープロセスがパフォーマンスモニタリングデータをキャプチャするために利用可能なメモリ量は、perf_event_mlock_kbの設定によって制御されます。 <a class="footnote-reference brackets" href="#id30" id="id27">2</a>
+このperf_event固有のリソース設定は、ユーザープロセスがパフォーマンスモニタリングを実行するために許可されるCPUごとのメモリ制限を定義します。設定は本質的にRLIMIT_MEMLOCKの制限を拡張しますが、パフォーマンスイベントおよび関連データをキャプチャするために特にマッピングされたメモリ領域にのみ適用されます。 <a class="footnote-reference brackets" href="#id39" id="id28">11</a> 制限ですが、パフォーマンスイベントおよび関連データをキャプチャするために特にマッピングされたメモリ領域にのみ適用されます。</p>
+<p>たとえば、マシンが8コアを持ち、perf_event_mlock_kbの制限が516 KiBに設定されている場合、ユーザーのプロセスには、RLIMIT_MEMLOCKの制限（ulimit -l）を超えて、516 KiB × 8 = 4128 KiBのメモリがperf_event mmapバッファ用に提供されます。特に、ユーザーが2つ以上のパフォーマンスモニタリングプロセスを起動したい場合、ユーザーは手動で利用可能な4128 KiBをモニタリングプロセス間で分配する必要があります（例: --mmap-pages Perf recordモードオプションを使用）。そうでない場合、最初に起動したパフォーマンスモニタリングプロセスがすべての利用可能な4128 KiBを確保し、他のプロセスはメモリ不足により実行不能になります。</p>
+<p>CAP_IPC_LOCKの能力を持つプロセスでは、RLIMIT_MEMLOCKおよびperf_event_mlock_kbのリソース制限は無視されます。したがって、perf_events/Perfの特権を持つユーザーは、Perf実行ファイルにCAP_IPC_LOCKの能力を付与することで、パフォーマンスモニタリング目的に応じて制限を超えたメモリを提供できます。</p>
+</section>
+</section>
+<section id="bibliography">
+<h2>参考文献<a class="headerlink" href="#bibliography" title="この見出しへのパーマリンク">¶</a></h2>
+<dl class="footnote brackets">
+<dt class="label" id="id29"><span class="brackets"><a class="fn-backref" href="#id1">1</a></span></dt>
+<dd><p><a class="reference external" href="https://lwn.net/Articles/337493/">https://lwn.net/Articles/337493/</a></p>
+</dd>
+<dt class="label" id="id30"><span class="brackets">2</span><span class="fn-backref">(<a href="#id2">1</a>,<a href="#id4">2</a>,<a href="#id7">3</a>,<a href="#id21">4</a>,<a href="#id22">5</a>,<a href="#id24">6</a>,<a href="#id27">7</a>)</span></dt>
+<dd><p><a class="reference external" href="http://man7.org/linux/man-pages/man2/perf_event_open.2.html">http://man7.org/linux/man-pages/man2/perf_event_open.2.html</a></p>
+</dd>
+<dt class="label" id="id31"><span class="brackets">3</span><span class="fn-backref">(<a href="#id3">1</a>,<a href="#id5">2</a>)</span></dt>
+<dd><p><a class="reference external" href="http://web.eece.maine.edu/~vweaver/projects/perf_events/">http://web.eece.maine.edu/~vweaver/projects/perf_events/</a></p>
+</dd>
+<dt class="label" id="id32"><span class="brackets"><a class="fn-backref" href="#id6">4</a></span></dt>
+<dd><p><a class="reference external" href="https://perf.wiki.kernel.org/index.php/Main_Page">https://perf.wiki.kernel.org/index.php/Main_Page</a></p>
+</dd>
+<dt class="label" id="id33"><span class="brackets">5</span><span class="fn-backref">(<a href="#id10">1</a>,<a href="#id12">2</a>)</span></dt>
+<dd><p><a class="reference external" href="https://www.kernel.org/doc/html/latest/security/credentials.html">https://www.kernel.org/doc/html/latest/security/credentials.html</a></p>
+</dd>
+<dt class="label" id="id34"><span class="brackets">6</span><span class="fn-backref">(<a href="#id11">1</a>,<a href="#id13">2</a>,<a href="#id17">3</a>,<a href="#id19">4</a>,<a href="#id20">5</a>,<a href="#id23">6</a>)</span></dt>
+<dd><p><a class="reference external" href="http://man7.org/linux/man-pages/man7/capabilities.7.html">http://man7.org/linux/man-pages/man7/capabilities.7.html</a></p>
+</dd>
+<dt class="label" id="id35"><span class="brackets"><a class="fn-backref" href="#id16">7</a></span></dt>
+<dd><p><a class="reference external" href="http://man7.org/linux/man-pages/man2/ptrace.2.html">http://man7.org/linux/man-pages/man2/ptrace.2.html</a></p>
+</dd>
+<dt class="label" id="id36"><span class="brackets"><a class="fn-backref" href="#id8">8</a></span></dt>
+<dd><p><a class="reference external" href="https://en.wikipedia.org/wiki/Hardware_performance_counter">https://en.wikipedia.org/wiki/Hardware_performance_counter</a></p>
+</dd>
+<dt class="label" id="id37"><span class="brackets"><a class="fn-backref" href="#id9">9</a></span></dt>
+<dd><p><a class="reference external" href="https://en.wikipedia.org/wiki/Model-specific_register">https://en.wikipedia.org/wiki/Model-specific_register</a></p>
+</dd>
+<dt class="label" id="id38"><span class="brackets"><a class="fn-backref" href="#id18">10</a></span></dt>
+<dd><p><a class="reference external" href="http://man7.org/linux/man-pages/man5/acl.5.html">http://man7.org/linux/man-pages/man5/acl.5.html</a></p>
+</dd>
+<dt class="label" id="id39"><span class="brackets">11</span><span class="fn-backref">(<a href="#id25">1</a>,<a href="#id28">2</a>)</span></dt>
+<dd><p><a class="reference external" href="http://man7.org/linux/man-pages/man2/getrlimit.2.html">http://man7.org/linux/man-pages/man2/getrlimit.2.html</a></p>
+</dd>
+<dt class="label" id="id40"><span class="brackets"><a class="fn-backref" href="#id26">12</a></span></dt>
+<dd><p><a class="reference external" href="http://man7.org/linux/man-pages/man5/limits.conf.5.html">http://man7.org/linux/man-pages/man5/limits.conf.5.html</a></p>
+</dd>
+<dt class="label" id="id41"><span class="brackets"><a class="fn-backref" href="#id14">13</a></span></dt>
+<dd><p><a class="reference external" href="https://sites.google.com/site/fullycapable">https://sites.google.com/site/fullycapable</a></p>
+</dd>
+<dt class="label" id="id42"><span class="brackets"><a class="fn-backref" href="#id15">14</a></span></dt>
+<dd><p><a class="reference external" href="http://man7.org/linux/man-pages/man8/auditd.8.html">http://man7.org/linux/man-pages/man8/auditd.8.html</a></p>
+</dd>
+</dl>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxカーネルユーザーおよび管理者のガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="README.html">Linux カーネルリリース 5.x &lt;http://kernel.org/&gt;</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kernel-parameters.html">カーネルのコマンドラインパラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="devices.html">Linux で割り当てられたデバイス（4.x 以降のバージョン）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysctl/index.html">/proc/sys に関するドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="abi.html">Linux ABI 説明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hw-vuln/index.html">ハードウェアの脆弱性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reporting-bugs.html">バグの報告</a></li>
+<li class="toctree-l2"><a class="reference internal" href="security-bugs.html">セキュリティ関連のバグ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bug-hunting.html">バグ狩り</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bug-bisect.html">バグのバイセクティング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tainted-kernels.html">汚染されたカーネル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ramoops.html">Ramoops oops/panic ロガー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dynamic-debug-howto.html">ダイナミックデバッグ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="init.html">「No working init found.」のブートハングメッセージの説明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kdump/index.html">Kdump に関するドキュメンテーション - kexec を使用したクラッシュダンプ解決策</a></li>
+<li class="toctree-l2"><a class="reference internal" href="perf/index.html">パフォーマンスモニタサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pstore-blk.html">pstore ブロック oops/panic ロガー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysfs-rules.html">sysfs 内の情報へのアクセスに関するルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="acpi/index.html">ACPI サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="aoe/index.html">ATA over Ethernet (AoE)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="auxdisplay/index.html">補助ディスプレイサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bcache.html">ブロックレイヤーのキャッシュ（bcache）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="binderfs.html">Android binderfs ファイルシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="binfmt-misc.html">Linux における miscellaneous Binary Formats（binfmt_misc）のカーネルサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blockdev/index.html">Linux RapidIO サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bootconfig.html">ブート構成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="braille-console.html">Linux ブライルコンソール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="btmrvl.html">btmrvl ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cgroup-v1/index.html">Control Groups バージョン 1</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cgroup-v2.html">Control Group v2</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cifs/index.html">CIFS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="clearing-warn-once.html">WARN_ONCE のクリア</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cpu-load.html">CPU ロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cputopology.html">sysfs を通じて CPU テポロジー情報がエクスポートされる仕組み</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dell_rbu.html">Dell Remote BIOS Update ドライバー (dell_rbu)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="device-mapper/index.html">Device Mapper</a></li>
+<li class="toctree-l2"><a class="reference internal" href="edid.html">EDID</a></li>
+<li class="toctree-l2"><a class="reference internal" href="efi-stub.html">EFI ブート ステブ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ext4.html">ext4 一般情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nfs/index.html">NFS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gpio/index.html">gpio</a></li>
+<li class="toctree-l2"><a class="reference internal" href="highuid.html">16 ビット UID から 32 ビット UID への変更に関する注意点</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hw_random.html">i8xx チップセットにおけるランダム数生成器の Linux サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="initrd.html">初期 RAM ディスク (initrd) の使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="iostats.html">I/O 統計項目</a></li>
+<li class="toctree-l2"><a class="reference internal" href="java.html">Java(tm) バイナリーカーネルサポート for Linux v1.03</a></li>
+<li class="toctree-l2"><a class="reference internal" href="jfs.html">IBM のジャーナル化ファイルシステム (JFS) for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kernel-per-CPU-kthreads.html">per-CPU kthread による OS ジャッタリングの軽減</a></li>
+<li class="toctree-l2"><a class="reference internal" href="laptops/index.html">ノートPCドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lcd-panel-cgram.html">パラレルポート LCD/キーパッドパネルサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ldm.html">LDM - ロジカルディスクマネージャー (ダイナミックディスク)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lockup-watchdogs.html">ソフトロックアップ検出器とハードロックアップ検出器 (nmi_watchdog とも呼ばれる)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="LSM/index.html">Linux セキュリティモジュールの使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="md.html">RAID アレイ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="media/index.html">メディアサブシステム管理およびユーザーガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mm/index.html">メモリ管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="module-signing.html">カーネルモジュール署名機能</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mono.html">Mono(tm) バイナリーカーネルサポート for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="namespaces/index.html">ネームスペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="numastat.html">NUMA ポリシー ヒット/ミス統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="parport.html">パラレルポート</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Perf イベントとツールセキュリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pm/index.html">電源管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pnp.html">Linux プラグアンドプレイドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rapidio.html">RapidIO サブシステムガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ras.html">信頼性、可用性、サービス性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rtc.html">リアルタイムクロック (RTC) ドライバー for Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="serial-console.html">Linux シリアルコンソール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="svga.html">ビデオモード選択サポート 2.13</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysrq.html">Linux Magic System Request Key Hacks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="thunderbolt.html">USB4 and Thunderbolt</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ufs.html">UFSの使用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="unicode.html">Unicodeのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vga-softcursor.html">VGA用ソフトウェアカーソル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="video-output.html">ビデオ出力スイッチャー制御</a></li>
+<li class="toctree-l2"><a class="reference internal" href="wimax/index.html">WiMAXサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfs.html">SGI XFS ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxカーネルユーザーおよび管理者のガイド</a><ul>
+<li>前へ: <a href="parport.html" title="前章">パラレルポート</a></li>
+<li>次へ: <a href="pm/index.html" title="次章">電源管理</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/admin-guide/perf-security.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>
