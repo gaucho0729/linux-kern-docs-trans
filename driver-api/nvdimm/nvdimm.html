@@ -1,0 +1,835 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>LIBNVDIMM: 非揮発性デバイス — Linux Kernelドキュメンテーション</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="btt.html" rel="next" title="BTT - ブロック翻訳テーブル"/>
+<link href="index.html" rel="prev" title="非揮発性メモリデバイス (NVDIMM)"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="libnvdimm-non-volatile-devices">
+<h1>LIBNVDIMM: 非揮発性デバイス<a class="headerlink" href="#libnvdimm-non-volatile-devices" title="この見出しへのパーマリンク">¶</a></h1>
+<p>libnvdimm - カーネル / libndctl - ユーザースペースの補助ライブラリ</p>
+<p><a class="reference external" href="mailto:linux-nvdimm%40lists.01.org">linux-nvdimm<span>@</span>lists<span>.</span>01<span>.</span>org</a></p>
+<p>バージョン13</p>
+<section id="glossary">
+<h2>用語集<a class="headerlink" href="#glossary" title="この見出しへのパーマリンク">¶</a></h2>
+<dl class="simple">
+<dt>PMEM:</dt><dd><p>システム物理アドレス範囲で、書き込みが永続的です。PMEMで構成されるブロックデバイスはDAXを実行可能です。PMEMアドレス範囲は複数のDIMMのインタレーブをまたがる場合があります。</p>
+</dd>
+<dt>BLK:</dt><dd><p>DIMMが提供する1つ以上のプログラマブルメモリマップアペルタの集合です。この間接性はインタレーブのパフォーマンスメリットを排除しますが、DIMM限定の失敗モードを可能にします。</p>
+</dd>
+<dt>DPA:</dt><dd><p>DIMM物理アドレスはDIMM相対オフセットです。システムに1つのDIMMがある場合、システム物理アドレス:DPAは1:1の関係になります。DIMMを追加すると、メモリコントローラーのインタレーブをデコードしてシステム物理アドレスに関連するDPAを特定する必要があります。BLK容量は常に単一DIMMのDPA範囲と1:1の関係を持ちます。</p>
+</dd>
+<dt>DAX:</dt><dd><p>ファイルシステム拡張機能で、ページキャッシュとブロックレイヤーをバイパスして、PMEMブロックデバイスからプロセスアドレス空間に直接マッピングするためのものです。</p>
+</dd>
+<dt>DSM:</dt><dd><p>デバイス固有メソッド: ACPIメソッドで特定のデバイスを制御します（この場合、ファームウェアを制御します）。</p>
+</dd>
+<dt>DCR:</dt><dd><p>ACPI 6セクション5.2.25.5で定義されたNVDIMM制御領域構造体です。これは特定のDIMMのベンダーアイデンティティ、デバイスID、インターフェースフォーマットを定義します。</p>
+</dd>
+<dt>BTT:</dt><dd><p>ブロック翻訳テーブル: 持続可能メモリはバイトアドレス可能です。既存のソフトウェアは、電源遮断時の書き込みの原子性が少なくとも1セクタ（512バイト）であることを期待しています。BTTは、PMEM/BLKブロックデバイスドライバを前面にし、任意の原子セクタサイズを提示するための間接テーブルで、原子的な更新セマンティクスを持ちます。</p>
+</dd>
+<dt>LABEL:</dt><dd><p>DIMMデバイスに保存されたメタデータで、PMEMとBLK間のストレージを分割し、識別（永続的に名前を付ける）します。また、BLKストレージをBLKパーティションごとに異なるパラメータを持つBTTにホストします。従来のパーティションテーブル（GPT/MBR）はBLKまたはPMEMデバイスの上にレイヤー化されています。</p>
+</dd>
+</dl>
+</section>
+<section id="overview">
+<h2>概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>LIBNVDIMMサブシステムは、PMEM、BLK、およびNVDIMMデバイスの3種類のサポートを提供します。これらは、PMEMモードとBLKモードの両方を同時にサポートできるデバイスです。この3つの動作モードは、ACPI 6における「NVDIMMファームウェアインターフェーステーブル」（NFIT）で記述されています。LIBNVDIMMの実装は汎用的であり、NFIT以前のプラットフォームにも対応していますが、ACPI 6で定義されたNVDIMMリソースのサポートに必要な機能のスーパーセットに基づいて設計されています。カーネルの実装の大部分は、PMEM経由でアクセス可能なDPA（Direct Physical Address）がBLK経由でアクセス可能なDPAとアリアス（同一のアドレス範囲）になっている場合の処理を担当しています。その場合、1つのモードごとにDPAを排他的にアクセスするためにLABELが必要です。</p>
+<section id="supporting-documents">
+<h3>関連ドキュメント<a class="headerlink" href="#supporting-documents" title="この見出しへのパーマリンク">¶</a></h3>
+<dl class="simple">
+<dt>ACPI 6:</dt><dd><p><a class="reference external" href="https://www.uefi.org/sites/default/files/resources/ACPI_6.0.pdf">https://www.uefi.org/sites/default/files/resources/ACPI_6.0.pdf</a></p>
+</dd>
+<dt>NVDIMMネームスペース:</dt><dd><p><a class="reference external" href="https://pmem.io/documents/NVDIMM_Namespace_Spec.pdf">https://pmem.io/documents/NVDIMM_Namespace_Spec.pdf</a></p>
+</dd>
+<dt>DSMインターフェース例:</dt><dd><p><a class="reference external" href="https://pmem.io/documents/NVDIMM_DSM_Interface_Example.pdf">https://pmem.io/documents/NVDIMM_DSM_Interface_Example.pdf</a></p>
+</dd>
+<dt>ドライバ開発者向けガイド:</dt><dd><p><a class="reference external" href="https://pmem.io/documents/NVDIMM_Driver_Writers_Guide.pdf">https://pmem.io/documents/NVDIMM_Driver_Writers_Guide.pdf</a></p>
+</dd>
+</dl>
+</section>
+<section id="git-trees">
+<h3>Gitツリー<a class="headerlink" href="#git-trees" title="この見出しへのパーマリンク">¶</a></h3>
+<dl class="simple">
+<dt>LIBNVDIMM:</dt><dd><p><a class="reference external" href="https://git.kernel.org/cgit/linux/kernel/git/djbw/nvdimm.git">https://git.kernel.org/cgit/linux/kernel/git/djbw/nvdimm.git</a></p>
+</dd>
+<dt>LIBNDCTL:</dt><dd><p><a class="reference external" href="https://github.com/pmem/ndctl.git">https://github.com/pmem/ndctl.git</a></p>
+</dd>
+<dt>PMEM:</dt><dd><p><a class="reference external" href="https://github.com/01org/prd">https://github.com/01org/prd</a></p>
+</dd>
+</dl>
+</section>
+</section>
+<section id="libnvdimm-pmem-and-blk">
+<h2>LIBNVDIMM PMEMおよびBLK<a class="headerlink" href="#libnvdimm-pmem-and-blk" title="この見出しへのパーマリンク">¶</a></h2>
+<p>NFITが導入される前は、非揮発性メモリはシステムにさまざまな非公式な方法で記述されていました。通常は最低限の情報しか提供されず、システム電源喪失後に書き込みが永続的なシステム物理アドレス範囲のみが提供されていました。現在では、NFIT仕様によりPMEMだけでなく、BLKやプラットフォーム間メッセージ送信のエントリポイントも標準化され、制御と設定が可能になりました。</p>
+<p>NVDIMMアクセス方法（PMEM、BLK）ごとにLIBNVDIMMはブロックデバイスドライバを提供します:</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>PMEM（nd_pmem.ko）：システム物理アドレス範囲を駆動します。この範囲はシステムメモリ内で連続しており、複数のDIMMにハードウェアメモリコントローラーによってストライピング（分散）されることがあります。ストライピングされている場合、プラットフォームは参加しているDIMMの詳細をオプションで提供することがあります。</p>
+<p>LIBNVDIMMは、BLKアクセスとアリアスするシステム物理アドレス範囲をND_NAMESPACE_PMEM範囲として、アリアスしない範囲をND_NAMESPACE_IO範囲として記述しますが、nd_pmemドライバにはこの区別はありません。異なるデバイスタイプは実装の詳細であり、ユーザー空間は「特定のDIMMからのアドレス範囲のみをインターフェースする」などのポリシーを実装するために利用できます。注意すべきは、アリアスが存在し、DIMMにラベルがなければ、ユーザー空間が少なくともPMEM範囲にDPAを1回割り当てを行う必要があるため、ブロックデバイスはデフォルトで作成されないことです。一方、ND_NAMESPACE_IO範囲は登録後、すぐにnd_pmemに接続できます。</p>
+</li>
+<li><p>BLK (nd_blk.ko): このドライバは、プラットフォームで定義されたアペラチャを用いてI/Oを実行します。アペラチャのセットは1つのDIMMにアクセスします。複数のウィンドウ（アペラチャ）は複数の同時アクセスを許可し、タグ付きコマンドキューイングと同様の動作をします。これにより、異なるスレッドや異なるCPUが使用する可能性があります。</p>
+<p>NFIT仕様ではBLKアペラチャの標準形式が定義されていますが、仕様はベンダー固有のレイアウトも許容しており、NFIT以外のBLK実装ではBLK I/Oに別の設計が採用される可能性があります。このため、「nd_blk」はプラットフォーム固有のコードに逆参照してI/Oを実行します。</p>
+<p>このような実装の一つは「ドライバライターズガイド」および「DSMインターフェース例」に定義されています。</p>
+</li>
+</ol>
+</div></blockquote>
+</section>
+<section id="why-blk">
+<h2>なぜBLKなのか？<a class="headerlink" href="#why-blk" title="この見出しへのパーマリンク">¶</a></h2>
+<p>PMEMはNVDIMMストレージに直接バイトアドレス可能なCPUロード/ストアアクセスを提供しますが、システムRAS（回復、可用性、サービス性）モデルとしては最適ではありません。破損したシステム物理アドレスへのアクセスはCPU例外を発生させますが、BLKアペラチャ経由での破損アドレスアクセスは、そのブロックウィンドウがレジスタにエラー状態を報告します。後者はホストバスアダプター接続ディスクが提供する標準的なエラーモデルにより近いです。</p>
+<p>また、管理者がメモリを交換する必要がある場合、DIMMモジュール境界でシステムをサービスするのはより簡単です。PMEMでは複数のDIMMに不透明なハードウェア固有の方法でデータがインターリーブされているため、比較対象になります。</p>
+<section id="pmem-vs-blk">
+<h3>PMEM vs BLK<a class="headerlink" href="#pmem-vs-blk" title="この見出しへのパーマリンク">¶</a></h3>
+<p>BLKアペラチャはこれらのRAS問題を解決しますが、その存在はNDサブシステムの複雑さの主な要因となっています。PMEMとBLKがDPA領域でアリアス化されるため、実装が複雑になります。任意のDIMMのDPA範囲は、1つ以上のシステム物理アドレスのインターリーブDIMMセットに貢献する可能性があります。 <em>および</em> また、BLKアペラチャ経由で全体をアクセスすることも可能です。システム物理アドレス経由でDPAにアクセスしながら、同時にBLKアペラチャ経由で同じDPAにアクセスすると未定義の結果になります。このため、この二重インターフェース構成を持つDIMMには、LABELを保存/取得するDSM機能が含まれています。LABELはDPA領域をシステム物理アドレスとBLKアペラチャアクセス可能な領域に分離します。簡潔さのため、DIMMは所属するインターリーブセットごとにPMEM「領域」を1つずつ許可されます。残りのDPA領域は任意の数のBLKデバイスに不連続な領域として分割できます。</p>
+<section id="blk-regions-pmem-regions-atomic-sectors-and-dax">
+<h4>BLK-REGIONs, PMEM-REGIONs, Atomic Sectors, and DAX<a class="headerlink" href="#blk-regions-pmem-regions-atomic-sectors-and-dax" title="この見出しへのパーマリンク">¶</a></h4>
+<p>複数のBLK名前空間を1つのREGIONごとに許可する理由は限られており、その1つは各BLK名前空間が一意のアトミックセクタサイズを持つBTT（Block Translation Table）で構成できるためです。PMEMデバイスはBTTをホストできますが、LABEL仕様ではPMEM名前空間のセクタサイズを指定する機能は提供されていません。</p>
+<p>これはPMEMの主な使用モデルがDAX経由であるという期待に基づいています。BTTはDAXと互換性がありません。ただし、アプリケーションやファイルシステムが依然としてアトミックセクタ更新の保証を必要とする場合、PMEMデバイスまたはパーティションにBTTを登録できます。参照：LIBNVDIMM/NDCTL: Block Translation Table "btt"</p>
+</section>
+</section>
+</section>
+<section id="example-nvdimm-platform">
+<h2>NVDIMMプラットフォームの例<a class="headerlink" href="#example-nvdimm-platform" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このドキュメントの残りの部分では、例のsysfsレイアウトを参照するために以下のダイアグラムが使用されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>                             (a)               (b)           DIMM   BLK-REGION
+          +-------------------+--------+--------+--------+
++------+  |       pm0.0       | blk2.0 | pm1.0  | blk2.1 |    0      region2
+| imc0 +--+- - - region0- - - +--------+        +--------+
++--+---+  |       pm0.0       | blk3.0 | pm1.0  | blk3.1 |    1      region3
+   |      +-------------------+--------v        v--------+
++--+---+                               |                 |
+| cpu0 |                                     region1
++--+---+                               |                 |
+   |      +----------------------------^        ^--------+
++--+---+  |           blk4.0           | pm1.0  | blk4.0 |    2      region4
+| imc1 +--+----------------------------|        +--------+
++------+  |           blk5.0           | pm1.0  | blk5.0 |    3      region5
+          +----------------------------+--------+--------+
+</pre></div>
+</div>
+<p>このプラットフォームでは1つのソケットに4つのDIMMと2つのメモリコントローラーがあります。DPA領域への各一意なインターフェース（BLKまたはPMEM）は、動的に割り当てられたID（REGION0 - REGION5）を持つリージョンデバイスで識別されます。</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>DIMM0とDIMM1の最初の部分はREGION0としてインターリーブされています。REGION0-SPA範囲内でユーザー指定の名前"pm0.0"で1つのPMEM名前空間が作成され、DIMM0とDIMM1の大部分をカバーします。そのインターリーブされたシステム物理アドレス範囲の一部は、DPAオフセット(a)から各DIMMにアクセス可能なBLK-aperture領域として再利用され、その領域内でREGION2とREGION3から2つのBLK-aperture "名前空間"が作成されます。"blk2.0"と"blk3.0"はユーザーが指定可能な任意の名前をLABELで設定できます。</p></li>
+<li><p>DIMM0とDIMM1の最後の部分には、REGION1としてインターリーブされたシステム物理アドレス範囲があり、この範囲はDIMM0とDIMM1だけでなくDIMM2とDIMM3もカバーします。REGION1の一部は"pm1.0"という名前でPMEM名前空間として割り当てられ、残りは4つのBLK-aperture名前空間（インターリーブセット内の各DIMMごと）として再利用されます。"blk2.1"、"blk3.1"、"blk4.0"、"blk5.0"がその例です。</p></li>
+<li><p>DIMM2とDIMM3のREGION1インターリーブされたシステム物理アドレス範囲に含まれない部分（つまりDPAオフセット(b)を超える領域）も"blk4.0"と"blk5.0"名前空間に含まれます。注意：この例ではBLK-aperture名前空間がDPA空間で連続する必要がないことが示されています。</p></li>
+</ol>
+<p>このバスは、nfit_test.koモジュールをtools/testing/nvdimmからロードした際、カーネルが/sys/devices/platform/nfit_test.0で提供します。これによりLIBNVDIMMだけでなく、acpi_nfit.koドライバもテストできます。</p>
+</div></blockquote>
+</section>
+<section id="libnvdimm-kernel-device-model-and-libndctl-userspace-api">
+<h2>LIBNVDIMMカーネルデバイスモデルとLIBNDCTLユーザースペースAPI<a class="headerlink" href="#libnvdimm-kernel-device-model-and-libndctl-userspace-api" title="この見出しへのパーマリンク">¶</a></h2>
+<p>以下に、LIBNVDIMM sysfsレイアウトの説明と、LIBNDCTL APIを通じて見た対応するオブジェクト階層ダイアグラムが示されています。例のsysfsパスとダイアグラムは、例のNVDIMMプラットフォームに基づいており、これはLIBNDCTLのユニットテストで使用されるLIBNVDIMMバスにも対応しています。</p>
+<section id="libndctl-context">
+<h3>LIBNDCTL: コンテキスト<a class="headerlink" href="#libndctl-context" title="この見出しへのパーマリンク">¶</a></h3>
+<p>LIBNDCTLライブラリ内のすべてのAPIコールは、ログパラメータやライブラリインスタンスの状態を保持するコンテキストを必要とします。このライブラリはlibabcテンプレートに基づいています:</p>
+<blockquote>
+<div><p><a class="reference external" href="https://git.kernel.org/cgit/linux/kernel/git/kay/libabc.git">https://git.kernel.org/cgit/linux/kernel/git/kay/libabc.git</a></p>
+</div></blockquote>
+<section id="libndctl-instantiate-a-new-library-context-example">
+<h4>LIBNDCTL: 新しいライブラリコンテキストの例<a class="headerlink" href="#libndctl-instantiate-a-new-library-context-example" title="この見出しへのパーマリンク">¶</a></h4>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct ndctl_ctx *ctx;
+
+if (ndctl_new(&amp;ctx) == 0)
+        return ctx;
+else
+        return NULL;
+</pre></div>
+</div>
+</section>
+</section>
+<section id="libnvdimm-libndctl-bus">
+<h3>LIBNVDIMM/LIBNDCTL: バス<a class="headerlink" href="#libnvdimm-libndctl-bus" title="この見出しへのパーマリンク">¶</a></h3>
+<p>バスはNFITと1対1の関係を持ちます。現在のACPIベースのシステムにおける期待される仕様は、プラットフォームグローバルに1つのNFITしか存在しないことです。ただし、複数のNFITを登録することは非常に簡単で、仕様はこれを禁止していません。インフラストラクチャは複数のバスをサポートしており、ユニットテストでは複数のNFIT構成をテストするためにこの機能を使用しています。</p>
+</section>
+<section id="libnvdimm-control-class-device-in-sys-class">
+<h3>LIBNVDIMM: /sys/class内の制御クラスデバイス<a class="headerlink" href="#libnvdimm-control-class-device-in-sys-class" title="この見出しへのパーマリンク">¶</a></h3>
+<p>このキャラクターデバイスは、NFITハンドルで識別されるDIMMにDSMメッセージを渡すために使用されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/class/nd/ndctl0
+|-- dev
+|-- device -&gt; ../../../ndbus0
+|-- subsystem -&gt; ../../../../../../../class/nd
+</pre></div>
+</div>
+</section>
+<section id="libnvdimm-bus">
+<h3>LIBNVDIMM: バス<a class="headerlink" href="#libnvdimm-bus" title="この見出しへのパーマリンク">¶</a></h3>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct nvdimm_bus *nvdimm_bus_register(struct device *parent,
+       struct nvdimm_bus_descriptor *nfit_desc);
+</pre></div>
+</div>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/devices/platform/nfit_test.0/ndbus0
+|-- commands
+|-- nd
+|-- nfit
+|-- nmem0
+|-- nmem1
+|-- nmem2
+|-- nmem3
+|-- power
+|-- provider
+|-- region0
+|-- region1
+|-- region2
+|-- region3
+|-- region4
+|-- region5
+|-- uevent
+`-- wait_probe
+</pre></div>
+</div>
+<section id="libndctl-bus-enumeration-example">
+<h4>LIBNDCTL: バスの列挙例<a class="headerlink" href="#libndctl-bus-enumeration-example" title="この見出しへのパーマリンク">¶</a></h4>
+<p>例のNVDIMMプラットフォームから説明されるバスのハンドルを検索します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static struct ndctl_bus *get_bus_by_provider(struct ndctl_ctx *ctx,
+                const char *provider)
+{
+        struct ndctl_bus *bus;
+
+        ndctl_bus_foreach(ctx, bus)
+                if (strcmp(provider, ndctl_bus_get_provider(bus)) == 0)
+                        return bus;
+
+        return NULL;
+}
+
+bus = get_bus_by_provider(ctx, "nfit_test.0");
+</pre></div>
+</div>
+</section>
+</section>
+<section id="libnvdimm-libndctl-dimm-nmem">
+<h3>LIBNVDIMM/LIBNDCTL: DIMM (NMEM)<a class="headerlink" href="#libnvdimm-libndctl-dimm-nmem" title="この見出しへのパーマリンク">¶</a></h3>
+<p>DIMMデバイスはハードウェアにコマンドを送信するためのキャラクターデバイスを提供し、LABELのコンテナとして機能します。DIMMがNFITで定義されている場合、NFIT固有の情報を追加するためのオプションの'nfit'属性サブディレクトリが利用可能です。</p>
+<p>「DIMMs」のカーネルデバイス名は「nmemX」です。NFITはこれらのデバイスを「メモリデバイスからシステム物理アドレス範囲マッピング構造」を通じて記述し、これらが実際に物理DIMMである必要はなく、より一般的な名前を使用しています。</p>
+<section id="libnvdimm-dimm-nmem">
+<h4>LIBNVDIMM: DIMM (NMEM)<a class="headerlink" href="#libnvdimm-dimm-nmem" title="この見出しへのパーマリンク">¶</a></h4>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct nvdimm *nvdimm_create(struct nvdimm_bus *nvdimm_bus, void *provider_data,
+                const struct attribute_group **groups, unsigned long flags,
+                unsigned long *dsm_mask);
+</pre></div>
+</div>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/devices/platform/nfit_test.0/ndbus0
+|-- nmem0
+|   |-- available_slots
+|   |-- commands
+|   |-- dev
+|   |-- devtype
+|   |-- driver -&gt; ../../../../../bus/nd/drivers/nvdimm
+|   |-- modalias
+|   |-- nfit
+|   |   |-- device
+|   |   |-- format
+|   |   |-- handle
+|   |   |-- phys_id
+|   |   |-- rev_id
+|   |   |-- serial
+|   |   `-- vendor
+|   |-- state
+|   |-- subsystem -&gt; ../../../../../bus/nd
+|   `-- uevent
+|-- nmem1
+[..]
+</pre></div>
+</div>
+</section>
+<section id="libndctl-dimm-enumeration-example">
+<h4>LIBNDCTL: DIMMの列挙例<a class="headerlink" href="#libndctl-dimm-enumeration-example" title="この見出しへのパーマリンク">¶</a></h4>
+<p>この例では、NFITで定義されたDIMMを前提としており、識別には「nfit_handle」という32ビットの値を使用します。ここで:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>ビット3:0 メモリチャネル内のDIMM番号</p></li>
+<li><p>ビット7:4 メモリチャネル番号</p></li>
+<li><p>ビット11:8 メモリコントローラーID</p></li>
+<li><p>ビット15:12 スロットID（ノードコントローラーが存在する場合のノードコントローラーのスコープ内）</p></li>
+<li><p>ビット27:16 ノードコントローラーID</p></li>
+<li><p>ビット31:28 予約済み</p></li>
+</ul>
+</div></blockquote>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static struct ndctl_dimm *get_dimm_by_handle(struct ndctl_bus *bus,
+       unsigned int handle)
+{
+        struct ndctl_dimm *dimm;
+
+        ndctl_dimm_foreach(bus, dimm)
+                if (ndctl_dimm_get_handle(dimm) == handle)
+                        return dimm;
+
+        return NULL;
+}
+
+#define DIMM_HANDLE(n, s, i, c, d) \
+        (((n &amp; 0xfff) &lt;&lt; 16) | ((s &amp; 0xf) &lt;&lt; 12) | ((i &amp; 0xf) &lt;&lt; 8) \
+         | ((c &amp; 0xf) &lt;&lt; 4) | (d &amp; 0xf))
+
+dimm = get_dimm_by_handle(bus, DIMM_HANDLE(0, 0, 0, 0, 0));
+</pre></div>
+</div>
+</section>
+</section>
+<section id="libnvdimm-libndctl-region">
+<h3>LIBNVDIMM/LIBNDCTL: レギオン<a class="headerlink" href="#libnvdimm-libndctl-region" title="この見出しへのパーマリンク">¶</a></h3>
+<p>PMEM範囲またはBLKアピターレットセットごとに一般的なREGIONデバイスが登録されます。例では6つのレギオンがあります：「nfit_test.0」バスには2つのPMEMと4つのBLKアピターレットセットがあります。レギオンの主な役割は「マッピング」を含むコンテナとしての役割を果たすことであり、マッピングは&lt;DIMM、DPA開始オフセット、長さ&gt;の組み合わせです。</p>
+<p>LIBNVDIMMは、これらのREGIONデバイス用に組み込みドライバを提供しています。このドライバは、すべてのリージョンにおけるアリアスDPAマッピングを調整し、LABELが存在する場合はそれを解析した後、nd_pmemまたはnd_blkデバイスドライバが消費できるよう、解決済み/排他的なDPA境界を持つNAMESPACEデバイスを生成します。</p>
+<p>「mapping」「interleave_ways」「size」などの汎用的な属性に加えて、REGIONデバイスはいくつかの便利な属性を公開します。「nstype」はこのリージョンが生成するnamespaceデバイスの整数型を示し、「devtype」はudevが「add」イベント時に保存したDEVTYPE変数を再現し、「modalias」はudevが「add」イベント時に保存したMODALIAS変数を再現します。最後に、リージョンがSPAで定義されている場合に限り、オプションの「spa_index」が提供されます。</p>
+<p>LIBNVDIMM: region:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct nd_region *nvdimm_pmem_region_create(struct nvdimm_bus *nvdimm_bus,
+                struct nd_region_desc *ndr_desc);
+struct nd_region *nvdimm_blk_region_create(struct nvdimm_bus *nvdimm_bus,
+                struct nd_region_desc *ndr_desc);
+</pre></div>
+</div>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/devices/platform/nfit_test.0/ndbus0
+|-- region0
+|   |-- available_size
+|   |-- btt0
+|   |-- btt_seed
+|   |-- devtype
+|   |-- driver -&gt; ../../../../../bus/nd/drivers/nd_region
+|   |-- init_namespaces
+|   |-- mapping0
+|   |-- mapping1
+|   |-- mappings
+|   |-- modalias
+|   |-- namespace0.0
+|   |-- namespace_seed
+|   |-- numa_node
+|   |-- nfit
+|   |   `-- spa_index
+|   |-- nstype
+|   |-- set_cookie
+|   |-- size
+|   |-- subsystem -&gt; ../../../../../bus/nd
+|   `-- uevent
+|-- region1
+[..]
+</pre></div>
+</div>
+<section id="libndctl-region-enumeration-example">
+<h4>LIBNDCTL: リージョンの列挙例<a class="headerlink" href="#libndctl-region-enumeration-example" title="この見出しへのパーマリンク">¶</a></h4>
+<p>PMEM用の「spa_index」（interleaveセットID）やBLK用の「nfit_handle」（DIMM ID）などのNFIT一意データに基づくサンプルリージョン取得ルーチン:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static struct ndctl_region *get_pmem_region_by_spa_index(struct ndctl_bus *bus,
+                unsigned int spa_index)
+{
+        struct ndctl_region *region;
+
+        ndctl_region_foreach(bus, region) {
+                if (ndctl_region_get_type(region) != ND_DEVICE_REGION_PMEM)
+                        continue;
+                if (ndctl_region_get_spa_index(region) == spa_index)
+                        return region;
+        }
+        return NULL;
+}
+
+static struct ndctl_region *get_blk_region_by_dimm_handle(struct ndctl_bus *bus,
+                unsigned int handle)
+{
+        struct ndctl_region *region;
+
+        ndctl_region_foreach(bus, region) {
+                struct ndctl_mapping *map;
+
+                if (ndctl_region_get_type(region) != ND_DEVICE_REGION_BLOCK)
+                        continue;
+                ndctl_mapping_foreach(region, map) {
+                        struct ndctl_dimm *dimm = ndctl_mapping_get_dimm(map);
+
+                        if (ndctl_dimm_get_handle(dimm) == handle)
+                                return region;
+                }
+        }
+        return NULL;
+}
+</pre></div>
+</div>
+</section>
+</section>
+<section id="why-not-encode-the-region-type-into-the-region-name">
+<h3>なぜリージョンのタイプをリージョン名にエンコードしないのか？<a class="headerlink" href="#why-not-encode-the-region-type-into-the-region-name" title="この見出しへのパーマリンク">¶</a></h3>
+<p>一見すると、NFITがPMEMとBLKインターフェースタイプのみを定義しているため、REGIONデバイスの名前をそれらのタイプ名から派生した名前にするべきだと考えられます。しかし、NDサブシステムは明示的にリージョン名を汎用的とし、ユーザー空間が常にリージョン属性を考慮する必要があるため、以下の4つの理由でリージョン名にタイプをエンコードしないのです:</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>すでにリージョンと「namespace」タイプは2種類以上存在しています。PMEMには2つのサブタイプがあります。前述したように、PMEMにはDIMMデバイスが判明しているPMEMと匿名PMEMがあります。BLKリージョンではNFIT仕様がすでにベンダー固有の実装を予期しています。リージョンが含む内容の正確な区別はリージョン属性ではなく、リージョン名やリージョンdevtypeではありません。</p></li>
+<li><p>子namespaceを持たないリージョンは可能配置です。たとえば、NFITはBLKアプライアンスと対応しないDCRの公開を許可しており、これはDIMMがコントロール/設定メッセージのみを受け付けることができ、孫ブロックデバイスを通じたI/Oは行えないDIMMを表します。この「タイプ」は属性（'mappings' == 0）で宣伝され、名前はあまり意味を成しません。</p></li>
+<li><p>今後、第三の主要なインターフェースタイプが登場する可能性はありますか？ベンダー固有の実装を除けば、BLKとPMEMを超えた第三のインターフェースタイプの存在を想像するのは難しくありません。デバイス階層のREGIONレベルに汎用的な名前を付けることで、古いユーザースペースの実装も新しいカーネルが宣伝するREGIONタイプを理解できます。ユーザースペースは「マッピング」「サイズ」などの汎用的な領域属性や、「namespace」と名付けられた予期される子デバイスに常に依存できます。この汎用的なデバイスモデル階層形式により、LIBNVDIMMとLIBNDCTLの実装がより統一的で将来性のあるものになります。</p></li>
+<li><p>領域の主なタイプを特定するためには、デバイス名よりもより信頼性の高いメカニズムがあります。次のセクション「領域の主なタイプをどのように特定するか」を参照してください。</p></li>
+</ol>
+</div></blockquote>
+</section>
+<section id="how-do-i-determine-the-major-type-of-a-region">
+<h3>領域の主なタイプをどのように特定するか<a class="headerlink" href="#how-do-i-determine-the-major-type-of-a-region" title="この見出しへのパーマリンク">¶</a></h3>
+<p>「libndctl」を使用することを推奨する一般的なアドバイスや、カーネルヘッダー（/usr/include/linux/ndctl.h）を確認して「nstype」整数属性をデコードする以外にも、以下のようなオプションがあります。</p>
+<section id="module-alias-lookup">
+<h4>1. モジュールアリアスの検索<a class="headerlink" href="#module-alias-lookup" title="この見出しへのパーマリンク">¶</a></h4>
+<blockquote>
+<div><p>領域/namespaceデバイスタイプの区別を行う目的は、どのLIBNVDIMM namespaceにブロックデバイスドライバーがアタッチするかを決定することです。このため、modaliasを用いて結果のモジュールを検索できます。この方法は、今後ベンダー固有ドライバーが登場しても信頼性があります。ベンダー固有の実装が標準のnd_blkドライバーを置き換える場合でも、LIBNVDIMMの他の部分への影響は最小限に抑えられます。</p>
+<p>実際、ベンダーはnd_region以外のベンダー固有の領域ドライバーをもつ場合もあります。たとえば、ベンダーが独自のLABEL形式を定義した場合、そのLABELを解析してnamespaceを生成するための独自の領域ドライバーが必要です。モジュール解決の出力は、領域名や領域デバイスタイプよりも正確です。</p>
+</div></blockquote>
+</section>
+<section id="udev">
+<h4>2. udev<a class="headerlink" href="#udev" title="この見出しへのパーマリンク">¶</a></h4>
+<blockquote>
+<div><p>カーネルの「devtype」はudevデータベースに登録されています：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># udevadm info --path=/devices/platform/nfit_test.0/ndbus0/region0
+P: /devices/platform/nfit_test.0/ndbus0/region0
+E: DEVPATH=/devices/platform/nfit_test.0/ndbus0/region0
+E: DEVTYPE=nd_pmem
+E: MODALIAS=nd:t2
+E: SUBSYSTEM=nd
+
+# udevadm info --path=/devices/platform/nfit_test.0/ndbus0/region4
+P: /devices/platform/nfit_test.0/ndbus0/region4
+E: DEVPATH=/devices/platform/nfit_test.0/ndbus0/region4
+E: DEVTYPE=nd_blk
+E: MODALIAS=nd:t3
+E: SUBSYSTEM=nd
+</pre></div>
+</div>
+<p>…そして、領域属性として利用できますが、注意点として「devtype」はサブタイプの変化を示しません。スクリプトは他の属性を理解する必要があります。</p>
+</div></blockquote>
+</section>
+<section id="type-specific-attributes">
+<h4>3. タイプ固有の属性<a class="headerlink" href="#type-specific-attributes" title="この見出しへのパーマリンク">¶</a></h4>
+<blockquote>
+<div><p>現在のところ、BLKアプライド領域は「nfit/spa_index」属性を持たず、非NFIT PMEM領域も同様です。マッピング値が0のBLK領域は、前述の通りI/Oを許可しないDIMMです。マッピング値が0のPMEM領域は単純なシステム物理アドレス範囲です。</p>
+</div></blockquote>
+</section>
+</section>
+<section id="libnvdimm-libndctl-namespace">
+<h3>LIBNVDIMM/LIBNDCTL: Namespace<a class="headerlink" href="#libnvdimm-libndctl-namespace" title="この見出しへのパーマリンク">¶</a></h3>
+<p>リージョンは、DPAのアリアス解決とLABEL指定境界を解決した後、1つ以上の「名前空間」デバイスを表面化します。現在、「名前空間」デバイスの到着は、nd_blkまたはnd_pmemドライバがロードされ、ディスク/ブロックデバイスを登録するようにトリガーされます。</p>
+<section id="libnvdimm-namespace">
+<h4>LIBNVDIMM: 名前空間<a class="headerlink" href="#libnvdimm-namespace" title="この見出しへのパーマリンク">¶</a></h4>
+<p>以下の例は、3つの主要なタイプのNAMESPACEから抜粋したものです。namespace0.0はDIMM情報ベースのPMEMを表し（'uuid'属性を持つことに注意）、namespace2.0はBLK名前空間を表し（'sector_size'属性を持つことに注意）、namespace6.0は匿名PMEM名前空間を表し（'uuid'属性をサポートしていないため、'uuid'属性を持たないことに注意）します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/devices/platform/nfit_test.0/ndbus0/region0/namespace0.0
+|-- alt_name
+|-- devtype
+|-- dpa_extents
+|-- force_raw
+|-- modalias
+|-- numa_node
+|-- resource
+|-- size
+|-- subsystem -&gt; ../../../../../../bus/nd
+|-- type
+|-- uevent
+`-- uuid
+/sys/devices/platform/nfit_test.0/ndbus0/region2/namespace2.0
+|-- alt_name
+|-- devtype
+|-- dpa_extents
+|-- force_raw
+|-- modalias
+|-- numa_node
+|-- sector_size
+|-- size
+|-- subsystem -&gt; ../../../../../../bus/nd
+|-- type
+|-- uevent
+`-- uuid
+/sys/devices/platform/nfit_test.1/ndbus1/region6/namespace6.0
+|-- block
+|   `-- pmem0
+|-- devtype
+|-- driver -&gt; ../../../../../../bus/nd/drivers/pmem
+|-- force_raw
+|-- modalias
+|-- numa_node
+|-- resource
+|-- size
+|-- subsystem -&gt; ../../../../../../bus/nd
+|-- type
+`-- uevent
+</pre></div>
+</div>
+</section>
+<section id="libndctl-namespace-enumeration-example">
+<h4>LIBNDCTL: 名前空間列挙例<a class="headerlink" href="#libndctl-namespace-enumeration-example" title="この見出しへのパーマリンク">¶</a></h4>
+<p>名前空間は、親リージョンに対してインデックス付けされます。以下の例をご覧ください。これらのインデックスは、起動ごとにほぼ静的なままですが、サブシステムはこの点について保証を提供しません。静的な名前空間識別子が必要な場合は、'uuid'属性を使用してください。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static struct ndctl_namespace
+*get_namespace_by_id(struct ndctl_region *region, unsigned int id)
+{
+        struct ndctl_namespace *ndns;
+
+        ndctl_namespace_foreach(region, ndns)
+                if (ndctl_namespace_get_id(ndns) == id)
+                        return ndns;
+
+        return NULL;
+}
+</pre></div>
+</div>
+</section>
+<section id="libndctl-namespace-creation-example">
+<h4>LIBNDCTL: 名前空間作成例<a class="headerlink" href="#libndctl-namespace-creation-example" title="この見出しへのパーマリンク">¶</a></h4>
+<p>アイドル状態の名前空間は、リージョンが新しい名前空間を作成するために十分な容量を持っている場合、カーネルによって自動的に作成されます。名前空間のインスタンス化には、アイドル状態の名前空間を検索し、設定を行う必要があります。名前空間属性の設定順序は基本的に自由ですが、'uuid'は'size'よりも前に設定する必要があります。これにより、カーネルが静的な識別子をもとにDPA割当を内部的に追跡できるようになります。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static int configure_namespace(struct ndctl_region *region,
+                struct ndctl_namespace *ndns,
+                struct namespace_parameters *parameters)
+{
+        char devname[50];
+
+        snprintf(devname, sizeof(devname), "namespace%d.%d",
+                        ndctl_region_get_id(region), paramaters-&gt;id);
+
+        ndctl_namespace_set_alt_name(ndns, devname);
+        /* 'uuid' must be set prior to setting size! */
+        ndctl_namespace_set_uuid(ndns, paramaters-&gt;uuid);
+        ndctl_namespace_set_size(ndns, paramaters-&gt;size);
+        /* unlike pmem namespaces, blk namespaces have a sector size */
+        if (parameters-&gt;lbasize)
+                ndctl_namespace_set_sector_size(ndns, parameters-&gt;lbasize);
+        ndctl_namespace_enable(ndns);
+}
+</pre></div>
+</div>
+</section>
+<section id="why-the-term-namespace">
+<h4>なぜ「名前空間」という用語を使うのか？<a class="headerlink" href="#why-the-term-namespace" title="この見出しへのパーマリンク">¶</a></h4>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>なぜ「ボリューム」ではないのか？「ボリューム」はND（libnvdimmサブシステム）をデバイスマッパーやボリュームマネージャーと混同するリスクがありました。</p></li>
+<li><p>この用語は、NVMEコントローラー内で作成できるサブデバイスを説明するために起源を持ちます（nvme仕様:
+<a class="reference external" href="https://www.nvmexpress.org/specifications/">https://www.nvmexpress.org/specifications/</a>)、そしてNFIT名前空間はNVME名前空間の機能と設定可能性を並行して表現することを目的としています。</p></li>
+</ol>
+</div></blockquote>
+</section>
+</section>
+<section id="libnvdimm-libndctl-block-translation-table-btt">
+<h3>LIBNVDIMM/LIBNDCTL: ブロック翻訳テーブル「btt」<a class="headerlink" href="#libnvdimm-libndctl-block-translation-table-btt" title="この見出しへのパーマリンク">¶</a></h3>
+<p>BTT（設計ドキュメント: <a class="reference external" href="https://pmem.io/2014/09/23/btt.html">https://pmem.io/2014/09/23/btt.html</a>)は、PMEMまたはBLK名前空間によって生成されたブロックデバイス全体またはそのパーティションを前面に据えるスタックされたブロックデバイスドライバーです。</p>
+<section id="libnvdimm-btt-layout">
+<h4>LIBNVDIMM: bttレイアウト<a class="headerlink" href="#libnvdimm-btt-layout" title="この見出しへのパーマリンク">¶</a></h4>
+<p>すべてのリージョンは、少なくとも1つのBTTデバイス（種子デバイス）から始まります。これを有効化するには、「名前空間」、「uuid」、「sector_size」属性を設定し、リージョンタイプに応じてデバイスをnd_pmemまたはnd_blkドライバにバインドします。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/devices/platform/nfit_test.1/ndbus0/region0/btt0/
+|-- namespace
+|-- delete
+|-- devtype
+|-- modalias
+|-- numa_node
+|-- sector_size
+|-- subsystem -&gt; ../../../../../bus/nd
+|-- uevent
+`-- uuid
+</pre></div>
+</div>
+</section>
+<section id="libndctl-btt-creation-example">
+<h4>LIBNDCTL: btt作成例<a class="headerlink" href="#libndctl-btt-creation-example" title="この見出しへのパーマリンク">¶</a></h4>
+<p>名前空間と同様に、リージョンごとにアイドル状態の BTT デバイスが自動的に作成されます。この「シード」BTT デバイスが設定され有効化されるたびに新しいシードが作成されます。BTT の構成を作成するには、アイドル状態の BTT を見つけて PMEM または BLK 名前空間を消費するように割り当てる 2 つのステップが必要です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static struct ndctl_btt *get_idle_btt(struct ndctl_region *region)
+{
+        struct ndctl_btt *btt;
+
+        ndctl_btt_foreach(region, btt)
+                if (!ndctl_btt_is_enabled(btt)
+                                &amp;&amp; !ndctl_btt_is_configured(btt))
+                        return btt;
+
+        return NULL;
+}
+
+static int configure_btt(struct ndctl_region *region,
+                struct btt_parameters *parameters)
+{
+        btt = get_idle_btt(region);
+
+        ndctl_btt_set_uuid(btt, parameters-&gt;uuid);
+        ndctl_btt_set_sector_size(btt, parameters-&gt;sector_size);
+        ndctl_btt_set_namespace(btt, parameters-&gt;ndns);
+        /* turn off raw mode device */
+        ndctl_namespace_disable(parameters-&gt;ndns);
+        /* turn on btt access */
+        ndctl_btt_enable(btt);
+}
+</pre></div>
+</div>
+<p>インスタンス化されると、該当のリージョンの下に新しい非アクティブな BTT シード デバイスが表示されます。</p>
+<p>BTT から「名前空間」が削除されると、その BTT デバイスのインスタンスが削除されるか、またはデフォルト値に戻されます。この削除はデバイスモデルレベルでのみ行われます。BTT を破壊するには「情報ブロック」を破壊する必要があります。注意点として、BTT を破壊するにはメディアがrawモードで書き込まれる必要があります。デフォルトでは、カーネルが BTT の存在を自動検出し、rawモードを無効にします。この自動検出動作は、ndctl_namespace_set_raw_mode() API を使って名前空間の raw モードを有効にすることで抑制できます。</p>
+</section>
+</section>
+<section id="summary-libndctl-diagram">
+<h3>要約 LIBNDCTL 図<a class="headerlink" href="#summary-libndctl-diagram" title="この見出しへのパーマリンク">¶</a></h3>
+<p>上記の例では、LIBNDCTL API が見ているオブジェクトのビューを以下に示します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>            +---+
+            |CTX|    +---------+   +--------------+  +---------------+
+            +-+-+  +-&gt; REGION0 +---&gt; NAMESPACE0.0 +--&gt; PMEM8 "pm0.0" |
+              |    | +---------+   +--------------+  +---------------+
++-------+     |    | +---------+   +--------------+  +---------------+
+| DIMM0 &lt;-+   |    +-&gt; REGION1 +---&gt; NAMESPACE1.0 +--&gt; PMEM6 "pm1.0" |
++-------+ |   |    | +---------+   +--------------+  +---------------+
+| DIMM1 &lt;-+ +-v--+ | +---------+   +--------------+  +---------------+
++-------+ +-+BUS0+---&gt; REGION2 +-+-&gt; NAMESPACE2.0 +--&gt; ND6  "blk2.0" |
+| DIMM2 &lt;-+ +----+ | +---------+ | +--------------+  +----------------------+
++-------+ |        |             +-&gt; NAMESPACE2.1 +--&gt; ND5  "blk2.1" | BTT2 |
+| DIMM3 &lt;-+        |               +--------------+  +----------------------+
++-------+          | +---------+   +--------------+  +---------------+
+                   +-&gt; REGION3 +-+-&gt; NAMESPACE3.0 +--&gt; ND4  "blk3.0" |
+                   | +---------+ | +--------------+  +----------------------+
+                   |             +-&gt; NAMESPACE3.1 +--&gt; ND3  "blk3.1" | BTT1 |
+                   |               +--------------+  +----------------------+
+                   | +---------+   +--------------+  +---------------+
+                   +-&gt; REGION4 +---&gt; NAMESPACE4.0 +--&gt; ND2  "blk4.0" |
+                   | +---------+   +--------------+  +---------------+
+                   | +---------+   +--------------+  +----------------------+
+                   +-&gt; REGION5 +---&gt; NAMESPACE5.0 +--&gt; ND1  "blk5.0" | BTT0 |
+                     +---------+   +--------------+  +---------------+------+
+</pre></div>
+</div>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../driver-model/index.html">ドライバモデル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../basics.html">ドライバの基礎</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infrastructure.html">デバイスドライバのインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ioctl.html">ioctlベースのインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../early-userspace/index.html">初期ユーザースペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pm/index.html">CPUおよびデバイスの電源管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../clk.html">共通のCLKフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device-io.html">バスを問わないデバイスアクセス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dma-buf.html">バッファ共有と同期</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device_link.html">デバイスリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../component.html">複合ドライバ用コンポーネントヘルパ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../message-based.html">メッセージベースのデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infiniband.html">InfiniBandおよびリモートDMA（RDMA）インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../frame-buffer.html">フレームバッファライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../regulator.html">電圧および電流レギュレータAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../input.html">入力サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../usb/index.html">Linux USB API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firewire.html">Firewire（IEEE 1394）ドライバインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pci/index.html">Linux PCIドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../spi.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i2c.html">I<sup>2</sup>CおよびSMBusサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmb.html">衛星MC用IPMBドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmi.html">Linux IPMIドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i3c/index.html">I3Cサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../interconnect.html">汎用システムインターコネクトサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../devfreq.html">デバイス周波数スケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hsi.html">高速同期シリアルインターフェース (HSI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../edac.html">エラー検出と訂正 (EDAC) デバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../scsi.html">SCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../libata.html">libATA開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../target.html">ターゲットおよびiSCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mailbox.html">共通メールボックスフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mtdnand.html">MTD NANDドライバプログラミングインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html">パラレルポートデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#x50-uart-driver">16x50 UARTドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#pulse-width-modulation-pwm">パルス幅変調 (PWM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mei/index.html">インテル(R) マネジメントエンジニアリングインターフェース (インテル(R) MEI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mtd/index.html">メモリ技術デバイス (MTD)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mmc/index.html">MMC/SD/SDIOカードサポート</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">非揮発性メモリデバイス (NVDIMM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../w1.html">W1: ダラスの1ワイヤーバス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rapidio/index.html">Linux RapidIO サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../s390-drivers.html">s390チャネルデバイスドライバの作成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vme.html">VMEデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../80211/index.html">Linux 802.11ドライバ開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../uio-howto.html">ユーザースペースI/O HOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firmware/index.html">LinuxファームウェアAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pinctl.html">PINCTRL (PIN CONTROL)サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../gpio/index.html">汎用入出力 (GPIO)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../md/index.html">RAID</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../media/index.html">メディアサブシステム カーネル内部API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../misc_devices.html">その他のデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nfc/index.html">近距離通信 (NFC)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dmaengine/index.html">DMAエンジンドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../slimbus.html">LinuxカーネルSLIMbusサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../soundwire/index.html">SoundWireドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../thermal/index.html">熱管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../fpga/index.html">FPGAサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../acpi/index.html">ACPI サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../backlight/lp855x-driver.html">カーネルドライバlp855x</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../connector.html">カーネルコンネクタ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../console.html">コンソールドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dcdbas.html">Dellシステム管理ベースドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../eisa.html">EISAバスサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isa.html">ISAドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isapnp.html">ISA Plug &amp; Playサポート (Jaroslav Kysela &lt;perex@suse.cz&gt;)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io-mapping.html">io_mapping関数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io_ordering.html">メモリマップアドレスへのI/O書き込みの順序付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../generic-counter.html">汎用カウンタインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lightnvm-pblk.html">pblk: 物理ブロックデバイスターゲット</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../memory-devices/index.html">メモリコントローラー ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../men-chameleon-bus.html">MEN Chameleon Bus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ntb.html">NTB ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nvmem.html">NVMEM サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../parport-lowlevel.html">PARPORT インターフェース ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pps.html">PPS - パルス毎秒 (Pulse Per Second)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ptp.html">Linux用PTP ハードウェアクロック インフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../phy/index.html">ジェネリック PHY フレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pti_intel_mid.html">インテル MID PTI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pwm.html">パルス幅変調 (PWM) インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html">PLDM ファームウェア フラッシュアップデート ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html#overview-of-the-pldmfw-library">概要: <code class="docutils literal notranslate"><span class="pre">pldmfw</span></code> ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rfkill.html">rfkill - RFキルスイッチサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../serial/index.html">シリアルデバイスのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sm501.html">SM501 ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../switchtec.html">Linux Switchtec サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sync_file.html">シンクファイル API ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio-mediated-device.html">VFIO メディエイテッドデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio.html">VFIO - 「仮想ファンクション I/O」 </a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xilinx/index.html">Xilinx FPGA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xillybus.html">ジェネリックFPGAインターフェース用Xillybusドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../zorro.html">Zorroデバイス用のデバイスドライバの作成</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul>
+<li><a href="index.html">非揮発性メモリデバイス (NVDIMM)</a><ul>
+<li>前へ: <a href="index.html" title="前章">非揮発性メモリデバイス (NVDIMM)</a></li>
+<li>次へ: <a href="btt.html" title="次章">BTT - ブロック翻訳テーブル</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/driver-api/nvdimm/nvdimm.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

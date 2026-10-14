@@ -1,0 +1,485 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>BTT - Block Translation Table — The Linux Kernel documentation</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="security.html" rel="next" title="NVDIMMセキュリティ"/>
+<link href="nvdimm.html" rel="prev" title="LIBNVDIMM: 非揮発性デバイス"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="btt-block-translation-table">
+<h1>BTT - ブロック翻訳テーブル<a class="headerlink" href="#btt-block-translation-table" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="introduction">
+<h2>1. はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>永続メモリベースのストレージは、バイト（正確にはキャッシュライン）単位でのIO操作が可能です。しかし、このようなストレージを伝統的なブロックデバイスとして公開したいケースは多いです。永続メモリ用のブロックドライバーはまさにこの目的を果たします。ただし、これらはアトミック性の保証を提供しません。伝統的なSSDは、キャパシタに蓄えたエネルギーを活用して、フライト中のブロック書き込みを完了するなど、ハードウェアレベルで破損セクタの保護を提供します。しかし、永続メモリにはこのような特権はありません。書き込みが進行中で電源が落ちた場合、ブロックには古いデータと新しいデータの混在が発生します。アプリケーションはこのような状況を想定していない可能性があります。</p>
+<p>ブロック翻訳テーブル（BTT）は、永続メモリデバイスにおいてアトミックなセクタ更新セマンティクスを提供します。これにより、セクタ書き込みが破損しないことを前提にしているアプリケーションも引き続き正常に動作できます。BTTはスタックされたブロックデバイスとして現れ、そのメタデータ用に基盤となるストレージの一部を確保します。その中心には、ボリューム内のすべてのブロックを再マッピングする間接テーブルがあり、非常にシンプルなファイルシステムのようにしか機能しません。</p>
+</section>
+<section id="static-layout">
+<h2>2. 静的レイアウト<a class="headerlink" href="#static-layout" title="この見出しへのパーマリンク">¶</a></h2>
+<p>BTTが配置可能な基盤となるストレージは、何の制限もありません。ただし、BTTは利用可能な空間を最大512 GiBのチャンクに分割します。このチャンクを「アレナ」と呼びます。</p>
+<p>各アレナはメタデータレイアウトにおいて同じ構造を持ち、アレナ内の参照はすべて内部に限定されます（ただし、次のアレナを指す1つのフィールドを除く）。以下の図は「ディスク上のメタデータレイアウト」を示しています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>  Backing Store     +-------&gt;  Arena
++---------------+   |   +------------------+
+|               |   |   | Arena info block |
+|    Arena 0    +---+   |       4K         |
+|     512G      |       +------------------+
+|               |       |                  |
++---------------+       |                  |
+|               |       |                  |
+|    Arena 1    |       |   Data Blocks    |
+|     512G      |       |                  |
+|               |       |                  |
++---------------+       |                  |
+|       .       |       |                  |
+|       .       |       |                  |
+|       .       |       |                  |
+|               |       |                  |
+|               |       |                  |
++---------------+       +------------------+
+                        |                  |
+                        |     BTT Map      |
+                        |                  |
+                        |                  |
+                        +------------------+
+                        |                  |
+                        |     BTT Flog     |
+                        |                  |
+                        +------------------+
+                        | Info block copy  |
+                        |       4K         |
+                        +------------------+
+</pre></div>
+</div>
+</section>
+<section id="theory-of-operation">
+<h2>3. 操作理論<a class="headerlink" href="#theory-of-operation" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="a-the-btt-map">
+<h3>a. BTT マップ<a class="headerlink" href="#a-the-btt-map" title="この見出しへのパーマリンク">¶</a></h3>
+<p>マップは、LBAを内部ブロックにマッピングするシンプルな検索/間接テーブルです。各マップエントリは32ビットです。2つの最上位ビットは特別なフラグで、残りは内部ブロック番号を形成します。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 12%"/>
+<col style="width: 88%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>ビット</p></th>
+<th class="head"><p>説明</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>31 - 30</p></td>
+<td><p>エラーおよびゼロフラグ - 以下の用途で使用されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>== ==  ====================================================
+31 30  Description
+== ==  ====================================================
+0  0   Initial state. Reads return zeroes; Premap = Postmap
+0  1   Zero state: Reads return zeroes
+1  0   Error state: Reads fail; Writes clear 'E' bit
+1  1   Normal Block – has valid postmap
+== ==  ====================================================
+</pre></div>
+</div>
+</td>
+</tr>
+<tr class="row-odd"><td><p>29 - 0</p></td>
+<td><p>内部の'postmap'ブロックへのマッピング</p></td>
+</tr>
+</tbody>
+</table>
+<p>以降で使用される用語のいくつか：</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 16%"/>
+<col style="width: 84%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>外部LBA</p></td>
+<td><p>上位レイヤーに見えるLBA</p></td>
+</tr>
+<tr class="row-even"><td><p>ABA</p></td>
+<td><p>アレナブロックアドレス - アレナ内のブロックオフセット/番号</p></td>
+</tr>
+<tr class="row-odd"><td><p>Premap ABA</p></td>
+<td><p>外部LBAの範囲チェックによって決定されたアレナ内のブロックオフセット</p></td>
+</tr>
+<tr class="row-even"><td><p>Postmap ABA</p></td>
+<td><p>マップからの間接によって得られた「データブロック」領域内のブロック番号</p></td>
+</tr>
+<tr class="row-odd"><td><p>nfree</p></td>
+<td><p>任意の時点で維持される空きブロックの数。これはアレナに同時に行われる書き込み操作の最大数です。</p></td>
+</tr>
+</tbody>
+</table>
+<p>たとえば、BTTを追加した後、1024GBのディスクが表示されます。外部LBAの読み取りが768GBで行われ、これは第二の領域に属します。この領域が提供する512GBのブロックのうち、このブロックは256GBに位置しています。したがって、プレマップABAは256GBです。次にマップを参照し、ブロック「X」（256GB）がブロック「Y」（例として「64」）にマッピングされていることを確認します。したがって、ポストマップABAは64になります。</p>
+</section>
+<section id="b-the-btt-flog">
+<h3>b. BTT フロッグ<a class="headerlink" href="#b-the-btt-flog" title="この見出しへのパーマリンク">¶</a></h3>
+<p>BTTは、すべての書き込みを「割当書き込み」として実行することによりセクタの原子性を提供します。つまり、すべての書き込みは「空きブロック」に実行されます。空きブロックの一覧はBTTフロッグとして維持されます。「フロッグ」は「free list（空きリスト）」と「log（ログ）」を組み合わせた語です。フロッグには'nfree'個のエントリがあり、エントリには以下の項目が含まれます。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 10%"/>
+<col style="width: 90%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>lba</p></td>
+<td><p>書き込まれているプレマップABA</p></td>
+</tr>
+<tr class="row-even"><td><p>old_map</p></td>
+<td><p>この書き込みが完了した後、このブロックは空きブロックになります。この古いポストマップABA</p></td>
+</tr>
+<tr class="row-odd"><td><p>new_map</p></td>
+<td><p>新しいポストマップABA。マップはこのlba-&gt;ポストマップABAのマッピングを反映するために更新されますが、復元が必要な場合に備えてここにログします。</p></td>
+</tr>
+<tr class="row-even"><td><p>seq</p></td>
+<td><p>このフロッグエントリの2つのセクションのうち、有効/最新のものを示すシーケンス番号です。通常の運用では01-&gt;10-&gt;11-&gt;01（2進数）と循環し、00は初期化されていない状態を示します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>lba’</p></td>
+<td><p>代替lbaエントリ</p></td>
+</tr>
+<tr class="row-even"><td><p>old_map’</p></td>
+<td><p>代替古いポストマップエントリ</p></td>
+</tr>
+<tr class="row-odd"><td><p>new_map’</p></td>
+<td><p>代替新しいポストマップエントリ</p></td>
+</tr>
+<tr class="row-even"><td><p>seq’</p></td>
+<td><p>代替シーケンス番号。</p></td>
+</tr>
+</tbody>
+</table>
+<p>上記の各フィールドは32ビットで、1つのエントリは32バイトになります。エントリはキャッシュラインの共有やアリアスを避けるため64バイトにパディングされます。フロッグの更新では、エントリを書き込む際、以下の手順で実行されます：a. シーケンス番号に基づいてエントリの「古い」セクションを上書き b. 「新しい」セクションを書き込み、シーケンス番号を最後に書き込みます。</p>
+</section>
+<section id="c-the-concept-of-lanes">
+<h3>c. ランの概念<a class="headerlink" href="#c-the-concept-of-lanes" title="この見出しへのパーマリンク">¶</a></h3>
+<p>「nfree」は、アリーナが同時に処理できるIO数を示しますが、「nlanes」はBTTデバイス全体が処理できるIO数です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>nlanes = min(nfree, num_cpus)
+</pre></div>
+</div>
+<p>ラン番号はIOの開始時に取得され、IOの実行中、すべてのディスク上のデータ構造およびメモリ内のデータ構造にインデックスとして使用されます。CPUが最大の可用ラン数より多い場合、ランはスピンロックで保護されます。</p>
+</section>
+<section id="d-in-memory-data-structure-read-tracking-table-rtt">
+<h3>d. メモリ内のデータ構造：読み取りトラッキングテーブル（RTT）<a class="headerlink" href="#d-in-memory-data-structure-read-tracking-table-rtt" title="この見出しへのパーマリンク">¶</a></h3>
+<p>2つのスレッドが存在するケースを考えてみましょう。一方は読み込み、もう一方は書き込みを行います。書き込みスレッドが空きブロックを取得して新しいIOを実行している間に、（遅い）読み込みスレッドがまだそのブロックから読み出している状態が発生する可能性があります。つまり、読み込みスレッドがマップエントリを確認し、対応するブロックを読み出している状態です。一方、書き込みスレッドが同じ外部LBAに書き込みを開始し、書き込み完了後にその外部LBAのマップを新しいポストマップABAに更新します。この時点で、読み込みスレッドがまだ読み出している内部のポストマップブロックが空きブロックリストに挿入されています。同じLBAに対して別の書き込みが発生した場合、その空きブロックを取得して書き込みを開始すると、読み込みスレッドが不正確なデータを読み取る可能性があります。このような問題を防ぐためにRTT（Read-Through Table）を導入します。</p>
+<p>RTTは、アリーナごとの単純なテーブルで、'nfree'個のエントリを持ちます。すべての読み込みスレッドは、読み出しているポストマップABAをrtt[lane_number]に挿入し、読み出し完了後にそのエントリをクリアします。すべての書き込みスレッドは、空きブロックを取得した後、RTTにその存在を確認します。RTTにポストマップ空きブロックが存在している場合、読み込みスレッドがRTTエントリをクリアするのを待ってから書き込みを開始します。</p>
+</section>
+<section id="e-in-memory-data-structure-map-locks">
+<h3>e. メモリ内データ構造: マップロック<a class="headerlink" href="#e-in-memory-data-structure-map-locks" title="この見出しへのパーマリンク">¶</a></h3>
+<p>2つの書き込みスレッドが同じLBAに書き込みを行うケースを考えてみましょう。以下のステップ順序に競合が発生する可能性があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>free[lane] = map[premap_aba]
+map[premap_aba] = postmap_aba
+</pre></div>
+</div>
+<p>両方のスレッドがそれぞれのfree[lane]に同じ古い、解放されたpostmap_abaを更新する可能性があります。これにより、空きエントリが失われる一方で、2つのレーンに別の空きエントリが複製されるため、レイアウトが不一致になります。</p>
+<p>この問題を解決するためには、アリーナごとの単一のマップロックを取得する必要があるかもしれませんが、競合が発生しすぎる可能性があるため、代わりに(nfree)個のマップロックを配列として使用します。この配列は、premap_aba modulo nfreeに基づいてインデックス付けされます。</p>
+</section>
+<section id="f-reconstruction-from-the-flog">
+<h3>f. Flogからの復元<a class="headerlink" href="#f-reconstruction-from-the-flog" title="この見出しへのパーマリンク">¶</a></h3>
+<p>起動時にBTT flogを解析して空きブロックリストを作成します。すべてのエントリを走査し、各レーンの2つの可能な「セクション」の中でもっとも最近のものを常に確認します（シーケンス番号に基づく）。復元ルール/ステップはシンプルです:</p>
+<ul class="simple">
+<li><p>map[log_entry.lba]を読み込みます。</p></li>
+<li><p>log_entry.newがマップエントリと一致する場合、log_entry.oldは空きブロックです。</p></li>
+<li><p>log_entry.newがマップエントリと一致しない場合、log_entry.newは空きブロックです。（このケースは電源オフ/不安全なシャットダウンによってのみ発生します）</p></li>
+</ul>
+</section>
+<section id="g-summarizing-read-and-write-flows">
+<h3>g. 要約 - 読み込みと書き込みフロー<a class="headerlink" href="#g-summarizing-read-and-write-flows" title="この見出しへのパーマリンク">¶</a></h3>
+<p>読み込み:</p>
+<ol class="arabic simple">
+<li><p>外部LBAをアリーナ番号＋pre-map ABAに変換します。</p></li>
+<li><p>レーンを取得し（レーンロックを取得します）</p></li>
+<li><p>マップを読み込み、このpre-map ABAに対応するエントリを取得します</p></li>
+<li><p>RTT[lane]にpost-map ABAを入力します</p></li>
+<li><p>マップ内のTRIMフラグが設定されている場合、ゼロを返してIOを終了し、ステップ8に移動します</p></li>
+<li><p>マップ内のERRORフラグが設定されている場合、EIOでIOを終了します（ステップ8に移動）</p></li>
+<li><p>このブロックからデータを読み込みます</p></li>
+<li><p>RTT[lane]からpost-map ABAエントリを削除します</p></li>
+<li><p>レーン（およびlane_lock）を解放します</p></li>
+</ol>
+<p>書き込み:</p>
+<ol class="arabic simple">
+<li><p>外部LBAをアリーナ番号＋pre-map ABAに変換します</p></li>
+<li><p>レーンを取得し（レーンロックを取得します）</p></li>
+<li><p>レーンをメモリ内の空きリストのインデックスとして使用し、新しいブロック、次のフラグインデックス、次のシーケンス番号を取得します</p></li>
+<li><p>RTTをスキャンし、空きブロックが存在するか確認します。存在する場合はスピン/待機します</p></li>
+<li><p>この空きブロックにデータを書き込みます</p></li>
+<li><p>マップからこのpre-map ABAに対応する既存のpost-map ABAエントリを読み込みます</p></li>
+<li><p>フラグエントリを書き込みます: [premap_aba / 旧postmap_aba / 新postmap_aba / seq_num]</p></li>
+<li><p>マップに新しいpost-map ABAを書き込みます</p></li>
+<li><p>古いpost-mapエントリを空きリストに書き込みます</p></li>
+<li><p>次のシーケンス番号を計算し、空きリストエントリに書き込みます</p></li>
+<li><p>レーン（およびlane_lock）を解放します</p></li>
+</ol>
+</section>
+</section>
+<section id="error-handling">
+<h2>4. エラー処理<a class="headerlink" href="#error-handling" title="この見出しへのパーマリンク">¶</a></h2>
+<p>情報ブロックのチェックサムが一致しない（復元も失敗する）場合、アリーナはエラー状態になります。以下の条件が発生した場合、エラーとみなされます:</p>
+<ul class="simple">
+<li><p>情報ブロックのチェックサムが一致しない（復元も失敗する）</p></li>
+<li><p>すべての内部空きブロックが、マップされたブロックと空きブロック（BTTフラグから）の合計で一意かつ完全にアドレス指定されていない</p></li>
+<li><p>フラグから空きリストを再構築すると、欠落/重複/不可能なエントリが判明する</p></li>
+<li><p>マップエントリが範囲外にある</p></li>
+</ul>
+<p>これらのエラー条件のいずれかが発生した場合、情報ブロック内のフラグを使用してアリーナを読み取り専用状態にします</p>
+</section>
+<section id="usage">
+<h2>5. 使い方<a class="headerlink" href="#usage" title="この見出しへのパーマリンク">¶</a></h2>
+<p>BTTはlibnvdimmサブシステム（pmem、またはblkモード）で露出される任意のディスク（名前空間）に設定できます。このような名前空間を設定する最も簡単な方法は、'ndctl'ユーティリティを使用することです [1]:</p>
+<p>例えば、4kセクタサイズでBTTを設定するndctlコマンドラインは以下の通りです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>ndctl create-namespace -f -e namespace0.0 -m sector -l 4k
+</pre></div>
+</div>
+<p>より多くのオプションについては、ndctl create-namespace –helpを参照してください</p>
+<p>[1]: <a class="reference external" href="https://github.com/pmem/ndctl">https://github.com/pmem/ndctl</a></p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../driver-model/index.html">ドライバモデル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../basics.html">ドライバの基礎</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infrastructure.html">デバイスドライバのインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ioctl.html">ioctlベースのインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../early-userspace/index.html">初期ユーザースペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pm/index.html">CPUおよびデバイスの電源管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../clk.html">共通のCLKフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device-io.html">バスを問わないデバイスアクセス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dma-buf.html">バッファ共有と同期</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device_link.html">デバイスリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../component.html">複合ドライバ用コンポーネントヘルパ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../message-based.html">メッセージベースのデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infiniband.html">InfiniBandおよびリモートDMA（RDMA）インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../frame-buffer.html">フレームバッファライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../regulator.html">電圧および電流レギュレータAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../input.html">入力サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../usb/index.html">Linux USB API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firewire.html">Firewire（IEEE 1394）ドライバインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pci/index.html">Linux PCIドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../spi.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i2c.html">I<sup>2</sup>CおよびSMBusサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmb.html">衛星MC用IPMBドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmi.html">Linux IPMIドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i3c/index.html">I3Cサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../interconnect.html">汎用システムインターコネクトサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../devfreq.html">デバイス周波数スケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hsi.html">高速同期シリアルインターフェース (HSI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../edac.html">エラー検出と訂正 (EDAC) デバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../scsi.html">SCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../libata.html">libATA開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../target.html">ターゲットおよびiSCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mailbox.html">共通メールボックスフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mtdnand.html">MTD NANDドライバプログラミングインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html">パラレルポートデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#x50-uart-driver">16x50 UARTドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#pulse-width-modulation-pwm">パルス幅変調 (PWM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mei/index.html">インテル(R) マネジメントエンジニアリングインターフェース (インテル(R) MEI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mtd/index.html">メモリ技術デバイス (MTD)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mmc/index.html">MMC/SD/SDIOカードサポート</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">非揮発性メモリデバイス (NVDIMM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../w1.html">W1: ダラスの1ワイヤーバス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rapidio/index.html">Linux RapidIO サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../s390-drivers.html">s390チャネルデバイスドライバの作成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vme.html">VMEデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../80211/index.html">Linux 802.11ドライバ開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../uio-howto.html">ユーザースペースI/O HOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firmware/index.html">LinuxファームウェアAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pinctl.html">PINCTRL (PIN CONTROL)サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../gpio/index.html">汎用入出力 (GPIO)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../md/index.html">RAID</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../media/index.html">メディアサブシステム カーネル内部API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../misc_devices.html">その他のデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nfc/index.html">近距離通信 (NFC)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dmaengine/index.html">DMAエンジンドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../slimbus.html">LinuxカーネルSLIMbusサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../soundwire/index.html">SoundWireドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../thermal/index.html">熱管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../fpga/index.html">FPGAサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../acpi/index.html">ACPI サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../backlight/lp855x-driver.html">カーネルドライバlp855x</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../connector.html">カーネルコンネクタ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../console.html">コンソールドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dcdbas.html">Dellシステム管理ベースドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../eisa.html">EISAバスサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isa.html">ISAドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isapnp.html">ISA Plug &amp; Playサポート (Jaroslav Kysela &lt;perex@suse.cz&gt;)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io-mapping.html">io_mapping関数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io_ordering.html">メモリマップアドレスへのI/O書き込みの順序付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../generic-counter.html">汎用カウンタインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lightnvm-pblk.html">pblk: 物理ブロックデバイスターゲット</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../memory-devices/index.html">メモリコントローラー ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../men-chameleon-bus.html">MEN Chameleon Bus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ntb.html">NTB ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nvmem.html">NVMEM サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../parport-lowlevel.html">PARPORT インターフェース ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pps.html">PPS - パルス毎秒 (Pulse Per Second)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ptp.html">Linux用PTP ハードウェアクロック インフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../phy/index.html">ジェネリック PHY フレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pti_intel_mid.html">インテル MID PTI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pwm.html">パルス幅変調 (PWM) インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html">PLDM ファームウェア フラッシュアップデート ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html#overview-of-the-pldmfw-library">概要: <code class="docutils literal notranslate"><span class="pre">pldmfw</span></code> ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rfkill.html">rfkill - RFキルスイッチサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../serial/index.html">シリアルデバイスのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sm501.html">SM501 ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../switchtec.html">Linux Switchtec サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sync_file.html">シンクファイル API ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio-mediated-device.html">VFIO メディエイテッドデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio.html">VFIO - 「仮想ファンクション I/O」 </a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xilinx/index.html">Xilinx FPGA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xillybus.html">ジェネリックFPGAインターフェース用Xillybusドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../zorro.html">Zorroデバイス用のデバイスドライバの作成</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul>
+<li><a href="index.html">非揮発性メモリデバイス (NVDIMM)</a><ul>
+<li>前へ: <a href="nvdimm.html" title="前章">LIBNVDIMM: 非揮発性デバイス</a></li>
+<li>次へ: <a href="security.html" title="次章">NVDIMMセキュリティ</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/driver-api/nvdimm/btt.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

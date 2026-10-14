@@ -1,0 +1,367 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>CPUアイドルタイム管理 — Linuxカーネルドキュメンテーション</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="devices.html" rel="next" title="デバイス電源管理の基礎"/>
+<link href="index.html" rel="prev" title="CPUおよびデバイスの電源管理"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="cpu-idle-time-management">
+<h1>CPUアイドル時間管理<a class="headerlink" href="#cpu-idle-time-management" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著作権</dt>
+<dd class="field-odd"><p>© 2019 Intel Corporation</p>
+</dd>
+<dt class="field-even">著者</dt>
+<dd class="field-even"><p>Rafael J. Wysocki &lt;<a class="reference external" href="mailto:rafael.j.wysocki%40intel.com">rafael<span>.</span>j<span>.</span>wysocki<span>@</span>intel<span>.</span>com</a>&gt;</p>
+</dd>
+</dl>
+<section id="cpu-idle-time-management-subsystem">
+<h2>CPUアイドル時間管理サブシステム<a class="headerlink" href="#cpu-idle-time-management-subsystem" title="この見出しへのパーマリンク">¶</a></h2>
+<p>システム内の論理CPU（命令を取得・実行するように見えるエンティティ：ハードウェアスレッド（存在する場合）またはプロセッサコア）が割り込みや同等のウェイクアップイベント後にアイドル状態になった場合、そのCPUにタスクを実行する必要がない（実行すべきタスクは、そのCPUに固有の特別な「アイドル」タスクのみ）ため、そのプロセッサのエネルギー節約の機会があります。この機会を活用するには、アイドル状態の論理CPUがメモリから命令を取得を停止し、そのCPUに依存するプロセッサの機能ユニットを低消費電力のアイドル状態に移行させることができます。</p>
+<p>ただし、このような状況で使用可能なアイドル状態は複数存在する可能性があるため、カーネルの観点から最も適切な状態を選び、プロセッサにその状態を使用（または「移行」）させる必要があります。これは、カーネル内にあるCPUアイドル時間管理サブシステムの役割であり、 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code>.</p>
+<p>の設計は <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> モジュール化されており、コードの複製回避の原則に基づいています。そのため、ハードウェアやプラットフォーム設計の詳細に依存しなくてもよい汎用コードは、ハードウェアとやりとりするコードとは分離されています。一般的には、以下の3つの機能ユニットに分類されます： <em>ガバニョア</em> アイドル状態を選択し、プロセッサに移行させる責任を負う、 <em>ドライバー</em> ガバニョアの決定をハードウェアに伝達し、 <em>コア</em> 共通のフレームワークを提供するものです。</p>
+</section>
+<section id="cpu-idle-time-governors">
+<h2>CPUアイドル時間ガバニョア<a class="headerlink" href="#cpu-idle-time-governors" title="この見出しへのパーマリンク">¶</a></h2>
+<p>CPUアイドル時間（<code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code>）ガバニョアは、システム内の論理CPUがアイドル状態になったときに実行されるポリシーコードの束です。その役割は、エネルギーを節約するためにプロセッサに移行させるアイドル状態を選択することです。</p>
+<p><code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ガバニョアは汎用的であり、Linuxカーネルが動作可能なあらゆるハードウェアプラットフォームで使用可能です。そのため、これらが操作するデータ構造も、ハードウェアアーキテクチャやプラットフォーム設計の詳細に依存していません。</p>
+<p>ガバニョア自身は、以下のフィールドで説明される4つのコールバックポインタを含むstruct cpuidle_governorオブジェクトで表されます。 <code class="xref c c-member docutils literal notranslate"><span class="pre">enable</span></code>, <code class="xref c c-member docutils literal notranslate"><span class="pre">disable</span></code>,
+<code class="xref c c-member docutils literal notranslate"><span class="pre">select</span></code>, <code class="xref c c-member docutils literal notranslate"><span class="pre">reflect</span></code>, a <code class="xref c c-member docutils literal notranslate"><span class="pre">rating</span></code> 以下の説明で説明されるフィールド、およびその識別に使用される名前（文字列）です。</p>
+<p>ガバニョアが利用可能になるためには、そのオブジェクトが <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> コアに登録される必要があります。そのためには、そのオブジェクトへのポインタを引数として <code class="xref c c-func docutils literal notranslate"><span class="pre">cpuidle_register_governor()</span></code> を呼び出します。成功すると、コアがそのガバニョアをグローバルな利用可能なガバニョア一覧に追加し、それが一覧に唯一のガバニョア（つまり、一覧が空だった場合）であるか、またはその
+<code class="xref c c-member docutils literal notranslate"><span class="pre">rating</span></code> フィールドの値が、現在使用中のガバナの該フィールドの値よりも大きい、または新しいガバナの名前がカーネルにコマンドラインパラメータとして渡された場合、その時点で新しいガバナが使用される (一度に使用中のガバナは1つだけである) <code class="docutils literal notranslate"><span class="pre">cpuidle.governor=</span></code> コマンドラインパラメータとして渡された場合、その時点で新しいガバナが使用される (一度に使用中のガバナは1つだけである)。また、ユーザー空間は、実行時に <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code>
+ガバナを選択して使用することが可能である。 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code>
+実行時に使用するガバナを <code class="docutils literal notranslate"><span class="pre">sysfs</span></code>.</p>
+<p>登録されると、 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ガバナはアンレジストレーションができないため、ロード可能なカーネルモジュールとして実装するのは現実的ではない。</p>
+<p>ガバナとコアの間のインターフェースは、4つのコールバックから成り立つ: <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ガバナとコアの間のインターフェースは、4つのコールバックから成り立つ:</p>
+<dl>
+<dt><code class="xref c c-member docutils literal notranslate"><span class="pre">enable</span></code></dt><dd><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int (*enable) (struct cpuidle_driver *drv, struct cpuidle_device *dev);
+</pre></div>
+</div>
+<p>このコールバックの役割は、struct cpuidle_deviceオブジェクトが指す(logical)CPUを処理するためにガバナを準備することである。 <code class="docutils literal notranslate"><span class="pre">dev</span></code> struct cpuidle_driverオブジェクトが指すCPUに使用するガバナ(その他の要素として、このCPUが進入できるアイドル状態を表すstruct cpuidle_stateオブジェクトのリストを含むべきである) <code class="docutils literal notranslate"><span class="pre">drv</span></code> struct cpuidle_driverオブジェクトが指すCPUに使用するガバナ(その他の要素として、このCPUが進入できるアイドル状態を表すstruct cpuidle_stateオブジェクトのリストを含むべきである) <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> struct cpuidle_driverオブジェクトが指すCPUに使用するガバナ(その他の要素として、このCPUが進入できるアイドル状態を表すstruct cpuidle_stateオブジェクトのリストを含むべきである)</p>
+<p>失敗する可能性があり、その場合負のエラーコードを返すことが期待され、その結果、カーネルは該当CPUでアーキテクチャ固有のデフォルトコードを実行するようになる。このコールバックが再度呼び出される <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code>
+まで、該当CPUでアーキテクチャ固有のデフォルトコードを実行するようになる。このコールバックが再度呼び出される <code class="docutils literal notranslate"><span class="pre">-&gt;enable()</span></code> ガバナコールバックが該当CPUに対して呼び出されるまで、該当CPUでアーキテクチャ固有のデフォルトコードを実行するようになる。</p>
+</dd>
+<dt><code class="xref c c-member docutils literal notranslate"><span class="pre">disable</span></code></dt><dd><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void (*disable) (struct cpuidle_driver *drv, struct cpuidle_device *dev);
+</pre></div>
+</div>
+<p>struct cpuidle_deviceオブジェクトが指す(logical)CPUを処理するガバナの停止を呼び出す。 <code class="docutils literal notranslate"><span class="pre">dev</span></code>
+引数。</p>
+<p>最後に該当CPUに対して呼び出された際に行った変更を逆にする、そのコールバックで割り当てられたメモリを解放するなど、処理を逆にする。 <code class="docutils literal notranslate"><span class="pre">-&gt;enable()</span></code>
+struct cpuidle_deviceオブジェクトが指す(logical)CPUを処理するガバナの停止を呼び出す。</p>
+</dd>
+<dt><code class="xref c c-member docutils literal notranslate"><span class="pre">select</span></code></dt><dd><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int (*select) (struct cpuidle_driver *drv, struct cpuidle_device *dev,
+               bool *stop_tick);
+</pre></div>
+</div>
+<p>struct cpuidle_deviceオブジェクトが指す(logical)CPUを保持するプロセッサにアイドル状態を選択する。
+<code class="docutils literal notranslate"><span class="pre">dev</span></code> 引数。</p>
+<p>考慮すべきアイドル状態のリストは、struct cpuidle_driverオブジェクトが指す
+<code class="xref c c-member docutils literal notranslate"><span class="pre">states</span></code> struct cpuidle_stateオブジェクトの配列によって表される。struct cpuidle_driverオブジェクトが指す <code class="docutils literal notranslate"><span class="pre">drv</span></code> argument (これは、該当CPUに使用するガバナを表す) <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> struct cpuidle_driverオブジェクトが指す該当CPUに使用するガバナを表す)。このコールバックで返される値は、その配列のインデックスとして解釈される (負のエラーコードの場合は除く)</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">stop_tick</span></code> argumentは、選択されたアイドル状態への移行前にスケジューラのティックを停止するかどうかを示す。この変数が <code class="docutils literal notranslate"><span class="pre">bool</span></code> argumentで示される変数 (このコールバックを呼び出す前には <code class="docutils literal notranslate"><span class="pre">true</span></code> に設定されている) がクリアされると、選択されたアイドル状態への移行時にスケジューラのティックを停止しない。ただし、そのCPUでティックがすでに停止されている場合、アイドル状態への移行前にティックを再開しない。 <code class="docutils literal notranslate"><span class="pre">false</span></code>に設定されている) がクリアされると、選択されたアイドル状態への移行時にスケジューラのティックを停止しない。ただし、そのCPUでティックがすでに停止されている場合、アイドル状態への移行前にティックを再開しない。</p>
+<p>このコールバックは必須です（つまり、 <code class="xref c c-member docutils literal notranslate"><span class="pre">select</span></code> struct cpuidle_governor内のコールバックポインタは <code class="docutils literal notranslate"><span class="pre">NULL</span></code> ガバニョールの登録が成功するためには必須です）。</p>
+</dd>
+<dt><code class="xref c c-member docutils literal notranslate"><span class="pre">reflect</span></code></dt><dd><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void (*reflect) (struct cpuidle_device *dev, int index);
+</pre></div>
+</div>
+<p>ガバニョールが前回のコールバック呼び出し時に選択されたアイドル状態の正確性を評価し、 <code class="docutils literal notranslate"><span class="pre">-&gt;select()</span></code> その結果を将来のアイドル状態選択の正確性向上に利用できるようにするため呼び出されます。</p>
+</dd>
+</dl>
+<p>さらに、 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ガバニョールはプロセッサのウェイクアップ遅延に関するパワーマネジメント品質サービス（PM QoS）制約を考慮してアイドル状態を選択する必要があります。あるCPUの現在の有効なPM QoSウェイクアップ遅延制約を取得するには、 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ガバニョールはCPUの番号を
+<code class="xref c c-func docutils literal notranslate"><span class="pre">cpuidle_governor_latency_req()</span></code>に渡す必要があります。その後、ガバニョールの <code class="docutils literal notranslate"><span class="pre">-&gt;select()</span></code>
+コールバックは、その関数が返す番号よりも大きいアイドル状態のインデックスを返してはなりません。
+<code class="xref c c-member docutils literal notranslate"><span class="pre">exit_latency</span></code> 値が</p>
+</section>
+<section id="cpu-idle-time-management-drivers">
+<h2>CPUアイドル時間管理ドライバ<a class="headerlink" href="#cpu-idle-time-management-drivers" title="この見出しへのパーマリンク">¶</a></h2>
+<p>CPUアイドル時間管理（<code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code>）ドライバは、 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> の他の部分とハードウェアの間のインターフェースを提供します。</p>
+<p>まず、 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ドライバは、 <code class="xref c c-member docutils literal notranslate"><span class="pre">states</span></code> struct cpuidle_driverオブジェクトに含まれるstruct cpuidle_stateオブジェクトの配列を埋め込む必要があります。この配列は、将来的には、このドライバで処理するすべての論理CPUが共有する、プロセッサハードウェアにエントリできる可用アイドル状態の一覧を表します。</p>
+<p>の配列のエントリは、struct cpuidle_state内の <code class="xref c c-member docutils literal notranslate"><span class="pre">states</span></code> フィールドの値を昇順に並べることで期待されます（つまり、インデックス0は、 <code class="xref c c-member docutils literal notranslate"><span class="pre">target_residency</span></code> の最小値を持つアイドル状態に対応します）。[ <code class="xref c c-member docutils literal notranslate"><span class="pre">target_residency</span></code>の値がstruct cpuidle_stateオブジェクトに含まれるアイドル状態の「深さ」を反映すると期待されるため、この並び順はアイドル状態の「深さ」を昇順に並べる並び順と同じであるべきです。]
+<code class="xref c c-member docutils literal notranslate"><span class="pre">target_residency</span></code> Three fields in struct cpuidle_state are used by the existing</p>
+<p>governors for computations related to idle state selection: <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code>
+このアイドル状態で消費する最小時間（この状態に入るのに必要な時間も含む）をマイクロ秒単位で表します。この時間は、同じ時間に浅いアイドル状態にとどまることで得られるエネルギーセーブよりも、より多くのエネルギーセーブを達成するために必要です。</p>
+<dl class="simple">
+<dt><code class="xref c c-member docutils literal notranslate"><span class="pre">target_residency</span></code></dt><dd><p>CPUがこのアイドル状態にプロセッサをエントリさせた後、ウェイクアップ後に最初の指令を実行し始めるまでにかかる最大時間（マイクロ秒単位）です。</p>
+</dd>
+<dt><code class="xref c c-member docutils literal notranslate"><span class="pre">exit_latency</span></code></dt><dd><p>アイドル状態のプロパティを表すフラグです。現在、ガバニョールはのみ</p>
+</dd>
+<dt><code class="xref c c-member docutils literal notranslate"><span class="pre">flags</span></code></dt><dd><p>を使用しています。 <code class="docutils literal notranslate"><span class="pre">CPUIDLE_FLAG_POLLING</span></code> 指定されたオブジェクトが実際のアイドル状態を表していないが、ソフトウェアの「ループ」インターフェースであり、プロセッサにアイドル状態に入る必要をまったく回避できるようにする場合に設定されるフラグです。[コアは特殊な状況で他のフラグも使用します。] <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code>
+struct cpuidle_state内のコールバックポインタで、これは</p>
+</dd>
+</dl>
+<p>以下の <code class="xref c c-member docutils literal notranslate"><span class="pre">enter</span></code> struct cpuidle_state内のコールバックポインタで、これは <code class="docutils literal notranslate"><span class="pre">NULL</span></code>プロセッサがこの特定のアイドル状態に入るよう依頼するための実行するルーチンを指します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void (*enter) (struct cpuidle_device *dev, struct cpuidle_driver *drv,
+               int index);
+</pre></div>
+</div>
+<p>このコールバックの最初の2つの引数は、このコールバックを実行している論理CPUを表すstruct cpuidle_deviceオブジェクトと、ドライバ自身を表すstruct cpuidle_driverオブジェクトをそれぞれ指し、最後の引数はドライバの
+<code class="xref c c-member docutils literal notranslate"><span class="pre">states</span></code> 配列内でアイドル状態を依頼するプロセッサのアイドル状態を表すstruct cpuidle_stateエントリのインデックスです。</p>
+<p>同様の <code class="docutils literal notranslate"><span class="pre">-&gt;enter_s2idle()</span></code> struct cpuidle_state内のコールバックは、スリープトアイドルのシステムワイドな電源管理機能を実装するためにのみ使用されます。"in"と <code class="docutils literal notranslate"><span class="pre">-&gt;enter()</span></code> の違いは、割り込みを常に再有効化してはならない（一時的にでも）こと、またはクロックイベントデバイスの状態を変更しようとすることがないことです。これは <code class="docutils literal notranslate"><span class="pre">-&gt;enter()</span></code> コールバックが時折行うことがあります。</p>
+<p>一旦 <code class="xref c c-member docutils literal notranslate"><span class="pre">states</span></code> 配列が埋め込まれた場合、その有効なエントリ数は、ドライバを表すstruct cpuidle_driverオブジェクトの <code class="xref c c-member docutils literal notranslate"><span class="pre">state_count</span></code> フィールドに保存する必要があります。さらに、配列内の <code class="xref c c-member docutils literal notranslate"><span class="pre">states</span></code> エントリが「結合された」アイドル状態（つまり、複数の関連する論理CPUがアイドル状態である場合にのみ依頼できるアイドル状態）を表している場合、struct cpuidle_driver内の <code class="xref c c-member docutils literal notranslate"><span class="pre">safe_state_index</span></code> フィールドは、結合されていないアイドル状態（つまり、単一の論理CPUがアイドル状態でも依頼できる）のインデックスでなければなりません。</p>
+<p>さらに、指定された <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ドライバがシステム内の論理CPUのサブセットのみを処理する場合、そのstruct cpuidle_driverオブジェクトの <code class="xref c c-member docutils literal notranslate"><span class="pre">cpumask</span></code> フィールドは、このドライバが処理するCPUのセット（マスク）を指す必要があります。</p>
+<p>A <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ドライバは登録されてからしか使用できません。ドライバの <code class="xref c c-member docutils literal notranslate"><span class="pre">states</span></code> 配列に「結合された」アイドル状態エントリがなければ、ドライバのstruct cpuidle_driverオブジェクトを <code class="xref c c-func docutils literal notranslate"><span class="pre">cpuidle_register_driver()</span></code>に渡すことで実現できます。そうでない場合は、 <code class="xref c c-func docutils literal notranslate"><span class="pre">cpuidle_register()</span></code>
+を使用する必要があります。</p>
+<p>ただし、指定された <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ドライバが処理するすべての論理CPU用のstruct cpuidle_deviceオブジェクトを登録する必要があります。これは、ドライバが登録された後で <code class="xref c c-func docutils literal notranslate"><span class="pre">cpuidle_register_device()</span></code> の助けを借りて行われるべきです。これは、 <code class="xref c c-func docutils literal notranslate"><span class="pre">cpuidle_register_driver()</span></code>とは異なり、自動的にこれを実行しないからです。このため、 <code class="xref c c-func docutils literal notranslate"><span class="pre">cpuidle_register()</span></code>を使用して自己登録するドライバは、struct cpuidle_deviceオブジェクトの登録も必要に応じて行う必要があります。そのため、すべてのケースで
+<code class="xref c c-func docutils literal notranslate"><span class="pre">cpuidle_register_driver()</span></code> ドライバ登録を使用することを推奨します。 <code class="xref c c-func docutils literal notranslate"><span class="pre">cpuidle_register()</span></code> のために、 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ドライバ登録を使用することを推奨します。</p>
+<p>struct cpuidle_deviceオブジェクトの登録により、インターフェースが作成され、その論理CPUを表すガバニョールのコールバックが呼び出されます。そのため、この登録は、該当するCPUを処理するドライバが登録される後に行う必要があります。 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code>
+<code class="docutils literal notranslate"><span class="pre">sysfs</span></code> インターフェースが作成され、その論理CPUを表すガバニョールのコールバックが呼び出されます。そのため、この登録は、該当するCPUを処理するドライバが登録される後に行う必要があります。 <code class="docutils literal notranslate"><span class="pre">-&gt;enable()</span></code> ドライバとstruct cpuidle_deviceオブジェクトは、必要なくなったときにアンレジストレーションされ、それに関連するリソースが解放されます。それらの間の依存関係により、指定されたドライバで処理するCPUを表すすべてのstruct cpuidle_deviceオブジェクトがアンレジストレーションされる必要があります。</p>
+<p><code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> アンレジストレーションされる必要があります。それらの間の依存関係により、指定されたドライバで処理するCPUを表すすべてのstruct cpuidle_deviceオブジェクトがアンレジストレーションされる必要があります。
+<code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> アンレジストレーションされる必要があります。それらの間の依存関係により、指定されたドライバで処理するCPUを表すすべてのstruct cpuidle_deviceオブジェクトがアンレジストレーションされる必要があります。
+<code class="xref c c-func docutils literal notranslate"><span class="pre">cpuidle_unregister_device()</span></code>アンレジストレーションされる必要があります。それらの間の依存関係により、指定されたドライバで処理するCPUを表すすべてのstruct cpuidle_deviceオブジェクトがアンレジストレーションされる必要があります。
+<code class="xref c c-func docutils literal notranslate"><span class="pre">cpuidle_unregister_driver()</span></code> アンレジストレーションされる必要があります。それらの間の依存関係により、指定されたドライバで処理するCPUを表すすべてのstruct cpuidle_deviceオブジェクトがアンレジストレーションされる必要があります。
+<code class="xref c c-func docutils literal notranslate"><span class="pre">cpuidle_unregister()</span></code> アンレジストレーションされる必要があります。それらの間の依存関係により、指定されたドライバで処理するCPUを表すすべてのstruct cpuidle_deviceオブジェクトがアンレジストレーションされる必要があります。 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> アンレジストレーションされる必要があります。それらの間の依存関係により、指定されたドライバで処理するCPUを表すすべてのstruct cpuidle_deviceオブジェクトがアンレジストレーションされる必要があります。</p>
+<p><code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ドライバは、システムの実行時設定変更により、利用可能なプロセッサアイドル状態のリストが変更される場合（たとえば、システムの電源がACからバッテリーに切り替わるなど）に、その変更に応じて動作します。 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ドライバは、その変更に応じて動作します。その変更に応じて動作します。 <code class="xref c c-func docutils literal notranslate"><span class="pre">cpuidle_pause_and_lock()</span></code> ドライバは、その変更に応じて動作します。その変更に応じて動作します。 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ドライバは、その変更に応じて動作します。その変更に応じて動作します。 <code class="xref c c-func docutils literal notranslate"><span class="pre">cpuidle_disable_device()</span></code> ドライバは、その変更に応じて動作します。その変更に応じて動作します。 <code class="xref c c-member docutils literal notranslate"><span class="pre">states</span></code> ドライバは、その変更に応じて動作します。その変更に応じて動作します。 <code class="xref c c-func docutils literal notranslate"><span class="pre">cpuidle_enable_device()</span></code> ドライバは、その変更に応じて動作します。その変更に応じて動作します。
+<code class="xref c c-func docutils literal notranslate"><span class="pre">cpuidle_resume_and_unlock()</span></code> ドライバは、その変更に応じて動作します。その変更に応じて動作します。 <code class="docutils literal notranslate"><span class="pre">CPUIdle</span></code> ドライバは、その変更に応じて動作します。その変更に応じて動作します。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../driver-model/index.html">ドライバモデル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../basics.html">ドライバの基礎</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infrastructure.html">デバイスドライバのインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ioctl.html">ioctlベースのインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../early-userspace/index.html">初期ユーザースペース</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">CPUおよびデバイスの電源管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../clk.html">共通のCLKフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device-io.html">バスを問わないデバイスアクセス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dma-buf.html">バッファ共有と同期</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device_link.html">デバイスリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../component.html">複合ドライバ用コンポーネントヘルパ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../message-based.html">メッセージベースのデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infiniband.html">InfiniBandおよびリモートDMA（RDMA）インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../frame-buffer.html">フレームバッファライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../regulator.html">電圧および電流レギュレータAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../input.html">入力サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../usb/index.html">Linux USB API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firewire.html">Firewire（IEEE 1394）ドライバインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pci/index.html">Linux PCIドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../spi.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i2c.html">I<sup>2</sup>CおよびSMBusサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmb.html">衛星MC用IPMBドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmi.html">Linux IPMIドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i3c/index.html">I3Cサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../interconnect.html">汎用システムインターコネクトサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../devfreq.html">デバイス周波数スケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hsi.html">高速同期シリアルインターフェース (HSI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../edac.html">エラー検出と訂正 (EDAC) デバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../scsi.html">SCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../libata.html">libATA開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../target.html">ターゲットおよびiSCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mailbox.html">共通メールボックスフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mtdnand.html">MTD NANDドライバプログラミングインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html">パラレルポートデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#x50-uart-driver">16x50 UARTドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#pulse-width-modulation-pwm">パルス幅変調 (PWM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mei/index.html">インテル(R) マネジメントエンジニアリングインターフェース (インテル(R) MEI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mtd/index.html">メモリ技術デバイス (MTD)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mmc/index.html">MMC/SD/SDIOカードサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nvdimm/index.html">非揮発性メモリデバイス (NVDIMM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../w1.html">W1: ダラスの1ワイヤーバス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rapidio/index.html">Linux RapidIO サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../s390-drivers.html">s390チャネルデバイスドライバの作成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vme.html">VMEデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../80211/index.html">Linux 802.11ドライバ開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../uio-howto.html">ユーザースペースI/O HOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firmware/index.html">LinuxファームウェアAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pinctl.html">PINCTRL (PIN CONTROL)サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../gpio/index.html">汎用入出力 (GPIO)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../md/index.html">RAID</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../media/index.html">メディアサブシステム カーネル内部API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../misc_devices.html">その他のデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nfc/index.html">近距離通信 (NFC)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dmaengine/index.html">DMAエンジンドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../slimbus.html">LinuxカーネルSLIMbusサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../soundwire/index.html">SoundWireドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../thermal/index.html">熱管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../fpga/index.html">FPGAサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../acpi/index.html">ACPI サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../backlight/lp855x-driver.html">カーネルドライバlp855x</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../connector.html">カーネルコンネクタ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../console.html">コンソールドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dcdbas.html">Dellシステム管理ベースドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../eisa.html">EISAバスサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isa.html">ISAドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isapnp.html">ISA Plug &amp; Playサポート (Jaroslav Kysela &lt;perex@suse.cz&gt;)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io-mapping.html">io_mapping関数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io_ordering.html">メモリマップアドレスへのI/O書き込みの順序付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../generic-counter.html">汎用カウンタインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lightnvm-pblk.html">pblk: 物理ブロックデバイスターゲット</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../memory-devices/index.html">メモリコントローラー ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../men-chameleon-bus.html">MEN Chameleon Bus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ntb.html">NTB ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nvmem.html">NVMEM サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../parport-lowlevel.html">PARPORT インターフェース ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pps.html">PPS - パルス毎秒 (Pulse Per Second)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ptp.html">Linux用PTP ハードウェアクロック インフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../phy/index.html">ジェネリック PHY フレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pti_intel_mid.html">インテル MID PTI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pwm.html">パルス幅変調 (PWM) インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html">PLDM ファームウェア フラッシュアップデート ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html#overview-of-the-pldmfw-library">概要: <code class="docutils literal notranslate"><span class="pre">pldmfw</span></code> ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rfkill.html">rfkill - RFキルスイッチサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../serial/index.html">シリアルデバイスのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sm501.html">SM501 ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../switchtec.html">Linux Switchtec サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sync_file.html">シンクファイル API ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio-mediated-device.html">VFIO メディエイテッドデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio.html">VFIO - 「仮想ファンクション I/O」 </a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xilinx/index.html">Xilinx FPGA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xillybus.html">ジェネリックFPGAインターフェース用Xillybusドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../zorro.html">Zorroデバイス用のデバイスドライバの作成</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul>
+<li><a href="index.html">CPUおよびデバイスの電源管理</a><ul>
+<li>前へ: <a href="index.html" title="前章">CPUおよびデバイスの電源管理</a></li>
+<li>次へ: <a href="devices.html" title="次章">デバイス電源管理の基礎</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/driver-api/pm/cpuidle.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

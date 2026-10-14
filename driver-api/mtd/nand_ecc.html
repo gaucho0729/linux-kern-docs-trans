@@ -1,0 +1,964 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>NAND エラー訂正コード — The Linux Kernel ドキュメント</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="spi-nor.html" rel="next" title="SPI NORフレームワーク"/>
+<link href="intel-spi.html" rel="prev" title="intel-spiを使用したBIOSのアップグレード"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="nand-error-correction-code">
+<h1>NAND エラー訂正コード<a class="headerlink" href="#nand-error-correction-code" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Linux の mtd/nand ドライバを確認し、特に nand_ecc.c を詳しく見てみた結果、最適化の余地があることに気づきました。数時間かけてコードを吟味し、テーブル検索などの工夫や不要なコードの削除などを行いました。その結果、速度が35〜40％向上しましたが、それでも十分ではなかったと感じました。さらに改善の余地があると感じたからです。</p>
+<p>悪い！私はハマってしまいました。このファイルに自分の手順を注釈として残すことにしました。誰かにとって参考になるかもしれないし、誰かが何かを学べるかもしれないからです。</p>
+</section>
+<section id="the-problem">
+<h2>問題<a class="headerlink" href="#the-problem" title="この見出しへのパーマリンク">¶</a></h2>
+<p>NANDフラッシュ（少なくともSLCの場合）は通常、256バイトのセクタを持ちます。しかしNANDフラッシュは極めて信頼性が低いので、エラー検出（および場合によっては訂正）が必要です。</p>
+<p>これはハミング符号によって実現されます。私は素人向けに説明を試みますが（専門家の方には適切な用語を使えていない可能性があることをお許しください）、私の符号理論の授業は30年前にあり、あまり好きではなかったことを認めます。</p>
+<p>先述した通り、ecc計算は256バイトのセクタに対して行われます。これは行と列ごとに複数のパリティビットを計算することによって実現されます。使用されるパリティは偶数パリティで、データの合計ビット数＋パリティビットが偶数になるようにします（理解できない場合はWikipediaを参照してください）。パリティ計算には排他的論理和（XOR）操作がよく用いられます。C言語では^がXOR演算子です。</p>
+<p>eccに戻ります。小さな例を示します：</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 16%"/>
+<col style="width: 7%"/>
+<col style="width: 7%"/>
+<col style="width: 7%"/>
+<col style="width: 7%"/>
+<col style="width: 7%"/>
+<col style="width: 7%"/>
+<col style="width: 7%"/>
+<col style="width: 7%"/>
+<col style="width: 5%"/>
+<col style="width: 5%"/>
+<col style="width: 5%"/>
+<col style="width: 5%"/>
+<col style="width: 7%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>バイト0:</p></td>
+<td><p>bit7</p></td>
+<td><p>bit6</p></td>
+<td><p>bit5</p></td>
+<td><p>bit4</p></td>
+<td><p>bit3</p></td>
+<td><p>bit2</p></td>
+<td><p>bit1</p></td>
+<td><p>bit0</p></td>
+<td><p>rp0</p></td>
+<td><p>rp2</p></td>
+<td><p>rp4</p></td>
+<td><p>…</p></td>
+<td><p>rp14</p></td>
+</tr>
+<tr class="row-even"><td><p>バイト1:</p></td>
+<td><p>bit7</p></td>
+<td><p>bit6</p></td>
+<td><p>bit5</p></td>
+<td><p>bit4</p></td>
+<td><p>bit3</p></td>
+<td><p>bit2</p></td>
+<td><p>bit1</p></td>
+<td><p>bit0</p></td>
+<td><p>rp1</p></td>
+<td><p>rp2</p></td>
+<td><p>rp4</p></td>
+<td><p>…</p></td>
+<td><p>rp14</p></td>
+</tr>
+<tr class="row-odd"><td><p>バイト2:</p></td>
+<td><p>bit7</p></td>
+<td><p>bit6</p></td>
+<td><p>bit5</p></td>
+<td><p>bit4</p></td>
+<td><p>bit3</p></td>
+<td><p>bit2</p></td>
+<td><p>bit1</p></td>
+<td><p>bit0</p></td>
+<td><p>rp0</p></td>
+<td><p>rp3</p></td>
+<td><p>rp4</p></td>
+<td><p>…</p></td>
+<td><p>rp14</p></td>
+</tr>
+<tr class="row-even"><td><p>バイト3:</p></td>
+<td><p>bit7</p></td>
+<td><p>bit6</p></td>
+<td><p>bit5</p></td>
+<td><p>bit4</p></td>
+<td><p>bit3</p></td>
+<td><p>bit2</p></td>
+<td><p>bit1</p></td>
+<td><p>bit0</p></td>
+<td><p>rp1</p></td>
+<td><p>rp3</p></td>
+<td><p>rp4</p></td>
+<td><p>…</p></td>
+<td><p>rp14</p></td>
+</tr>
+<tr class="row-odd"><td><p>バイト4:</p></td>
+<td><p>bit7</p></td>
+<td><p>bit6</p></td>
+<td><p>bit5</p></td>
+<td><p>bit4</p></td>
+<td><p>bit3</p></td>
+<td><p>bit2</p></td>
+<td><p>bit1</p></td>
+<td><p>bit0</p></td>
+<td><p>rp0</p></td>
+<td><p>rp2</p></td>
+<td><p>rp5</p></td>
+<td><p>…</p></td>
+<td><p>rp14</p></td>
+</tr>
+<tr class="row-even"><td><p>…</p></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr class="row-odd"><td><p>バイト254:</p></td>
+<td><p>bit7</p></td>
+<td><p>bit6</p></td>
+<td><p>bit5</p></td>
+<td><p>bit4</p></td>
+<td><p>bit3</p></td>
+<td><p>bit2</p></td>
+<td><p>bit1</p></td>
+<td><p>bit0</p></td>
+<td><p>rp0</p></td>
+<td><p>rp3</p></td>
+<td><p>rp5</p></td>
+<td><p>…</p></td>
+<td><p>rp15</p></td>
+</tr>
+<tr class="row-even"><td><p>バイト255:</p></td>
+<td><p>bit7 cp1 cp3 cp5</p></td>
+<td><p>bit6 cp0 cp3 cp5</p></td>
+<td><p>bit5 cp1 cp2 cp5</p></td>
+<td><p>bit4 cp0 cp2 cp5</p></td>
+<td><p>bit3 cp1 cp3 cp4</p></td>
+<td><p>bit2 cp0 cp3 cp4</p></td>
+<td><p>bit1 cp1 cp2 cp4</p></td>
+<td><p>bit0 cp0 cp2 cp4</p></td>
+<td><p>rp1</p></td>
+<td><p>rp3</p></td>
+<td><p>rp5</p></td>
+<td><p>…</p></td>
+<td><p>rp15</p></td>
+</tr>
+</tbody>
+</table>
+<p>この図は256バイトのセクタを表しています。cpは私の略で列パリティ、rpは行パリティを表します。</p>
+<p>では、列パリティについて説明を始めましょう。</p>
+<ul>
+<li><p>cp0はbit0、bit2、bit4、bit6のすべてに属するパリティです。</p>
+<p>したがって、bit0、bit2、bit4、bit6のすべての値の合計＋cp0自身は偶数になります。</p>
+</li>
+</ul>
+<p>同様にcp1はbit1、bit3、bit5、bit7のすべての合計です。</p>
+<ul class="simple">
+<li><p>cp2はbit0、bit1、bit4、bit5のパリティです。</p></li>
+<li><p>cp3はbit2、bit3、bit6、bit7のパリティです。</p></li>
+<li><p>cp4はbit0、bit1、bit2、bit3のパリティです。</p></li>
+<li><p>cp5はbit4、bit5、bit6、bit7のパリティです。</p></li>
+</ul>
+<p>cp0〜cp5のそれぞれは、正確に1ビットです。</p>
+<p>行パリティは実際にはほぼ同じように動作します。</p>
+<ul>
+<li><p>rp0はすべての偶数バイト（0、2、4、6、… 252、254）のパリティです。</p></li>
+<li><p>rp1はすべての奇数バイト（1、3、5、7、…、253、255）のパリティです。</p></li>
+<li><p>rp2は0、1、4、5、8、9、…（2バイトを処理してから2バイトスキップ）のパリティです。</p></li>
+<li><p>rp3はrp2がカバーしない部分（2、3、6、7、10、11、…）をカバーします。</p></li>
+<li><p>rp4のルールは4バイトをカバーしてから4バイトスキップ、4バイトカバーしてから4バイトスキップと続きます。</p>
+<p>したがって、rp4は0、1、2、3、8、9、10、11、16、…のバイトのパリティを計算します。</p>
+</li>
+<li><p>rp5はもう一方の半分をカバーするので、4、5、6、7、12、13、14、15、20、…のバイトです。</p></li>
+</ul>
+<p>この後は物語が非常に退屈になります。おそらくお分かりいただけたでしょう。</p>
+<ul class="simple">
+<li><p>rp6は8バイトをカバーしてから8バイトスキップしますなど</p></li>
+<li><p>rp7は8バイトスキップしてから8バイトカバーしますなど</p></li>
+<li><p>rp8は16バイトをカバーしてから16バイトスキップしますなど</p></li>
+<li><p>rp9は16バイトスキップしてから16バイトカバーしますなど</p></li>
+<li><p>rp10は32バイトをカバーしてから32バイトスキップしますなど</p></li>
+<li><p>rp11は32バイトスキップしてから32バイトカバーしますなど</p></li>
+<li><p>rp12は64バイトをカバーしてから64バイトスキップしますなど</p></li>
+<li><p>rp13は64バイトスキップしてから64バイトカバーしますなど</p></li>
+<li><p>rp14は128バイトをカバーしてから128バイトスキップします</p></li>
+<li><p>rp15は128バイトスキップしてから128バイトカバーします</p></li>
+</ul>
+<p>結局、パリティビットは以下の3バイトにまとめられます：</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 11%"/>
+<col style="width: 11%"/>
+<col style="width: 11%"/>
+<col style="width: 11%"/>
+<col style="width: 11%"/>
+<col style="width: 11%"/>
+<col style="width: 11%"/>
+<col style="width: 11%"/>
+<col style="width: 11%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>ECC</p></th>
+<th class="head"><p>ビット7</p></th>
+<th class="head"><p>ビット6</p></th>
+<th class="head"><p>ビット5</p></th>
+<th class="head"><p>ビット4</p></th>
+<th class="head"><p>ビット3</p></th>
+<th class="head"><p>ビット2</p></th>
+<th class="head"><p>ビット1</p></th>
+<th class="head"><p>ビット0</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>ECC 0</p></td>
+<td><p>rp07</p></td>
+<td><p>rp06</p></td>
+<td><p>rp05</p></td>
+<td><p>rp04</p></td>
+<td><p>rp03</p></td>
+<td><p>rp02</p></td>
+<td><p>rp01</p></td>
+<td><p>rp00</p></td>
+</tr>
+<tr class="row-odd"><td><p>ECC 1</p></td>
+<td><p>rp15</p></td>
+<td><p>rp14</p></td>
+<td><p>rp13</p></td>
+<td><p>rp12</p></td>
+<td><p>rp11</p></td>
+<td><p>rp10</p></td>
+<td><p>rp09</p></td>
+<td><p>rp08</p></td>
+</tr>
+<tr class="row-even"><td><p>ECC 2</p></td>
+<td><p>cp5</p></td>
+<td><p>cp4</p></td>
+<td><p>cp3</p></td>
+<td><p>cp2</p></td>
+<td><p>cp1</p></td>
+<td><p>cp0</p></td>
+<td><p>1</p></td>
+<td><p>1</p></td>
+</tr>
+</tbody>
+</table>
+<p>この文章を書いた後で、STアプリケーションノートAN1823（<a class="reference external" href="http://www.st.com/stonline/">http://www.st.com/stonline/</a>)ははるかに良い説明をしています。(ただし彼らは「line parity」という用語を使い、私は「row parity」を使っています) まあ、私はグラフィックに弱いので、少々お付き合いください:-)</p>
+<p>STの画像は著作権の理由で再利用できませんでした。</p>
+</section>
+<section id="attempt-0">
+<h2>Attempt 0<a class="headerlink" href="#attempt-0" title="この見出しへのパーマリンク">¶</a></h2>
+<p>パリティ計算の実装は非常に簡単です。Cの擬似コードで:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>for (i = 0; i &lt; 256; i++)
+{
+  if (i &amp; 0x01)
+     rp1 = bit7 ^ bit6 ^ bit5 ^ bit4 ^ bit3 ^ bit2 ^ bit1 ^ bit0 ^ rp1;
+  else
+     rp0 = bit7 ^ bit6 ^ bit5 ^ bit4 ^ bit3 ^ bit2 ^ bit1 ^ bit0 ^ rp0;
+  if (i &amp; 0x02)
+     rp3 = bit7 ^ bit6 ^ bit5 ^ bit4 ^ bit3 ^ bit2 ^ bit1 ^ bit0 ^ rp3;
+  else
+     rp2 = bit7 ^ bit6 ^ bit5 ^ bit4 ^ bit3 ^ bit2 ^ bit1 ^ bit0 ^ rp2;
+  if (i &amp; 0x04)
+    rp5 = bit7 ^ bit6 ^ bit5 ^ bit4 ^ bit3 ^ bit2 ^ bit1 ^ bit0 ^ rp5;
+  else
+    rp4 = bit7 ^ bit6 ^ bit5 ^ bit4 ^ bit3 ^ bit2 ^ bit1 ^ bit0 ^ rp4;
+  if (i &amp; 0x08)
+    rp7 = bit7 ^ bit6 ^ bit5 ^ bit4 ^ bit3 ^ bit2 ^ bit1 ^ bit0 ^ rp7;
+  else
+    rp6 = bit7 ^ bit6 ^ bit5 ^ bit4 ^ bit3 ^ bit2 ^ bit1 ^ bit0 ^ rp6;
+  if (i &amp; 0x10)
+    rp9 = bit7 ^ bit6 ^ bit5 ^ bit4 ^ bit3 ^ bit2 ^ bit1 ^ bit0 ^ rp9;
+  else
+    rp8 = bit7 ^ bit6 ^ bit5 ^ bit4 ^ bit3 ^ bit2 ^ bit1 ^ bit0 ^ rp8;
+  if (i &amp; 0x20)
+    rp11 = bit7 ^ bit6 ^ bit5 ^ bit4 ^ bit3 ^ bit2 ^ bit1 ^ bit0 ^ rp11;
+  else
+    rp10 = bit7 ^ bit6 ^ bit5 ^ bit4 ^ bit3 ^ bit2 ^ bit1 ^ bit0 ^ rp10;
+  if (i &amp; 0x40)
+    rp13 = bit7 ^ bit6 ^ bit5 ^ bit4 ^ bit3 ^ bit2 ^ bit1 ^ bit0 ^ rp13;
+  else
+    rp12 = bit7 ^ bit6 ^ bit5 ^ bit4 ^ bit3 ^ bit2 ^ bit1 ^ bit0 ^ rp12;
+  if (i &amp; 0x80)
+    rp15 = bit7 ^ bit6 ^ bit5 ^ bit4 ^ bit3 ^ bit2 ^ bit1 ^ bit0 ^ rp15;
+  else
+    rp14 = bit7 ^ bit6 ^ bit5 ^ bit4 ^ bit3 ^ bit2 ^ bit1 ^ bit0 ^ rp14;
+  cp0 = bit6 ^ bit4 ^ bit2 ^ bit0 ^ cp0;
+  cp1 = bit7 ^ bit5 ^ bit3 ^ bit1 ^ cp1;
+  cp2 = bit5 ^ bit4 ^ bit1 ^ bit0 ^ cp2;
+  cp3 = bit7 ^ bit6 ^ bit3 ^ bit2 ^ cp3
+  cp4 = bit3 ^ bit2 ^ bit1 ^ bit0 ^ cp4
+  cp5 = bit7 ^ bit6 ^ bit5 ^ bit4 ^ cp5
+}
+</pre></div>
+</div>
+</section>
+<section id="analysis-0">
+<h2>Analysis 0<a class="headerlink" href="#analysis-0" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Cにはビット演算子はあるものの、上記のような効率的な演算を行うための演算子は実際には存在せず（ほとんどのハードウェアも同様の命令を持っていません）、この実装を行わなければ、上のコードがノーベル賞をもたらすことは明らかでした :-)</p>
+<p>幸いなことに排他的OR演算は可換性を持ち、値を任意の順序で結合できます。したがって、個別にすべてのビットを計算するのではなく、式を再配置してみましょう。列パリティの場合これは簡単です。単にバイトをXORし、最後に関連するビットのみをフィルタリングすればよいのです。これにより、ループ外でcp計算をすべて実行できるため、非常に効率的です。</p>
+<p>同様に、各行のバイトをまずXORしてから処理することもできます。これにより以下のように導かれます:</p>
+</section>
+<section id="attempt-1">
+<h2>Attempt 1<a class="headerlink" href="#attempt-1" title="この見出しへのパーマリンク">¶</a></h2>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>const char parity[256] = {
+    0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+    1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
+    1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
+    0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+    1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
+    0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+    0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+    1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
+    1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
+    0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+    0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+    1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
+    0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+    1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
+    1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
+    0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0
+};
+
+void ecc1(const unsigned char *buf, unsigned char *code)
+{
+    int i;
+    const unsigned char *bp = buf;
+    unsigned char cur;
+    unsigned char rp0, rp1, rp2, rp3, rp4, rp5, rp6, rp7;
+    unsigned char rp8, rp9, rp10, rp11, rp12, rp13, rp14, rp15;
+    unsigned char par;
+
+    par = 0;
+    rp0 = 0; rp1 = 0; rp2 = 0; rp3 = 0;
+    rp4 = 0; rp5 = 0; rp6 = 0; rp7 = 0;
+    rp8 = 0; rp9 = 0; rp10 = 0; rp11 = 0;
+    rp12 = 0; rp13 = 0; rp14 = 0; rp15 = 0;
+
+    for (i = 0; i &lt; 256; i++)
+    {
+        cur = *bp++;
+        par ^= cur;
+        if (i &amp; 0x01) rp1 ^= cur; else rp0 ^= cur;
+        if (i &amp; 0x02) rp3 ^= cur; else rp2 ^= cur;
+        if (i &amp; 0x04) rp5 ^= cur; else rp4 ^= cur;
+        if (i &amp; 0x08) rp7 ^= cur; else rp6 ^= cur;
+        if (i &amp; 0x10) rp9 ^= cur; else rp8 ^= cur;
+        if (i &amp; 0x20) rp11 ^= cur; else rp10 ^= cur;
+        if (i &amp; 0x40) rp13 ^= cur; else rp12 ^= cur;
+        if (i &amp; 0x80) rp15 ^= cur; else rp14 ^= cur;
+    }
+    code[0] =
+        (parity[rp7] &lt;&lt; 7) |
+        (parity[rp6] &lt;&lt; 6) |
+        (parity[rp5] &lt;&lt; 5) |
+        (parity[rp4] &lt;&lt; 4) |
+        (parity[rp3] &lt;&lt; 3) |
+        (parity[rp2] &lt;&lt; 2) |
+        (parity[rp1] &lt;&lt; 1) |
+        (parity[rp0]);
+    code[1] =
+        (parity[rp15] &lt;&lt; 7) |
+        (parity[rp14] &lt;&lt; 6) |
+        (parity[rp13] &lt;&lt; 5) |
+        (parity[rp12] &lt;&lt; 4) |
+        (parity[rp11] &lt;&lt; 3) |
+        (parity[rp10] &lt;&lt; 2) |
+        (parity[rp9]  &lt;&lt; 1) |
+        (parity[rp8]);
+    code[2] =
+        (parity[par &amp; 0xf0] &lt;&lt; 7) |
+        (parity[par &amp; 0x0f] &lt;&lt; 6) |
+        (parity[par &amp; 0xcc] &lt;&lt; 5) |
+        (parity[par &amp; 0x33] &lt;&lt; 4) |
+        (parity[par &amp; 0xaa] &lt;&lt; 3) |
+        (parity[par &amp; 0x55] &lt;&lt; 2);
+    code[0] = ~code[0];
+    code[1] = ~code[1];
+    code[2] = ~code[2];
+}
+</pre></div>
+</div>
+<p>まだ比較的ストレートです。最後の3つの反転ステートメントは、空のフラッシュにおけるチェックサムが 0xff 0xff 0xff になるようにするためのものです。空のフラッシュではすべてのデータが 0xff なので、チェックサムは一致します。</p>
+<p>また、パリティ検索を導入しました。この方法がパリティを計算する最も高速な方法だと予想していましたが、後で代替案を検討する予定です。</p>
+</section>
+<section id="analysis-1">
+<h2>分析 1<a class="headerlink" href="#analysis-1" title="この見出しへのパーマリンク">¶</a></h2>
+<p>コードは動作しますが、非常に効率的ではありません。私のシステムでは、Linux ドライバコードと比べてほぼ4倍の時間がかかりました。しかし、もし簡単だったなら、ずっと以前に実装されていたでしょう。痛みがないと得られないのです。
+<em>これ</em> easy this would have been done long before. No pain. no gain.</p>
+<p>幸いにも改善の余地は十分あります。</p>
+<p>ステップ1ではビット単位の計算からバイト単位の計算に移行しました。しかしC言語では符号なしの long データ型を使用することもでき、ほぼすべての現代のマイクロプロセッサが32ビット演算をサポートしているため、なぜ32ビット単位でデータを処理するコードを書かないのか不思議です。</p>
+<p>もちろん、行パリティがバイト単位で計算されるため、いくつかの修正が必要です。簡易な分析：列パリティには par 変数を使用します。32ビットに拡張する際、最終的に rp0 と rp1 を簡単に計算できます。(par は4バイトから成り、MSBからLSBへ rp1, rp0, rp1, rp0 にそれぞれ寄与します) また、rp2 と rp3 も par から簡単に取得できます。rp3 は最初の2つのMSBをカバーし、rp2 は最後の2つのLSBをカバーします。</p>
+<p>ループが現在は64回しか実行されないことに注意してください（256/4）。また、バイトの順序に関する注意が必要です。long型のバイトの順序はマシン依存であり、私たちに影響を与える可能性があります。いずれにせよ、問題が生じた場合は、このコードはx86（正確にはDELL PCのD920 Intel CPU）で開発されています。</p>
+<p>パフォーマンスはアライメントに依存するかもしれませんが、nandドライバのI/Oバッファが適切にアライメントされていると想定しています（そうでない場合は最大パフォーマンスを得るために修正する必要があります）。</p>
+<p>試してみましょう…</p>
+</section>
+<section id="attempt-2">
+<h2>試行2<a class="headerlink" href="#attempt-2" title="この見出しへのパーマリンク">¶</a></h2>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>extern const char parity[256];
+
+void ecc2(const unsigned char *buf, unsigned char *code)
+{
+    int i;
+    const unsigned long *bp = (unsigned long *)buf;
+    unsigned long cur;
+    unsigned long rp0, rp1, rp2, rp3, rp4, rp5, rp6, rp7;
+    unsigned long rp8, rp9, rp10, rp11, rp12, rp13, rp14, rp15;
+    unsigned long par;
+
+    par = 0;
+    rp0 = 0; rp1 = 0; rp2 = 0; rp3 = 0;
+    rp4 = 0; rp5 = 0; rp6 = 0; rp7 = 0;
+    rp8 = 0; rp9 = 0; rp10 = 0; rp11 = 0;
+    rp12 = 0; rp13 = 0; rp14 = 0; rp15 = 0;
+
+    for (i = 0; i &lt; 64; i++)
+    {
+        cur = *bp++;
+        par ^= cur;
+        if (i &amp; 0x01) rp5 ^= cur; else rp4 ^= cur;
+        if (i &amp; 0x02) rp7 ^= cur; else rp6 ^= cur;
+        if (i &amp; 0x04) rp9 ^= cur; else rp8 ^= cur;
+        if (i &amp; 0x08) rp11 ^= cur; else rp10 ^= cur;
+        if (i &amp; 0x10) rp13 ^= cur; else rp12 ^= cur;
+        if (i &amp; 0x20) rp15 ^= cur; else rp14 ^= cur;
+    }
+    /*
+       we need to adapt the code generation for the fact that rp vars are now
+       long; also the column parity calculation needs to be changed.
+       we'll bring rp4 to 15 back to single byte entities by shifting and
+       xoring
+    */
+    rp4 ^= (rp4 &gt;&gt; 16); rp4 ^= (rp4 &gt;&gt; 8); rp4 &amp;= 0xff;
+    rp5 ^= (rp5 &gt;&gt; 16); rp5 ^= (rp5 &gt;&gt; 8); rp5 &amp;= 0xff;
+    rp6 ^= (rp6 &gt;&gt; 16); rp6 ^= (rp6 &gt;&gt; 8); rp6 &amp;= 0xff;
+    rp7 ^= (rp7 &gt;&gt; 16); rp7 ^= (rp7 &gt;&gt; 8); rp7 &amp;= 0xff;
+    rp8 ^= (rp8 &gt;&gt; 16); rp8 ^= (rp8 &gt;&gt; 8); rp8 &amp;= 0xff;
+    rp9 ^= (rp9 &gt;&gt; 16); rp9 ^= (rp9 &gt;&gt; 8); rp9 &amp;= 0xff;
+    rp10 ^= (rp10 &gt;&gt; 16); rp10 ^= (rp10 &gt;&gt; 8); rp10 &amp;= 0xff;
+    rp11 ^= (rp11 &gt;&gt; 16); rp11 ^= (rp11 &gt;&gt; 8); rp11 &amp;= 0xff;
+    rp12 ^= (rp12 &gt;&gt; 16); rp12 ^= (rp12 &gt;&gt; 8); rp12 &amp;= 0xff;
+    rp13 ^= (rp13 &gt;&gt; 16); rp13 ^= (rp13 &gt;&gt; 8); rp13 &amp;= 0xff;
+    rp14 ^= (rp14 &gt;&gt; 16); rp14 ^= (rp14 &gt;&gt; 8); rp14 &amp;= 0xff;
+    rp15 ^= (rp15 &gt;&gt; 16); rp15 ^= (rp15 &gt;&gt; 8); rp15 &amp;= 0xff;
+    rp3 = (par &gt;&gt; 16); rp3 ^= (rp3 &gt;&gt; 8); rp3 &amp;= 0xff;
+    rp2 = par &amp; 0xffff; rp2 ^= (rp2 &gt;&gt; 8); rp2 &amp;= 0xff;
+    par ^= (par &gt;&gt; 16);
+    rp1 = (par &gt;&gt; 8); rp1 &amp;= 0xff;
+    rp0 = (par &amp; 0xff);
+    par ^= (par &gt;&gt; 8); par &amp;= 0xff;
+
+    code[0] =
+        (parity[rp7] &lt;&lt; 7) |
+        (parity[rp6] &lt;&lt; 6) |
+        (parity[rp5] &lt;&lt; 5) |
+        (parity[rp4] &lt;&lt; 4) |
+        (parity[rp3] &lt;&lt; 3) |
+        (parity[rp2] &lt;&lt; 2) |
+        (parity[rp1] &lt;&lt; 1) |
+        (parity[rp0]);
+    code[1] =
+        (parity[rp15] &lt;&lt; 7) |
+        (parity[rp14] &lt;&lt; 6) |
+        (parity[rp13] &lt;&lt; 5) |
+        (parity[rp12] &lt;&lt; 4) |
+        (parity[rp11] &lt;&lt; 3) |
+        (parity[rp10] &lt;&lt; 2) |
+        (parity[rp9]  &lt;&lt; 1) |
+        (parity[rp8]);
+    code[2] =
+        (parity[par &amp; 0xf0] &lt;&lt; 7) |
+        (parity[par &amp; 0x0f] &lt;&lt; 6) |
+        (parity[par &amp; 0xcc] &lt;&lt; 5) |
+        (parity[par &amp; 0x33] &lt;&lt; 4) |
+        (parity[par &amp; 0xaa] &lt;&lt; 3) |
+        (parity[par &amp; 0x55] &lt;&lt; 2);
+    code[0] = ~code[0];
+    code[1] = ~code[1];
+    code[2] = ~code[2];
+}
+</pre></div>
+</div>
+<p>パリティ配列はもう表示されません。また、これらの例では、通常のプログラミングスタイルから多少逸脱しています。1行に複数のステートメントを許可し、then/elseブロックで単一のステートメントのみを使用し、^=などの演算子を使用している点です。</p>
+</section>
+<section id="analysis-2">
+<h2>分析2<a class="headerlink" href="#analysis-2" title="この見出しへのパーマリンク">¶</a></h2>
+<p>コード（もちろん）は動作し、素晴らしい！私たちはLinuxドライバコードよりも少し速い（約15％）。しかし、待ってください、すぐに喜んではいけません。さらに改善の余地があります。rp14とrp15を見てみると、データをrp14またはrp15でXORしていることがわかります。しかし、parはすべてのデータをカバーしています。これはrp14を計算する必要がないことを意味します。なぜなら、par = rp14 ^ rp15であり、rp14 = par ^ rp15で計算できるからです（必要に応じてrp15を計算せず、rp14からrp15を計算することもできます）。これが逆パリティと呼ばれる理由です。もちろん、rp4/5、rp6/7、rp8/9、rp10/11、rp12/13にも同じことが適用されます。つまり、if文のelse句を削除できます。また、最終的な計算を少し最適化するためにlongからbyteに変換することもできます。実際にはテーブル参照を完全に回避することも可能です。</p>
+</section>
+<section id="attempt-3">
+<h2>試行3<a class="headerlink" href="#attempt-3" title="この見出しへのパーマリンク">¶</a></h2>
+<p>奇数が置き換えられました:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>if (i &amp; 0x01) rp5 ^= cur; else rp4 ^= cur;
+if (i &amp; 0x02) rp7 ^= cur; else rp6 ^= cur;
+if (i &amp; 0x04) rp9 ^= cur; else rp8 ^= cur;
+if (i &amp; 0x08) rp11 ^= cur; else rp10 ^= cur;
+if (i &amp; 0x10) rp13 ^= cur; else rp12 ^= cur;
+if (i &amp; 0x20) rp15 ^= cur; else rp14 ^= cur;
+</pre></div>
+</div>
+<p>以下のように変更してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>if (i &amp; 0x01) rp5 ^= cur;
+if (i &amp; 0x02) rp7 ^= cur;
+if (i &amp; 0x04) rp9 ^= cur;
+if (i &amp; 0x08) rp11 ^= cur;
+if (i &amp; 0x10) rp13 ^= cur;
+if (i &amp; 0x20) rp15 ^= cur;
+</pre></div>
+</div>
+<p>ループ外に追加されました:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>rp4  = par ^ rp5;
+rp6  = par ^ rp7;
+rp8  = par ^ rp9;
+rp10  = par ^ rp11;
+rp12  = par ^ rp13;
+rp14  = par ^ rp15;
+</pre></div>
+</div>
+<p>その後、コードはステートメント数が減少しているにもかかわらず、約30％時間が増えるようになりました。これはアセンブリコードにも反映されています。</p>
+</section>
+<section id="analysis-3">
+<h2>分析3<a class="headerlink" href="#analysis-3" title="この見出しへのパーマリンク">¶</a></h2>
+<p>非常に不思議です。キャッシュやインストラクション並列性などに原因があるのかもしれません。また、eeePC（Celeron、900 MHzで動作）でも試してみました。興味深い観察点は、このデバイスが私の3GHz D920プロセッサと比較して、時間にかかってコードを実行する際には30％遅いということです。</p>
+<p>まあ、予想通り難しかったので、別のアプローチに移行するかもしれません。試行2のコードに戻り、ループ展開を行ってみましょう。これにより、いくつかのif文を削除できます。異なるループ展開量を試して、最も効果的なものを確認します。</p>
+</section>
+<section id="attempt-4">
+<h2>試行4<a class="headerlink" href="#attempt-4" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ループを1回、2回、3回、4回展開しました。4回の場合はコードは以下のように始まります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>for (i = 0; i &lt; 4; i++)
+{
+    cur = *bp++;
+    par ^= cur;
+    rp4 ^= cur;
+    rp6 ^= cur;
+    rp8 ^= cur;
+    rp10 ^= cur;
+    if (i &amp; 0x1) rp13 ^= cur; else rp12 ^= cur;
+    if (i &amp; 0x2) rp15 ^= cur; else rp14 ^= cur;
+    cur = *bp++;
+    par ^= cur;
+    rp5 ^= cur;
+    rp6 ^= cur;
+    ...
+</pre></div>
+</div>
+</section>
+<section id="analysis-4">
+<h2>分析4<a class="headerlink" href="#analysis-4" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ループ展開を1回行うことで約15％の改善が得られます。</p>
+<p>2回のアンロールにより、改善率は約15％に抑えられます</p>
+<p>3回のアンロールにより、試行2と比較して改善率は30％になります</p>
+<p>4回のアンロールにより、3回のアンロールと比較してわずかな改善があります</p>
+<p>私は4回アンロールされたループを進める決断をしました。次のステップでさらに改善が得られるだろうという直感があったからです</p>
+<p>parはすべてのバイトのXORを含み、rp4とrp5はそれぞれすべてのバイトの半分のXORを含みます。したがって、par = rp4 ^ rp5と表現できます。XORは可換なので、rp5 = par ^ rp4とも言えます。これによりrp4とrp5の両方を保持する必要はありません。rp5（またはrp4、ただしもう一つの最適化を予測していたため）を削除できます。rp6/7、rp8/9、rp10/11、rp12/13、rp14/15にも同様のことが適用されます</p>
+</section>
+<section id="attempt-5">
+<h2>試行5<a class="headerlink" href="#attempt-5" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ループ内のすべての奇数番号のrp割当が削除されました。これはif文のelse句も含みます。もちろんループの後にはコードを追加して状態を修正する必要があります</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>rp5 = par ^ rp4;
+</pre></div>
+</div>
+<p>初期割当（rp5 = 0; など）も削除できます。この辺りでrp0/1/2/3の初期化も削除しました</p>
+</section>
+<section id="analysis-5">
+<h2>分析5<a class="headerlink" href="#analysis-5" title="この見出しへのパーマリンク">¶</a></h2>
+<p>測定結果ではこの変更が良い選択だったことが分かりました。実行時間は試行4（4回アンロール）と比較してほぼ半分になり、現在のLinuxカーネルのコードと比較してプロセッサ時間は1/3程度に抑えられます</p>
+<p>しかし、まだ何か改善の余地があると考えていました。すべてのif文を好きになれませんでした。なぜなら、継続的なパリティを保持し、最後のif文だけを残す方が良いからです。もう一つのバージョンを作成する時間です！</p>
+</section>
+<section id="attempt-6">
+<h2>試行6<a class="headerlink" href="#attempt-6" title="この見出しへのパーマリンク">¶</a></h2>
+<p>forループ内のコードは以下のようになりました：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>for (i = 0; i &lt; 4; i++)
+{
+    cur = *bp++; tmppar  = cur; rp4 ^= cur;
+    cur = *bp++; tmppar ^= cur; rp6 ^= tmppar;
+    cur = *bp++; tmppar ^= cur; rp4 ^= cur;
+    cur = *bp++; tmppar ^= cur; rp8 ^= tmppar;
+
+    cur = *bp++; tmppar ^= cur; rp4 ^= cur; rp6 ^= cur;
+    cur = *bp++; tmppar ^= cur; rp6 ^= cur;
+    cur = *bp++; tmppar ^= cur; rp4 ^= cur;
+    cur = *bp++; tmppar ^= cur; rp10 ^= tmppar;
+
+    cur = *bp++; tmppar ^= cur; rp4 ^= cur; rp6 ^= cur; rp8 ^= cur;
+    cur = *bp++; tmppar ^= cur; rp6 ^= cur; rp8 ^= cur;
+    cur = *bp++; tmppar ^= cur; rp4 ^= cur; rp8 ^= cur;
+    cur = *bp++; tmppar ^= cur; rp8 ^= cur;
+
+    cur = *bp++; tmppar ^= cur; rp4 ^= cur; rp6 ^= cur;
+    cur = *bp++; tmppar ^= cur; rp6 ^= cur;
+    cur = *bp++; tmppar ^= cur; rp4 ^= cur;
+    cur = *bp++; tmppar ^= cur;
+
+    par ^= tmppar;
+    if ((i &amp; 0x1) == 0) rp12 ^= tmppar;
+    if ((i &amp; 0x2) == 0) rp14 ^= tmppar;
+}
+</pre></div>
+</div>
+<p>tmpparはforループの各イテレーション内でパリティを累積するために使用されています。最後の3行ではparに加算され、必要に応じてrp12とrp14にも加算されます</p>
+<p>変更を加える過程で、tmpparがこのイテレーションの継続的なパリティを含んでいることに気づきました。そのため、rp4 ^= cur; rp6 ^= cur; の代わりに、rp6 ^= cur; のステートメントを削除し、次のステートメントでrp6 ^= tmppar; としました。rp8とrp10にも同様の変更を行いました</p>
+</section>
+<section id="analysis-6">
+<h2>分析6<a class="headerlink" href="#analysis-6" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このコードを再度測定した結果、大幅な改善が確認されました。元のLinuxコードを100万回実行するのに、私のシステムでは約1秒かかりました。（パフォーマンスを測定するためにtimeを使用）。このイテレーション後、0.075秒に戻りました。実際には、精度を失わないために1000万回以上のイテレーションから測定を開始する必要がありました。これは間違いなく大当たりです！</p>
+<p>ただし、改善の余地はまだ少しあります。ステートメントがある場所は3か所あります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>rp4 ^= cur; rp6 ^= cur;
+</pre></div>
+</div>
+<p>whileループ内で変数rp4_6も保持しておく方がより効率的です。これにより1回のループごとに3行分のステートメントを省略できます。もちろんループの後に修正を行う必要がありますので、以下のように加算します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>rp4 ^= rp4_6;
+rp6 ^= rp4_6
+</pre></div>
+</div>
+<p>さらにrp8への4回の連続割り当てがあります。これによりtmpparを4行の前後に保存し、後にrp8 = rp8 ^ tmppar ^ notrp8; とすることでより効率的にエンコードできます（notrp8は4行の前のrp8の値）。再びxorの可換性を活用しています。新しいテストの時間です！</p>
+</section>
+<section id="attempt-7">
+<h2>試行7<a class="headerlink" href="#attempt-7" title="この見出しへのパーマリンク">¶</a></h2>
+<p>新しいコードは以下のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>for (i = 0; i &lt; 4; i++)
+{
+    cur = *bp++; tmppar  = cur; rp4 ^= cur;
+    cur = *bp++; tmppar ^= cur; rp6 ^= tmppar;
+    cur = *bp++; tmppar ^= cur; rp4 ^= cur;
+    cur = *bp++; tmppar ^= cur; rp8 ^= tmppar;
+
+    cur = *bp++; tmppar ^= cur; rp4_6 ^= cur;
+    cur = *bp++; tmppar ^= cur; rp6 ^= cur;
+    cur = *bp++; tmppar ^= cur; rp4 ^= cur;
+    cur = *bp++; tmppar ^= cur; rp10 ^= tmppar;
+
+    notrp8 = tmppar;
+    cur = *bp++; tmppar ^= cur; rp4_6 ^= cur;
+    cur = *bp++; tmppar ^= cur; rp6 ^= cur;
+    cur = *bp++; tmppar ^= cur; rp4 ^= cur;
+    cur = *bp++; tmppar ^= cur;
+    rp8 = rp8 ^ tmppar ^ notrp8;
+
+    cur = *bp++; tmppar ^= cur; rp4_6 ^= cur;
+    cur = *bp++; tmppar ^= cur; rp6 ^= cur;
+    cur = *bp++; tmppar ^= cur; rp4 ^= cur;
+    cur = *bp++; tmppar ^= cur;
+
+    par ^= tmppar;
+    if ((i &amp; 0x1) == 0) rp12 ^= tmppar;
+    if ((i &amp; 0x2) == 0) rp14 ^= tmppar;
+}
+rp4 ^= rp4_6;
+rp6 ^= rp4_6;
+</pre></div>
+</div>
+<p>大きな変更ではありませんが、すべての1セントが大切です :-)</p>
+</section>
+<section id="analysis-7">
+<h2>分析7<a class="headerlink" href="#analysis-7" title="この見出しへのパーマリンク">¶</a></h2>
+<p>実際には状況が悪化しています。それほど大きくはないものの、誤った方向へ進まないよう気を付けたいです。後で調査するべきかもしれません。キャッシュ関連の問題かもしれません。</p>
+<p>おそらくループ内で勝ち取るべきものはこれくらいです。もう一度ループを展開するだけで改善するかもしれません。まずは試行7の最適化を維持します。</p>
+</section>
+<section id="attempt-8">
+<h2>試行8<a class="headerlink" href="#attempt-8" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ループをもう一度展開しました。</p>
+</section>
+<section id="analysis-8">
+<h2>分析8<a class="headerlink" href="#analysis-8" title="この見出しへのパーマリンク">¶</a></h2>
+<p>これにより状況が悪化しています。試行6に戻ってから進めます。ループ内のコードはもう最適化できないように見えますが、eccコードの生成を最適化する余地があります。単純に合計パリティを計算すればよいです。パリティが0であればrp4 = rp5など、パリティが1であればrp4 = !rp5; とします。</p>
+<p>しかしrp4 = rp5であればrp5などは必要ありません。結果バイトに偶数ビットを直接書き込むだけで、その後以下のように処理できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>code[0] |= (code[0] &lt;&lt; 1);
+</pre></div>
+</div>
+<p>これをテストしてみましょう。</p>
+</section>
+<section id="attempt-9">
+<h2>試行9<a class="headerlink" href="#attempt-9" title="この見出しへのパーマリンク">¶</a></h2>
+<p>コードを変更しましたが、再びパフォーマンスがわずかに低下しています。他の方法も試しました。たとえばparity配列を専用にしてparity[rp7] &lt;&lt; 7; の後のシフトを避けるなど。しかし効果は見られませんでした。parity配列を使用する代わりにシフト演算子を使用する（例: parity[rp7] &lt;&lt; 7 を以下のように置き換える）なども試しました。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>rp7 ^= (rp7 &lt;&lt; 4);
+rp7 ^= (rp7 &lt;&lt; 2);
+rp7 ^= (rp7 &lt;&lt; 1);
+rp7 &amp;= 0x80;
+</pre></div>
+</div>
+<p>効果は見られませんでした。</p>
+<p>唯一の微細な変更はパリティビットを反転させたことで、これにより最後の3つの反転ステートメントを削除できます。</p>
+<p>残念ながらこれ以上改善は見られません。ただし、Linuxドライバコードで1000万回のイテレーションを実行すると13〜13.5秒かかりますが、私のコードでは約0.73秒で完了します。つまり私のシステムではパフォーマンスが18倍向上しています。それほど悪くありません。ただし、ハードウェアによって結果は異なります。保証は一切ありません！</p>
+<p>ただし無料のランチはありません。コードサイズはほぼ3倍に（562バイトから1434バイト）増えました。ただし、それほど大きくはないです。</p>
+</section>
+<section id="correcting-errors">
+<h2>エラー訂正<a class="headerlink" href="#correcting-errors" title="この見出しへのパーマリンク">¶</a></h2>
+<p>エラー訂正については再度STのアプリケーションノートを参考にしましたが、既存のコードも確認しました。</p>
+<p>アルゴリズム自体は非常にシンプルです。与えられたECCと計算されたECCをXORするだけでよいです。すべてのバイトが0であれば問題ありません。11ビットが1であれば1ビットの訂正可能なエラーがあります。1ビットが1であれば、与えられたECCコードにエラーがあります。</p>
+<p>テーブルの参照を行うことで最も高速化できることが確認されました。私のシステムでは修理が必要な場合、性能向上は約2倍、修理が不要な場合は1％程度でした。</p>
+<p>この関数のコードサイズは330バイトから686バイトに増加しました。(gcc 4.2, -O3)</p>
+</section>
+<section id="conclusion">
+<h2>結論<a class="headerlink" href="#conclusion" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ECCの計算時の効果は非常に大きいです。私の開発ハードウェアではECC計算の高速化が18倍達成されました。MIPSコアを搭載した埋め込みシステムでのテストでは7倍の高速化が得られました。</p>
+<p>Linksys NSLU2（ARMv5TEプロセッサ）でのテストでは、ビッグエンディアンモードでgcc 4.1.2、-O3で5倍の高速化が得られました。</p>
+<p>訂正については、ビットフリップがまれなので大幅な効果は得られませんでした。ただし、処理にかかるサイクル数は大幅に少ないです。</p>
+<p>C言語でプログラミングした場合、これ以上効果を引き出すことは難しいようです。もちろんアセンブリプログラムでさらに効果を引き出すことは可能かもしれませんが、パイプラインの動作などにより非常に困難です（少なくともインテルのハードウェアでは）。</p>
+<p>著者: フランス・ミューレンブロエクス</p>
+<p>著作権 (C) 2008 コンインクレーブ・フィリップス・エレクトロニクス・NV.</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../driver-model/index.html">ドライバモデル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../basics.html">ドライバの基礎</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infrastructure.html">デバイスドライバのインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ioctl.html">ioctlベースのインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../early-userspace/index.html">初期ユーザースペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pm/index.html">CPUおよびデバイスの電源管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../clk.html">共通のCLKフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device-io.html">バスを問わないデバイスアクセス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dma-buf.html">バッファ共有と同期</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device_link.html">デバイスリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../component.html">複合ドライバ用コンポーネントヘルパ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../message-based.html">メッセージベースのデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infiniband.html">InfiniBandおよびリモートDMA（RDMA）インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../frame-buffer.html">フレームバッファライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../regulator.html">電圧および電流レギュレータAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../input.html">入力サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../usb/index.html">Linux USB API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firewire.html">Firewire（IEEE 1394）ドライバインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pci/index.html">Linux PCIドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../spi.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i2c.html">I<sup>2</sup>CおよびSMBusサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmb.html">衛星MC用IPMBドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmi.html">Linux IPMIドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i3c/index.html">I3Cサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../interconnect.html">汎用システムインターコネクトサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../devfreq.html">デバイス周波数スケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hsi.html">高速同期シリアルインターフェース (HSI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../edac.html">エラー検出と訂正 (EDAC) デバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../scsi.html">SCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../libata.html">libATA開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../target.html">ターゲットおよびiSCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mailbox.html">共通メールボックスフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mtdnand.html">MTD NANDドライバプログラミングインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html">パラレルポートデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#x50-uart-driver">16x50 UARTドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#pulse-width-modulation-pwm">パルス幅変調 (PWM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mei/index.html">インテル(R) マネジメントエンジニアリングインターフェース (インテル(R) MEI)</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">メモリ技術デバイス (MTD)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mmc/index.html">MMC/SD/SDIOカードサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nvdimm/index.html">非揮発性メモリデバイス (NVDIMM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../w1.html">W1: ダラスの1ワイヤーバス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rapidio/index.html">Linux RapidIO サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../s390-drivers.html">s390チャネルデバイスドライバの作成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vme.html">VMEデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../80211/index.html">Linux 802.11ドライバ開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../uio-howto.html">ユーザースペースI/O HOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firmware/index.html">LinuxファームウェアAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pinctl.html">PINCTRL (PIN CONTROL)サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../gpio/index.html">汎用入出力 (GPIO)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../md/index.html">RAID</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../media/index.html">メディアサブシステム カーネル内部API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../misc_devices.html">その他のデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nfc/index.html">近距離通信 (NFC)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dmaengine/index.html">DMAエンジンドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../slimbus.html">LinuxカーネルSLIMbusサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../soundwire/index.html">SoundWireドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../thermal/index.html">熱管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../fpga/index.html">FPGAサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../acpi/index.html">ACPI サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../backlight/lp855x-driver.html">カーネルドライバlp855x</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../connector.html">カーネルコンネクタ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../console.html">コンソールドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dcdbas.html">Dellシステム管理ベースドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../eisa.html">EISAバスサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isa.html">ISAドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isapnp.html">ISA Plug &amp; Playサポート (Jaroslav Kysela &lt;perex@suse.cz&gt;)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io-mapping.html">io_mapping関数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io_ordering.html">メモリマップアドレスへのI/O書き込みの順序付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../generic-counter.html">汎用カウンタインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lightnvm-pblk.html">pblk: 物理ブロックデバイスターゲット</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../memory-devices/index.html">メモリコントローラー ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../men-chameleon-bus.html">MEN Chameleon Bus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ntb.html">NTB ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nvmem.html">NVMEM サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../parport-lowlevel.html">PARPORT インターフェース ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pps.html">PPS - パルス毎秒 (Pulse Per Second)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ptp.html">Linux用PTP ハードウェアクロック インフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../phy/index.html">ジェネリック PHY フレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pti_intel_mid.html">インテル MID PTI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pwm.html">パルス幅変調 (PWM) インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html">PLDM ファームウェア フラッシュアップデート ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html#overview-of-the-pldmfw-library">概要: <code class="docutils literal notranslate"><span class="pre">pldmfw</span></code> ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rfkill.html">rfkill - RFキルスイッチサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../serial/index.html">シリアルデバイスのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sm501.html">SM501 ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../switchtec.html">Linux Switchtec サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sync_file.html">シンクファイル API ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio-mediated-device.html">VFIO メディエイテッドデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio.html">VFIO - 「仮想ファンクション I/O」 </a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xilinx/index.html">Xilinx FPGA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xillybus.html">ジェネリックFPGAインターフェース用Xillybusドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../zorro.html">Zorroデバイス用のデバイスドライバの作成</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul>
+<li><a href="index.html">メモリ技術デバイス (MTD)</a><ul>
+<li>前へ: <a href="intel-spi.html" title="前章">intel-spiを使用したBIOSのアップグレード</a></li>
+<li>次へ: <a href="spi-nor.html" title="次章">SPI NORフレームワーク</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/driver-api/mtd/nand_ecc.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>
