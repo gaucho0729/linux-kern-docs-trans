@@ -1,0 +1,353 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>キャッシュおよびTLBフラッシュ：Linuxカーネルドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="cpu_hotplug.html" rel="next" title="カーネルにおけるCPUホットプラグ"/>
+<link href="../RCU/Design/Data-Structures/Data-Structures.html" rel="prev" title="TREE_RCUのデータ構造をめぐるツアー [LWN.net]"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="cache-and-tlb-flushing-under-linux">
+<h1>Cache and TLB Flushing Under Linux<a class="headerlink" href="#cache-and-tlb-flushing-under-linux" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>David S. Miller &lt;<a class="reference external" href="mailto:davem%40redhat.com">davem<span>@</span>redhat<span>.</span>com</a>&gt;</p>
+</dd>
+</dl>
+<p>このドキュメントでは、Linux VMサブシステムが呼び出すキャッシュ/TLBフラッシュインターフェースについて説明します。各インターフェースの目的と、インターフェースが呼び出された後の副作用について記載しています。</p>
+<p>以下で説明する副作用はシングルプロセッサ実装向けに記述されており、その単一プロセッサでの動作を示しています。SMP（対称マルチプロセッサ）のケースは、この副作用がシステム内のすべてのプロセッサで発生するように定義を拡張するだけであり、SMPのキャッシュ/TLBフラッシュが効率が悪いとは思わないでください。多くの最適化が可能であることがこの分野の特徴です。例えば、あるCPUでユーザーアドレス空間が実行されたことがないことが証明できる場合（mm_cpumask()を参照）、そのCPUではそのアドレス空間に対するフラッシュは行いません。</p>
+<p>まずTLBフラッシュインターフェースについて説明します。これらは最もシンプルなインターフェースです。LinuxではTLBは、CPUがソフトウェアのページテーブルから取得した仮想アドレス→物理アドレスの翻訳をキャッシュする機構として抽象化されています。つまり、ソフトウェアのページテーブルが変更されると、このTLBキャッシュに古くなった翻訳が存在する可能性があります。そのため、ソフトウェアのページテーブルが変更された後、カーネルは以下のいずれかのフラッシュメソッドを呼び出します。</p>
+<ol class="arabic">
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">flush_tlb_all(void)</span></code></p>
+<blockquote>
+<div><p>最も深刻なフラッシュです。このインターフェースが実行されると、これまでのすべてのページテーブルの変更がCPUに反映されます。</p>
+<p>このインターフェースは、カーネルのページテーブルが変更された場合に通常呼び出されます。このような翻訳は「グローバル」な性質を持っています。</p>
+</div></blockquote>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">flush_tlb_mm(struct</span> <span class="pre">mm_struct</span> <span class="pre">*mm)</span></code></p>
+<blockquote>
+<div><p>このインターフェースは、ユーザーのアドレス空間全体をTLBからフラッシュします。実行後、アドレス空間「mm」のすべての以前のページテーブルの変更がCPUに反映される必要があります。つまり、実行後は「mm」に関するTLBにエントリが存在しなくなります。</p>
+<p>このインターフェースは、forkやexecなどのユーザーアドレス空間全体を扱うページテーブル操作を処理するために使用されます。</p>
+</div></blockquote>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">flush_tlb_range(struct</span> <span class="pre">vm_area_struct</span> <span class="pre">*vma,</span>
+<span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">start,</span> <span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">end)</span></code></p>
+<blockquote>
+<div><p>ここでは、特定の範囲の（ユーザー）仮想アドレスの翻訳をTLBからフラッシュします。実行後、アドレス空間「vma-&gt;vm_mm」の範囲「start」から「end-1」までのすべての以前のページテーブルの変更がCPUに反映される必要があります。つまり、実行後は「start」から「end-1」までの仮想アドレスに関する「mm」のTLBエントリは存在しなくなります。</p>
+<p>「vma」は、領域に使用されているバックストアです。主にmunmap()型の操作で使用されます。</p>
+<p>このインターフェースは、ポートが複数のページサイズの翻訳をTLBから効率的に削除する方法を見つけることを目的としています。これにより、各エントリに対してカーネルがflush_tlb_pageを呼び出すのではなく、より効率的な処理が可能になります（以下参照）。</p>
+</div></blockquote>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">flush_tlb_page(struct</span> <span class="pre">vm_area_struct</span> <span class="pre">*vma,</span> <span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">addr)</span></code></p>
+<blockquote>
+<div><p>今回は、PAGE_SIZEサイズの翻訳をTLBから削除する必要があります。「vma」はLinuxがプロセスのmmap’d領域を追跡するために使用するバックイング構造です。アドレス空間はvma-&gt;vm_mmを通じて取得可能です。また、(vma-&gt;vm_flags &amp; VM_EXEC)をテストすることで、この領域が実行可能かどうか（したがって、split-tlb型の設定では「インストラクションTLB」に含まれる可能性があるかどうか）を確認できます。</p>
+<p>実行後、このインターフェースは、ユーザー仮想アドレス「addr」に対するアドレス空間「vma-&gt;vm_mm」の前のページテーブルの変更がCPUに見えるようにする必要があります。つまり、実行後、アドレス「addr」に対する「vma-&gt;vm_mm」のTLBにはエントリが存在しなくなります。</p>
+<p>主にフォールト処理中に使用されます。</p>
+</div></blockquote>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">update_mmu_cache(struct</span> <span class="pre">vm_area_struct</span> <span class="pre">*vma,</span>
+<span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">address,</span> <span class="pre">pte_t</span> <span class="pre">*ptep)</span></code></p>
+<blockquote>
+<div><p>ページフォールトの終わりに、このルーチンが呼び出され、アーキテクチャ固有のコードに、アドレス空間「vma-&gt;vm_mm」の仮想アドレス「address」に翻訳が存在することを通知します。これはソフトウェアページテーブル内で行われます。</p>
+<p>ポートはこの情報を利用して任意の方法を採用できます。例えば、ソフトウェア管理TLB構成のTLB翻訳を事前にロードするなど、このイベントを活用できます。sparc64ポートは現在このようにしています。</p>
+</div></blockquote>
+</li>
+</ol>
+<p>次に、キャッシュフラッシュインターフェースがあります。一般的に、Linuxが既存の仮想→物理マッピングを新しい値に変更する際、以下のいずれかの形式でシーケンスが行われます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1) flush_cache_mm(mm);
+   change_all_page_tables_of(mm);
+   flush_tlb_mm(mm);
+
+2) flush_cache_range(vma, start, end);
+   change_range_of_page_tables(mm, start, end);
+   flush_tlb_range(vma, start, end);
+
+3) flush_cache_page(vma, addr, pfn);
+   set_pte(pte_pointer, new_pte_val);
+   flush_tlb_page(vma, addr);
+</pre></div>
+</div>
+<p>キャッシュレベルのフラッシュは常に最初に行われます。これは、キャッシュが厳格で、仮想アドレスがキャッシュからフラッシュされる際、その仮想アドレスに仮想→物理の翻訳が存在している必要があるシステムを適切に処理するためです。HyperSparc CPUはこのような属性を持つCPUの例です。</p>
+<p>以下のキャッシュフラッシュルーチンは、特定のCPUにとって必要な範囲でキャッシュフラッシュを処理するだけでよいです。主に、仮想インデックスを持つキャッシュがあり、仮想→物理の翻訳が変更または削除されるときにフラッシュが必要なCPUに対してこれらのルーチンを実装する必要があります。例えば、IA3,2プロセッサの物理インデックス・物理タグキャッシュは、キャッシュが完全に同期しており、翻訳情報に依存しないため、これらのインターフェースを実装する必要がありません。</p>
+<p>以下にルーチンを一つずつ紹介します:</p>
+<ol class="arabic">
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">flush_cache_mm(struct</span> <span class="pre">mm_struct</span> <span class="pre">*mm)</span></code></p>
+<blockquote>
+<div><p>このインターフェースは、ユーザーのアドレス空間全体をキャッシュからフラッシュします。つまり、実行後、'mm' に関連するキャッシュラインは存在しなくなります。</p>
+<p>このインターフェースは、プロセスの mmap’d レギオンを追跡するための Linux の内部構造として使用される 'vma' が含まれるページテーブル操作を処理するために使用されます。</p>
+</div></blockquote>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">flush_cache_dup_mm(struct</span> <span class="pre">mm_struct</span> <span class="pre">*mm)</span></code></p>
+<blockquote>
+<div><p>このインターフェースは、ユーザーのアドレス空間全体をキャッシュからフラッシュします。つまり、実行後、'mm' に関連するキャッシュラインは存在しなくなります。</p>
+<p>このインターフェースは、fork 時に発生するページテーブル操作を処理するために使用されます。</p>
+<p>このオプションは flush_cache_mm とは別に用意されており、VIPT キャッシュに対する一部の最適化を可能にします。</p>
+</div></blockquote>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">flush_cache_range(struct</span> <span class="pre">vm_area_struct</span> <span class="pre">*vma,</span>
+<span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">start,</span> <span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">end)</span></code></p>
+<blockquote>
+<div><p>ここでは、特定の範囲の (ユーザー) 虚擬アドレスをキャッシュからフラッシュしています。実行後、'vma-&gt;vm_mm' に関連する 'start' から 'end-1' までの仮想アドレスのキャッシュエントリは存在しなくなります。</p>
+<p>「vma」は、領域に使用されているバックストアです。主にmunmap()型の操作で使用されます。</p>
+<p>このインターフェースは、複数のページサイズの領域をキャッシュから効率的に削除する方法をポートが見つけることを願って提供されています。これにより、各エントリを修正するたびにカーネルが flush_cache_page を呼び出す必要がなくなるためです（以下参照）。</p>
+</div></blockquote>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">flush_cache_page(struct</span> <span class="pre">vm_area_struct</span> <span class="pre">*vma,</span> <span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">addr,</span> <span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">pfn)</span></code></p>
+<blockquote>
+<div><p>今回は PAGE_SIZE サイズの範囲をキャッシュから削除する必要があります。'vma' は Linux がプロセスの mmap’d レギオンを追跡するために使用するバックイング構造であり、アドレス空間は vma-&gt;vm_mm から取得可能です。また、'vma-&gt;vm_flags &amp; VM_EXEC' をテストすることで、この領域が実行可能かどうか（つまり「ハーバード」型キャッシュレイアウトでの「インストラクションキャッシュ」に含まれる可能性があるかどうか）を確認できます。</p>
+<p>'pfn' は 'addr' にマッピングされる物理ページフレーム（この値を PAGE_SHIFT だけ左シフトすることで物理アドレスを得られます）を示します。このマッピングがキャッシュから削除されるべきです。</p>
+<p>実行後、'vma-&gt;vm_mm' に関連する仮想アドレス 'addr'（これは 'pfn' にマッピングされます）のキャッシュエントリは存在しなくなります。</p>
+<p>主にフォールト処理中に使用されます。</p>
+</div></blockquote>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">flush_cache_kmaps(void)</span></code></p>
+<blockquote>
+<div><p>このルーチンは、プラットフォームが highmem を利用する場合にのみ実装する必要があります。これはすべての kmaps が無効化される直前に呼び出されます。</p>
+<p>実行後、カーネル仮想アドレス範囲 PKMAP_ADDR(0) から PKMAP_ADDR(LAST_PKMAP) のキャッシュエントリは存在しなくなります。</p>
+<p>このルーチンは asm/highmem.h で実装する必要があります。</p>
+</div></blockquote>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">flush_cache_vmap(unsigned</span> <span class="pre">long</span> <span class="pre">start,</span> <span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">end)</span></code>
+<code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">flush_cache_vunmap(unsigned</span> <span class="pre">long</span> <span class="pre">start,</span> <span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">end)</span></code></p>
+<blockquote>
+<div><p>ここではこの2つのインターフェースを通じて、特定の範囲の (カーネル) 虚擬アドレスをキャッシュからフラッシュしています。実行後、カーネルアドレス空間の 'start' から 'end-1' までの仮想アドレスのキャッシュエントリは存在しなくなります。</p>
+<p>これらの2つのルーチンのうち、最初のものは map_kernel_range() がページテーブルエントリをインストールした後に呼び出されます。2番目のものは unmap_kernel_range() がページテーブルエントリを削除する直前に呼び出されます。</p>
+</div></blockquote>
+</li>
+</ol>
+<p>現在、CPUキャッシュに関する別のクラスの問題があり、これらを適切に処理するにはまったく異なるインターフェースセットが必要です。最も大きな問題は、プロセッサのデータキャッシュにおける仮想アリアシング（仮想アドレスによる同一物理アドレスの複数キャッシュラインの存在）です。</p>
+<p>あなたのポートがDキャッシュにおける仮想アリアシングに影響を受けている可能性がありますか？Dキャッシュが仮想インデックスで構成され、サイズがPAGE_SIZEより大きく、かつ同一物理アドレスに対応する複数のキャッシュラインが同時に存在することを防いでいない場合、この問題が発生します。</p>
+<p>Dキャッシュにこの問題がある場合、まずasm/shmparam.hのSHMLBAを適切に定義してください。これは基本的にあなたの仮想アドレス空間で使用されるDキャッシュのサイズ（サイズが可変の場合には最大可能サイズ）に設定すべきです。この設定により、SYSv IPCレイヤーはユーザープロセスが共有メモリをマップする際、この値の倍数のアドレスのみを許可します。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>この方法は共有mmapを解決しません。解決方法の一つとしてsparc64ポートを参照してください（特にSPARC_FLAG_MMAPSHARED）。</p>
+</div>
+<p>次に、他のすべてのケースにおけるDキャッシュアリアシングの問題を解決する必要があります。注意すべきは、あるページがユーザーのアドレス空間にマップされている場合、常にそのページをカーネルが線形マッピング（PAGE_OFFSETから開始）でマップしているという事実です。したがって、ユーザーが最初に物理ページをアドレス空間にマップした瞬間、カーネルがそのページをすでに仮想アドレスでマップしているため、Dキャッシュアリアシングの問題が発生する可能性があります。</p>
+<blockquote>
+<div><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">copy_user_page(void</span> <span class="pre">*to,</span> <span class="pre">void</span> <span class="pre">*from,</span> <span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">addr,</span> <span class="pre">struct</span> <span class="pre">page</span> <span class="pre">*page)</span></code>
+<code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">clear_user_page(void</span> <span class="pre">*to,</span> <span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">addr,</span> <span class="pre">struct</span> <span class="pre">page</span> <span class="pre">*page)</span></code></p>
+<blockquote>
+<div><p>これらのルーチンはユーザーの匿名またはCOWページにデータを保存します。これにより、ユーザー空間とカーネル間でのDキャッシュアリアシングの問題を効率的に回避できます。</p>
+<p>たとえば、ポートはコピー中に「from」と「to」を一時的にカーネル仮想アドレスにマップする場合があります。これらの2つのページの仮想アドレスは、カーネルのロード/ストア命令がユーザーのページマッピングと同じ「色」の仮想アドレスを処理するように選択されます。SPARC64はこの技術を採用しています。</p>
+<p>'addr'パラメータは、ユーザーが最終的にこのページをマップする仮想アドレスを指定し、'page'パラメータはターゲットのstruct pageへのポインタを提供します。</p>
+<p>Dキャッシュアリアシングが問題でない場合、これらのルーチンはmemcpy/memsetを直接呼び出すだけで、他の処理は行いません。</p>
+</div></blockquote>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">flush_dcache_page(struct</span> <span class="pre">page</span> <span class="pre">*page)</span></code></p>
+<blockquote>
+<div><p>カーネルがページキャッシュページに書き込むとき、またはカーネルがページキャッシュページから読み込む準備をしているとき、かつユーザー空間での共有/読み取り可能マッピングが存在する場合、このルーチンが呼び出されます。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>このルーチンは、ユーザープロセスのアドレス空間にマッピングされる可能性のあるページキャッシュページに対してのみ呼び出さなければならない。たとえば、ページキャッシュ内でvfsシンボリックリンクを処理するVFSレイヤーのコードは、このインターフェースを一切呼び出さなくてもよい。</p>
+</div>
+<p>「カーネルがページキャッシュページに書き込む」という表現は、具体的には、カーネルがそのページのpage-&gt;virtualマッピングに対してストア命令を実行し、そのページにデータを汚染することを指す。ここでフラッシュを行うのは、Dキャッシュのアリアスングを処理するためであり、これらのカーネルのストアがそのページのユーザー空間マッピングに見えるようにするためである。</p>
+<p>この逆のケースも同様に重要である。このファイルに共有可能で書き込み可能なマッピングを持つユーザーがいる場合、カーネルがこれらのページを読み込む際には、ユーザーが行った最新のストアを必ず見なければならない。</p>
+<p>Dキャッシュのアリアスングが問題にならない場合、このルーチンはそのアーキテクチャでnop（何もしない）として定義することができる。</p>
+<p>page-&gt;flags（PG_arch_1）には「アーキテクチャ固有」というビットが割り当てられている。カーネルは、ページキャッシュページが最初にページキャッシュに入るときにこのビットを必ずクリアする保証をする。</p>
+<p>これにより、これらのインターフェースをはるかに効率よく実装できる。現在このページをマッピングしているユーザープロセスがなければ、実際のフラッシュを「遅延」（おそらく無限に）することが可能である。sparc64のflush_dcache_pageとupdate_mmu_cacheの実装例を参照されたい。</p>
+<p>アイデアは、最初にflush_dcache_page()のタイミングで、page-&gt;mapping-&gt;i_mmapが空の木であれば、アーキテクチャ固有のページフラグビットを設定する。後でupdate_mmu_cache()でこのフラグビットを確認し、設定されている場合はフラッシュを実行してフラグビットをクリアする。</p>
+<div class="admonition important">
+<p class="admonition-title">重要です。</p>
+<p>フラッシュを遅延する場合、実際のフラッシュがページを汚染したCPUと同じCPUで行われることが重要である。再び、sparc64の例を参照されたい。</p>
+</div>
+</div></blockquote>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">copy_to_user_page(struct</span> <span class="pre">vm_area_struct</span> <span class="pre">*vma,</span> <span class="pre">struct</span> <span class="pre">page</span> <span class="pre">*page,</span>
+<span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">user_vaddr,</span> <span class="pre">void</span> <span class="pre">*dst,</span> <span class="pre">void</span> <span class="pre">*src,</span> <span class="pre">int</span> <span class="pre">len)</span></code>
+<code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">copy_from_user_page(struct</span> <span class="pre">vm_area_struct</span> <span class="pre">*vma,</span> <span class="pre">struct</span> <span class="pre">page</span> <span class="pre">*page,</span>
+<span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">user_vaddr,</span> <span class="pre">void</span> <span class="pre">*dst,</span> <span class="pre">void</span> <span class="pre">*src,</span> <span class="pre">int</span> <span class="pre">len)</span></code></p>
+<blockquote>
+<div><p>カーネルがptrace()などの用途で、任意のユーザーページと任意のデータをやり取りする必要がある場合、この2つのルーチンを使用する。</p>
+<p>必要なキャッシュフラッシュやその他のコヒーレンス操作はここに実行すべきである。プロセッサのインストラクションキャッシュがCPUストアをスヌープしない場合、copy_to_user_page()でインストラクションキャッシュをフラッシュする必要がある可能性が高い。</p>
+</div></blockquote>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">flush_anon_page(struct</span> <span class="pre">vm_area_struct</span> <span class="pre">*vma,</span> <span class="pre">struct</span> <span class="pre">page</span> <span class="pre">*page,</span>
+<span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">vmaddr)</span></code></p>
+<blockquote>
+<div><p>カーネルが匿名ページの内容にアクセスする必要がある場合、この関数（現在はget_user_pages()のみ）を呼び出します。注意：flush_dcache_page()は匿名ページに対して意図的に動作しません。デフォルトの実装は nop（すべてのコヒーレントアーキテクチャでこのまま維持すべきです）。非コヒーレントアーキテクチャでは、vmaddrのページキャッシュをフラッシュする必要があります。</p>
+</div></blockquote>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">flush_kernel_dcache_page(struct</span> <span class="pre">page</span> <span class="pre">*page)</span></code></p>
+<blockquote>
+<div><p>カーネルがkmapで取得したユーザーページを変更する必要がある場合、すべての変更が完了した後（kunmappingする前に）この関数を呼び出して、下位のページを最新状態に更新します。ここではユーザーが非コヒーレントなキャッシュコピーを持っていない（つまり、元のページはget_user_pages()などのメカニズムから取得されている）と仮定しています。デフォルトの実装は nop であり、すべてのコヒーレントアーキテクチャでこのまま維持すべきです。非コヒーレントアーキテクチャでは、page_address(page)を使用してページのカーネルキャッシュをフラッシュする必要があります。</p>
+</div></blockquote>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">flush_icache_range(unsigned</span> <span class="pre">long</span> <span class="pre">start,</span> <span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">end)</span></code></p>
+<blockquote>
+<div><p>カーネルが実行するコードからアクセスするアドレスにデータを保存する場合（例：モジュールをロードする際）、この関数が呼び出されます。</p>
+<p>ICacheがストアをスヌープしない場合、このルーチンはICacheをフラッシュする必要があります。</p>
+</div></blockquote>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">flush_icache_page(struct</span> <span class="pre">vm_area_struct</span> <span class="pre">*vma,</span> <span class="pre">struct</span> <span class="pre">page</span> <span class="pre">*page)</span></code></p>
+<blockquote>
+<div><p>flush_icache_pageのすべての機能はflush_dcache_pageとupdate_mmu_cacheで実装可能です。今後はこのインターフェースを完全に削除する予定です。</p>
+</div></blockquote>
+</div></blockquote>
+<p>最後のAPIカテゴリは、カーネル内部の意図的にアリアス化されたアドレス範囲へのI/O用です。このようなアリアスはvmap/vmalloc APIを使用して設定されます。カーネルのI/Oは物理ページを通じて行われるため、I/Oサブシステムはユーザーマッピングとカーネルオフセットマッピングが唯一のアリアスであると仮定しています。これはvmapアリアスには当てはまらないため、カーネル内でvmap領域へのI/Oを行う場合は、手動でコヒーレンシーを管理する必要があります。I/Oを行う前にvmap範囲をフラッシュし、I/Oが完了後にそれを無効化する必要があります。</p>
+<blockquote>
+<div><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">flush_kernel_vmap_range(void</span> <span class="pre">*vaddr,</span> <span class="pre">int</span> <span class="pre">size)</span></code></p>
+<blockquote>
+<div><p>vmap領域内の指定された仮想アドレス範囲のカーネルキャッシュをフラッシュします。これにより、カーネルがvmap範囲で変更したデータが物理ページに反映されるようにします。この領域がI/O操作に安全であるように設計されています。注意：このAPIは <em>ではありません</em> 該当範囲のオフセットマップアリアスもフラッシュします。</p>
+</div></blockquote>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">invalidate_kernel_vmap_range(void</span> <span class="pre">*vaddr,</span> <span class="pre">int</span> <span class="pre">size)</span> <span class="pre">invalidates</span></code></p>
+<blockquote>
+<div><p>vmap領域内の指定された仮想アドレス範囲のキャッシュをフラッシュし、I/Oが物理ページに行われている間、プロセッサがキャッシュを古くしてデータをスペクテイティブに読み取らないようにします。これはvmap領域へのデータ読み取りにのみ必要です。</p>
+</div></blockquote>
+</div></blockquote>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">コアAPIドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#core-utilities">Core utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#data-structures-and-low-level-utilities">Data structures and low-level utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#concurrency-primitives">Concurrency primitives</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#low-level-hardware-management">Low-level hardware management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#memory-management">Memory management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#interfaces-for-kernel-debugging">Interfaces for kernel debugging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#everything-else">Everything else</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">コアAPIドキュメント</a><ul>
+<li>前へ: <a href="../RCU/Design/Data-Structures/Data-Structures.html" title="前章">TREE_RCUのデータ構造をめぐるツアー [LWN.net]</a></li>
+<li>次へ: <a href="cpu_hotplug.html" title="次章">カーネルにおけるCPUホットプラグ</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/core-api/cachetlb.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

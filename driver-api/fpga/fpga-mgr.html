@@ -1,0 +1,496 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>FPGA Manager — Linux Kernel ドキュメント</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="fpga-bridge.html" rel="next" title="FPGA Bridge"/>
+<link href="intro.html" rel="prev" title="はじめに"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="fpga-manager">
+<h1>FPGA Manager<a class="headerlink" href="#fpga-manager" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="overview">
+<h2>概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>FPGAマネージャーのコアは、イメージでFPGAをプログラミングするための関数セットをエクスポートします。このAPIはメーカーに依存しません。すべてのメーカー固有の仕様は、低レベルドライバに隠蔽されており、このドライバはコアにオペレーションのセットを登録します。FPGAイメージデータ自体はメーカー固有ですが、我々の目的では単なるバイナリデータと見なします。FPGAマネージャーのコアはこれを解析しません。</p>
+<p>プログラミングするFPGAイメージはスキャッターガatherリスト、単一の連続バッファ、またはファームウェアファイルのいずれかで提供できます。カーネルメモリの連続割り当てを避けるべきであるため、ユーザーは可能であればスキャッターガatherリストを使用することを推奨します。</p>
+<p>イメージのプログラミングに関する詳細は構造体（<a class="reference internal" href="fpga-programming.html#c.fpga_image_info" title="fpga_image_info"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span>
+<span class="pre">fpga_image_info</span></code></a>）に記述されています。この構造体には、FPGAイメージへのポインタや、イメージ固有の詳細（フルリコンフィギュレーション用か部分リコンフィギュレーション用かなど）などのパラメータが含まれます。</p>
+</section>
+<section id="how-to-support-a-new-fpga-device">
+<h2>新しいFPGAデバイスをサポートする方法<a class="headerlink" href="#how-to-support-a-new-fpga-device" title="この見出しへのパーマリンク">¶</a></h2>
+<p>もう一つのFPGAマネージャーを追加するには、特定のオペレーションを実装するドライバを書きます。プローブ関数は、 <a class="reference internal" href="#c.fpga_mgr_register" title="fpga_mgr_register"><code class="xref c c-func docutils literal notranslate"><span class="pre">fpga_mgr_register()</span></code></a>、例えば：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static const struct fpga_manager_ops socfpga_fpga_ops = {
+        .write_init = socfpga_fpga_ops_configure_init,
+        .write = socfpga_fpga_ops_configure_write,
+        .write_complete = socfpga_fpga_ops_configure_complete,
+        .state = socfpga_fpga_ops_state,
+};
+
+static int socfpga_fpga_probe(struct platform_device *pdev)
+{
+        struct device *dev = &amp;pdev-&gt;dev;
+        struct socfpga_fpga_priv *priv;
+        struct fpga_manager *mgr;
+        int ret;
+
+        priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+        if (!priv)
+                return -ENOMEM;
+
+        /*
+         * do ioremaps, get interrupts, etc. and save
+         * them in priv
+         */
+
+        mgr = devm_fpga_mgr_create(dev, "Altera SOCFPGA FPGA Manager",
+                                   &amp;socfpga_fpga_ops, priv);
+        if (!mgr)
+                return -ENOMEM;
+
+        platform_set_drvdata(pdev, mgr);
+
+        return fpga_mgr_register(mgr);
+}
+
+static int socfpga_fpga_remove(struct platform_device *pdev)
+{
+        struct fpga_manager *mgr = platform_get_drvdata(pdev);
+
+        fpga_mgr_unregister(mgr);
+
+        return 0;
+}
+</pre></div>
+</div>
+<p>これらのオペレーションは、この特定のFPGAのプログラミングシーケンスに必要なデバイス固有のレジスタ書き込みを実装します。成功時は0を返し、エラー時は負のエラーコードを返します。</p>
+<dl class="simple">
+<dt>プログラミングシーケンスは以下の通りです：</dt><dd><ol class="arabic simple">
+<li><p>.write_init</p></li>
+<li><p>.write または .write_sg（1回または複数回呼び出される可能性あり）</p></li>
+<li><p>.write_complete</p></li>
+</ol>
+</dd>
+</dl>
+<p>.write_init関数はFPGAをイメージデータの受信準備にします。.write_initに渡されるバッファは最大で.initial_header_sizeバイトの長さです。全体のビットストリームが即座に利用できない場合、コアコードは少なくともこの量をバッファリングした後で開始します。</p>
+<p>.write関数はバッファをFPGAに書き込みます。このバッファはFPGAイメージ全体を含む場合もあれば、イメージの小さなチャンクを含む場合もあります。後者の場合、この関数は連続するチャンクごとに複数回呼び出されます。このインターフェースはPIOを用いるドライバに適しています。</p>
+<p>.write_sgバージョンは.writeと同様の動作ですが、入力はsg_tableスキャッターガatherリストになります。このインターフェースはDMAを用いるドライバに適しています。</p>
+<p>.write_complete関数はすべてのイメージが書き込まれた後、FPGAを運用モードに移行するために呼び出されます。</p>
+<p>オペレーションには.state関数が含まれており、これはFPGAの現在の状態を判定し、型 <a class="reference internal" href="#c.fpga_mgr_states" title="fpga_mgr_states"><code class="xref c c-enum docutils literal notranslate"><span class="pre">enum</span> <span class="pre">fpga_mgr_states</span></code></a>のコードを返します。これにより状態の変化は起こりません。</p>
+</section>
+<section id="api-for-implementing-a-new-fpga-manager-driver">
+<h2>新しいFPGAマネージャードライバを実装するためのAPI<a class="headerlink" href="#api-for-implementing-a-new-fpga-manager-driver" title="この見出しへのパーマリンク">¶</a></h2>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">fpga_mgr_states</span></code> — <span class="c-expr sig sig-inline c"><a class="reference internal" href="#c.fpga_manager" title="fpga_manager"><span class="n">fpga_manager</span></a><span class="o">-&gt;</span><span class="n">状態</span></span>.</p></li>
+<li><p><a class="reference internal" href="#c.fpga_manager" title="fpga_manager"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">fpga_manager</span></code></a> — FPGAマネージャー構造体</p></li>
+<li><p><a class="reference internal" href="#c.fpga_manager_ops" title="fpga_manager_ops"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">fpga_manager_ops</span></code></a> — 低レベルFPGAマネージャードライバオペレーション</p></li>
+<li><p><a class="reference internal" href="#c.devm_fpga_mgr_create" title="devm_fpga_mgr_create"><code class="xref c c-func docutils literal notranslate"><span class="pre">devm_fpga_mgr_create()</span></code></a> — マネージャ構造体を割り当ておよび初期化</p></li>
+<li><p><a class="reference internal" href="#c.fpga_mgr_register" title="fpga_mgr_register"><code class="xref c c-func docutils literal notranslate"><span class="pre">fpga_mgr_register()</span></code></a> — FPGAマネージャを登録</p></li>
+<li><p><a class="reference internal" href="#c.fpga_mgr_unregister" title="fpga_mgr_unregister"><code class="xref c c-func docutils literal notranslate"><span class="pre">fpga_mgr_unregister()</span></code></a> — FPGAマネージャをアンレジスト</p></li>
+</ul>
+<dl class="c enum">
+<dt class="sig sig-object c" id="c.fpga_mgr_states">
+<span class="k"><span class="pre">enum</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">fpga_mgr_states</span></span></span><a class="headerlink" href="#c.fpga_mgr_states" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>fpgaフレームワークの状態</p>
+</dd></dl>
+<p><strong>定数</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">FPGA_MGR_STATE_UNKNOWN</span></code></dt><dd><p>状態を特定できません</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">FPGA_MGR_STATE_POWER_OFF</span></code></dt><dd><p>FPGAの電源がオフ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">FPGA_MGR_STATE_POWER_UP</span></code></dt><dd><p>FPGAが電源がオンと報告</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">FPGA_MGR_STATE_RESET</span></code></dt><dd><p>FPGAがリセット状態</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">FPGA_MGR_STATE_FIRMWARE_REQ</span></code></dt><dd><p>ファームウェアリクエスト中</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">FPGA_MGR_STATE_FIRMWARE_REQ_ERR</span></code></dt><dd><p>ファームウェアリクエスト失敗</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">FPGA_MGR_STATE_WRITE_INIT</span></code></dt><dd><p>FPGAをプログラミング準備</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">FPGA_MGR_STATE_WRITE_INIT_ERR</span></code></dt><dd><p>WRITE_INITステージでのエラー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">FPGA_MGR_STATE_WRITE</span></code></dt><dd><p>イメージをFPGAに書き込み中</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">FPGA_MGR_STATE_WRITE_ERR</span></code></dt><dd><p>FPGA書き込み中のエラー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">FPGA_MGR_STATE_WRITE_COMPLETE</span></code></dt><dd><p>プログラミング後のステップ実行中</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">FPGA_MGR_STATE_WRITE_COMPLETE_ERR</span></code></dt><dd><p>WRITE_COMPLETEステージでのエラー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">FPGA_MGR_STATE_OPERATING</span></code></dt><dd><p>FPGAがプログラミング完了し運用中</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.fpga_manager">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">fpga_manager</span></span></span><a class="headerlink" href="#c.fpga_manager" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>FPGAマネージャ構造体</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fpga_manager {
+  const char *name;
+  struct device dev;
+  struct mutex ref_mutex;
+  enum fpga_mgr_states state;
+  struct fpga_compat_id *compat_id;
+  const struct fpga_manager_ops *mops;
+  void *priv;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">name</span></code></dt><dd><p>低レベルFPGAマネージャの名前</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dev</span></code></dt><dd><p>FPGAマネージャデバイス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ref_mutex</span></code></dt><dd><p>FPGAマネージャへの参照を1つだけ許可</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">state</span></code></dt><dd><p>FPGAマネージャの状態</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">compat_id</span></code></dt><dd><p>互換性確認用のFPGAマネージャID</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mops</span></code></dt><dd><p>FPGAマネージャ操作構造体へのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">priv</span></code></dt><dd><p>低レベルドライバのプライベートデータ</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.fpga_manager_ops">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">fpga_manager_ops</span></span></span><a class="headerlink" href="#c.fpga_manager_ops" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>低レベルFPGAマネージャドライバ用の操作</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fpga_manager_ops {
+  size_t initial_header_size;
+  enum fpga_mgr_states (*state)(struct fpga_manager *mgr);
+  u64 (*status)(struct fpga_manager *mgr);
+  int (*write_init)(struct fpga_manager *mgr,struct fpga_image_info *info, const char *buf, size_t count);
+  int (*write)(struct fpga_manager *mgr, const char *buf, size_t count);
+  int (*write_sg)(struct fpga_manager *mgr, struct sg_table *sgt);
+  int (*write_complete)(struct fpga_manager *mgr, struct fpga_image_info *info);
+  void (*fpga_remove)(struct fpga_manager *mgr);
+  const struct attribute_group **groups;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">initial_header_size</span></code></dt><dd><p>write_initに渡すべき最大バイト数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">state</span></code></dt><dd><p>FPGAの状態を表すenum値を返す</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">status</span></code></dt><dd><p>FPGAの状態を返す（再構成エラー コードを含む）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">write_init</span></code></dt><dd><p>FPGAを構成データの受信に準備</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">write</span></code></dt><dd><p>FPGAにcountバイトの構成データを書き込む</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">write_sg</span></code></dt><dd><p>FPGAに構成データのスキャッターリストを書き込む</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">write_complete</span></code></dt><dd><p>書き込みが完了後にFPGAを運用状態に設定</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">fpga_remove</span></code></dt><dd><p>オプション: ドライバの除去中にFPGAを特定の状態に設定</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">groups</span></code></dt><dd><p>オプションの属性グループ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>fpga_manager_opsは特定のFPGAマネージャドライバで実装される低レベル関数です。オプションの関数は呼び出される前にNULLかどうかテストされるため、省略しても問題ありません。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.devm_fpga_mgr_create">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.fpga_manager" title="fpga_manager"><span class="n"><span class="pre">fpga_manager</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">devm_fpga_mgr_create</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="../infrastructure.html#c.device" title="デバイス"><span class="n"><span class="pre">デバイス</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dev</span></span>, <span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="kt"><span class="pre">char</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">名前</span></span>, <span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.fpga_manager_ops" title="fpga_manager_ops"><span class="n"><span class="pre">fpga_manager_ops</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">mops</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">priv</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.devm_fpga_mgr_create" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>マネージド FPGA マネージャ構造体を生成および初期化</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">device</span> <span class="pre">*dev</span></code></dt><dd><p>pdevからFPGAマネージャデバイス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">char</span> <span class="pre">*name</span></code></dt><dd><p>FPGAマネージャ名</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">struct</span> <span class="pre">fpga_manager_ops</span> <span class="pre">*mops</span></code></dt><dd><p>FPGAマネージャ操作構造体へのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*priv</span></code></dt><dd><p>FPGAマネージャプライベートデータ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この関数は、FPGAマネージャドライバのprobe関数で使用することを意図しています。マネージャドライバがmanager structを生成した後
+<a class="reference internal" href="#c.devm_fpga_mgr_create" title="devm_fpga_mgr_create"><code class="xref c c-func docutils literal notranslate"><span class="pre">devm_fpga_mgr_create()</span></code></a>、それを <a class="reference internal" href="#c.fpga_mgr_register" title="fpga_mgr_register"><code class="xref c c-func docutils literal notranslate"><span class="pre">fpga_mgr_register()</span></code></a>で登録する必要があります。マネージャドライバのremove関数では <a class="reference internal" href="#c.fpga_mgr_unregister" title="fpga_mgr_unregister"><code class="xref c c-func docutils literal notranslate"><span class="pre">fpga_mgr_unregister()</span></code></a>を呼び出す必要があります。この関数で割り当てられたmanager structは、ドライバの解除時に自動的に解放されます。これは、 <a class="reference internal" href="#c.fpga_mgr_register" title="fpga_mgr_register"><code class="xref c c-func docutils literal notranslate"><span class="pre">fpga_mgr_register()</span></code></a>、構造体は依然としてクリーンアップされます</p>
+<p><strong>戻り値</strong></p>
+<p>ポインタ <a class="reference internal" href="#c.fpga_manager" title="fpga_manager"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">fpga_manager</span></code></a> またはNULL</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.fpga_mgr_register">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">fpga_mgr_register</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.fpga_manager" title="fpga_manager"><span class="n"><span class="pre">fpga_manager</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">を呼び出す前に関数がエラーを返した場合も含まれます</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.fpga_mgr_register" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>FPGAマネージャの登録</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">fpga_manager</span> <span class="pre">*mgr</span></code></dt><dd><p>FPGAマネージャ構造体</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、エラー時は負のエラーコードを返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.fpga_mgr_unregister">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">fpga_mgr_unregister</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.fpga_manager" title="fpga_manager"><span class="n"><span class="pre">fpga_manager</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">を呼び出す前に関数がエラーを返した場合も含まれます</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.fpga_mgr_unregister" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>FPGAマネージャの登録解除</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">fpga_manager</span> <span class="pre">*mgr</span></code></dt><dd><p>FPGAマネージャ構造体</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この関数は、FPGAマネージャドライバのremove関数で使用することを意図しています。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../driver-model/index.html">ドライバモデル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../basics.html">ドライバの基礎</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infrastructure.html">デバイスドライバのインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ioctl.html">ioctlベースのインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../early-userspace/index.html">初期ユーザースペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pm/index.html">CPUおよびデバイスの電源管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../clk.html">共通のCLKフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device-io.html">バスを問わないデバイスアクセス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dma-buf.html">バッファ共有と同期</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device_link.html">デバイスリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../component.html">複合ドライバ用コンポーネントヘルパ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../message-based.html">メッセージベースのデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infiniband.html">InfiniBandおよびリモートDMA（RDMA）インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../frame-buffer.html">フレームバッファライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../regulator.html">電圧および電流レギュレータAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../input.html">入力サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../usb/index.html">Linux USB API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firewire.html">Firewire（IEEE 1394）ドライバインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pci/index.html">Linux PCIドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../spi.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i2c.html">I<sup>2</sup>CおよびSMBusサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmb.html">衛星MC用IPMBドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmi.html">Linux IPMIドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i3c/index.html">I3Cサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../interconnect.html">汎用システムインターコネクトサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../devfreq.html">デバイス周波数スケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hsi.html">高速同期シリアルインターフェース (HSI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../edac.html">エラー検出と訂正 (EDAC) デバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../scsi.html">SCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../libata.html">libATA開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../target.html">ターゲットおよびiSCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mailbox.html">共通メールボックスフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mtdnand.html">MTD NANDドライバプログラミングインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html">パラレルポートデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#x50-uart-driver">16x50 UARTドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#pulse-width-modulation-pwm">パルス幅変調 (PWM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mei/index.html">インテル(R) マネジメントエンジニアリングインターフェース (インテル(R) MEI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mtd/index.html">メモリ技術デバイス (MTD)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mmc/index.html">MMC/SD/SDIOカードサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nvdimm/index.html">非揮発性メモリデバイス (NVDIMM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../w1.html">W1: ダラスの1ワイヤーバス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rapidio/index.html">Linux RapidIO サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../s390-drivers.html">s390チャネルデバイスドライバの作成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vme.html">VMEデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../80211/index.html">Linux 802.11ドライバ開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../uio-howto.html">ユーザースペースI/O HOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firmware/index.html">LinuxファームウェアAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pinctl.html">PINCTRL (PIN CONTROL)サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../gpio/index.html">汎用入出力 (GPIO)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../md/index.html">RAID</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../media/index.html">メディアサブシステム カーネル内部API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../misc_devices.html">その他のデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nfc/index.html">近距離通信 (NFC)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dmaengine/index.html">DMAエンジンドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../slimbus.html">LinuxカーネルSLIMbusサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../soundwire/index.html">SoundWireドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../thermal/index.html">熱管理</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">FPGAサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../acpi/index.html">ACPI サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../backlight/lp855x-driver.html">カーネルドライバlp855x</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../connector.html">カーネルコンネクタ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../console.html">コンソールドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dcdbas.html">Dellシステム管理ベースドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../eisa.html">EISAバスサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isa.html">ISAドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isapnp.html">ISA Plug &amp; Playサポート (Jaroslav Kysela &lt;perex@suse.cz&gt;)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io-mapping.html">io_mapping関数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io_ordering.html">メモリマップアドレスへのI/O書き込みの順序付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../generic-counter.html">汎用カウンタインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lightnvm-pblk.html">pblk: 物理ブロックデバイスターゲット</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../memory-devices/index.html">メモリコントローラー ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../men-chameleon-bus.html">MEN Chameleon Bus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ntb.html">NTB ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nvmem.html">NVMEM サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../parport-lowlevel.html">PARPORT インターフェース ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pps.html">PPS - パルス毎秒 (Pulse Per Second)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ptp.html">Linux用PTP ハードウェアクロック インフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../phy/index.html">ジェネリック PHY フレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pti_intel_mid.html">インテル MID PTI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pwm.html">パルス幅変調 (PWM) インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html">PLDM ファームウェア フラッシュアップデート ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html#overview-of-the-pldmfw-library">概要: <code class="docutils literal notranslate"><span class="pre">pldmfw</span></code> ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rfkill.html">rfkill - RFキルスイッチサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../serial/index.html">シリアルデバイスのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sm501.html">SM501 ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../switchtec.html">Linux Switchtec サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sync_file.html">シンクファイル API ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio-mediated-device.html">VFIO メディエイテッドデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio.html">VFIO - 「仮想ファンクション I/O」 </a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xilinx/index.html">Xilinx FPGA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xillybus.html">ジェネリックFPGAインターフェース用Xillybusドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../zorro.html">Zorroデバイス用のデバイスドライバの作成</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul>
+<li><a href="index.html">FPGAサブシステム</a><ul>
+<li>前へ: <a href="intro.html" title="前章">はじめに</a></li>
+<li>次へ: <a href="fpga-bridge.html" title="次章">FPGA Bridge</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/driver-api/fpga/fpga-mgr.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

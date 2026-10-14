@@ -1,0 +1,317 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>未アライメントメモリアクセス — Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="../dev-tools/index.html" rel="next" title="カーネル用の開発ツール"/>
+<link href="../riscv/patch-acceptance.html" rel="prev" title="開発者向けのarch/riscvメンテナンスガイドライン"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="unaligned-memory-accesses">
+<h1>アライメントされていないメモリアクセス<a class="headerlink" href="#unaligned-memory-accesses" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Daniel Drake &lt;<a class="reference external" href="mailto:dsd%40gentoo.org">dsd<span>@</span>gentoo<span>.</span>org</a>&gt;,</p>
+</dd>
+<dt class="field-even">著者</dt>
+<dd class="field-even"><p>Johannes Berg &lt;<a class="reference external" href="mailto:johannes%40sipsolutions.net">johannes<span>@</span>sipsolutions<span>.</span>net</a>&gt;</p>
+</dd>
+<dt class="field-odd">以下の皆様のご協力により</dt>
+<dd class="field-odd"><p>アラン・コックス、アヴュトーン・オリッチ、ヘイッキ・オルシラ、ジャン・エンゲルハルト、ケイル・マクマーティン、ケイル・モフフィット、ランディ・ダンラップ、ロバート・ハンコック、ウリ・クニッツ、ヴァディム・ロバノフ</p>
+</dd>
+</dl>
+<p>Linuxはさまざまなアーキテクチャで動作し、メモリアクセスの挙動はアーキテクチャによって異なります。このドキュメントでは、未アライメントアクセスについての詳細、なぜコードで未アライメントアクセスを起こさないことが重要なのか、そしてそのようなコードを書く方法について説明します。</p>
+<section id="the-definition-of-an-unaligned-access">
+<h2>未アライメントアクセスの定義<a class="headerlink" href="#the-definition-of-an-unaligned-access" title="この見出しへのパーマリンク">¶</a></h2>
+<p>未アライメントメモリアクセスは、NバイトのデータをアドレスがNで割り切れない（addr % N != 0）場所から読み込むときに発生します。たとえば、アドレス0x10004から4バイトのデータを読み込むのは問題ありませんが、アドレス0x10005から4バイトのデータを読み込むと未アライメントメモリアクセスになります。</p>
+<p>上記は少し曖昧に感じるかもしれませんが、コンテキストは機械語レベルです。特定の命令がメモリから複数バイトのデータを読み書きします（例: x86アセンブリのmovb、movw、movl）。後述するように、C言語の文が複数バイトのメモリアクセス命令にコンパイルされるのは、u16、u32、u64などの型を扱うときです。</p>
+</section>
+<section id="natural-alignment">
+<h2>ナチュラルアライメント<a class="headerlink" href="#natural-alignment" title="この見出しへのパーマリンク">¶</a></h2>
+<p>上記のルールはナチュラルアライメントと呼ばれます。Nバイトのメモリをアクセスする際、ベースアドレスはNで割り切れなければなりません（addr % N == 0）。</p>
+<p>コードを書く際には、ターゲットアーキテクチャがナチュラルアライメントの要件を満たしているものと仮定してください。</p>
+<p>現実には、ナチュラルアライメントをすべてのメモリアクセスサイズで要求するアーキテクチャは限られています。しかし、すべてのサポートされているアーキテクチャを考慮する必要があります。ナチュラルアライメントの要件を満たすコードを書くのが、フルポータビリティを達成する最も簡単な方法です。</p>
+</section>
+<section id="why-unaligned-access-is-bad">
+<h2>未アライメントアクセスが悪い理由<a class="headerlink" href="#why-unaligned-access-is-bad" title="この見出しへのパーマリンク">¶</a></h2>
+<p>未アライメントメモリアクセスの影響はアーキテクチャによって異なります。ここでの違いについての説明は長くなるため、以下に一般的なシナリオのサマリーを示します：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>一部のアーキテクチャでは未アライメントメモリアクセスを透明に処理できますが、通常はパフォーマンスに大きなコストが生じます。</p></li>
+<li><p>一部のアーキテクチャでは未アライメントアクセスが発生するとプロセッサ例外を発生させます。例外ハンドラは未アライメントアクセスを修正できますが、パフォーマンスに大きなコストが生じます。</p></li>
+<li><p>一部のアーキテクチャではアライメントが取れていないメモリアクセスが発生した際にプロセッサ例外が発生しますが、その例外にはアライメントが取れていないアクセスを修正するための情報が十分に含まれていません。</p></li>
+<li><p>一部のアーキテクチャではアライメントが取れていないメモリアクセスを実行することはできませんが、要求されたアクセスとは異なるメモリアクセスを静かに実行してしまい、検出が難しい微細なコードのバグを引き起こします！</p></li>
+</ul>
+</div></blockquote>
+<p>上記の内容から明らかですが、コードがアライメントが取れていないメモリアクセスを引き起こす場合、特定のプラットフォームでは正しく動作しなくなり、他のプラットフォームではパフォーマンス問題を引き起こします。</p>
+</section>
+<section id="code-that-does-not-cause-unaligned-access">
+<h2>アライメントが取れていないメモリアクセスを引き起こさないコード<a class="headerlink" href="#code-that-does-not-cause-unaligned-access" title="この見出しへのパーマリンク">¶</a></h2>
+<p>最初は上記の概念が実際にコード作成にどう関係するのか少し理解が難しいかもしれません。畢竟、特定の変数のメモリアドレスに対して十分な制御を保有していないからです。</p>
+<p>幸いなことに、ほとんどの場合コンパイラが問題なく動作するよう保証してくれます。例えば、以下の構造体を考えてみましょう：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct foo {
+        u16 field1;
+        u32 field2;
+        u8 field3;
+};
+</pre></div>
+</div>
+<p>上記の構造体のインスタンスがメモリ上にアドレス0x10000から開始して配置されていると仮定します。基本的な理解に基づけば、field2へのアクセスがアライメントが取れていないアクセスを引き起こすことは不自然ではありません。field2が構造体のオフセット2バイト位置に配置される（アドレス0x10002）と予想されますが、このアドレスは4で割り切れません（4バイトの値を読み込んでいることを思い出してください）。</p>
+<p>幸いなことにコンパイラはアライメント制約を理解しているため、上記の例ではfield1とfield2の間に2バイトのパディングを挿入します。したがって、標準の構造体タイプに対してはコンパイラが構造体をパディングしてアライメントを確保してくれるため、フィールドへのアクセスが適切にアライメントされることが保証されます（ただし、フィールドを異なる長さの型にキャストしない限り）。</p>
+<p>同様に、コンパイラは変数や関数パラメータを、変数の型のサイズに基づいた自然なアライメントに配置してくれます。</p>
+<p>この時点で明らかですが、1バイト（u8またはchar）をアクセスしてもアライメントが取れていないメモリアクセスを引き起こすことはありません。なぜなら、すべてのメモリアドレスが1で割り切れているからです。</p>
+<p>関連する話題として、上記の考慮点を踏まえると、構造体のフィールドの順序を変更してパディング領域に配置することで、構造体インスタンスの居住メモリサイズを削減できることが観察されます。上記の例の最適なレイアウトは：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct foo {
+        u32 field2;
+        u16 field1;
+        u8 field3;
+};
+</pre></div>
+</div>
+<p>自然なアライメントスキームの場合、コンパイラは構造体の最後に1バイトのパディングを追加するだけで済みます。このパディングは、これらの構造体の配列のアライメント制約を満たすために追加されます。</p>
+<p>もう一つ注目すべき点は、構造体型に__attribute__((packed))を適用する方法です。これはGCC固有の属性で、コンパイラに構造体内部にパディングを挿入しないように指示します。Cの構造体を、固定の並びで取得されるデータを表現する際に有用です。</p>
+<p>この属性の使用が、アーキテクチャのアライメント要件を満たさないフィールドにアクセスする際に未アライメントアクセスを引き起こす可能性があると考えられるかもしれません。しかし、コンパイラはアライメント制約を把握しており、メモリアクセスを未アライメントアクセスを引き起こさない方法で実行するための追加のインストラクションを生成します。ただし、この追加のインストラクションはパッケージ化されていない場合に比べてパフォーマンス低下を引き起こすため、パッケージ化属性は構造体パディングを回避する必要性が高いためにのみ使用すべきです。</p>
+</section>
+<section id="code-that-causes-unaligned-access">
+<h2>未アライメントアクセスを引き起こすコード<a class="headerlink" href="#code-that-causes-unaligned-access" title="この見出しへのパーマリンク">¶</a></h2>
+<p>上述のことを踏まえ、未アライメントメモリアクセスを引き起こす関数の現実的な例に移ります。次の関数は、include/linux/etherdevice.hから取得され、2つのイーサネットMACアドレスの等価性を比較するための最適化されたルーチンです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>bool ether_addr_equal(const u8 *addr1, const u8 *addr2)
+{
+#ifdef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+      u32 fold = ((*(const u32 *)addr1) ^ (*(const u32 *)addr2)) |
+                 ((*(const u16 *)(addr1 + 4)) ^ (*(const u16 *)(addr2 + 4)));
+
+      return fold == 0;
+#else
+      const u16 *a = (const u16 *)addr1;
+      const u16 *b = (const u16 *)addr2;
+      return ((a[0] ^ b[0]) | (a[1] ^ b[1]) | (a[2] ^ b[2])) == 0;
+#endif
+}
+</pre></div>
+</div>
+<p>上記の関数では、ハードウェアが効率的な未アライメントアクセスをサポートしている場合、このコードには問題はありません。しかし、ハードウェアが任意の境界でのメモリアクセスをサポートしていない場合、a[0]への参照はaddr1アドレスから2バイト（16ビット）のデータを読み込むことになります。</p>
+<p>addr1が奇数アドレス（例：0x10003）だった場合に何が起こるか想像してください。（ヒント：これは未アライメントアクセスです。）</p>
+<p>上記の関数における潜在的な未アライメントアクセスの問題にもかかわらず、この関数はカーネルに含まれていますが、16ビットアライメントアドレスでのみ正常に動作すると理解されています。このアライメント不安全な関数は、アライメントを確保する場合にのみ使用するか、呼び出し元がアライメントを確保する責任を負う必要があります。この関数は、イーサネットネットワーキングの文脈ではほぼ常にアライメントが確保されるため、十分な最適化として依然として有用です。</p>
+<p>未アライメントアクセスを引き起こす可能性のあるコードのもう一つの例は以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void myfunc(u8 *data, u32 value)
+{
+        [...]
+        *((u32 *) data) = cpu_to_le32(value);
+        [...]
+}
+</pre></div>
+</div>
+<p>このコードは、dataパラメータが4で割り切れないアドレスを指しているたびに未アライメントアクセスを引き起こします。</p>
+<p>まとめると、未アライメントアクセスの問題が発生する2つの主なシナリオは以下の通りです：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>変数を長さの異なる型にキャストする</p></li>
+<li><p>ポインタ算術の後、少なくとも2バイトのデータへのアクセス</p></li>
+</ol>
+</div></blockquote>
+</section>
+<section id="avoiding-unaligned-accesses">
+<h2>未アライメントアクセスを避ける<a class="headerlink" href="#avoiding-unaligned-accesses" title="この見出しへのパーマリンク">¶</a></h2>
+<p>未アライメントアクセスを避ける最も簡単な方法は、&lt;asm/unaligned.h&gt;ヘッダーファイルで提供されているget_unaligned()とput_unaligned()マクロを使用することです。</p>
+<p>未アライメントアクセスを引き起こす可能性のあるコードの以前の例に戻ります</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void myfunc(u8 *data, u32 value)
+{
+        [...]
+        *((u32 *) data) = cpu_to_le32(value);
+        [...]
+}
+</pre></div>
+</div>
+<p>未アライメントメモリアクセスを避けるために、以下のように再構成します</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void myfunc(u8 *data, u32 value)
+{
+        [...]
+        value = cpu_to_le32(value);
+        put_unaligned(value, (u32 *) data);
+        [...]
+}
+</pre></div>
+</div>
+<p>dataがメモリへのポインタであると仮定し、未アライメントアクセスを避けるためにその使用方法は以下の通りです</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>u32 value = get_unaligned((u32 *) data);
+</pre></div>
+</div>
+<p>これらのマクロは、メモリアクセスの長さに関係なく（上記の例のように32ビットに限らない）動作します。ただし、標準的なアライメントメモリアクセスと比較して、これらのマクロを使用して未アライメントメモリにアクセスすると、パフォーマンスにコストがかかる可能性があります。</p>
+<p>このようなマクロの使用が不便な場合、別のオプションとして <a class="reference internal" href="kernel-api.html#c.memcpy" title="memcpy"><code class="xref c c-func docutils literal notranslate"><span class="pre">memcpy()</span></code></a>, ソースまたは宛先（または両方）がu8*またはunsigned char*型である場合。この操作はバイト単位で行われるため、未アライメントアクセスは避けられます。</p>
+</section>
+<section id="alignment-vs-networking">
+<h2>アライメント vs. ネットワーク<a class="headerlink" href="#alignment-vs-networking" title="この見出しへのパーマリンク">¶</a></h2>
+<p>アライメントされたロードを必要とするアーキテクチャでは、ネットワークのためにはIPヘッダーが4バイト境界にアライメントされている必要があります。通常のイーサネットハードウェアでは、NET_IP_ALIGN定数が使用されます。ほとんどのアーキテクチャではこの定数は2に設定されており、通常のイーサネットヘッダーは14バイト長いため、適切なアライメントを得るためにDMAを4*n + 2のアドレスに実行する必要があります。ここでの例外はpowerpcで、NET_IP_ALIGNを0に定義しています。これはDMAを未アライメントアドレスに実行するコストが非常に高く、未アライメントロードのコストを上回るためです。</p>
+<p>DMAを未アライメントアドレス（4*n+2や非イーサネットハードウェア）に実行できない一部のイーサネットハードウェアでは、この問題が生じるため、受信フレームをアライメントされたバッファにコピーする必要があります。これは未アライメントアクセスが可能であるアーキテクチャでは不要なため、コードはCONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESSに依存するようにできます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#ifdef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+        skb = original skb
+#else
+        skb = copy skb
+#endif
+</pre></div>
+</div>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">コアAPIドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#core-utilities">Core utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#data-structures-and-low-level-utilities">Data structures and low-level utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#concurrency-primitives">Concurrency primitives</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#low-level-hardware-management">Low-level hardware management</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#memory-management">Memory management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#interfaces-for-kernel-debugging">Interfaces for kernel debugging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#everything-else">Everything else</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../process/index.html">カーネル開発コミュニティとの協働</a><ul>
+<li>前へ: <a href="../riscv/patch-acceptance.html" title="前章">開発者向けのarch/riscvメンテナンスガイドライン</a></li>
+<li>次へ: <a href="../dev-tools/index.html" title="次章">カーネル用の開発ツール</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/core-api/unaligned-memory-access.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

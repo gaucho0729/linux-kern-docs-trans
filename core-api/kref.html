@@ -1,0 +1,438 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>カーネルオブジェクトに参照カウンタ（krefs）を追加 — Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="assoc_array.html" rel="next" title="汎用連想配列の実装"/>
+<link href="kobject.html" rel="prev" title="kobjects、ksets、ktypesについてのすべての知識"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="adding-reference-counters-krefs-to-kernel-objects">
+<h1>カーネルオブジェクトに参照カウンタ（krefs）を追加する<a class="headerlink" href="#adding-reference-counters-krefs-to-kernel-objects" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Corey Minyard &lt;<a class="reference external" href="mailto:minyard%40acm.org">minyard<span>@</span>acm<span>.</span>org</a>&gt;</p>
+</dd>
+<dt class="field-even">著者</dt>
+<dd class="field-even"><p>Thomas Hellstrom &lt;<a class="reference external" href="mailto:thellstrom%40vmware.com">thellstrom<span>@</span>vmware<span>.</span>com</a>&gt;</p>
+</dd>
+</dl>
+<p>この内容は、Greg Kroah-Hartman 氏が2004年のOLSで発表したkrefsに関する論文とプレゼンテーションから多くを借用しています。詳細は以下をご覧ください:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p><a class="reference external" href="http://www.kroah.com/linux/talks/ols_2004_kref_paper/Reprint-Kroah-Hartman-OLS2004.pdf">http://www.kroah.com/linux/talks/ols_2004_kref_paper/Reprint-Kroah-Hartman-OLS2004.pdf</a></p></li>
+<li><p><a class="reference external" href="http://www.kroah.com/linux/talks/ols_2004_kref_talk/">http://www.kroah.com/linux/talks/ols_2004_kref_talk/</a></p></li>
+</ul>
+</div></blockquote>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>krefsは、オブジェクトに参照カウンタを追加するためのメカニズムです。複数の場所で使用され、他のスレッドに渡されるオブジェクトがある場合、参照カウンタがなければコードはほぼ間違いなく破損しています。参照カウンタが必要な場合は、krefsを使用するのが最適です。</p>
+<p>krefを使用するには、データ構造に以下のように追加します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct my_data
+{
+    .
+    .
+    struct kref refcount;
+    .
+    .
+};
+</pre></div>
+</div>
+<p>krefはデータ構造内のどこにでも存在できます。</p>
+</section>
+<section id="initialization">
+<h2>初期化<a class="headerlink" href="#initialization" title="この見出しへのパーマリンク">¶</a></h2>
+<p>krefを初期化するには、割り当てた後でkref_initを呼び出します。以下のようにします:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct my_data *data;
+
+data = kmalloc(sizeof(*data), GFP_KERNEL);
+if (!data)
+       return -ENOMEM;
+kref_init(&amp;data-&gt;refcount);
+</pre></div>
+</div>
+<p>これにより、kref内の参照カウンタが1に設定されます。</p>
+</section>
+<section id="kref-rules">
+<h2>krefのルール<a class="headerlink" href="#kref-rules" title="この見出しへのパーマリンク">¶</a></h2>
+<p>初期化されたkrefを扱う際には、以下のルールを厳守してください:</p>
+<ol class="arabic">
+<li><p>ポインタの非一時的なコピーを作成する場合、特に他の実行スレッドに渡す可能性がある場合は、渡す前にkref_get()で参照カウンタをインクリメントする必要があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kref_get(&amp;data-&gt;refcount);
+</pre></div>
+</div>
+<p>すでにkref-ed構造体（参照カウンタがゼロにならない）の有効なポインタを保持している場合、ロックなしでこの操作を行うことができます。</p>
+</li>
+<li><p>ポインタを使用が終わった場合は、必ずkref_put()を呼び出してください:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kref_put(&amp;data-&gt;refcount, data_release);
+</pre></div>
+</div>
+<p>このポインタが最後の参照だった場合、解放ルーチンが呼び出されます。コードがすでに有効なポインタを保持している状態でkref-ed構造体への有効なポインタを取得しようとしていない限り、ロックなしでこの操作を行うことができます。</p>
+</li>
+<li><p>コードがすでに有効なポインタを保持している状態でない場合にkref-ed構造体への参照を取得しようとすると、kref_get()中にkref_put()が発生しないようにアクセスをシリアライズする必要があります。また、kref_get()中に構造体が有効な状態を維持しなければなりません。</p></li>
+</ol>
+<p>例えば、データを割り当てて別のスレッドに処理を渡す場合:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void data_release(struct kref *ref)
+{
+    struct my_data *data = container_of(ref, struct my_data, refcount);
+    kfree(data);
+}
+
+void more_data_handling(void *cb_data)
+{
+    struct my_data *data = cb_data;
+    .
+    . do stuff with data here
+    .
+    kref_put(&amp;data-&gt;refcount, data_release);
+}
+
+int my_data_handler(void)
+{
+    int rv = 0;
+    struct my_data *data;
+    struct task_struct *task;
+    data = kmalloc(sizeof(*data), GFP_KERNEL);
+    if (!data)
+            return -ENOMEM;
+    kref_init(&amp;data-&gt;refcount);
+
+    kref_get(&amp;data-&gt;refcount);
+    task = kthread_run(more_data_handling, data, "more_data_handling");
+    if (task == ERR_PTR(-ENOMEM)) {
+            rv = -ENOMEM;
+            kref_put(&amp;data-&gt;refcount, data_release);
+            goto out;
+    }
+
+    .
+    . do stuff with data here
+    .
+out:
+    kref_put(&amp;data-&gt;refcount, data_release);
+    return rv;
+}
+</pre></div>
+</div>
+<p>このようにすることで、2つのスレッドがデータをどの順序で処理しても問題ありません。kref_put()がデータが参照されなくなったタイミングを把握し、解放処理を行います。kref_get()はすでに有効なポインタを保持しているためロック不要です。put操作もロック不要です。なぜなら、誰もポインタを取得せずにデータにアクセスしようとしていないからです。</p>
+<p>上記の例では、成功経路とエラーパスの両方でkref_put()が2回呼び出されます。これはkref_init()とkref_get()で参照カウンタが2回インクリメントされたためです。</p>
+<p>ルール1の「before（前）」の部分は非常に重要です。以下のようすることは決して行わないでください:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>task = kthread_run(more_data_handling, data, "more_data_handling");
+if (task == ERR_PTR(-ENOMEM)) {
+        rv = -ENOMEM;
+        goto out;
+} else
+        /* BAD BAD BAD - get is after the handoff */
+        kref_get(&amp;data-&gt;refcount);
+</pre></div>
+</div>
+<p>自分の知識を過信せず、上記の構造を使用してください。まず、あなたが何をやっているのかを知らない可能性があります。第二に、あなたが何をやっているのかを知っている場合（ロックが関与する状況などでは上記の方法が法的に許可される場合があります）でも、他人がコードを変更したりコピーしたりする可能性があります。不適切なスタイルです。やめましょう。</p>
+<p>get と put の最適化が可能な状況もあります。例えば、オブジェクトを別の処理に渡す際には、get と put を行う必要はありません:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/* Silly extra get and put */
+kref_get(&amp;obj-&gt;ref);
+enqueue(obj);
+kref_put(&amp;obj-&gt;ref, obj_cleanup);
+</pre></div>
+</div>
+<p>ただ enqueue を行うだけでよいです。この点に関するコメントは常に歓迎されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>enqueue(obj);
+/* We are done with obj, so we pass our refcount off
+   to the queue.  DON'T TOUCH obj AFTER HERE! */
+</pre></div>
+</div>
+<p>最後のルール（ルール3）は最も厄介なものです。例えば、リスト内の各項目が kref-ed されていて、最初の項目を取得したい場合、単にリストから最初の項目を取り出して kref_get() するのはルール3に違反します。なぜなら、すでに有効なポインタを持っていないからです。mutex（または他のロック）を追加する必要があります。例えば:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static DEFINE_MUTEX(mutex);
+static LIST_HEAD(q);
+struct my_data
+{
+        struct kref      refcount;
+        struct list_head link;
+};
+
+static struct my_data *get_entry()
+{
+        struct my_data *entry = NULL;
+        mutex_lock(&amp;mutex);
+        if (!list_empty(&amp;q)) {
+                entry = container_of(q.next, struct my_data, link);
+                kref_get(&amp;entry-&gt;refcount);
+        }
+        mutex_unlock(&amp;mutex);
+        return entry;
+}
+
+static void release_entry(struct kref *ref)
+{
+        struct my_data *entry = container_of(ref, struct my_data, refcount);
+
+        list_del(&amp;entry-&gt;link);
+        kfree(entry);
+}
+
+static void put_entry(struct my_data *entry)
+{
+        mutex_lock(&amp;mutex);
+        kref_put(&amp;entry-&gt;refcount, release_entry);
+        mutex_unlock(&amp;mutex);
+}
+</pre></div>
+</div>
+<p>kref_put() の戻り値は、ロックを全体の解放操作中保持しない場合に役立ちます。例えば、上記の例でロックを保持して呼び出す必要がない場合（それほど意味がないからです）:
+<a class="reference internal" href="mm-api.html#c.kfree" title="kfree"><code class="xref c c-func docutils literal notranslate"><span class="pre">kfree()</span></code></a> kref_put() を以下のように使用できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static void release_entry(struct kref *ref)
+{
+        /* All work is done after the return from kref_put(). */
+}
+
+static void put_entry(struct my_data *entry)
+{
+        mutex_lock(&amp;mutex);
+        if (kref_put(&amp;entry-&gt;refcount, release_entry)) {
+                list_del(&amp;entry-&gt;link);
+                mutex_unlock(&amp;mutex);
+                kfree(entry);
+        } else
+                mutex_unlock(&amp;mutex);
+}
+</pre></div>
+</div>
+<p>他のルーチンを解放操作中に呼び出す必要がある場合、この方法はより有用です（長時間かかる場合や同じロックを取得する可能性がある場合）。ただし、すべての解放処理をリリースルーチン内で行うのがよりスマートです。</p>
+<p>上記の例は、kref_get_unless_zero() を使用して最適化することもできます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static struct my_data *get_entry()
+{
+        struct my_data *entry = NULL;
+        mutex_lock(&amp;mutex);
+        if (!list_empty(&amp;q)) {
+                entry = container_of(q.next, struct my_data, link);
+                if (!kref_get_unless_zero(&amp;entry-&gt;refcount))
+                        entry = NULL;
+        }
+        mutex_unlock(&amp;mutex);
+        return entry;
+}
+
+static void release_entry(struct kref *ref)
+{
+        struct my_data *entry = container_of(ref, struct my_data, refcount);
+
+        mutex_lock(&amp;mutex);
+        list_del(&amp;entry-&gt;link);
+        mutex_unlock(&amp;mutex);
+        kfree(entry);
+}
+
+static void put_entry(struct my_data *entry)
+{
+        kref_put(&amp;entry-&gt;refcount, release_entry);
+}
+</pre></div>
+</div>
+<p>put_entry() 内の kref_put() に mutex ロックを外すのに有用ですが、kref_get_unless_zero は検索テーブルでエントリを見つけた同じクリティカルセクション内に含める必要があります。そうでないと、kref_get_unless_zero がすでに解放されたメモリを参照する可能性があります。注意点として、kref_get_unless_zero を使用する際は必ず戻り値を確認する必要があります。すでに有効なポインタを持っていることを確認している場合は、kref_get() を使用してください。</p>
+</section>
+<section id="krefs-and-rcu">
+<h2>Krefs と RCU<a class="headerlink" href="#krefs-and-rcu" title="この見出しへのパーマリンク">¶</a></h2>
+<p>kref_get_unless_zero は、上記の例で検索に RCU ロックを使用することも可能にします:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct my_data
+{
+        struct rcu_head rhead;
+        .
+        struct kref refcount;
+        .
+        .
+};
+
+static struct my_data *get_entry_rcu()
+{
+        struct my_data *entry = NULL;
+        rcu_read_lock();
+        if (!list_empty(&amp;q)) {
+                entry = container_of(q.next, struct my_data, link);
+                if (!kref_get_unless_zero(&amp;entry-&gt;refcount))
+                        entry = NULL;
+        }
+        rcu_read_unlock();
+        return entry;
+}
+
+static void release_entry_rcu(struct kref *ref)
+{
+        struct my_data *entry = container_of(ref, struct my_data, refcount);
+
+        mutex_lock(&amp;mutex);
+        list_del_rcu(&amp;entry-&gt;link);
+        mutex_unlock(&amp;mutex);
+        kfree_rcu(entry, rhead);
+}
+
+static void put_entry(struct my_data *entry)
+{
+        kref_put(&amp;entry-&gt;refcount, release_entry_rcu);
+}
+</pre></div>
+</div>
+<p>ただし、release_entry_rcu を呼び出した後も、struct kref メンバーが RCU グレース期間内に有効なメモリに保たれる必要があります。これは kfree_rcu(entry, rhead) を使用するか、kfree に使用する前に関数を呼び出すことで実現できます。 <a class="reference internal" href="kernel-api.html#c.synchronize_rcu" title="synchronize_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code></a>
+kfree に使用する前に関数を呼び出すことができますが、 <a class="reference internal" href="kernel-api.html#c.synchronize_rcu" title="synchronize_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code></a> は相当な時間の間待機する可能性があります。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">コアAPIドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#core-utilities">Core utilities</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#data-structures-and-low-level-utilities">Data structures and low-level utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#concurrency-primitives">Concurrency primitives</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#low-level-hardware-management">Low-level hardware management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#memory-management">Memory management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#interfaces-for-kernel-debugging">Interfaces for kernel debugging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#everything-else">Everything else</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">コアAPIドキュメント</a><ul>
+<li>前へ: <a href="kobject.html" title="前章">kobjects、ksets、ktypesについてのすべての知識</a></li>
+<li>次へ: <a href="assoc_array.html" title="次章">汎用連想配列の実装</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/core-api/kref.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

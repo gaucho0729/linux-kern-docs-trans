@@ -1,0 +1,556 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Reed-Solomon Library Programming Interface — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="../locking/index.html" rel="next" title="ロック"/>
+<link href="debugging-via-ohci1394.html" rel="prev" title="OHCI-1394 FireWireコントローラーが提供する物理DMAを用いたデバッグ"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="reed-solomon-library-programming-interface">
+<h1>Reed-Solomon Library Programming Interface<a class="headerlink" href="#reed-solomon-library-programming-interface" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Thomas Gleixner</p>
+</dd>
+</dl>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>一般的なReed-Solomon Libraryは、符号化、復号およびエラー訂正機能を提供します。</p>
+<p>Reed-Solomon符号は、通信およびストレージアプリケーションでデータの整合性を確保するために使用されます。</p>
+<p>このドキュメンテーションは、ライブラリが提供する機能を活用したい開発者向けに提供されています。</p>
+</section>
+<section id="known-bugs-and-assumptions">
+<h2>既知のバグと仮定<a class="headerlink" href="#known-bugs-and-assumptions" title="この見出しへのパーマリンク">¶</a></h2>
+<p>なし。</p>
+</section>
+<section id="usage">
+<h2>使い方<a class="headerlink" href="#usage" title="この見出しへのパーマリンク">¶</a></h2>
+<p>この章では、ライブラリの使用方法の例を示します。</p>
+<section id="initializing">
+<h3>初期化<a class="headerlink" href="#initializing" title="この見出しへのパーマリンク">¶</a></h3>
+<p>init_rs関数は、指定された多項式で符号化、復号およびエラー訂正を行うために必要な情報を保持するrsデコーダー構造体へのポインタを返します。既存のマッチングデコーダーを使用するか、新しいデコーダーを作成します。作成時には高速符号化/復号用のすべての検索テーブルが作成されるため、関数呼び出しには時間がかかる場合があります。クリティカルなコードパスで呼び出すのは避けましょう。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/* the Reed Solomon control structure */
+static struct rs_control *rs_decoder;
+
+/* Symbolsize is 10 (bits)
+ * Primitive polynomial is x^10+x^3+1
+ * first consecutive root is 0
+ * primitive element to generate roots = 1
+ * generator polynomial degree (number of roots) = 6
+ */
+rs_decoder = init_rs (10, 0x409, 0, 1, 6);
+</pre></div>
+</div>
+</section>
+<section id="encoding">
+<h3>符号化<a class="headerlink" href="#encoding" title="この見出しへのパーマリンク">¶</a></h3>
+<p>エンコーダーは、指定されたデータ長に基づいてReed-Solomon符号を計算し、結果をパリティバッファに保存します。注意点として、エンコーダーを呼び出す前にパリティバッファを初期化しておく必要があります。</p>
+<p>拡張データは、非ゼロの反転マスクを提供することで即座に反転できます。拡張データはマスクとXORされます。これは例えばFLASH ECCで、すべての0xFFが0x00に反転される用途に使用されます。すべての0x00のReed-Solomon符号はすべての0x00になります。符号をFLASHに保存する前に反転させることで0xFFになります。これにより、消去されたFLASHから読み込む際にECCエラーを防ぎます。</p>
+<p>データバイトは、指定されたシンボルサイズに即座に拡張されます。現在はシンボルサイズが8以外の連続ビットストリームの符号化をサポートしていません。必要であれば実装はそれほど難しくありません。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/* Parity buffer. Size = number of roots */
+uint16_t par[6];
+/* Initialize the parity buffer */
+memset(par, 0, sizeof(par));
+/* Encode 512 byte in data8. Store parity in buffer par */
+encode_rs8 (rs_decoder, data8, 512, par, 0);
+</pre></div>
+</div>
+</section>
+<section id="decoding">
+<h3>復号<a class="headerlink" href="#decoding" title="この見出しへのパーマリンク">¶</a></h3>
+<p>デコーダーは、指定されたデータ長と受信したパリティ符号に基づいてsyndromeを計算し、データ内のエラーを訂正します。</p>
+<p>ハードウェアデコーダーからsyndromeが提供されている場合は、syndrome計算はスキップされます。</p>
+<p>デコーダーに補正パターンバッファとエラー位置バッファを提供することで、データバッファの補正を抑制できます。デコーダーは計算されたエラー位置と補正ビットマスクを指定されたバッファに保存します。これは、異常なビット順序スキーマを使用するハードウェアデコーダーで有用です。</p>
+<p>データバイトは、指定されたシンボルサイズに即座に拡張されます。現在はシンボルサイズが8以外の連続ビットストリームの復号をサポートしていません。必要であれば実装はそれほど難しくありません。</p>
+<section id="decoding-with-syndrome-calculation-direct-data-correction">
+<h4>syndrome計算による復号、直接データ補正<a class="headerlink" href="#decoding-with-syndrome-calculation-direct-data-correction" title="この見出しへのパーマリンク">¶</a></h4>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/* Parity buffer. Size = number of roots */
+uint16_t par[6];
+uint8_t  data[512];
+int numerr;
+/* Receive data */
+.....
+/* Receive parity */
+.....
+/* Decode 512 byte in data8.*/
+numerr = decode_rs8 (rs_decoder, data8, par, 512, NULL, 0, NULL, 0, NULL);
+</pre></div>
+</div>
+</section>
+<section id="decoding-with-syndrome-given-by-hardware-decoder-direct-data-correction">
+<h4>ハードウェアデコーダーによって生成されたsyndromeを使用した復号、直接データ訂正<a class="headerlink" href="#decoding-with-syndrome-given-by-hardware-decoder-direct-data-correction" title="この見出しへのパーマリンク">¶</a></h4>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/* Parity buffer. Size = number of roots */
+uint16_t par[6], syn[6];
+uint8_t  data[512];
+int numerr;
+/* Receive data */
+.....
+/* Receive parity */
+.....
+/* Get syndrome from hardware decoder */
+.....
+/* Decode 512 byte in data8.*/
+numerr = decode_rs8 (rs_decoder, data8, par, 512, syn, 0, NULL, 0, NULL);
+</pre></div>
+</div>
+</section>
+<section id="decoding-with-syndrome-given-by-hardware-decoder-no-direct-data-correction">
+<h4>ハードウェアデコーダーによって生成されたsyndromeを使用した復号、直接データ訂正なし。<a class="headerlink" href="#decoding-with-syndrome-given-by-hardware-decoder-no-direct-data-correction" title="この見出しへのパーマリンク">¶</a></h4>
+<p>注意: デコーダーにデータと受信したパリティを提供する必要はありません。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/* Parity buffer. Size = number of roots */
+uint16_t par[6], syn[6], corr[8];
+uint8_t  data[512];
+int numerr, errpos[8];
+/* Receive data */
+.....
+/* Receive parity */
+.....
+/* Get syndrome from hardware decoder */
+.....
+/* Decode 512 byte in data8.*/
+numerr = decode_rs8 (rs_decoder, NULL, NULL, 512, syn, 0, errpos, 0, corr);
+for (i = 0; i &lt; numerr; i++) {
+    do_error_correction_in_your_buffer(errpos[i], corr[i]);
+}
+</pre></div>
+</div>
+</section>
+</section>
+<section id="cleanup">
+<h3>クリーンアップ<a class="headerlink" href="#cleanup" title="この見出しへのパーマリンク">¶</a></h3>
+<p>free_rs関数は、呼び出し元がデコーダーの最後のユーザーである場合、割り当てられたリソースを解放します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/* Release resources */
+free_rs(rs_decoder);
+</pre></div>
+</div>
+</section>
+</section>
+<section id="structures">
+<h2>構造体<a class="headerlink" href="#structures" title="この見出しへのパーマリンク">¶</a></h2>
+<p>この章は、Reed-Solomonライブラリで使用される構造体の自動生成ドキュメンテーションを含んでいます。これらは開発者にとって重要です。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.rs_codec">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">rs_codec</span></span></span><a class="headerlink" href="#c.rs_codec" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>rs codecデータ</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct rs_codec {
+  int mm;
+  int nn;
+  uint16_t *alpha_to;
+  uint16_t *index_of;
+  uint16_t *genpoly;
+  int nroots;
+  int fcr;
+  int prim;
+  int iprim;
+  int gfpoly;
+  int (*gffunc)(int);
+  int users;
+  struct list_head list;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">mm</span></code></dt><dd><p>シンボルあたりのビット数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">nn</span></code></dt><dd><p>ブロックあたりのシンボル数 (= (1&lt;&lt;mm)-1)</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">alpha_to</span></code></dt><dd><p>ログ検索テーブル</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">index_of</span></code></dt><dd><p>アンチログ検索テーブル</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">genpoly</span></code></dt><dd><p>生成多項式</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">nroots</span></code></dt><dd><p>生成多項式の根の数 = パリティシンボルの数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">fcr</span></code></dt><dd><p>連続する最初の根、インデックス形式</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">prim</span></code></dt><dd><p>原始要素、インデックス形式</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">iprim</span></code></dt><dd><p>prim-th根の1、インデックス形式</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">gfpoly</span></code></dt><dd><p>原始生成多項式</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">gffunc</span></code></dt><dd><p>非標準表現を使用する場合のフィールド生成関数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">users</span></code></dt><dd><p>この構造体のユーザー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">list</span></code></dt><dd><p>rs codecリストのリストエントリ</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.rs_control">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">rs_control</span></span></span><a class="headerlink" href="#c.rs_control" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>インスタンスごとのrs制御構造体</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct rs_control {
+  struct rs_codec *codec;
+  uint16_t buffers[];
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">codec</span></code></dt><dd><p>このインスタンスに使用されるコーデック</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">buffers</span></code></dt><dd><p>decode_rs()呼び出しで使用される内部一時バッファ</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.init_rs">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.rs_control" title="rs_control"><span class="n"><span class="pre">rs_control</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">init_rs</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">symsize</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">gfpoly</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">fcr</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">prim</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nroots</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.init_rs" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>RS制御構造体を作成し、初期化します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">symsize</span></code></dt><dd><p>シンボルサイズ（ビット数）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">gfpoly</span></code></dt><dd><p>拡張ガロア体生成多項式の係数、0番目の係数は低位ビットに配置。多項式は原始的でなければなりません;</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">fcr</span></code></dt><dd><p>rsコード生成多項式の連続する最初の根、インデックス形式</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">prim</span></code></dt><dd><p>多項式根を生成する原始要素</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nroots</span></code></dt><dd><p>RSコード生成多項式の次数（根の数）</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>割当はGFP_KERNELを使用します。</p>
+</section>
+<section id="public-functions-provided">
+<h2>公開関数<a class="headerlink" href="#public-functions-provided" title="この見出しへのパーマリンク">¶</a></h2>
+<p>この章は、エクスポートされるReed-Solomon関数の自動生成ドキュメンテーションを含んでいます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.free_rs">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">free_rs</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.rs_control" title="rs_control"><span class="n"><span class="pre">rs_control</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">rs</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.free_rs" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>rs制御構造体を解放する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">rs_control</span> <span class="pre">*rs</span></code></dt><dd><p>呼び出し元によってもはや使用されなくなった制御構造体</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>制御構造体を解放する。もし <strong>rs</strong> 関連するコーデックの最後のユーザーであれば、コーデックも解放する。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.init_rs_gfp">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.rs_control" title="rs_control"><span class="n"><span class="pre">rs_control</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">init_rs_gfp</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">symsize</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">gfpoly</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">fcr</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">prim</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nroots</span></span>, <span class="n"><span class="pre">gfp_t</span></span><span class="w"> </span><span class="n"><span class="pre">gfp</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.init_rs_gfp" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>RS制御構造体を作成し、初期化します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">symsize</span></code></dt><dd><p>シンボルサイズ（ビット数）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">gfpoly</span></code></dt><dd><p>拡張ガロア体生成多項式の係数、0番目の係数は低位ビットに配置。多項式は原始的でなければなりません;</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">fcr</span></code></dt><dd><p>rsコード生成多項式の連続する最初の根、インデックス形式</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">prim</span></code></dt><dd><p>多項式根を生成する原始要素</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nroots</span></code></dt><dd><p>RSコード生成多項式の次数（根の数）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">gfp_t</span> <span class="pre">gfp</span></code></dt><dd><p>メモリ割当フラグ。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.init_rs_non_canonical">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.rs_control" title="rs_control"><span class="n"><span class="pre">rs_control</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">init_rs_non_canonical</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">symsize</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="p"><span class="pre">(</span></span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">gffunc</span></span><span class="p"><span class="pre">)</span></span><span class="p"><span class="pre">(</span></span><span class="kt"><span class="pre">int</span></span><span class="p"><span class="pre">)</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">fcr</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">prim</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nroots</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.init_rs_non_canonical" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>非正規表現を持つフィールド用のrs制御構造体を確保する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">symsize</span></code></dt><dd><p>シンボルサイズ（ビット数）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">(*gffunc)(int)</span></code></dt><dd><p>次のフィールド要素を生成する関数ポインタ、または0を指定した場合の乗法単位元。gfpolyが0の場合はこの関数を使用する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">fcr</span></code></dt><dd><p>rsコード生成多項式の連続する最初の根、インデックス形式</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">prim</span></code></dt><dd><p>多項式根を生成する原始要素</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nroots</span></code></dt><dd><p>RSコード生成多項式の次数（根の数）</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.encode_rs8">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">encode_rs8</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.rs_control" title="rs_control"><span class="n"><span class="pre">rs_control</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">rsc</span></span>, <span class="n"><span class="pre">uint8_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">len</span></span>, <span class="n"><span class="pre">uint16_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">par</span></span>, <span class="n"><span class="pre">uint16_t</span></span><span class="w"> </span><span class="n"><span class="pre">invmsk</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.encode_rs8" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>データ値のパリティを計算する（8bitデータ幅）</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">rs_control</span> <span class="pre">*rsc</span></code></dt><dd><p>rs制御構造体</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">uint8_t</span> <span class="pre">*data</span></code></dt><dd><p>指定された型のデータフィールド</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">len</span></code></dt><dd><p>データ長</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">uint16_t</span> <span class="pre">*par</span></code></dt><dd><p>パリティデータ、呼び出し元が初期化する必要がある（通常はすべて0）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">uint16_t</span> <span class="pre">invmsk</span></code></dt><dd><p>データマスクを反転（データに排他的論理和される）</p>
+<p>パリティはuint16_tデータ型を使用して符号サイズを8bit以上に可能にする。呼び出し元はこのコードを呼び出す前に、症候結果の符号化と受信パリティの復号を担当する必要がある。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.decode_rs8">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">decode_rs8</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.rs_control" title="rs_control"><span class="n"><span class="pre">rs_control</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">rsc</span></span>, <span class="n"><span class="pre">uint8_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span>, <span class="n"><span class="pre">uint16_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">par</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">len</span></span>, <span class="n"><span class="pre">uint16_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">s</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">no_eras</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">eras_pos</span></span>, <span class="n"><span class="pre">uint16_t</span></span><span class="w"> </span><span class="n"><span class="pre">invmsk</span></span>, <span class="n"><span class="pre">uint16_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">corr</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.decode_rs8" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>符号語を復号する（8bitデータ幅）</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">rs_control</span> <span class="pre">*rsc</span></code></dt><dd><p>rs制御構造体</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">uint8_t</span> <span class="pre">*data</span></code></dt><dd><p>指定された型のデータフィールド</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">uint16_t</span> <span class="pre">*par</span></code></dt><dd><p>受信したパリティデータフィールド</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">len</span></code></dt><dd><p>データ長</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">uint16_t</span> <span class="pre">*s</span></code></dt><dd><p>症候データフィールド、インデックス形式でなければならない（NULLの場合は症候を計算する）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">no_eras</span></code></dt><dd><p>消去数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">*eras_pos</span></code></dt><dd><p>消去位置、NULLでも可</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">uint16_t</span> <span class="pre">invmsk</span></code></dt><dd><p>データマスクを反転（データに排他的論理和される、パリティには適用されない！）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">uint16_t</span> <span class="pre">*corr</span></code></dt><dd><p>eras_posに修正ビットマスクを保存するバッファ</p>
+<p>症候およびパリティはuint16_tデータ型を使用して符号サイズを8bit以上に可能にする。呼び出し元はこのコードを呼び出す前に、症候結果の復号と受信パリティの処理を担当する必要がある。</p>
+</dd>
+</dl>
+<p><strong>注意</strong></p>
+<dl>
+<dt>rs_control構造体 <strong>rsc</strong> デコードに使用されるバッファを含む</dt><dd><p>デコード処理はシリアル化されていなければならないため、呼び出し元が確保しなければならない。</p>
+<p>修正された符号数を返す。修正不能なエラーの場合は-EBADMSGを返す。カウントにはパリティのエラーも含まれる。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.encode_rs16">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">encode_rs16</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.rs_control" title="rs_control"><span class="n"><span class="pre">rs_control</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">rsc</span></span>, <span class="n"><span class="pre">uint16_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">len</span></span>, <span class="n"><span class="pre">uint16_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">par</span></span>, <span class="n"><span class="pre">uint16_t</span></span><span class="w"> </span><span class="n"><span class="pre">invmsk</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.encode_rs16" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>データ値のパリティを計算する（16bitデータ幅）</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">rs_control</span> <span class="pre">*rsc</span></code></dt><dd><p>rs制御構造体</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">uint16_t</span> <span class="pre">*data</span></code></dt><dd><p>指定された型のデータフィールド</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">len</span></code></dt><dd><p>データ長</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">uint16_t</span> <span class="pre">*par</span></code></dt><dd><p>パリティデータ、呼び出し元が初期化する必要がある（通常はすべて0）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">uint16_t</span> <span class="pre">invmsk</span></code></dt><dd><p>データマスクを反転（データに排他的論理和される、パリティには適用されない！）</p>
+<p>データ配列の各フィールドは、最大で符号サイズビットの有効データを含む。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.decode_rs16">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">decode_rs16</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.rs_control" title="rs_control"><span class="n"><span class="pre">rs_control</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">rsc</span></span>, <span class="n"><span class="pre">uint16_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span>, <span class="n"><span class="pre">uint16_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">par</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">len</span></span>, <span class="n"><span class="pre">uint16_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">s</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">no_eras</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">eras_pos</span></span>, <span class="n"><span class="pre">uint16_t</span></span><span class="w"> </span><span class="n"><span class="pre">invmsk</span></span>, <span class="n"><span class="pre">uint16_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">corr</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.decode_rs16" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>コーディングワードをデコード (16ビットデータ幅)</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">rs_control</span> <span class="pre">*rsc</span></code></dt><dd><p>rs制御構造体</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">uint16_t</span> <span class="pre">*data</span></code></dt><dd><p>指定された型のデータフィールド</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">uint16_t</span> <span class="pre">*par</span></code></dt><dd><p>受信したパリティデータフィールド</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">len</span></code></dt><dd><p>データ長</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">uint16_t</span> <span class="pre">*s</span></code></dt><dd><p>症候データフィールド、インデックス形式でなければならない（NULLの場合は症候を計算する）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">no_eras</span></code></dt><dd><p>消去数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">*eras_pos</span></code></dt><dd><p>消去位置、NULLでも可</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">uint16_t</span> <span class="pre">invmsk</span></code></dt><dd><p>データマスクを反転（データに排他的論理和される、パリティには適用されない！）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">uint16_t</span> <span class="pre">*corr</span></code></dt><dd><p>eras_posに修正ビットマスクを保存するバッファ</p>
+<p>データ配列の各フィールドは、最大で符号サイズビットの有効データを含む。</p>
+</dd>
+</dl>
+<p><strong>注意</strong></p>
+<dl>
+<dt>rc_control 構造体 <strong>rsc</strong> デコードに使用されるバッファを含む</dt><dd><p>デコード処理はシリアル化されていなければならないため、呼び出し元が確保しなければならない。</p>
+<p>修正された符号数を返す。修正不能なエラーの場合は-EBADMSGを返す。カウントにはパリティのエラーも含まれる。</p>
+</dd>
+</dl>
+</section>
+<section id="credits">
+<h2>貢献者<a class="headerlink" href="#credits" title="この見出しへのパーマリンク">¶</a></h2>
+<p>符号化および復号のライブラリコードは、Phil Karn によって書かれています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Copyright 2002, Phil Karn, KA9Q
+May be used under the terms of the GNU General Public License (GPL)
+</pre></div>
+</div>
+<p>ラッパー関数およびインターフェースは、Thomas Gleixner によって書かれています。</p>
+<p>テストのためにバグ修正、改善、サポートを提供してくれたユーザーに感謝します。</p>
+<p>以下の人物がこのドキュメントの作成に直接または間接的に貢献しています：</p>
+<p>Thomas Gleixner<a class="reference external" href="mailto:tglx%40linutronix.de">tglx<span>@</span>linutronix<span>.</span>de</a></p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">コアAPIドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#core-utilities">Core utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#data-structures-and-low-level-utilities">Data structures and low-level utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#concurrency-primitives">Concurrency primitives</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#low-level-hardware-management">Low-level hardware management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#memory-management">Memory management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#interfaces-for-kernel-debugging">Interfaces for kernel debugging</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#everything-else">Everything else</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">コアAPIドキュメント</a><ul>
+<li>前へ: <a href="debugging-via-ohci1394.html" title="前章">OHCI-1394 FireWireコントローラーが提供する物理DMAを用いたデバッグ</a></li>
+<li>次へ: <a href="../locking/index.html" title="次章">ロック</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/core-api/librs.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

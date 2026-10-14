@@ -1,0 +1,1890 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Concurrency Managed Workqueue (cmwq) — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="printk-basics.html" rel="next" title="printkを使用したメッセージログ"/>
+<link href="kernel-api.html" rel="prev" title="LinuxカーネルAPI"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="concurrency-managed-workqueue-cmwq">
+<h1>コンカレンシー管理ワーキュー (cmwq)<a class="headerlink" href="#concurrency-managed-workqueue-cmwq" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">日付</dt>
+<dd class="field-odd"><p>2010年9月</p>
+</dd>
+<dt class="field-even">著者</dt>
+<dd class="field-even"><p>Tejun Heo &lt;<a class="reference external" href="mailto:tj%40kernel.org">tj<span>@</span>kernel<span>.</span>org</a>&gt;</p>
+</dd>
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Florian Mickler &lt;<a class="reference external" href="mailto:florian%40mickler.org">florian<span>@</span>mickler<span>.</span>org</a>&gt;</p>
+</dd>
+</dl>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>非同期プロセス実行コンテキストが必要なケースが多数存在し、そのようなケースではworkqueue (wq) APIが最も一般的に使用されるメカニズムです。</p>
+<p>このような非同期実行コンテキストが必要な場合、実行すべき関数を記述したwork itemがキューに置かれます。独立したスレッドが非同期実行コンテキストとして動作し、このキューはworkqueueと呼ばれ、スレッドはworkerと呼ばれます。</p>
+<p>workqueueにwork itemが存在する間、workerはその関連する関数を順番に実行します。workqueueにwork itemがなくなった場合、workerはアイドル状態になります。新しいwork itemがキューに追加されると、workerは再び実行を開始します。</p>
+</section>
+<section id="why-cmwq">
+<h2>なぜcmwqなのか？<a class="headerlink" href="#why-cmwq" title="この見出しへのパーマリンク">¶</a></h2>
+<p>元のwq実装では、マルチスレッド（MT）のwqは各CPUごとにworkerスレッドを1つ保持し、シングルスレッド（ST）のwqはシステム全体で1つのworkerスレッドを保持していました。MTのwqではCPUの数と同程度のworkerスレッドを維持する必要があり、年々カーネルでMT wqのユーザーが増加し、CPUコア数が継続的に増加する中、一部のシステムでは起動時からデフォルトの32,768 PID空間を満たしてしまうほどになりました。</p>
+<p>MT wqは多くのリソースを無駄にしていたものの、提供する並行性のレベルは不十分でした。この制限はSTとMTの両方のwqに共通していましたが、MTではより深刻な問題でした。各wqは独自のworkerプールを保持しており、MT wqは各CPUごとに1つの実行コンテキストしか提供できず、ST wqはシステム全体で1つの実行コンテキストを提供しました。work itemはこれらの限られた実行コンテキストを競争する必要があり、シングル実行コンテキスト周りのデッドロックの発生など、さまざまな問題を引き起こしました。</p>
+<p>提供される並行性レベルとリソース使用量の間のトレードオフは、ユーザーに不要な選択を余儀なくさせました。たとえばlibataはポーリングPIOの処理にST wqを使用し、同時に2つのポーリングPIOが進まないという不要な制限を受け入れることになりました。MT wqは並行性を大幅に向上させるものではなく、より高い並行性が必要なユーザー（例: asyncやfscache）は自前のスレッドプールを実装する必要がありました。</p>
+<p>Concurrency Managed Workqueue (cmwq)は、以下の目標を重視してwqの再実装です。</p>
+<ul class="simple">
+<li><p>元のworkqueue APIとの互換性を維持します。</p></li>
+<li><p>per-CPUの統合workerプールをすべてのwqで共有し、リソースを無駄にせずに柔軟な並行性レベルを必要に応じて提供します。</p></li>
+<li><p>ワーカーポールと並行度を自動的に調整し、APIユーザーがこのような詳細について心配する必要がないようにします。</p></li>
+</ul>
+</section>
+<section id="the-design">
+<h2>デザイン<a class="headerlink" href="#the-design" title="この見出しへのパーマリンク">¶</a></h2>
+<p>関数の非同期実行を容易にするために、新しい抽象化手法であるワークアイテムが導入されています。</p>
+<p>ワークアイテムは、非同期に実行される関数へのポインタを保持するシンプルな構造体です。ドライバーやサブシステムが関数を非同期に実行したい場合、その関数へのポインタを持つワークアイテムを設定し、ワークキューにキューイングする必要があります。</p>
+<p>特別な用途のスレッドであるワーカースレッドは、キューから関数を順番に実行します。キューに作業がなければ、ワーカースレッドはアイドル状態になります。これらのワーカースレッドは、ワーカーポールという名前の管理下で処理されます。</p>
+<p>cmwq設計では、サブシステムやドライバーがワークアイテムをキューイングするユーザー向けワークキューと、ワーカーポールを管理し、キューイングされたワークアイテムを処理するバックエンドメカニズムの違いを区別しています。</p>
+<p>各可能なCPUに対して、通常のワークアイテム用と高優先度のワークアイテム用の2つのワーカーポールがあり、さらに未バインドのワークキューにキューイングされたワークアイテムを処理する追加のワーカーポールがあります。これらのバックイングプールの数は動的です。</p>
+<p>サブシステムやドライバーは、必要に応じて特別なワークキューAPI関数を通じてワークアイテムを生成し、キューイングできます。ワークアイテムを配置するワークキューにフラグを設定することで、ワークアイテムの実行方法に影響を与えることができます。これらのフラグには、CPUローカル性、並行度制限、優先度などが含まれます。詳細な概要については、APIの説明を参照してください。
+<code class="docutils literal notranslate"><span class="pre">alloc_workqueue()</span></code> も参照してください。</p>
+<p>ワークアイテムがワークキューにキューイングされるとき、キューのパラメータとワークキューの属性に基づいてターゲットのワーカーポールが決定され、そのワーカーポールの共有ワークリストに追加されます。たとえば、特に上書きされていない場合、バインドされたワークキューのワークアイテムは、発行者が実行しているCPUに関連する通常または高優先度のワーカーポールのワークリストにキューイングされます。</p>
+<p>どのワーカーポールの実装においても、並行度（アクティブな実行コンテキストの数）の管理は重要な課題です。cmwqは、リソースを節約するための最小限の並行度を維持しつつ、システムが最大容量で利用されるように十分なレベルを保とうと努力しています。</p>
+<p>各CPUにバインドされたワーカーポールは、スケジューラに接続してコンカレンシー管理を実装します。アクティブなワーカーが起動または停止した際、ワーカーポールは通知され、現在実行可能なワーカーの数を追跡します。一般的に、作業項目はCPUを長時間占有して多くのサイクルを消費するものではありません。つまり、作業処理が停止しないように必要なだけのコンカレンシーを維持することが最適です。CPUに1つ以上の実行可能なワーカーが存在する限り、ワーカーポールは新しい作業を実行しませんが、最後の実行中のワーカーが停止した際にはすぐに新しいワーカーをスケジュールして、未処理の作業項目がある間CPUがアイドル状態にならないようにします。</p>
+<p>アイドル状態のワーカーを保持しておくコストは、kthreadのメモリ領域以外にありませんので、cmwqは一定時間アイドル状態のワーカーを保持した後、それらを終了します。</p>
+<p>バインドされていないワークキューでは、バックイングプールの数は動的です。バインドされていないワークキューは、
+<code class="docutils literal notranslate"><span class="pre">apply_workqueue_attrs()</span></code> カスタム属性を割り当てることができます。ワークキューは自動的に属性に一致するバックイングワーカーポールを生成します。コンカレンシー管理レベルの調整はユーザーの責任です。また、コンカレンシー管理を無視するバインドされたwqを指定するフラグもあります。詳細についてはAPIセクションを参照してください。</p>
+<p>進捗保証は、必要に応じてワーカーが作成できることが前提です。これは救援ワーカーの使用によって保証されます。メモリ回収処理を扱うコードパスで使用される作業項目は、メモリ圧力下で実行できるように救援ワーカーを確保したワークキューにキューイングする必要があります。それ以外の場合、ワーカーポールが実行コンテキストを解放するのを待ってデッドロックする可能性があります。</p>
+</section>
+<section id="application-programming-interface-api">
+<h2>アプリケーションプログラミングインターフェース（API）<a class="headerlink" href="#application-programming-interface-api" title="この見出しへのパーマリンク">¶</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">alloc_workqueue()</span></code> ワーキューを割り当てます。元の
+<code class="docutils literal notranslate"><span class="pre">create_*workqueue()</span></code> 関数は非推奨とされており、削除予定です。  <code class="docutils literal notranslate"><span class="pre">alloc_workqueue()</span></code> 3つの引数を取ります。 <code class="docutils literal notranslate"><span class="pre">@name</span></code>,
+<code class="docutils literal notranslate"><span class="pre">@flags</span></code> および <code class="docutils literal notranslate"><span class="pre">@max_active</span></code>.  <code class="docutils literal notranslate"><span class="pre">@name</span></code> はワーキューの名前であり、救援スレッドの名前としても使用されます（存在する場合）。</p>
+<p>ワーキューはもはや実行リソースを管理せず、進捗保証、フラッシュ、作業項目属性のドメインとして機能します。 <code class="docutils literal notranslate"><span class="pre">@flags</span></code>
+および <code class="docutils literal notranslate"><span class="pre">@max_active</span></code> 作業項目が実行リソースを割り当てられ、スケジュールされ、実行される方法を制御します。</p>
+<section id="flags">
+<h3><code class="docutils literal notranslate"><span class="pre">flags</span></code><a class="headerlink" href="#flags" title="この見出しへのパーマリンク">¶</a></h3>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">WQ_UNBOUND</span></code></dt><dd><p>未バインドのwqにキューイングされたワークアイテムは、特定のCPUにバインドされていないワーカーをホストする特別なワーカーポールによって処理されます。これにより、wqは並行性管理を行わない単純な実行コンテキストプロバイダーとして動作します。未バインドワーカーポールは、ワークアイテムの実行をできるだけ早く開始しようとします。未バインドのwqはローカル性を犠牲にしますが、以下のケースで有用です。</p>
+<ul class="simple">
+<li><p>並行性レベルの要件が大幅に変動する予想される場合、バインドされたwqを使用すると、発行元が異なるCPUを移動するたびに、多くのCPUにわたってほとんど使用されないワーカーが作成される可能性があります。</p></li>
+<li><p>長時間CPUを食い尽くすようなワークロードで、システムスケジューラによってより効率的に管理できる場合。</p></li>
+</ul>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">WQ_FREEZABLE</span></code></dt><dd><p>フリーザブルなwqはシステムのスリープ操作におけるフリーズフェーズに参加します。wq上のワークアイテムはドレインされ、解凍されるまで新たなワークアイテムの実行は行われません。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">WQ_MEM_RECLAIM</span></code></dt><dd><p>メモリ回収パスで使用される可能性のあるすべてのwq <strong>MUST</strong>
+このフラグが設定されています。メモリ圧力に関係なく、wqは少なくとも1つの実行コンテキストを保証されています。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">WQ_HIGHPRI</span></code></dt><dd><p>高優先度のwqのワークアイテムは、ターゲットCPUの高優先度ワーカーポールにキューイングされます。高優先度ワーカーポールは、niceレベルが上げられたワーカースレッドによって処理されます。</p>
+<p>通常のワーカーポールと高優先度ワーカーポールは相互に干渉しません。それぞれが独立したワーカーポールを維持し、その内部のワーカー間で並行性管理を行います。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">WQ_CPU_INTENSIVE</span></code></dt><dd><p>CPUを食い尽くすようなwqのワークアイテムは並行性レベルに貢献しません。つまり、実行可能なCPU食い尽くすワークアイテムは、同じワーカーポール内の他のワークアイテムの実行を妨げることはありません。これは、システムスケジューラによって実行が制御される予想されるバインドされたワークアイテムにとって有用です。</p>
+<p>CPU食い尽くすワークアイテムは並行性レベルに貢献しませんが、実行の開始は依然として並行性管理によって制御され、実行可能な非CPU食い尽くすワークアイテムはCPU食い尽くすワークアイテムの実行を遅らせることができます。</p>
+<p>このフラグは未バインドのwqには意味がありません。</p>
+</dd>
+</dl>
+<p>フラグ <code class="docutils literal notranslate"><span class="pre">WQ_NON_REENTRANT</span></code> はすべてのワークキューが非再入可能になったため、現在は存在しません。どのCPUでも、任意の時点でワークアイテムが1つのワーカーによってのみ実行されることが保証されています。</p>
+</section>
+<section id="max-active">
+<h3><code class="docutils literal notranslate"><span class="pre">max_active</span></code><a class="headerlink" href="#max-active" title="この見出しへのパーマリンク">¶</a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">@max_active</span></code> このフラグは、ワークキューのワークアイテムに割り当て可能なCPUごとの実行コンテキストの最大数を決定します。例えば、 <code class="docutils literal notranslate"><span class="pre">@max_active</span></code> が16の場合、各CPUごとに同時に実行中のwqのワークアイテムは最大16個までです。</p>
+<p>現在、バインドされたwqの場合、最大制限は <code class="docutils literal notranslate"><span class="pre">@max_active</span></code> は512であり、0が指定された場合のデフォルト値は256です。バインドされていないwqの場合、制限値は512と4 * のうち大きい方です。
+<code class="docutils literal notranslate"><span class="pre">num_possible_cpus()</span></code>これらの値は、ランナウェイ状態での保護を確保しつつ、制限要因にならないように十分に高い値が選ばれています。</p>
+<p>wqのアクティブなワーキットアイテム数は、通常、wqの利用者によって制御されます。具体的には、利用者が同時にキューに並べられるワーキットアイテム数によって制御されます。アクティブなワーキットアイテム数を制限する必要がない限り、'0'を指定することをお勧めします。</p>
+<p>一部のユーザーはST wqの厳密な実行順序に依存しています。この動作を実現するために、 <code class="docutils literal notranslate"><span class="pre">@max_active</span></code> の1と <code class="docutils literal notranslate"><span class="pre">WQ_UNBOUND</span></code> が使用されます。このようなwqにキューイングされたワーキットアイテムは常にバインドされていないワーカーポールにキューイングされ、同時にアクティブなワーキットアイテムは1つだけであったため、ST wqと同じ順序性を達成していました。</p>
+<p>現在の実装では、上述の設定は指定されたNUMAノード内でST動作を保証します。代わりに、 <code class="docutils literal notranslate"><span class="pre">alloc_ordered_queue()</span></code> を使用してシステム全体でのST動作を達成する必要があります。</p>
+</section>
+</section>
+<section id="example-execution-scenarios">
+<h2>実行例のシナリオ<a class="headerlink" href="#example-execution-scenarios" title="この見出しへのパーマリンク">¶</a></h2>
+<p>以下の例は、cmwqが異なる設定下でどのように動作するかを示しています。</p>
+<blockquote>
+<div><p>ワーキットアイテムw0、w1、w2が同じCPU上のバインドされたwq q0にキューイングされます。w0はCPUを5ms使用してから10msスリープし、再びCPUを5ms使用して終了します。w1とw2はそれぞれCPUを5ms使用してから10msスリープします。</p>
+</div></blockquote>
+<p>他のタスクや作業、処理オーバーヘッドを無視し、単純なFIFOスケジューリングを仮定すると、以下の例は元のwqでの可能なイベントのシーケンスの非常に簡略化されたバージョンです。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>TIME IN MSECS  EVENT
+0              w0 starts and burns CPU
+5              w0 sleeps
+15             w0 wakes up and burns CPU
+20             w0 finishes
+20             w1 starts and burns CPU
+25             w1 sleeps
+35             w1 wakes up and finishes
+35             w2 starts and burns CPU
+40             w2 sleeps
+50             w2 wakes up and finishes
+</pre></div>
+</div>
+<p>そして、cmwqで <code class="docutils literal notranslate"><span class="pre">@max_active</span></code> &gt;= 3,</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>TIME IN MSECS  EVENT
+0              w0 starts and burns CPU
+5              w0 sleeps
+5              w1 starts and burns CPU
+10             w1 sleeps
+10             w2 starts and burns CPU
+15             w2 sleeps
+15             w0 wakes up and burns CPU
+20             w0 finishes
+20             w1 wakes up and finishes
+25             w2 wakes up and finishes
+</pre></div>
+</div>
+<p>もし <code class="docutils literal notranslate"><span class="pre">@max_active</span></code> == 2,</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>TIME IN MSECS  EVENT
+0              w0 starts and burns CPU
+5              w0 sleeps
+5              w1 starts and burns CPU
+10             w1 sleeps
+15             w0 wakes up and burns CPU
+20             w0 finishes
+20             w1 wakes up and finishes
+20             w2 starts and burns CPU
+25             w2 sleeps
+35             w2 wakes up and finishes
+</pre></div>
+</div>
+<p>を設定した場合、
+<code class="docutils literal notranslate"><span class="pre">WQ_CPU_INTENSIVE</span></code> が設定されていると、</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>TIME IN MSECS  EVENT
+0              w0 starts and burns CPU
+5              w0 sleeps
+5              w1 and w2 start and burn CPU
+10             w1 sleeps
+15             w2 sleeps
+15             w0 wakes up and burns CPU
+20             w0 finishes
+20             w1 wakes up and finishes
+25             w2 wakes up and finishes
+</pre></div>
+</div>
+</section>
+<section id="guidelines">
+<h2>ガイドライン<a class="headerlink" href="#guidelines" title="この見出しへのパーマリンク">¶</a></h2>
+<ul class="simple">
+<li><p>を忘れずに使用してください。メモリ回収中に使用されるワーキットアイテムを処理する可能性のあるwqの場合です。 <code class="docutils literal notranslate"><span class="pre">WQ_MEM_RECLAIM</span></code> が設定されているwqには、実行コンテキストが予約されています。メモリ回収中に使用される複数のワーキットアイテム間に依存関係がある場合、それらはそれぞれ
+<code class="docutils literal notranslate"><span class="pre">WQ_MEM_RECLAIM</span></code> が設定されている別個のwqにキューイングする必要があります。
+<code class="docutils literal notranslate"><span class="pre">WQ_MEM_RECLAIM</span></code>.</p></li>
+<li><p>厳密な順序性が求められない限り、ST wqを使用する必要はありません。</p></li>
+<li><p>特定の必要がない限り、@max_activeに0を使用することをお勧めします。ほとんどの使用ケースでは、コンカレンシーレベルはデフォルトの制限を大幅に下回ります。</p></li>
+<li><p>wqはフォワード進捗保証（<code class="docutils literal notranslate"><span class="pre">WQ_MEM_RECLAIM</span></code>、フラッシュおよびワーキットアイテム属性のドメインです。メモリ回収に関与しないことや、グループのワーキットアイテムとしてフラッシュする必要がないこと、また特別な属性を必要としないワーキットアイテムは、システムのwqのいずれかを使用できます。専用のwqを使用する場合とシステムwqを使用する場合の実行特性には違いはありません。</p></li>
+<li><p>ワークアイテムが大量のCPUサイクルを消費する予定でない限り、ワークキュー操作およびワークアイテム実行におけるローカリティの向上により、バウンドのワークキューを使用することは通常有益です。</p></li>
+</ul>
+</section>
+<section id="debugging">
+<h2>デバッグ<a class="headerlink" href="#debugging" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ワーク関数はジェネリックなワーカースレッドによって実行されるため、不適切なワークキュー利用の問題を明確にするためにいくつかのトリックが必要です。</p>
+<p>ワーカースレッドはプロセスリストに以下のように表示されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>root      5671  0.0  0.0      0     0 ?        S    12:07   0:00 [kworker/0:1]
+root      5672  0.0  0.0      0     0 ?        S    12:07   0:00 [kworker/1:2]
+root      5673  0.0  0.0      0     0 ?        S    12:12   0:00 [kworker/0:0]
+root      5674  0.0  0.0      0     0 ?        S    12:13   0:00 [kworker/1:0]
+</pre></div>
+</div>
+<p>kworkersが異常な状態（CPUを過剰に使用している）の場合、2種類の可能性のある問題があります:</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>連続してスケジュールされる何かが原因</p></li>
+<li><p>単一のワークアイテムが大量のCPUサイクルを消費している</p></li>
+</ol>
+</div></blockquote>
+<p>最初の問題はトレーシングを使用して追跡できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ echo workqueue:workqueue_queue_work &gt; /sys/kernel/debug/tracing/set_event
+$ cat /sys/kernel/debug/tracing/trace_pipe &gt; out.txt
+(wait a few secs)
+^C
+</pre></div>
+</div>
+<p>ワークキューイングに忙しいループが原因の場合、出力に支配的になり、ワークアイテム関数を使用して問題の原因を特定できます。</p>
+<p>2番目の問題については、問題の原因となるワーカースレッドのスタックトレースを確認するだけで解決可能でしょう。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ cat /proc/THE_OFFENDING_KWORKER/stack
+</pre></div>
+</div>
+<p>ワークアイテムの関数はスタックトレースで簡単に確認できます。</p>
+</section>
+<section id="kernel-inline-documentations-reference">
+<h2>カーネルインラインドキュメンテーション参照<a class="headerlink" href="#kernel-inline-documentations-reference" title="この見出しへのパーマリンク">¶</a></h2>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.workqueue_attrs">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">workqueue_attrs</span></span></span><a class="headerlink" href="#c.workqueue_attrs" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワークキュー属性の構造体。</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct workqueue_attrs {
+  int nice;
+  cpumask_var_t cpumask;
+  bool no_numa;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">nice</span></code></dt><dd><p>niceレベル</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cpumask</span></code></dt><dd><p>許可されたCPU</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">no_numa</span></code></dt><dd><p>NUMAアフィニティを無効化</p>
+<p>他のフィールドとは異なり、 <code class="docutils literal notranslate"><span class="pre">no_numa</span></code> worker_poolのプロパティではありません。これは、 <a class="reference internal" href="#c.apply_workqueue_attrs" title="apply_workqueue_attrs"><code class="xref c c-func docutils literal notranslate"><span class="pre">apply_workqueue_attrs()</span></code></a> プールを選択する方法を変更するだけで、プールハッシュ計算や等価性比較には参加しません。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>これは、バウンドされていないワークキューの属性を変更するために使用できます。</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.work_pending">
+<span class="sig-name descname"><span class="n"><span class="pre">work_pending</span></span></span><a class="headerlink" href="#c.work_pending" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">work_pending</span> <span class="pre">(work)</span></code></p>
+<blockquote>
+<div><p>ワークアイテムが現在待機中かどうかを確認する</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">work</span></code></dt><dd><p>対象のワークアイテム</p>
+</dd>
+</dl>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.delayed_work_pending">
+<span class="sig-name descname"><span class="n"><span class="pre">delayed_work_pending</span></span></span><a class="headerlink" href="#c.delayed_work_pending" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">delayed_work_pending</span> <span class="pre">(w)</span></code></p>
+<blockquote>
+<div><p>遅延可能なワークアイテムが現在待機中かどうかを確認する</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">w</span></code></dt><dd><p>対象のワークアイテム</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.alloc_workqueue">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">alloc_workqueue</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="kt"><span class="pre">char</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">fmt</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">max_active</span></span>, <span class="p"><span class="pre">...</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.alloc_workqueue" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワークキューを割り当てる</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">char</span> <span class="pre">*fmt</span></code></dt><dd><p>ワークキュー名のprintf形式</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">flags</span></code></dt><dd><p>WQ_* フラグ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">max_active</span></code></dt><dd><p>最大同時進行中のワークアイテム数、0でデフォルト値を指定、残りの引数: 引数 <strong>fmt</strong></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">...</span></code></dt><dd><p>可変引数</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>指定されたパラメータでワークキューを割り当てる。WQ_* フラグの詳細情報については、
+<a class="reference internal" href="#"><span class="doc">コンカレンシー管理ワーキュー (cmwq)</span></a>.</p>
+<p><strong>戻り値</strong></p>
+<p>成功時の割り当てられたワークキューへのポインタ、 <code class="docutils literal notranslate"><span class="pre">NULL</span></code> を返します。</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.alloc_ordered_workqueue">
+<span class="sig-name descname"><span class="n"><span class="pre">alloc_ordered_workqueue</span></span></span><a class="headerlink" href="#c.alloc_ordered_workqueue" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">alloc_ordered_workqueue</span> <span class="pre">(fmt,</span> <span class="pre">flags,</span> <span class="pre">args...)</span></code></p>
+<blockquote>
+<div><p>順序付きワークキューを割り当てる</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">fmt</span></code></dt><dd><p>ワークキュー名のprintf形式</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">flags</span></code></dt><dd><p>WQ_* フラグ（WQ_FREEZABLEとWQ_MEM_RECLAIMのみ意味を持つ）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">args...</span></code></dt><dd><p>引数 <strong>fmt</strong></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>順序付きワークキューを割り当てる。順序付きワークキューは、キュー順で最大1つのワークアイテムのみを実行します。これらは、バウンドされていないワークキューとして実装され、 <strong>max_active</strong> 1つのプールを持つ。</p>
+<p><strong>戻り値</strong></p>
+<p>成功時の割り当てられたワークキューへのポインタ、 <code class="docutils literal notranslate"><span class="pre">NULL</span></code> を返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.queue_work">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">queue_work</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">wq</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">work_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">作業</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.queue_work" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワークキューにワークをキューイングする</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*wq</span></code></dt><dd><p>使用するworkqueue</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">work_struct</span> <span class="pre">*work</span></code></dt><dd><p>キューに登録する作業</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>を渡します。 <code class="docutils literal notranslate"><span class="pre">false</span></code> に鍵を追加する際に、 <strong>作業</strong> すでにキューに登録されていました、 <code class="docutils literal notranslate"><span class="pre">true</span></code> それ以外の場合</p>
+<p>作業をその作業が提出されたCPUにキューに登録しますが、CPUが死んだ場合でも、他のCPUで処理できます。</p>
+<p>メモリ順序の性質: それが返す場合 <code class="docutils literal notranslate"><span class="pre">true</span></code>、呼び出しの前のすべてのストアが、CPUが実行するときに見えることを保証します <a class="reference internal" href="#c.queue_work" title="queue_work"><code class="xref c c-func docutils literal notranslate"><span class="pre">queue_work()</span></code></a> プログラム順序で行われるすべてのストアが、実行するCPUから見える <strong>作業</strong> その作業が実行されるまでに、例えば</p>
+<p>{ x は初期値として 0 }</p>
+<blockquote>
+<div><p>CPU0 CPU1</p>
+<p>WRITE_ONCE(x, 1); [ <strong>作業</strong> 実行中] r0 = queue_work(wq, work); r1 = READ_ONCE(x);</p>
+</div></blockquote>
+<p>禁止: r0 == true かつ r1 == 0</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.queue_delayed_work">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">queue_delayed_work</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">wq</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">delayed_work</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dwork</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">遅延</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.queue_delayed_work" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>遅延後にworkqueueに作業をキューに登録する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*wq</span></code></dt><dd><p>使用するworkqueue</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">delayed_work</span> <span class="pre">*dwork</span></code></dt><dd><p>キューに登録可能な遅延可能な作業</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">delay</span></code></dt><dd><p>キューに登録する前に待機するjiffiesの数</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>同等です <a class="reference internal" href="#c.queue_delayed_work_on" title="queue_delayed_work_on"><code class="xref c c-func docutils literal notranslate"><span class="pre">queue_delayed_work_on()</span></code></a> ただし、ローカルのCPUを使用しようとします。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.mod_delayed_work">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mod_delayed_work</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">wq</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">delayed_work</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dwork</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">遅延</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.mod_delayed_work" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>遅延可能な作業の遅延を変更するか、キューに登録する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*wq</span></code></dt><dd><p>使用するworkqueue</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">delayed_work</span> <span class="pre">*dwork</span></code></dt><dd><p>キューに登録する作業</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">delay</span></code></dt><dd><p>キューに登録する前に待機するjiffiesの数</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p><a class="reference internal" href="#c.mod_delayed_work_on" title="mod_delayed_work_on"><code class="xref c c-func docutils literal notranslate"><span class="pre">mod_delayed_work_on()</span></code></a> ローカルのCPUで</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.schedule_work_on">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">schedule_work_on</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">CPU</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">work_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">作業</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.schedule_work_on" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>特定のCPUに作業タスクを配置する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">cpu</span></code></dt><dd><p>作業タスクを配置するCPU</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">work_struct</span> <span class="pre">*work</span></code></dt><dd><p>実行すべき作業</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>これは特定のCPUに作業を配置します</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.schedule_work">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">schedule_work</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">work_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">作業</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.schedule_work" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>グローバルworkqueueに作業タスクを配置する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">work_struct</span> <span class="pre">*work</span></code></dt><dd><p>実行すべき作業</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>を渡します。 <code class="docutils literal notranslate"><span class="pre">false</span></code> に鍵を追加する際に、 <strong>作業</strong> すでにカーネルグローバルworkqueueにあり、
+<code class="docutils literal notranslate"><span class="pre">true</span></code> それ以外の場合</p>
+<p>これは、すでにキューに登録されていない場合にカーネルグローバルworkqueueに作業を配置し、それ以外の場合はカーネルグローバルworkqueueの同じ位置に残します。</p>
+<p>同じメモリ順序の性質を持ちます <a class="reference internal" href="#c.queue_work" title="queue_work"><code class="xref c c-func docutils literal notranslate"><span class="pre">queue_work()</span></code></a>、cf. DocBookヘッダーの <a class="reference internal" href="#c.queue_work" title="queue_work"><code class="xref c c-func docutils literal notranslate"><span class="pre">queue_work()</span></code></a>.</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.flush_scheduled_work">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">flush_scheduled_work</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.flush_scheduled_work" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>すべてのスケジュールされた作業が完了するまでを保証します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>カーネルグローバルworkqueueの実行を強制し、完了するまでブロックします。</p>
+<p>この関数を呼び出す前に二度考えましょう！注意を払わなければ、簡単に問題に巻き込まれます。以下のいずれかの状況はデッドロックを引き起こします：</p>
+<blockquote>
+<div><p>現在workqueueに登録されている作業項目のうち、あなたのコードまたはその呼び出し元が保持しているロックを取得する必要があります。</p>
+<p>あなたのコードは作業ルーチンの文脈で実行されています。</p>
+</div></blockquote>
+<p>これらはlockdepによって検出されますが、最初のものは非常に頻繁に発生するとは限りません。これはworkqueueに登録されている作業項目とそれらが必要とするロックの種類に依存し、あなたが制御できません。</p>
+<p>ほとんどの状況では、全体のworkqueueをフラッシュするのは過剰です。特定の作業項目がキューに登録されておらず、実行中でないことを確認するだけで十分です。このような場合、以下の関数を使用してください。 <a class="reference internal" href="#c.cancel_delayed_work_sync" title="遅延ワークをキャンセルし、完了を待つ"><code class="xref c c-func docutils literal notranslate"><span class="pre">cancel_delayed_work_sync()</span></code></a> または
+<a class="reference internal" href="#c.cancel_work_sync" title="cancel_work_sync"><code class="xref c c-func docutils literal notranslate"><span class="pre">cancel_work_sync()</span></code></a> を呼び出してください。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.schedule_delayed_work_on">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">schedule_delayed_work_on</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">CPU</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">delayed_work</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dwork</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">遅延</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.schedule_delayed_work_on" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>遅延後にグローバルワークキューに作業をキューイングする（指定されたCPU上）</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">cpu</span></code></dt><dd><p>使用するCPU</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">delayed_work</span> <span class="pre">*dwork</span></code></dt><dd><p>実行すべき作業</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">delay</span></code></dt><dd><p>待機するjiffies数</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>指定されたCPU上のカーネルグローバルワークキューにジョブを配置するために、指定された時間待機します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.schedule_delayed_work">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">schedule_delayed_work</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">delayed_work</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dwork</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">遅延</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.schedule_delayed_work" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>遅延後にグローバルワークキューに作業タスクを配置する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">delayed_work</span> <span class="pre">*dwork</span></code></dt><dd><p>実行すべき作業</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">delay</span></code></dt><dd><p>待機するjiffies数または即時実行の場合は0</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>指定された時間待機した後、カーネルグローバルワークキューにジョブを配置します。</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.for_each_pool">
+<span class="sig-name descname"><span class="n"><span class="pre">for_each_pool</span></span></span><a class="headerlink" href="#c.for_each_pool" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">for_each_pool</span> <span class="pre">(pool,</span> <span class="pre">pi)</span></code></p>
+<blockquote>
+<div><p>システム内のすべてのworker_poolsを繰り返す</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">pool</span></code></dt><dd><p>繰り返しカーソル</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">pi</span></code></dt><dd><p>繰り返しに使用される整数</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この関数はwq_pool_mutexを保持しているか、RCU read lockを取得している必要があります。プールがロックの効果を超えて使用される必要がある場合、呼び出し元がプールがオンラインのままになることを保証する責任があります。</p>
+<p>if/else文はlockdepのアサーションのために存在し、無視できます。</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.for_each_pool_worker">
+<span class="sig-name descname"><span class="n"><span class="pre">for_each_pool_worker</span></span></span><a class="headerlink" href="#c.for_each_pool_worker" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">for_each_pool_worker</span> <span class="pre">(worker,</span> <span class="pre">pool)</span></code></p>
+<blockquote>
+<div><p>指定されたworker_poolのすべてのworkerを繰り返す</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">worker</span></code></dt><dd><p>繰り返しカーソル</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">pool</span></code></dt><dd><p>繰り返すworker_pool</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この関数はwq_pool_attach_mutexを保持している必要があります。</p>
+<p>if/else文はlockdepのアサーションのために存在し、無視できます。</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.for_each_pwq">
+<span class="sig-name descname"><span class="n"><span class="pre">for_each_pwq</span></span></span><a class="headerlink" href="#c.for_each_pwq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">for_each_pwq</span> <span class="pre">(pwq,</span> <span class="pre">wq)</span></code></p>
+<blockquote>
+<div><p>指定されたworkqueueのすべてのpool_workqueuesを繰り返す</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">pwq</span></code></dt><dd><p>繰り返しカーソル</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">wq</span></code></dt><dd><p>ターゲットworkqueue</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この関数はwq-&gt;mutexを保持しているか、RCU read lockを取得している必要があります。pwqがロックの効果を超えて使用される必要がある場合、呼び出し元がpwqがオンラインのままになることを保証する責任があります。</p>
+<p>if/else文はlockdepのアサーションのために存在し、無視できます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.worker_pool_assign_id">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">worker_pool_assign_id</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">worker_pool</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">プール</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.worker_pool_assign_id" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>IDを割り当てて <strong>プール</strong></p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker_pool</span> <span class="pre">*pool</span></code></dt><dd><p>対象のプールポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>IDが[0, WORK_OFFQ_POOL_NONE)の範囲内で正常に割り当てられた場合、0を返します。失敗時は-errnoを返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.unbound_pwq_by_node">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pool_workqueue</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">unbound_pwq_by_node</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">wq</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">node</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.unbound_pwq_by_node" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定されたノードのunbound pool_workqueueを返す</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*wq</span></code></dt><dd><p>ターゲットworkqueue</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">node</span></code></dt><dd><p>ノードID</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この関数はwq_pool_mutex、wq-&gt;mutex、またはRCU read lockのいずれかを保持している必要があります。pwqがロックの効果を超えて使用される必要がある場合、呼び出し元がpwqがオンラインのままになることを保証する責任があります。</p>
+<p><strong>戻り値</strong></p>
+<p>のunbound pool_workqueue <strong>node</strong>.</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.get_work_pool">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">worker_pool</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">get_work_pool</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">work_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">作業</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.get_work_pool" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定された作業が関連付けられたworker_poolを返す</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">work_struct</span> <span class="pre">*work</span></code></dt><dd><p>対象の作業項目</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>プールはwq_pool_mutexの下で作成および破壊され、RCU read lockの下で読み取りアクセスが可能です。したがって、この関数はwq_pool_mutexの下で呼び出されるべきです。または、 <a class="reference internal" href="kernel-api.html#c.rcu_read_lock" title="rcu_read_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code></a> リージョン内で呼び出してください。</p>
+<p>ロックが有効な限り、返されたプールのすべてのフィールドにアクセスできます。返されたプールがクリティカルセクションを超えて使用される必要がある場合、呼び出し元がプールがオンラインであり続けていることを保証する責任があります。</p>
+<p><strong>戻り値</strong></p>
+<p>ワーカープール <strong>作業</strong> 最後に関連付けられていた。  <code class="docutils literal notranslate"><span class="pre">NULL</span></code> なし。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.get_work_pool_id">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">get_work_pool_id</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">work_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">作業</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.get_work_pool_id" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定された作業が関連付けられているワーカープールIDを取得</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">work_struct</span> <span class="pre">*work</span></code></dt><dd><p>対象の作業項目</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>ワーカープールID <strong>作業</strong> 最後に関連付けられていた。
+<code class="docutils literal notranslate"><span class="pre">WORK_OFFQ_POOL_NONE</span></code> なし。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.wake_up_worker">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">wake_up_worker</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">worker_pool</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">プール</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.wake_up_worker" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>アイドル状態のワーカーを起動</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker_pool</span> <span class="pre">*pool</span></code></dt><dd><p>起動するワーカーのワーカープール</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>を起動する最初のアイドルワーカーを <strong>プール</strong>.</p>
+<p><strong>コンテキスト</strong></p>
+<p>raw_spin_lock_irq(pool-&gt;lock).</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.wq_worker_running">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">wq_worker_running</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">task_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">task</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.wq_worker_running" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワーカーが再び実行中である</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">task_struct</span> <span class="pre">*task</span></code></dt><dd><p>起動タスク</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ワーカーがschedule()から戻るときにこの関数が呼ばれます</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.wq_worker_sleeping">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">wq_worker_sleeping</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">task_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">task</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.wq_worker_sleeping" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワーカーが睡眠に入る</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">task_struct</span> <span class="pre">*task</span></code></dt><dd><p>睡眠に入るタスク</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>忙しいワーカーが睡眠に入るときにschedule()から呼ばれます。優先度の上げ下げを無効化する必要があります。-&gt;sleepingの割り当てを保護するためです。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.wq_worker_last_func">
+<span class="n"><span class="pre">work_func_t</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">wq_worker_last_func</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">task_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">task</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.wq_worker_last_func" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワーカーの最後に実行した作業関数を取得</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">task_struct</span> <span class="pre">*task</span></code></dt><dd><p>最後の作業関数を取得するタスク。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ワーカーが最後に実行した関数を特定します。これはスケジューラからワーカーの最後の識別情報を取得するために呼び出されます。</p>
+<p>kworkerが睡眠に入るときにschedule()から呼ばれます。psiがデキューイング中に集約ワーカーを特定するために使用され、そのワーカーがシステムまたはcgroupで最後のタスクに睡眠に入るとき、定期的な集約をオフにします。</p>
+<p>この関数は作業キュー関連のロックを伴わないため、スケジューラのキューイングおよびデキューイングパス内で呼ばれた場合、 <strong>task</strong>、これはkworkerでなければならず、作業を処理していないことが保証される必要があります。</p>
+<p><strong>コンテキスト</strong></p>
+<p>raw_spin_lock_irq(rq-&gt;lock)</p>
+<p><strong>戻り値</strong></p>
+<p>最後に実行した作業関数 <code class="docutils literal notranslate"><span class="pre">current</span></code> ワーカーとして実行された、まだ作業を実行していない場合はNULL。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.worker_set_flags">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">worker_set_flags</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.worker_set_flags" title="ワーカー"><span class="n"><span class="pre">ワーカー</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ワーカー</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.worker_set_flags" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>フラグを設定し、nr_runningを適切に調整</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker</span> <span class="pre">*worker</span></code></dt><dd><p>自身</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">flags</span></code></dt><dd><p>設定するフラグ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>Set <strong>フラグ</strong> の <strong>worker-&gt;flags</strong> を設定し、nr_runningを適切に調整。</p>
+<p><strong>コンテキスト</strong></p>
+<p>raw_spin_lock_irq(pool-&gt;lock)</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.worker_clr_flags">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">worker_clr_flags</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.worker_clr_flags" title="ワーカー"><span class="n"><span class="pre">ワーカー</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ワーカー</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.worker_clr_flags" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>フラグをクリアし、nr_runningを適切に調整</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker</span> <span class="pre">*worker</span></code></dt><dd><p>自身</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">flags</span></code></dt><dd><p>クリアするフラグ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>クリア <strong>フラグ</strong> の <strong>worker-&gt;flags</strong> を設定し、nr_runningを適切に調整。</p>
+<p><strong>コンテキスト</strong></p>
+<p>raw_spin_lock_irq(pool-&gt;lock)</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.find_worker_executing_work">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">ワーカー</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">find_worker_executing_work</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">worker_pool</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">プール</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">work_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">作業</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.find_worker_executing_work" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>実行中のワーカーを検索する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker_pool</span> <span class="pre">*pool</span></code></dt><dd><p>関心プール</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">work_struct</span> <span class="pre">*work</span></code></dt><dd><p>ワーカーを検索するためのワーク</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>実行中のワーカーを検索する <strong>作業</strong> on <strong>プール</strong> 検索によって
+<strong>pool-&gt;busy_hash</strong> アドレスによってキー付けされている <strong>作業</strong>。ワーカーが一致するには、その現在の実行がアドレスと一致する必要があります <strong>作業</strong> そのワーク関数と一致する必要があります。これは、ワーク項目が再利用される一方で実行が続く場合、関係のないワーク実行間の不望な依存関係を避けるためです</p>
+<p>これは少し複雑です。ワーク項目は実行が開始されると解放され、解放された領域が他のワーク項目に再利用される可能性があります。もしあるワーク項目のアドレスが元の実行が完了する前に再利用されると、workqueueは再利用されたワーク項目を現在実行中と識別し、現在の実行が完了するまで待機させることで、不望な依存関係を導入します</p>
+<p>この関数は、偽陽性を避けるためにワーク項目のアドレスとワーク関数を確認します。注意点として、この処理は完全ではありません。なぜなら、再利用されたワーク項目を通じて自身に依存関係を導入するワーク関数を構築する可能性があるからです。まあ、もし誰かが足を踏まれるほど自己破壊したいのなら、私たちはそれほど多くのことをすることができません。そのようなデッドロックが実際に発生した場合、問題のワーク関数を特定するのは簡単です</p>
+<p><strong>コンテキスト</strong></p>
+<p>raw_spin_lock_irq(pool-&gt;lock).</p>
+<p><strong>戻り値</strong></p>
+<p>実行中のワーカーへのポインタ <strong>作業</strong> 見つかった場合、 <code class="docutils literal notranslate"><span class="pre">NULL</span></code>
+それ以外の場合</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.move_linked_works">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">move_linked_works</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">work_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">作業</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">list_head</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ヘッド</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">work_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">nextp</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.move_linked_works" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>リンクされたワークをリストに移動</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">work_struct</span> <span class="pre">*work</span></code></dt><dd><p>スケジュールされるワークの系列の開始</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">list_head</span> <span class="pre">*head</span></code></dt><dd><p>追加先のターゲットリスト <strong>作業</strong> に（木の下から葉に向かって）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">work_struct</span> <span class="pre">**nextp</span></code></dt><dd><p>ネストされたワークリストのウォーク用の出力パラメータ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>開始からリンクされたワークをスケジュール <strong>作業</strong> に（木の下から葉に向かって） <strong>ヘッド</strong>。スケジュールされるワーク系列はここから開始 <strong>作業</strong> そして、前のワークにWORK_STRUCT_LINKEDが設定されている連続するワークを含みます</p>
+<p>もし <strong>nextp</strong> NULLでない場合、最後にスケジュールされたワークの次のワークを指すよう更新されます。これにより、 <a class="reference internal" href="#c.move_linked_works" title="move_linked_works"><code class="xref c c-func docutils literal notranslate"><span class="pre">move_linked_works()</span></code></a> 外側のものの中にネストされる <a class="reference internal" href="kernel-api.html#c.list_for_each_entry_safe" title="list_for_each_entry_safe"><code class="xref c c-func docutils literal notranslate"><span class="pre">list_for_each_entry_safe()</span></code></a>.</p>
+<p><strong>コンテキスト</strong></p>
+<p>raw_spin_lock_irq(pool-&gt;lock).</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.get_pwq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">get_pwq</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pool_workqueue</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">pwq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.get_pwq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定されたpool_workqueueに追加の参照を取得</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pool_workqueue</span> <span class="pre">*pwq</span></code></dt><dd><p>取得するpool_workqueue</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>取得する <strong>pwq</strong>。呼び出し元は、
+<strong>pwq</strong> 正のrefcntを持ち、一致するpool-&gt;lockを保持していることを保証する必要があります</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.put_pwq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">put_pwq</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pool_workqueue</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">pwq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.put_pwq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>pool_workqueueの参照を解放</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pool_workqueue</span> <span class="pre">*pwq</span></code></dt><dd><p>解放するpool_workqueue</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>参照を解放 <strong>pwq</strong>。refcntがゼロになると、その破壊をスケジュールします。呼び出し元は一致するpool-&gt;lockを保持している必要があります</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.put_pwq_unlocked">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">put_pwq_unlocked</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pool_workqueue</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">pwq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.put_pwq_unlocked" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p><a class="reference internal" href="#c.put_pwq" title="put_pwq"><code class="xref c c-func docutils literal notranslate"><span class="pre">put_pwq()</span></code></a> 周囲のpool lock/unlockとともに</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pool_workqueue</span> <span class="pre">*pwq</span></code></dt><dd><p>pool_workqueueにプッシュする（有効な <code class="docutils literal notranslate"><span class="pre">NULL</span></code>)</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p><a class="reference internal" href="#c.put_pwq" title="put_pwq"><code class="xref c c-func docutils literal notranslate"><span class="pre">put_pwq()</span></code></a> ロックを伴う。この関数はまた、 <code class="docutils literal notranslate"><span class="pre">NULL</span></code> <strong>pwq</strong>.</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.pwq_dec_nr_in_flight">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">pwq_dec_nr_in_flight</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pool_workqueue</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">pwq</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">color</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.pwq_dec_nr_in_flight" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>pwqのnr_in_flightを減算する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pool_workqueue</span> <span class="pre">*pwq</span></code></dt><dd><p>対象のpwq</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">color</span></code></dt><dd><p>キューから離れたワークのcolor</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ワークは完了したか、またはpendingキューから削除されたため、そのpwqのnr_in_flightを減算し、workqueueのフラッシュ処理を行います。</p>
+<p><strong>コンテキスト</strong></p>
+<p>raw_spin_lock_irq(pool-&gt;lock).</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.try_to_grab_pending">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">try_to_grab_pending</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">work_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">作業</span></span>, <span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n"><span class="pre">is_dwork</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">フラグ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.try_to_grab_pending" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>worklistからワーク項目を盗み取り、割り込みを無効にする</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">work_struct</span> <span class="pre">*work</span></code></dt><dd><p>盗み取るワーク項目</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">is_dwork</span></code></dt><dd><p><strong>作業</strong> delayed_workである</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">*flags</span></code></dt><dd><p>割り込み状態を保存する場所</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>PENDINGビットを取得しようと試みる <strong>作業</strong>。この関数は、 <strong>作業</strong> 安定した状態（アイドル、タイマーやworklist上）で処理可能です。</p>
+<p>成功した場合、&gt;=0を返し、割り込みが無効化され、callerはlocal_irq_restore(<strong>*flags</strong>).</p>
+<p>この関数は、IRQハンドラを含むあらゆるコンテキストから安全に呼び出せます。</p>
+<p><strong>戻り値</strong></p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 11%"/>
+<col style="width: 89%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>1</p></td>
+<td><p>に鍵を追加する際に、 <strong>作業</strong> 待機中だったがPENDINGを成功裏に盗んだ</p></td>
+</tr>
+<tr class="row-even"><td><p>0</p></td>
+<td><p>に鍵を追加する際に、 <strong>作業</strong> アイドル状態だったがPENDINGを主張した</p></td>
+</tr>
+<tr class="row-odd"><td><p>-EAGAIN</p></td>
+<td><p>PENDINGを取得できなかった場合、再試行可能で安全</p></td>
+</tr>
+<tr class="row-even"><td><p>-ENOENT</p></td>
+<td><p>他のスレッドがキャンセルしている場合 <strong>作業</strong>、この状態は任意に長く続く可能性があります</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p><strong>注意</strong></p>
+<p>&gt;=0を返した場合、callerが <strong>作業</strong>のPENDINGビットを所有します。PENDINGを保持しながら <strong>作業</strong> キューから外れるのを避けるため、入力時に割り込みを無効化する必要があります。これに加えて、delayed_work-&gt;timerが割り込み安全であるため、有限の短時間の間、-EAGAINを返すことが保証されます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.insert_work">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">insert_work</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pool_workqueue</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">pwq</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">work_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">作業</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">list_head</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ヘッド</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">extra_flags</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.insert_work" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワークをプールに挿入する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pool_workqueue</span> <span class="pre">*pwq</span></code></dt><dd><p>pwq <strong>作業</strong> 属する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">work_struct</span> <span class="pre">*work</span></code></dt><dd><p>挿入するワーク</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">list_head</span> <span class="pre">*head</span></code></dt><dd><p>挿入位置</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">extra_flags</span></code></dt><dd><p>設定するWORK_STRUCT_*フラグの追加</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>挿入 <strong>作業</strong> 属する <strong>pwq</strong> RCU保護データ構造からデータ要素を削除した後、 <strong>ヘッド</strong>.  <strong>extra_flags</strong> ワーク構造体フラグに論理和される</p>
+<p><strong>コンテキスト</strong></p>
+<p>raw_spin_lock_irq(pool-&gt;lock).</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.queue_work_on">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">queue_work_on</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">CPU</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">wq</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">work_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">作業</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.queue_work_on" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>特定のCPUで作業をキューに追加する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">cpu</span></code></dt><dd><p>実行するCPUの番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*wq</span></code></dt><dd><p>使用するworkqueue</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">work_struct</span> <span class="pre">*work</span></code></dt><dd><p>キューに登録する作業</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>作業を特定のCPUにキューに追加します。呼び出し元は、作業が別のCPUに移動しないことを保証する必要があります。</p>
+<p><strong>戻り値</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">false</span></code> に鍵を追加する際に、 <strong>作業</strong> すでにキューに登録されていました、 <code class="docutils literal notranslate"><span class="pre">true</span></code> それ以外の場合</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.workqueue_select_cpu_near">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">workqueue_select_cpu_near</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">node</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.workqueue_select_cpu_near" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>NUMAノードに基づいてCPUを選択する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">node</span></code></dt><dd><p>選択するCPUのNUMAノードID</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この関数は、指定されたノード上で利用可能な「ランダムな」CPUを検索しようとします。指定されたノード上に利用可能なCPUがなければ、WORK_CPU_UNBOUNDを返します。これは、この作業をスケジュールする必要がある場合に、任意の利用可能なCPUにスケジュールするように示します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.queue_work_node">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">queue_work_node</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">node</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">wq</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">work_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">作業</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.queue_work_node" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定されたNUMAノード内の「ランダムな」CPUで作業をキューに追加する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">node</span></code></dt><dd><p>ターゲットとするNUMAノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*wq</span></code></dt><dd><p>使用するworkqueue</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">work_struct</span> <span class="pre">*work</span></code></dt><dd><p>キューに登録する作業</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>指定されたNUMAノード内の「ランダムな」CPUに作業をキューに追加します。ここでの基本的な考え方は、作業を特定のNUMAノードに関連付ける方法を提供することです。</p>
+<p>この関数は、正しいNUMAノードに作業を配置するための最大限の努力を行います。ノードが指定されていないか、指定されたノードがオフラインの場合、標準のqueue_workの動作に戻ります。</p>
+<p>現在、「ランダムな」CPUは、cpu_online_maskとノードのcpumaskの交差部分にある最初の利用可能なCPUになります。ただし、ノード上で実行している場合は、現在のCPUを使用します。</p>
+<p><strong>戻り値</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">false</span></code> に鍵を追加する際に、 <strong>作業</strong> すでにキューに登録されていました、 <code class="docutils literal notranslate"><span class="pre">true</span></code> それ以外の場合</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.queue_delayed_work_on">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">queue_delayed_work_on</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">CPU</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">wq</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">delayed_work</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dwork</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">遅延</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.queue_delayed_work_on" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>遅延後に特定のCPUで作業をキューに追加する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">cpu</span></code></dt><dd><p>実行するCPUの番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*wq</span></code></dt><dd><p>使用するworkqueue</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">delayed_work</span> <span class="pre">*dwork</span></code></dt><dd><p>キューに登録する作業</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">delay</span></code></dt><dd><p>キューに登録する前に待機するjiffiesの数</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">false</span></code> に鍵を追加する際に、 <strong>作業</strong> すでにキューに登録されていました、 <code class="docutils literal notranslate"><span class="pre">true</span></code> それ以外の場合。もし
+<strong>遅延</strong> がゼロで <strong>dwork</strong> がアイドル状態であれば、即時実行される予定です。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.mod_delayed_work_on">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mod_delayed_work_on</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">CPU</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">wq</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">delayed_work</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dwork</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">遅延</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.mod_delayed_work_on" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>遅延を修正するか、特定のCPUで遅延作業をキューに追加する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">cpu</span></code></dt><dd><p>実行するCPUの番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*wq</span></code></dt><dd><p>使用するworkqueue</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">delayed_work</span> <span class="pre">*dwork</span></code></dt><dd><p>キューに登録する作業</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">delay</span></code></dt><dd><p>キューに登録する前に待機するjiffiesの数</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>もし <strong>dwork</strong> がアイドル状態であれば、同等です <a class="reference internal" href="#c.queue_delayed_work_on" title="queue_delayed_work_on"><code class="xref c c-func docutils literal notranslate"><span class="pre">queue_delayed_work_on()</span></code></a>；それ以外の場合、修正する <strong>dwork</strong>のタイマを、後に期限切れとなるように修正する <strong>遅延</strong>. <strong>遅延</strong> がゼロであれば、 <strong>作業</strong> 現在の状態に関係なく、即時スケジュールされることが保証されます。</p>
+<p>この関数は、IRQハンドラを含む任意のコンテキストから呼び出すことができます。参照: <a class="reference internal" href="#c.try_to_grab_pending" title="try_to_grab_pending"><code class="xref c c-func docutils literal notranslate"><span class="pre">try_to_grab_pending()</span></code></a> 詳しくは以下をご参照ください。</p>
+<p><strong>戻り値</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">false</span></code> に鍵を追加する際に、 <strong>dwork</strong> がアイドル状態でキューに追加されていました <code class="docutils literal notranslate"><span class="pre">true</span></code> に鍵を追加する際に、 <strong>dwork</strong> が待機状態で、タイマが修正されました。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.queue_rcu_work">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">queue_rcu_work</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">wq</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">rcu_work</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">rwork</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.queue_rcu_work" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>RCUグレース期間後に作業をキューに追加する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*wq</span></code></dt><dd><p>使用するworkqueue</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">rcu_work</span> <span class="pre">*rwork</span></code></dt><dd><p>キューに登録する作業</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">false</span></code> に鍵を追加する際に、 <strong>rwork</strong> すでに待機状態でした <code class="docutils literal notranslate"><span class="pre">true</span></code> それ以外の場合。注意: 完全なRCUグレース期間は、特定の操作の後だけ保証されます。 <code class="docutils literal notranslate"><span class="pre">true</span></code> 戻り値。ただし <strong>rwork</strong> が、RCUグレース期間後に実行されることが保証されています <code class="docutils literal notranslate"><span class="pre">false</span></code> 戻り値、実行は完全なRCUグレース期間が経過する前に発生する可能性があります。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.worker_enter_idle">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">worker_enter_idle</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.worker_enter_idle" title="ワーカー"><span class="n"><span class="pre">ワーカー</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ワーカー</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.worker_enter_idle" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>アイドル状態に入る</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker</span> <span class="pre">*worker</span></code></dt><dd><p>アイドル状態に入るワーカー</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p><strong>ワーカー</strong> アイドル状態に入っています。必要に応じて統計情報とアイドルタイマを更新します。</p>
+<p>ロック: raw_spin_lock_irq(pool-&gt;lock).</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.worker_leave_idle">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">worker_leave_idle</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.worker_leave_idle" title="ワーカー"><span class="n"><span class="pre">ワーカー</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ワーカー</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.worker_leave_idle" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>アイドル状態から離脱</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker</span> <span class="pre">*worker</span></code></dt><dd><p>アイドル状態から離脱中のワーカー</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p><strong>ワーカー</strong> アイドル状態から離脱中。統計情報を更新します。</p>
+<p>ロック: raw_spin_lock_irq(pool-&gt;lock).</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.worker_attach_to_pool">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">worker_attach_to_pool</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.worker_attach_to_pool" title="ワーカー"><span class="n"><span class="pre">ワーカー</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ワーカー</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">worker_pool</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">プール</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.worker_attach_to_pool" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワーカーをプールにアタッチ</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker</span> <span class="pre">*worker</span></code></dt><dd><p>アタッチされるワーカー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker_pool</span> <span class="pre">*pool</span></code></dt><dd><p>ターゲットプール</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>アタッチ <strong>ワーカー</strong> に（木の下から葉に向かって） <strong>プール</strong>アタッチ後、 <code class="docutils literal notranslate"><span class="pre">WORKER_UNBOUND</span></code> フラグおよびCPUバインディング <strong>ワーカー</strong> CPUのホットプラグ/ホットアンプラグを越えてプールと連携して維持されます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.worker_detach_from_pool">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">worker_detach_from_pool</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.worker_detach_from_pool" title="ワーカー"><span class="n"><span class="pre">ワーカー</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ワーカー</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.worker_detach_from_pool" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワーカーをそのプールから分離</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker</span> <span class="pre">*worker</span></code></dt><dd><p>そのプールにアタッチされているワーカー</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>以前に実行されたアタッチを解除 <a class="reference internal" href="#c.worker_attach_to_pool" title="worker_attach_to_pool"><code class="xref c c-func docutils literal notranslate"><span class="pre">worker_attach_to_pool()</span></code></a>呼び出し元のワーカーは、分離後はプールへのアクセスを行ってはいけません（プールへの他の参照がある場合を除く）。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.create_worker">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">ワーカー</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">create_worker</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">worker_pool</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">プール</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.create_worker" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>新しいワークキュー・ワーカーを作成</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker_pool</span> <span class="pre">*pool</span></code></dt><dd><p>新しいワーカーが所属するプール</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>新しいワーカーを作成・開始し、アタッチされている <strong>プール</strong>.</p>
+<p><strong>コンテキスト</strong></p>
+<p>スリープする可能性があります。GFP_KERNELの割当を行います。</p>
+<p><strong>戻り値</strong></p>
+<p>新たに作成されたワーカーへのポインタ。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.destroy_worker">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">destroy_worker</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.destroy_worker" title="ワーカー"><span class="n"><span class="pre">ワーカー</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ワーカー</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.destroy_worker" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワークキュー・ワーカーを破棄</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker</span> <span class="pre">*worker</span></code></dt><dd><p>破棄されるワーカー</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>破棄 <strong>ワーカー</strong> および調整 <strong>プール</strong> 統計情報を適切に調整します。ワーカーはアイドル状態でなければなりません。</p>
+<p><strong>コンテキスト</strong></p>
+<p>raw_spin_lock_irq(pool-&gt;lock).</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.maybe_create_worker">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">maybe_create_worker</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">worker_pool</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">プール</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.maybe_create_worker" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>必要に応じて新しいワーカーを作成</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker_pool</span> <span class="pre">*pool</span></code></dt><dd><p>新しいワーカーを作成するためのプール</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>新しいワーカーを作成します <strong>プール</strong> 必要に応じて。  <strong>プール</strong> この関数から戻るときに少なくとも1つのアイドルワーカーが存在します。新しいワーカーの作成がMAYDAY_INTERVALよりも時間がかかる場合、スケジュールされている作業を持つすべてのレスカーフがmaydayを受信します。 <strong>プール</strong> 可能な割当デッドロックを解決するため。</p>
+<p>戻るときにneed_to_create_worker()は保証されて <code class="docutils literal notranslate"><span class="pre">false</span></code> およびmay_start_working() <code class="docutils literal notranslate"><span class="pre">true</span></code>.</p>
+<p>ロック: raw_spin_lock_irq(pool-&gt;lock) は複数回解放および再取得される可能性があります。GFP_KERNELの割当を行います。マネージャーからのみ呼び出されます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.manage_workers">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">ワーカーを管理する</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.manage_workers" title="ワーカー"><span class="n"><span class="pre">ワーカー</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ワーカー</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.manage_workers" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワーカー・プールを管理する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker</span> <span class="pre">*worker</span></code></dt><dd><p>自身</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>マネージャーの役割を取得し、ワーカー・プールを管理する <strong>ワーカー</strong> 所属する。いつでも、プールごとにマネージャーはゼロまたは1つしか存在できません。この機能により自動的に排他制御が行われます。</p>
+<p>呼び出し元はfalseの戻り値で作業を安全に処理を開始できます。trueの戻り値ではneed_to_create_worker()がfalseであり、may_start_working()がtrueであることが保証されます。</p>
+<p><strong>コンテキスト</strong></p>
+<p>raw_spin_lock_irq(pool-&gt;lock)を取得し、複数回解放・再取得される可能性があります。GFP_KERNELの割当を行います。</p>
+<p><strong>戻り値</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">false</span></code> プールが管理不要で呼び出し元が作業を安全に処理を開始できる場合、 <code class="docutils literal notranslate"><span class="pre">true</span></code> 管理関数が実行され、呼び出し元が関数呼び出し前に確認した条件がもはや成立していない可能性がある場合、</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.process_one_work">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">process_one_work</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.process_one_work" title="ワーカー"><span class="n"><span class="pre">ワーカー</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ワーカー</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">work_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">作業</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.process_one_work" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>単一の作業を処理する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker</span> <span class="pre">*worker</span></code></dt><dd><p>自身</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">work_struct</span> <span class="pre">*work</span></code></dt><dd><p>処理する作業</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>処理 <strong>作業</strong>この関数には、1つの作業を処理するためのすべてのロジックが含まれています。同期処理や同CPU上の他のワーカーとの相互作用、キューイングおよびフラッシュ処理も含まれます。コンテキスト要件が満たされている限り、どのワーカーもこの関数を呼び出して作業を処理できます。</p>
+<p><strong>コンテキスト</strong></p>
+<p>raw_spin_lock_irq(pool-&gt;lock)を取得し、解放・再取得されます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.process_scheduled_works">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">process_scheduled_works</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.process_scheduled_works" title="ワーカー"><span class="n"><span class="pre">ワーカー</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ワーカー</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.process_scheduled_works" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>スケジュールされた作業を処理する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker</span> <span class="pre">*worker</span></code></dt><dd><p>自身</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>すべてのスケジュールされた作業を処理します。注意点として、作業を処理している間にもスケジュールリストが変化する可能性があるため、この関数は常に先頭の作業を取得して実行します。</p>
+<p><strong>コンテキスト</strong></p>
+<p>raw_spin_lock_irq(pool-&gt;lock)を取得し、複数回解放・再取得される可能性があります。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.worker_thread">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">worker_thread</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">__worker</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.worker_thread" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワーカースレッド関数</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*__worker</span></code></dt><dd><p>自身</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ワーカースレッド関数。すべてのワーカーはworker_poolに所属します。これはパーセルCPU用のプールか、動的でバインドされていないプールです。これらのワーカーは、特定のターゲットワークキューに関係なくすべての作業項目を処理します。例外は、rescuerを持つワークキューに属する作業項目です。これは <a class="reference internal" href="#c.rescuer_thread" title="rescuer_thread"><code class="xref c c-func docutils literal notranslate"><span class="pre">rescuer_thread()</span></code></a>.</p>
+<p><strong>戻り値</strong></p>
+<p>0</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.rescuer_thread">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">rescuer_thread</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">__rescuer</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.rescuer_thread" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>レスカーラースレッド関数</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*__rescuer</span></code></dt><dd><p>自身</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ワークキューのレスカーラースレッド関数。WQ_MEM_RECLAIMが設定されているすべてのワークキューには1つのレスカーラーがあります。</p>
+<p>プールでの通常の作業処理は、新しいワーカーの作成を試みる際にGFP_KERNEL割当を使用するため、一部の作業が同じキューで処理される必要がある場合、デッドロックの可能性があります。これはレスカーラーが解決する問題です。</p>
+<p>このような状況が発生する可能性がある場合、プールはそのプールにキューイングされているワークキューのすべてのレスカーラーを呼び出し、それらの作業を処理させることで、進展を保証します。</p>
+<p>これはめったに起こりません。</p>
+<p><strong>戻り値</strong></p>
+<p>0</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.check_flush_dependency">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">check_flush_dependency</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">target_wq</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">work_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">target_work</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.check_flush_dependency" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>フラッシュ依存関係の健全性を確認する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*target_wq</span></code></dt><dd><p>ワークキューがフラッシュ中</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">work_struct</span> <span class="pre">*target_work</span></code></dt><dd><p>ワークアイテムがフラッシュ中 (ワークキューのフラッシュではNULL)</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">current</span></code> 全体をフラッシュしようとしている <strong>target_wq</strong> または <strong>target_work</strong> その上。もし <strong>target_wq</strong> ノードを持っていない場合、何も実行しません。注意点として、検索されたキーノードが単一の値（配列でない）を持つ場合でもブロックは1回実行されます。ただし、検索されたキーノードに値が存在しない（キーのみのノード）場合は何も実行しません。したがって、キー値ペアの存在をテストするにはこの機能は使用しないでください <code class="docutils literal notranslate"><span class="pre">WQ_MEM_RECLAIM</span></code>、確認してください <code class="docutils literal notranslate"><span class="pre">current</span></code> メモリを回収していないか、またはワークキューでない場合
+<code class="docutils literal notranslate"><span class="pre">WQ_MEM_RECLAIM</span></code> これにより進行保証が破られ、デッドロックにつながる可能性があります。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.insert_wq_barrier">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">insert_wq_barrier</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pool_workqueue</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">pwq</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">wq_barrier</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">barr</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">work_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">target</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.insert_wq_barrier" title="ワーカー"><span class="n"><span class="pre">ワーカー</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ワーカー</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.insert_wq_barrier" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>バリアンスワークを挿入</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pool_workqueue</span> <span class="pre">*pwq</span></code></dt><dd><p>バリアンスを挿入するpwq</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">wq_barrier</span> <span class="pre">*barr</span></code></dt><dd><p>挿入するwq_barrier</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">work_struct</span> <span class="pre">*target</span></code></dt><dd><p>アタッチするターゲットワーク <strong>barr</strong> に（木の下から葉に向かって）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker</span> <span class="pre">*worker</span></code></dt><dd><p>現在実行中のワーカー <strong>target</strong>、NULLの場合 <strong>target</strong> 実行していない</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p><strong>barr</strong> リンクされている <strong>target</strong> このような <strong>barr</strong> 完了するのはこれ以降
+<strong>target</strong> 実行が終了するまで。注: オーダー保証は、 <strong>target</strong> ローカルCPUでのみ</p>
+<p>現在、キューイングされたバリアンスはキャンセルできません。これは以下の理由です
+<a class="reference internal" href="#c.try_to_grab_pending" title="try_to_grab_pending"><code class="xref c c-func docutils literal notranslate"><span class="pre">try_to_grab_pending()</span></code></a> が私たちの下で変更される可能性があるため、</p>
+<p>注: 以下の条件が満たされる場合 <strong>ワーカー</strong> がNULLでない場合、 <strong>target</strong> が私たちの下で変更される可能性があるため、 <strong>target</strong>.</p>
+<p><strong>コンテキスト</strong></p>
+<p>raw_spin_lock_irq(pool-&gt;lock).</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.flush_workqueue_prep_pwqs">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">flush_workqueue_prep_pwqs</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">wq</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">flush_color</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">work_color</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.flush_workqueue_prep_pwqs" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワークキューのフラッシュ用にpwqを準備</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*wq</span></code></dt><dd><p>ワークキューがフラッシュ中</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">flush_color</span></code></dt><dd><p>新しいフラッシュカラー、&lt; 0は無操作</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">work_color</span></code></dt><dd><p>新しいワークカラー、&lt; 0は無操作</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ワークキューのフラッシュ用にpwqを準備します。</p>
+<p>もし <strong>flush_color</strong> が非負の場合、すべてのpwqのflush_colorは-1にする必要があります。指定されたカラーでイン・フライティングコマンドをもつpwqがなければ、すべてのpwq-&gt;flush_colorは-1のまま、 <code class="docutils literal notranslate"><span class="pre">false</span></code> が返されます。あるpwqがイン・フライティングコマンドをもつ場合、そのpwq-&gt;flush_colorは
+<strong>flush_color</strong>, <strong>wq-&gt;nr_pwqs_to_flush</strong> が更新され、pwqのウェイクアップロジックが有効化され、 <code class="docutils literal notranslate"><span class="pre">true</span></code> nilを返します。</p>
+<p>呼び出し元は、 <strong>wq-&gt;first_flusher</strong> この関数を非負数で呼び出す前に <strong>flush_color</strong>.
+<strong>flush_color</strong> 負数である場合、フラッシュカラーの更新は行われず <code class="docutils literal notranslate"><span class="pre">false</span></code>
+nilを返します。</p>
+<p>もし <strong>work_color</strong> 非負数である場合、すべてのpwqsは以前のwork_colorを持つべきです <strong>work_color</strong> すべては進み、 <strong>work_color</strong>.</p>
+<p><strong>コンテキスト</strong></p>
+<p>mutex_lock(wq-&gt;mutex).</p>
+<p><strong>戻り値</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">true</span></code> に鍵を追加する際に、 <strong>flush_color</strong> &gt;= 0 であり、フラッシュするものが存在する場合  <code class="docutils literal notranslate"><span class="pre">false</span></code>
+それ以外の場合</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.flush_workqueue">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">flush_workqueue</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">wq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.flush_workqueue" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>すべてのスケジュールされた作業が完了するまでを保証します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*wq</span></code></dt><dd><p>フラッシュするワークキュー</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この関数は、入力時にキューイングされたすべての作業項目が実行を終了するまで待機しますが、新しい入力によってライブロックされることはありません。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.drain_workqueue">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drain_workqueue</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">wq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.drain_workqueue" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワークキューをドレインする</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*wq</span></code></dt><dd><p>ドレインするワークキュー</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ワークキューが空になるのを待機します。ドレイン中は、みぞれキューイングのみ許可されます。つまり、現在待機中または実行中の作業項目のみが、 <strong>wq</strong> さらに作業項目をキューイングできます。  <strong>wq</strong> フラッシュが繰り返し行われるまで空になるまで行われます。フラッシング回数はチェインの深さによって決まり、比較的短い時間で完了する必要があります。長時間かかる場合は警告します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.flush_work">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">flush_work</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">work_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">作業</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.flush_work" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>作業が最後のキューイングインスタンスを実行完了するのを待機する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">work_struct</span> <span class="pre">*work</span></code></dt><dd><p>フラッシュする作業</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>待機して、 <strong>作業</strong> 実行が終了するまで。  <strong>作業</strong> フラッシュ開始後、再キューイングされていない場合、返却時にアイドル状態が保証されます。</p>
+<p><strong>戻り値</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">true</span></code> に鍵を追加する際に、 <a class="reference internal" href="#c.flush_work" title="flush_work"><code class="xref c c-func docutils literal notranslate"><span class="pre">flush_work()</span></code></a> 作業の実行完了を待機した場合、
+<code class="docutils literal notranslate"><span class="pre">false</span></code> すでにアイドル状態だった場合は、</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.cancel_work_sync">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">cancel_work_sync</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">work_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">作業</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.cancel_work_sync" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>作業をキャンセルし、実行完了を待機する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">work_struct</span> <span class="pre">*work</span></code></dt><dd><p>キャンセルする作業</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>キャンセル <strong>作業</strong> およびその実行完了を待機します。この関数は、作業が自身を再キューイングしたり、他のワークキューに移動したりしても使用可能です。この関数から返却後、 <strong>作業</strong> どのCPUでも待機中または実行中でないことが保証されます。</p>
+<p>cancel_work_sync(<code class="xref c c-type docutils literal notranslate"><span class="pre">delayed_work-&gt;work</span></code>) は遅延作業（delayed_work）には使用できません。代わりに <a class="reference internal" href="#c.cancel_delayed_work_sync" title="遅延ワークをキャンセルし、完了を待つ"><code class="xref c c-func docutils literal notranslate"><span class="pre">cancel_delayed_work_sync()</span></code></a> を呼び出してください。</p>
+<p>呼び出し元は、 <strong>作業</strong> 最後にキューイングされたワークキューがこの関数が返る前に破壊されないことを保証しなければなりません。</p>
+<p><strong>戻り値</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">true</span></code> に鍵を追加する際に、 <strong>作業</strong> 待機中だった場合、 <code class="docutils literal notranslate"><span class="pre">false</span></code> それ以外の場合</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.flush_delayed_work">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">flush_delayed_work</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">delayed_work</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dwork</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.flush_delayed_work" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>遅延作業が最後のキューイングインスタンスを実行完了するのを待機する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">delayed_work</span> <span class="pre">*dwork</span></code></dt><dd><p>フラッシュする遅延作業</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>遅延タイマーはキャンセルされ、待機中の作業は即時実行のためにキューイングされます。同様に、 <a class="reference internal" href="#c.flush_work" title="flush_work"><code class="xref c c-func docutils literal notranslate"><span class="pre">flush_work()</span></code></a>この関数は、 <strong>dwork</strong>.</p>
+<p><strong>戻り値</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">true</span></code> に鍵を追加する際に、 <a class="reference internal" href="#c.flush_work" title="flush_work"><code class="xref c c-func docutils literal notranslate"><span class="pre">flush_work()</span></code></a> 作業の実行完了を待機した場合、
+<code class="docutils literal notranslate"><span class="pre">false</span></code> すでにアイドル状態だった場合は、</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.flush_rcu_work">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">flush_rcu_work</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">rcu_work</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">rwork</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.flush_rcu_work" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワークの最後のキューイングを終了するのを待つ</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">rcu_work</span> <span class="pre">*rwork</span></code></dt><dd><p>フラッシュするRCUワーク</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">true</span></code> に鍵を追加する際に、 <a class="reference internal" href="#c.flush_rcu_work" title="flush_rcu_work"><code class="xref c c-func docutils literal notranslate"><span class="pre">flush_rcu_work()</span></code></a> 作業の実行完了を待機した場合、
+<code class="docutils literal notranslate"><span class="pre">false</span></code> すでにアイドル状態だった場合は、</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.cancel_delayed_work">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">遅延ワークをキャンセルする</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">delayed_work</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dwork</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.cancel_delayed_work" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>遅延ワークをキャンセルする</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">delayed_work</span> <span class="pre">*dwork</span></code></dt><dd><p>キャンセルする遅延ワーク</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>待機中の遅延ワークを終了する。</p>
+<p>この関数は、IRQハンドラを含むあらゆるコンテキストから安全に呼び出せます。</p>
+<p><strong>戻り値</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">true</span></code> に鍵を追加する際に、 <strong>dwork</strong> 待機中だったがキャンセルされた場合; <code class="docutils literal notranslate"><span class="pre">false</span></code> 待機していなかった場合は</p>
+<p><strong>注意</strong></p>
+<p>戻り時にワークコールバック関数がまだ実行中である可能性があります。ただし、関数が返却値を返さない限り、ワークが再アームされない場合があります。 <code class="docutils literal notranslate"><span class="pre">true</span></code> 明示的にフラッシュするか、使用してください。 <a class="reference internal" href="#c.cancel_delayed_work_sync" title="遅延ワークをキャンセルし、完了を待つ"><code class="xref c c-func docutils literal notranslate"><span class="pre">cancel_delayed_work_sync()</span></code></a> 待機するための</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.cancel_delayed_work_sync">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">遅延ワークをキャンセルし、完了を待つ</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">delayed_work</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dwork</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.cancel_delayed_work_sync" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>遅延ワークキャンセル</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">delayed_work</span> <span class="pre">*dwork</span></code></dt><dd><p>遅延ワークのキャンセル</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>これは <a class="reference internal" href="#c.cancel_work_sync" title="cancel_work_sync"><code class="xref c c-func docutils literal notranslate"><span class="pre">cancel_work_sync()</span></code></a> 遅延ワークのための</p>
+<p><strong>戻り値</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">true</span></code> に鍵を追加する際に、 <strong>dwork</strong> 待機中だった場合、 <code class="docutils literal notranslate"><span class="pre">false</span></code> それ以外の場合</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.schedule_on_each_cpu">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">各オンラインCPUで関数を同期して実行する</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">work_func_t</span></span><span class="w"> </span><span class="n"><span class="pre">func</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.schedule_on_each_cpu" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>各オンラインCPUで関数を同期して実行する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">work_func_t</span> <span class="pre">func</span></code></dt><dd><p>呼び出す関数</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p><a class="reference internal" href="#c.schedule_on_each_cpu" title="各オンラインCPUで関数を同期して実行する"><code class="xref c c-func docutils literal notranslate"><span class="pre">schedule_on_each_cpu()</span></code></a> 実行する <strong>func</strong> システムワークキューを使用して各オンラインCPUで実行し、すべてのCPUが完了するのをブロックする。
+<a class="reference internal" href="#c.schedule_on_each_cpu" title="各オンラインCPUで関数を同期して実行する"><code class="xref c c-func docutils literal notranslate"><span class="pre">schedule_on_each_cpu()</span></code></a> 非常に遅いです。</p>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、失敗時は-errnoを返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.execute_in_process_context">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">プロセスコンテキストで実行する</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">work_func_t</span></span><span class="w"> </span><span class="n"><span class="pre">すべての保存されたポインタを反復処理します。</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">ワークを実行する</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ew</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.execute_in_process_context" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ユーザーコンテキストで確実にルーチンを実行する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">work_func_t</span> <span class="pre">fn</span></code></dt><dd><p>実行する関数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">execute_work</span> <span class="pre">*ew</span></code></dt><dd><p>実行ワーク構造体の保証されたストレージ（ワークが実行されるときに利用可能でなければならない）</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>プロセスコンテキストが利用可能であれば関数を即座に実行し、それ以外の場合は関数を遅延実行としてスケジュールします。</p>
+<p><strong>戻り値</strong></p>
+<dl class="simple">
+<dt>0 - 関数が実行されました</dt><dd><p>1 - 関数が実行スケジュールされました</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.free_workqueue_attrs">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">ワークキュー属性を解放する</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.workqueue_attrs" title="workqueue_attrs"><span class="n"><span class="pre">workqueue_attrs</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">attrs</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.free_workqueue_attrs" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワークキュー属性を解放する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_attrs</span> <span class="pre">*attrs</span></code></dt><dd><p>解放するワークキュー属性</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>元に戻す <a class="reference internal" href="#c.alloc_workqueue_attrs" title="ワークキュー属性を割り当てる"><code class="xref c c-func docutils literal notranslate"><span class="pre">alloc_workqueue_attrs()</span></code></a>.</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.alloc_workqueue_attrs">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.workqueue_attrs" title="workqueue_attrs"><span class="n"><span class="pre">workqueue_attrs</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">ワークキュー属性を割り当てる</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.alloc_workqueue_attrs" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワークキュー属性を割り当てる</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>新しいワークキュー属性を割り当て、デフォルト設定で初期化し、それを返します。</p>
+<p><strong>戻り値</strong></p>
+<p>割り当てられた新しいワークキュー属性（成功時） <code class="docutils literal notranslate"><span class="pre">NULL</span></code> を返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.init_worker_pool">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">ワーカーパールプルを初期化する</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">worker_pool</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">プール</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.init_worker_pool" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>新規にzallocされたワーカーパールプルを初期化する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker_pool</span> <span class="pre">*pool</span></code></dt><dd><p>worker_poolを初期化する</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>新たにzalloc’dされたworker_poolを初期化します <strong>プール</strong>また、pool-&gt;attrsも割り当てます <strong>pool-&gt;attrs</strong>.</p>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、失敗時は-errnoを返します。失敗しても、内部のすべてのフィールドは <strong>プール</strong> 適切に初期化され、 <a class="reference internal" href="#c.put_unbound_pool" title="put_unbound_pool"><code class="xref c c-func docutils literal notranslate"><span class="pre">put_unbound_pool()</span></code></a> 呼び出しが可能です <strong>プール</strong> 安全に解放できます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.put_unbound_pool">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">put_unbound_pool</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">worker_pool</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">プール</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.put_unbound_pool" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>worker_poolを解放します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker_pool</span> <span class="pre">*pool</span></code></dt><dd><p>解放するworker_pool</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>解放します <strong>プール</strong>refcntがゼロになると、RCU安全な方法で破壊されます。  <a class="reference internal" href="#c.get_unbound_pool" title="get_unbound_pool"><code class="xref c c-func docutils literal notranslate"><span class="pre">get_unbound_pool()</span></code></a> 失敗時の処理でこの関数を呼び出し、成功または失敗に関わらず、この関数がプールを解放できる必要があります。 <a class="reference internal" href="#c.init_worker_pool" title="ワーカーパールプルを初期化する"><code class="xref c c-func docutils literal notranslate"><span class="pre">init_worker_pool()</span></code></a>.</p>
+<p>wq_pool_mutexを保持しながら呼び出さなければなりません。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.get_unbound_pool">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">worker_pool</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">get_unbound_pool</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.workqueue_attrs" title="workqueue_attrs"><span class="n"><span class="pre">workqueue_attrs</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">attrs</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.get_unbound_pool" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定された属性を持つworker_poolを取得します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">struct</span> <span class="pre">workqueue_attrs</span> <span class="pre">*attrs</span></code></dt><dd><p>取得するworker_poolの属性</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>同じ属性を持つworker_poolを取得します <strong>attrs</strong>参照カウントをインクリメントして返します。既に一致するworker_poolが存在する場合はそれを使用し、そうでない場合は新しいものを生成しようとします。</p>
+<p>wq_pool_mutexを保持しながら呼び出さなければなりません。</p>
+<p><strong>戻り値</strong></p>
+<p>成功した場合、同じ属性を持つ worker_pool に対して <strong>attrs</strong>失敗した場合、 <code class="docutils literal notranslate"><span class="pre">NULL</span></code>.</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.pwq_adjust_max_active">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">pwq_adjust_max_active</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pool_workqueue</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">pwq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.pwq_adjust_max_active" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>pwq の max_active を現在の設定に更新する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pool_workqueue</span> <span class="pre">*pwq</span></code></dt><dd><p>ターゲットの pool_workqueue</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>もし <strong>pwq</strong> 凍結していない場合、設定を <strong>pwq-&gt;max_active</strong> 関連する workqueue の saved_max_active に設定し、遅延された作業項目を適切にアクティブ化する。もし <strong>pwq</strong> 凍結している場合、クリアする <strong>pwq-&gt;max_active</strong> ゼロに設定する。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.wq_calc_node_cpumask">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">wq_calc_node_cpumask</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.workqueue_attrs" title="workqueue_attrs"><span class="n"><span class="pre">workqueue_attrs</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">attrs</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">node</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">cpu_going_down</span></span>, <span class="n"><span class="pre">cpumask_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">cpumask</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.wq_calc_node_cpumask" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定されたノード用の wq_attrs の cpumask を計算する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">struct</span> <span class="pre">workqueue_attrs</span> <span class="pre">*attrs</span></code></dt><dd><p>ターゲット workqueue のデフォルト pwq の wq_attrs</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">node</span></code></dt><dd><p>ターゲット NUMA ノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">cpu_going_down</span></code></dt><dd><p>0 以上の場合、オフラインとみなす CPU</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cpumask_t</span> <span class="pre">*cpumask</span></code></dt><dd><p>outarg に結果の cpumask</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>作業キューが使用する cpumask を計算する <strong>attrs</strong> 使用するノード <strong>node</strong>.
+<strong>cpu_going_down</strong> が0以上の場合、そのCPUは計算中にオフラインとみなされます。結果は以下に保存されます <strong>cpumask</strong>.</p>
+<p>NUMAアフィニティが有効になっていない場合、 <strong>attrs-&gt;cpumask</strong> 常に使用されます。有効になっており、 <strong>node</strong> が要求されたオンラインCPUを有する場合、返されたcpumaskはの可能なCPUの交差になります <strong>attrs</strong>、返されたcpumaskはの可能なCPUの交差になります <strong>node</strong> および
+<strong>attrs-&gt;cpumask</strong>.</p>
+<p>呼び出し元はのcpumaskが安定していることを保証する責任があります <strong>node</strong> 安定している</p>
+<p><strong>戻り値</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">true</span></code> 結果が <strong>cpumask</strong> が異なる場合 <strong>attrs-&gt;cpumask</strong>,
+<code class="docutils literal notranslate"><span class="pre">false</span></code> が等しい場合</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.apply_workqueue_attrs">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">apply_workqueue_attrs</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">wq</span></span>, <span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.workqueue_attrs" title="workqueue_attrs"><span class="n"><span class="pre">workqueue_attrs</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">attrs</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.apply_workqueue_attrs" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>未バインドのワーキューに新しいworkqueue_attrsを適用します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*wq</span></code></dt><dd><p>ターゲットworkqueue</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">struct</span> <span class="pre">workqueue_attrs</span> <span class="pre">*attrs</span></code></dt><dd><p>適用するworkqueue_attrsは、で割り当てられた <a class="reference internal" href="#c.alloc_workqueue_attrs" title="ワークキュー属性を割り当てる"><code class="xref c c-func docutils literal notranslate"><span class="pre">alloc_workqueue_attrs()</span></code></a></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>適用します <strong>attrs</strong> 未バインドのワーキューに <strong>wq</strong>。無効になっていない限り、NUMAマシンでは、この関数は、可能CPUを持つ各NUMAノードに別個のpwqをマップします <strong>attrs-&gt;cpumask</strong> ワークアイテムが発行されたNUMAノードにアフィニティを持つようにします。古いpwqは、進行中のワークアイテムが完了するたびに解放されます。注意点として、ワークアイテムが連続して自身を再キューイングする場合、現在のpwqにとどまります</p>
+<p>GFP_KERNELの割り当てを行います</p>
+<p>呼び出し元がCPUホットプラグの読み取り排他を保持していると仮定します、つまりget_online_cpus()です</p>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、失敗時は-errnoを返します</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.wq_update_unbound_numa">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">wq_update_unbound_numa</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">wq</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">CPU</span></span>, <span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n"><span class="pre">オンライン</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.wq_update_unbound_numa" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>CPUホットプラグ（ホットアンプラグ）時のwqのNUMAアフィニティを更新します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*wq</span></code></dt><dd><p>ターゲットworkqueue</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">cpu</span></code></dt><dd><p>CPUが起動するか、停止するか</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">online</span></code></dt><dd><p>～かどうか <strong>CPU</strong> ～が起動するか、停止するか</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この関数は以下から呼び出されます <code class="docutils literal notranslate"><span class="pre">CPU_DOWN_PREPARE</span></code>, <code class="docutils literal notranslate"><span class="pre">CPU_ONLINE</span></code> および
+<code class="docutils literal notranslate"><span class="pre">CPU_DOWN_FAILED</span></code>.  <strong>CPU</strong> ホットプラグ（ホットアンプラグ）されている場合、のNUMAアフィニティを更新します
+<strong>wq</strong> 適切に</p>
+<p>NUMAアフィニティがメモリ割り当て失敗により調整できない場合、戻ります <strong>wq-&gt;dfl_pwq</strong> これは最適でないかもしれませんが常に正しいです</p>
+<p>注意点として、NUMAノードの最後の許可されたCPUが、複数のノードをカバーするcpumaskを持つワークキューでオフラインになると、既に実行中のワークアイテムを持つワーカーはCPUアフィニティを失い、任意のCPUで実行される可能性があります。これはCPU_DOWNでのper-cpuワークキューの挙動に似ています。ワークキューのユーザーが厳密なアフィニティを望む場合、ユーザーがCPU_DOWN_PREPAREからワークアイテムをフラッシュする責任があります</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.destroy_workqueue">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">destroy_workqueue</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">wq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.destroy_workqueue" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワークキューを安全に終了します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*wq</span></code></dt><dd><p>ターゲットワークキュー</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ワークキューを安全に破壊します。現在待機中のすべての作業は最初に完了します</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.workqueue_set_max_active">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">workqueue_set_max_active</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">wq</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">max_active</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.workqueue_set_max_active" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワークキューのmax_activeを調整します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*wq</span></code></dt><dd><p>ターゲットワークキュー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">max_active</span></code></dt><dd><p>新しいmax_active値</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>max_active を設定します <strong>wq</strong> に（木の下から葉に向かって） <strong>max_active</strong>.</p>
+<p><strong>コンテキスト</strong></p>
+<p>IRQ コンテキストから呼び出さないでください</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.current_work">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">work_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">current_work</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.current_work" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>取得 <code class="docutils literal notranslate"><span class="pre">current</span></code> タスクの work struct</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>タスクが workqueue worker であり、何を処理しているかを確認します <code class="docutils literal notranslate"><span class="pre">current</span></code> タスクがどのコンテキストで実行されているかを確認するために役立ちます <code class="docutils literal notranslate"><span class="pre">current</span></code> タスクが実行されているコンテキストを確認するために役立ちます</p>
+<p><strong>戻り値</strong></p>
+<p>work struct が <code class="docutils literal notranslate"><span class="pre">current</span></code> タスクが workqueue worker である場合、 <code class="docutils literal notranslate"><span class="pre">NULL</span></code> それ以外の場合</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.current_is_workqueue_rescuer">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">current_is_workqueue_rescuer</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.current_is_workqueue_rescuer" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>通常のRCU読み込み側クリティカルセクションは、条件付きでスリープロックを取得することが許容されます（例として <code class="docutils literal notranslate"><span class="pre">current</span></code> workqueue rescuer ですか？</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>確認しますか <code class="docutils literal notranslate"><span class="pre">current</span></code> workqueue rescuer ですか。work 関数から呼び出される際、rescuer タスクで実行されているかを確認するために使用できます</p>
+<p><strong>戻り値</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">true</span></code> に鍵を追加する際に、 <code class="docutils literal notranslate"><span class="pre">current</span></code> workqueue rescuer です <code class="docutils literal notranslate"><span class="pre">false</span></code> それ以外の場合</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.workqueue_congested">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">workqueue_congested</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">CPU</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">wq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.workqueue_congested" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>workqueue が混雑しているかをテストします</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">cpu</span></code></dt><dd><p>対象の CPU</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*wq</span></code></dt><dd><p>ターゲットワークキュー</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>テストしますか <strong>wq</strong>の CPU workqueue です <strong>CPU</strong> 混雑しています。この関数周辺の同期が行われていないため、テスト結果は信頼性がなく、アドバイザリーやデバッグ用にのみ有用です。</p>
+<p>もし <strong>CPU</strong> WORK_CPU_UNBOUNDの場合、テストはローカルCPU上で実行されます。注意として、per-cpuおよびunbound workqueuesは複数のpool_workqueuesと関連付けられ、それぞれが別個の混雑状態を持ちます。あるCPUでworkqueueが混雑しているからといって、他のCPUやNUMAノードでも混雑しているとは限りません。</p>
+<p><strong>戻り値</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">true</span></code> 混雑している場合、 <code class="docutils literal notranslate"><span class="pre">false</span></code> それ以外の場合</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.work_busy">
+<span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">work_busy</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">work_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">作業</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.work_busy" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワークが現在待機中または実行中であるかをテストする</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">work_struct</span> <span class="pre">*work</span></code></dt><dd><p>テスト対象のワーク</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>テストしますか <strong>作業</strong> 現在待機中または実行中です。この関数周辺の同期が行われていないため、テスト結果は信頼性がなく、アドバイザリーやデバッグ用にのみ有用です。</p>
+<p><strong>戻り値</strong></p>
+<p>WORK_BUSY_*ビットのORで結合されたビットマスク</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.set_worker_desc">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">set_worker_desc</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="kt"><span class="pre">char</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">fmt</span></span>, <span class="p"><span class="pre">...</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.set_worker_desc" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>現在のワーク項目の説明を設定する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">char</span> <span class="pre">*fmt</span></code></dt><dd><p>printfスタイルのフォーマット文字列</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">...</span></code></dt><dd><p>フォーマット文字列の引数</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この関数は、実行中のワーク関数から呼び出して、ワーク項目の内容を説明するためのものです。ワーカータスクがダンプされた場合、この情報が一緒に出力されデバッグに役立ちます。説明はWORKER_DESC_LEN以内で、末尾に'0'を含む必要があります。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.print_worker_info">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">print_worker_info</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="kt"><span class="pre">char</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">log_lvl</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">task_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">task</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.print_worker_info" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワーカー情報と説明を出力する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">char</span> <span class="pre">*log_lvl</span></code></dt><dd><p>出力時に使用するログレベル</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">task_struct</span> <span class="pre">*task</span></code></dt><dd><p>ターゲットタスク</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>もし <strong>task</strong> ワーカーであり、現在ワーク項目を実行中である場合、サービス中のワークキュー名と、
+<a class="reference internal" href="#c.set_worker_desc" title="set_worker_desc"><code class="xref c c-func docutils literal notranslate"><span class="pre">set_worker_desc()</span></code></a> 現在実行中のワーク項目によって設定された説明を印刷します。</p>
+<p>タスク構造体自体がアクセス可能であれば、どのタスクでもこの関数を安全に呼び出せます。ただし、同期が行われていないため、出力内容が混雑したり、限定的な長さのゴミデータになる可能性があります。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.show_workqueue_state">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">show_workqueue_state</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.show_workqueue_state" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワーキュー状態をダンプする</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>sysrqハンドラまたはtry_to_freeze_tasks()から呼び出され、すべてのbusyなワーキューとプールを出力します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.rebind_workers">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">rebind_workers</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">worker_pool</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">プール</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.rebind_workers" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>プールのすべてのワーカーを関連するCPUに再バインドする</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker_pool</span> <span class="pre">*pool</span></code></dt><dd><p>関心プール</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p><strong>pool-&gt;cpu</strong> オンラインになるCPU。すべてのワーカーをCPUに再バインドします。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.restore_unbound_workers_cpumask">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">restore_unbound_workers_cpumask</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">worker_pool</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">プール</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">CPU</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.restore_unbound_workers_cpumask" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>未バインドワーカーのcpumaskを復元する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">worker_pool</span> <span class="pre">*pool</span></code></dt><dd><p>関心のある未バインドプール</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">cpu</span></code></dt><dd><p>起動するCPU</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>未バインドプールは、オンラインCPUを含まないcpumaskを持つ可能性があります。このようなプールのワーカーがスケジューリングされると、スケジューラーがcpus_allowedをリセットします。もし <strong>CPU</strong> が以前にオンラインCPUを含まなかったcpumaskに属していた場合、そのすべてのワーカーのcpus_allowedを復元する必要があります。 <strong>プール</strong>work_on_cpu</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.work_on_cpu">
+<span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">特定のCPU上でのスレッドコンテキストでの関数実行</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">CPU</span></span>, <span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="p"><span class="pre">(</span></span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">すべての保存されたポインタを反復処理します。</span></span><span class="p"><span class="pre">)</span></span><span class="p"><span class="pre">(</span></span><span class="kt"><span class="pre">void</span></span><span class="p"><span class="pre">*</span></span><span class="p"><span class="pre">)</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">arg</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.work_on_cpu" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>実行するCPU</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">cpu</span></code></dt><dd><p>実行する関数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">long</span> <span class="pre">(*fn)(void</span> <span class="pre">*)</span></code></dt><dd><p>関数の引数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*arg</span></code></dt><dd><p>It is up to the caller to ensure that the cpu doesn’t go offline. The caller must not hold any locks which would prevent</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>from completing. <strong>すべての保存されたポインタを反復処理します。</strong> The value</p>
+<p><strong>戻り値</strong></p>
+<p>work_on_cpu_safe <strong>すべての保存されたポインタを反復処理します。</strong> 戻ります。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.work_on_cpu_safe">
+<span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">関数引数</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">CPU</span></span>, <span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="p"><span class="pre">(</span></span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">すべての保存されたポインタを反復処理します。</span></span><span class="p"><span class="pre">)</span></span><span class="p"><span class="pre">(</span></span><span class="kt"><span class="pre">void</span></span><span class="p"><span class="pre">*</span></span><span class="p"><span class="pre">)</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">arg</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.work_on_cpu_safe" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>実行するCPU</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">cpu</span></code></dt><dd><p>実行する関数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">long</span> <span class="pre">(*fn)(void</span> <span class="pre">*)</span></code></dt><dd><p>関数の引数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*arg</span></code></dt><dd><p>CPUホットプラグを無効化し、</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>. The caller must not hold any locks which would prevent <a class="reference internal" href="#c.work_on_cpu" title="特定のCPU上でのスレッドコンテキストでの関数実行"><code class="xref c c-func docutils literal notranslate"><span class="pre">work_on_cpu()</span></code></a>freeze_workqueues_begin <strong>すべての保存されたポインタを反復処理します。</strong> The value</p>
+<p><strong>戻り値</strong></p>
+<p>work_on_cpu_safe <strong>すべての保存されたポインタを反復処理します。</strong> 戻ります。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.freeze_workqueues_begin">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">凍結開始</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.freeze_workqueues_begin" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>凍結可能なワーキューの凍結を開始します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>凍結可能なワーキューは、この関数が返る後、新しい作業をdelayed_worksリストにキューイングするようになります。pool-&gt;worklistにキューイングされなくなります。</p>
+<p><strong>コンテキスト</strong></p>
+<p>wq_pool_mutex、wq-&gt;mutexおよびpool-&gt;lockを取得・解放します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.freeze_workqueues_busy">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">freeze_workqueues_busy</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.freeze_workqueues_busy" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>凍結可能なワーキューがまだbusyですか？</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>凍結が完了しているか確認します。この関数は <a class="reference internal" href="#c.freeze_workqueues_begin" title="凍結開始"><code class="xref c c-func docutils literal notranslate"><span class="pre">freeze_workqueues_begin()</span></code></a> および <a class="reference internal" href="#c.thaw_workqueues" title="thaw_workqueues"><code class="xref c c-func docutils literal notranslate"><span class="pre">thaw_workqueues()</span></code></a>.</p>
+<p><strong>コンテキスト</strong></p>
+<p>wq_pool_mutexを取得・解放します。</p>
+<p><strong>戻り値</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">true</span></code> 凍結可能なワーキューがまだbusyかどうか  <code class="docutils literal notranslate"><span class="pre">false</span></code> 凍結が完了しているか</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.thaw_workqueues">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">thaw_workqueues</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.thaw_workqueues" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ワーキューを解凍する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ワーキューを解凍します。通常のキューイングが復元され、すべての凍結された作業がそれぞれのプールworklistに転送されます。</p>
+<p><strong>コンテキスト</strong></p>
+<p>wq_pool_mutex、wq-&gt;mutexおよびpool-&gt;lockを取得・解放します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.workqueue_set_unbound_cpumask">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">workqueue_set_unbound_cpumask</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">cpumask_var_t</span></span><span class="w"> </span><span class="n"><span class="pre">cpumask</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.workqueue_set_unbound_cpumask" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>低レベルの未バインド cpumask を設定する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">cpumask_var_t</span> <span class="pre">cpumask</span></code></dt><dd><p>設定する cpumask</p>
+<p>低レベルの workqueues cpumask は、すべての未バインド workqueues のアフィニティを制限するグローバル cpumask です。この関数は、 <strong>cpumask</strong>
+その cpumask をすべての未バインド workqueues に適用し、それらの pwqs を更新します。</p>
+<dl class="simple">
+<dt>戻り値: 0 - 成功</dt><dd><p>-EINVAL - 無効 <strong>cpumask</strong>
+-ENOMEM - attrs や pwqs のメモリ割当てに失敗</p>
+</dd>
+</dl>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.workqueue_sysfs_register">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">workqueue_sysfs_register</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">wq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.workqueue_sysfs_register" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>workqueue を sysfs で表示可能にする</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*wq</span></code></dt><dd><p>登録する workqueue</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>公開 <strong>wq</strong> sysfs の /sys/bus/workqueue/devices 以下で表示します。alloc_workqueue*() は WQ_SYSFS が設定されている場合自動的にこの関数を呼び出します（推奨方法です）。</p>
+<p>workqueue ユーザーは、sysfs で workqueue を表示する前に workqueue_attrs を適用したい場合にのみこの関数を直接使用すべきです。それ以外の場合、
+<a class="reference internal" href="#c.apply_workqueue_attrs" title="apply_workqueue_attrs"><code class="xref c c-func docutils literal notranslate"><span class="pre">apply_workqueue_attrs()</span></code></a> ユーザー空間が属性を更新する際に競合が発生する可能性があります。</p>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、失敗時は-errnoを返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.workqueue_sysfs_unregister">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">workqueue_sysfs_unregister</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">workqueue_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">wq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.workqueue_sysfs_unregister" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>解除 <a class="reference internal" href="#c.workqueue_sysfs_register" title="workqueue_sysfs_register"><code class="xref c c-func docutils literal notranslate"><span class="pre">workqueue_sysfs_register()</span></code></a></p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">workqueue_struct</span> <span class="pre">*wq</span></code></dt><dd><p>登録を解除する workqueue</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>もし <strong>wq</strong> sysfs に登録されているのは、 <a class="reference internal" href="#c.workqueue_sysfs_register" title="workqueue_sysfs_register"><code class="xref c c-func docutils literal notranslate"><span class="pre">workqueue_sysfs_register()</span></code></a>、解除します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.workqueue_init_early">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">workqueue_init_early</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.workqueue_init_early" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>workqueue サブシステムの早期初期化</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>これは 2 段階初期化の最初の段階で、メモリ割当て、cpumasks、idr が準備された時点で呼び出されます。すべてのデータ構造とシステム workqueues を設定し、早期ブートコードが workqueue を作成し、work item をキューイング/キャンセルできるようにします。実際の work item 実行は、kthreads を作成・スケジューリングできるようになる直前に早期初期化呼び出しで開始されます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.workqueue_init">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">workqueue_init</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.workqueue_init" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>workqueue サブシステムを完全にオンラインにする</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>これは 2 段階初期化の後半で、kthreads を作成・スケジューリングできる時点で呼び出されます。workqueues は作成され、work item がキューイングされていますが、まだ kworkers が work item を実行していません。初期 worker を worker プールに追加し、今後の kworker 作成を有効化します。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">コアAPIドキュメント</a><ul class="current">
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#core-utilities">Core utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#data-structures-and-low-level-utilities">Data structures and low-level utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#concurrency-primitives">Concurrency primitives</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#low-level-hardware-management">Low-level hardware management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#memory-management">Memory management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#interfaces-for-kernel-debugging">Interfaces for kernel debugging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#everything-else">Everything else</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">コアAPIドキュメント</a><ul>
+<li>前へ: <a href="kernel-api.html" title="前章">LinuxカーネルAPI</a></li>
+<li>次へ: <a href="printk-basics.html" title="次章">printkを使用したメッセージログ</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/core-api/workqueue.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

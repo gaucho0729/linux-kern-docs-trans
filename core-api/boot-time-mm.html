@@ -1,0 +1,1292 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>ブート時のメモリ管理 — Linux Kernel ドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="gfp_mask-from-fs-io.html" rel="next" title="FS/IOコンテキストから使用されるGFPマスク"/>
+<link href="pin_user_pages.html" rel="prev" title="pin_user_pages()関連の呼び出し"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="boot-time-memory-management">
+<h1>ブート時のメモリ管理<a class="headerlink" href="#boot-time-memory-management" title="この見出しへのパーマリンク">¶</a></h1>
+<p>早期システム初期化では「通常」のメモリ管理を使用できないのは、まだ設定されていないからです。ただし、さまざまなデータ構造のメモリ割り当てが必要なため、例えば物理ページアロケータなどにメモリを確保する必要があります。</p>
+<p>専用のアロケータとして呼ばれる <code class="docutils literal notranslate"><span class="pre">memblock</span></code> がブート時のメモリ管理を行います。アーキテクチャ固有の初期化では、これをの初期化に設定し、の終了時に破棄する必要があります。 <code class="xref c c-func docutils literal notranslate"><span class="pre">setup_arch()</span></code> の初期化に設定し、の終了時に破棄する必要があります。
+<code class="xref c c-func docutils literal notranslate"><span class="pre">mem_init()</span></code> 関数の終わりを注釈する必要があります。</p>
+<p>早期メモリ管理が利用可能になると、メモリ割り当て用のさまざまな関数やマクロが提供されます。割り当て要求は、NUMAシステムでは最初の（おそらく唯一の）ノードまたは特定のノードに指定できます。割り当て失敗時にpanicするAPI変体と、そうでない変体があります。</p>
+<p>Memblockは自身の挙動を制御するためのさまざまなAPIも提供しています。</p>
+<section id="memblock-overview">
+<h2>Memblock 概要<a class="headerlink" href="#memblock-overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Memblockは、通常のカーネルメモリアロケータが動作していない早期ブート期間におけるメモリ領域の管理方法です。</p>
+<p>Memblockはシステムメモリを連続領域のコレクションとして扱います。このようなコレクションの種類はいくつかあります：</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">memory</span></code> - カーネルに利用可能な物理メモリを記述します。これはシステムにインストールされた実際の物理メモリと異なる場合があります（例：コマンドラインパラメータでメモリ制限をかけた場合）
+<code class="docutils literal notranslate"><span class="pre">mem=</span></code> コマンドラインパラメータ</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">reserved</span></code> - 割り当てられた領域を記述します</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">physmem</span></code> - ブート時の実際の物理メモリを記述します。これはメモリ制限やホットプラグ/ホットアンプラグに関係なく、ブート時の実際の物理メモリを示します。この「physmem」タイプは一部のアーキテクチャでのみ利用可能です。 <code class="docutils literal notranslate"><span class="pre">physmem</span></code> タイプ</p></li>
+</ul>
+<p>各領域は <a class="reference internal" href="#c.memblock_region" title="memblock_region"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">memblock_region</span></code></a> で表され、これは領域の範囲、属性、NUMAシステムでのNUMAノードIDを定義します。すべてのメモリタイプは <a class="reference internal" href="#c.memblock_type" title="memblock_type"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">memblock_type</span></code></a>
+で記述され、これはメモリ領域の配列とアロケータメタデータを含みます。『memory』および『reserved』タイプは、がこれらをラップしています。 <a class="reference internal" href="#c.memblock" title="memblock"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">memblock</span></code></a>この構造体はビルド時に静的に初期化されます。領域配列は初期サイズとして『memory』用に『reserved』用に『physmem』用に『』が設定されます。
+<code class="docutils literal notranslate"><span class="pre">INIT_MEMBLOCK_REGIONS</span></code> 『memory』用に『』 <code class="docutils literal notranslate"><span class="pre">INIT_MEMBLOCK_RESERVED_REGIONS</span></code>
+『reserved』用に『』
+<code class="docutils literal notranslate"><span class="pre">INIT_PHYSMEM_REGIONS</span></code>『physmem』用に『』</p>
+<p>早期アーキテクチャの設定では、memblockに物理メモリレイアウトを伝えるために <a class="reference internal" href="#c.memblock_add" title="memblock_add"><code class="xref c c-func docutils literal notranslate"><span class="pre">memblock_add()</span></code></a> または <a class="reference internal" href="#c.memblock_add_node" title="memblock_add_node"><code class="xref c c-func docutils literal notranslate"><span class="pre">memblock_add_node()</span></code></a>
+関数です。最初の関数は、リージョンをNUMAノードに割り当てません。UMAシステムに適しています。ただし、NUMAシステムでも使用可能で、設定プロセスの後半でリージョンをNUMAノードに割り当てることができます。 <a class="reference internal" href="#c.memblock_set_node" title="memblock_set_node"><code class="xref c c-func docutils literal notranslate"><span class="pre">memblock_set_node()</span></code></a>の部分で、
+<a class="reference internal" href="#c.memblock_add_node" title="memblock_add_node"><code class="xref c c-func docutils literal notranslate"><span class="pre">memblock_add_node()</span></code></a> この関数は、直接その割り当てを行います。</p>
+<p>memblockが設定されると、メモリは以下のAPI変体のいずれかを使用して割り当てることができます：</p>
+<ul class="simple">
+<li><p>memblock_phys_alloc*() - これらの関数は、 <strong>物理</strong>
+割り当てられたメモリのアドレスを返します</p></li>
+<li><p>memblock_alloc*() - これらの関数は、 <strong>仮想</strong> 割り当てられたメモリのアドレスを返します。</p></li>
+</ul>
+<p>両方のAPI変体は、許可されたメモリ範囲に関する暗黙の仮定とフォールバックメソッドを使用します。詳細な説明については、 <a class="reference internal" href="#c.memblock_alloc_internal" title="memblock_alloc_internal"><code class="xref c c-func docutils literal notranslate"><span class="pre">memblock_alloc_internal()</span></code></a> および <a class="reference internal" href="#c.memblock_alloc_range_nid" title="memblock_alloc_range_nid"><code class="xref c c-func docutils literal notranslate"><span class="pre">memblock_alloc_range_nid()</span></code></a>
+関数のドキュメンテーションを参照してください。</p>
+<p>システムの起動が進むにつれて、アーキテクチャ固有のmem_init()関数がすべてのメモリを buddy page allocator に解放します。</p>
+<p>アーキテクチャがこれを有効にしない限り、 <code class="docutils literal notranslate"><span class="pre">CONFIG_ARCH_KEEP_MEMBLOCK</span></code>memblockデータ構造（「physmem」を除く）はシステム初期化が完了後に破棄されます。</p>
+</section>
+<section id="functions-and-structures">
+<h2>関数と構造体<a class="headerlink" href="#functions-and-structures" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ここに、memblockデータ構造、関数、マクロの説明があります。一部は内部的に使用されるものですが、ドキュメンテーションされているため省略するのは馬鹿げています。さらに、内部関数の説明を読むことで、裏側で実際に起きていることの理解が深まります。</p>
+<dl class="c enum">
+<dt class="sig sig-object c" id="c.memblock_flags">
+<span class="k"><span class="pre">enum</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_flags</span></span></span><a class="headerlink" href="#c.memblock_flags" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>メモリリージョン属性の定義</p>
+</dd></dl>
+<p><strong>定数</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">MEMBLOCK_NONE</span></code></dt><dd><p>特別な要求なし</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">MEMBLOCK_HOTPLUG</span></code></dt><dd><p>ホットプラグ可能なリージョン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">MEMBLOCK_MIRROR</span></code></dt><dd><p>ミラーリングされたリージョン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">MEMBLOCK_NOMAP</span></code></dt><dd><p>カーネルの直接マッピングに追加しない</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.memblock_region">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_region</span></span></span><a class="headerlink" href="#c.memblock_region" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>メモリリージョンを表します</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct memblock_region {
+  phys_addr_t base;
+  phys_addr_t size;
+  enum memblock_flags flags;
+#ifdef CONFIG_NEED_MULTIPLE_NODES;
+  int nid;
+#endif;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">base</span></code></dt><dd><p>リージョンのベースアドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">size</span></code></dt><dd><p>リージョンのサイズ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">flags</span></code></dt><dd><p>メモリリージョン属性</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">nid</span></code></dt><dd><p>NUMAノードID</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.memblock_type">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_type</span></span></span><a class="headerlink" href="#c.memblock_type" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>特定のタイプのメモリリージョンのコレクション</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct memblock_type {
+  unsigned long cnt;
+  unsigned long max;
+  phys_addr_t total_size;
+  struct memblock_region *regions;
+  char *name;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">cnt</span></code></dt><dd><p>リージョンの数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">max</span></code></dt><dd><p>割り当てられた配列のサイズ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">total_size</span></code></dt><dd><p>すべてのリージョンのサイズの合計</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">regions</span></code></dt><dd><p>リージョンの配列</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">name</span></code></dt><dd><p>メモリタイプのシンボリック名</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.memblock">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock</span></span></span><a class="headerlink" href="#c.memblock" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>memblockアロケーターメタデータ</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct memblock {
+  bool bottom_up;
+  phys_addr_t current_limit;
+  struct memblock_type memory;
+  struct memblock_type reserved;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">bottom_up</span></code></dt><dd><p>ボトムアップ方向ですか？</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">current_limit</span></code></dt><dd><p>現在のアロケーション制限の物理アドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">memory</span></code></dt><dd><p>使用可能なメモリリージョン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">reserved</span></code></dt><dd><p>予約されたメモリリージョン</p>
+</dd>
+</dl>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.for_each_physmem_range">
+<span class="sig-name descname"><span class="n"><span class="pre">for_each_physmem_range</span></span></span><a class="headerlink" href="#c.for_each_physmem_range" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">for_each_physmem_range</span> <span class="pre">(i,</span> <span class="pre">type,</span> <span class="pre">p_start,</span> <span class="pre">p_end)</span></code></p>
+<blockquote>
+<div><p>typeに含まれないphysmem領域を反復処理します。</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">i</span></code></dt><dd><p>ループ変数として使用されるu64</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">type</span></code></dt><dd><p>反復から除外されるmemblock_typeへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_start</span></code></dt><dd><p>範囲の開始アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_end</span></code></dt><dd><p>範囲の終了アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+</dl>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.__for_each_mem_range">
+<span class="sig-name descname"><span class="n"><span class="pre">__for_each_mem_range</span></span></span><a class="headerlink" href="#c.__for_each_mem_range" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">__for_each_mem_range</span> <span class="pre">(i,</span> <span class="pre">type_a,</span> <span class="pre">type_b,</span> <span class="pre">nid,</span> <span class="pre">flags,</span> <span class="pre">p_start,</span> <span class="pre">p_end,</span> <span class="pre">p_nid)</span></code></p>
+<blockquote>
+<div><p>type_aから反復し、type_bに含まれない領域を処理。type_bがNULLの場合は、type_aのみを処理。</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">i</span></code></dt><dd><p>ループ変数として使用されるu64</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">type_a</span></code></dt><dd><p>反復するmemblock_typeへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">type_b</span></code></dt><dd><p>反復から除外されるmemblock_typeへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">nid</span></code></dt><dd><p>ノードセレクター、 <code class="docutils literal notranslate"><span class="pre">NUMA_NO_NODE</span></code> すべてのノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">flags</span></code></dt><dd><p>メモリ属性に基づいてブロックを選択</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_start</span></code></dt><dd><p>範囲の開始アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_end</span></code></dt><dd><p>範囲の終了アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_nid</span></code></dt><dd><p>範囲のnidのintへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+</dl>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.__for_each_mem_range_rev">
+<span class="sig-name descname"><span class="n"><span class="pre">__for_each_mem_range_rev</span></span></span><a class="headerlink" href="#c.__for_each_mem_range_rev" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">__for_each_mem_range_rev</span> <span class="pre">(i,</span> <span class="pre">type_a,</span> <span class="pre">type_b,</span> <span class="pre">nid,</span> <span class="pre">flags,</span> <span class="pre">p_start,</span> <span class="pre">p_end,</span> <span class="pre">p_nid)</span></code></p>
+<blockquote>
+<div><p>type_aから逆順に反復し、type_bに含まれない領域を処理。type_bがNULLの場合は、type_aのみを処理。</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">i</span></code></dt><dd><p>ループ変数として使用されるu64</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">type_a</span></code></dt><dd><p>反復するmemblock_typeへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">type_b</span></code></dt><dd><p>反復から除外されるmemblock_typeへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">nid</span></code></dt><dd><p>ノードセレクター、 <code class="docutils literal notranslate"><span class="pre">NUMA_NO_NODE</span></code> すべてのノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">flags</span></code></dt><dd><p>メモリ属性に基づいてブロックを選択</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_start</span></code></dt><dd><p>範囲の開始アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_end</span></code></dt><dd><p>範囲の終了アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_nid</span></code></dt><dd><p>範囲のnidのintへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+</dl>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.for_each_mem_range">
+<span class="sig-name descname"><span class="n"><span class="pre">for_each_mem_range</span></span></span><a class="headerlink" href="#c.for_each_mem_range" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">for_each_mem_range</span> <span class="pre">(i,</span> <span class="pre">p_start,</span> <span class="pre">p_end)</span></code></p>
+<blockquote>
+<div><p>メモリ領域を反復処理</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">i</span></code></dt><dd><p>ループ変数として使用されるu64</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_start</span></code></dt><dd><p>範囲の開始アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_end</span></code></dt><dd><p>範囲の終了アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+</dl>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.for_each_mem_range_rev">
+<span class="sig-name descname"><span class="n"><span class="pre">for_each_mem_range_rev</span></span></span><a class="headerlink" href="#c.for_each_mem_range_rev" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">for_each_mem_range_rev</span> <span class="pre">(i,</span> <span class="pre">p_start,</span> <span class="pre">p_end)</span></code></p>
+<blockquote>
+<div><p>type_aから逆順に反復し、type_bに含まれない領域を処理。type_bがNULLの場合は、type_aのみを処理。</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">i</span></code></dt><dd><p>ループ変数として使用されるu64</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_start</span></code></dt><dd><p>範囲の開始アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_end</span></code></dt><dd><p>範囲の終了アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+</dl>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.for_each_reserved_mem_range">
+<span class="sig-name descname"><span class="n"><span class="pre">for_each_reserved_mem_range</span></span></span><a class="headerlink" href="#c.for_each_reserved_mem_range" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">for_each_reserved_mem_range</span> <span class="pre">(i,</span> <span class="pre">p_start,</span> <span class="pre">p_end)</span></code></p>
+<blockquote>
+<div><p>すべての予約済みmemblock領域を反復処理</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">i</span></code></dt><dd><p>ループ変数として使用されるu64</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_start</span></code></dt><dd><p>範囲の開始アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_end</span></code></dt><dd><p>範囲の終了アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>memblockの予約領域を走査。memblockが初期化されると利用可能。</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.for_each_mem_pfn_range">
+<span class="sig-name descname"><span class="n"><span class="pre">for_each_mem_pfn_range</span></span></span><a class="headerlink" href="#c.for_each_mem_pfn_range" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">for_each_mem_pfn_range</span> <span class="pre">(i,</span> <span class="pre">nid,</span> <span class="pre">p_start,</span> <span class="pre">p_end,</span> <span class="pre">p_nid)</span></code></p>
+<blockquote>
+<div><p>早期メモリpfn範囲イテレータ</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">i</span></code></dt><dd><p>ループ変数として使用される整数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">nid</span></code></dt><dd><p>ノードセレクター、 <code class="docutils literal notranslate"><span class="pre">MAX_NUMNODES</span></code> すべてのノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_start</span></code></dt><dd><p>範囲の開始pfnのulongへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_end</span></code></dt><dd><p>範囲の終了pfnのulongへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_nid</span></code></dt><dd><p>範囲のnidのintへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>設定されたメモリ範囲を走査。</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.for_each_free_mem_pfn_range_in_zone">
+<span class="sig-name descname"><span class="n"><span class="pre">for_each_free_mem_pfn_range_in_zone</span></span></span><a class="headerlink" href="#c.for_each_free_mem_pfn_range_in_zone" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">for_each_free_mem_pfn_range_in_zone</span> <span class="pre">(i,</span> <span class="pre">zone,</span> <span class="pre">p_start,</span> <span class="pre">p_end)</span></code></p>
+<blockquote>
+<div><p>特定ゾーンの空きmemblock領域を反復処理</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">i</span></code></dt><dd><p>ループ変数として使用されるu64</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">zone</span></code></dt><dd><p>すべてのメモリブロックが存在するゾーン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_start</span></code></dt><dd><p>範囲の開始アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_end</span></code></dt><dd><p>範囲の終了アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>特定ゾーンの空き（メモリ&amp;&amp;!予約）memblock領域を走査。memblockと空ゾーンが初期化されると利用可能。基本的な仮定は、ゾーンの開始、終了、pgdatが関連付けられていること。これにより、ゾーンを用いてNUMAノードを判定し、memblockの一部がゾーンに有効かどうかを確認できる。</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.for_each_free_mem_pfn_range_in_zone_from">
+<span class="sig-name descname"><span class="n"><span class="pre">for_each_free_mem_pfn_range_in_zone_from</span></span></span><a class="headerlink" href="#c.for_each_free_mem_pfn_range_in_zone_from" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">for_each_free_mem_pfn_range_in_zone_from</span> <span class="pre">(i,</span> <span class="pre">zone,</span> <span class="pre">p_start,</span> <span class="pre">p_end)</span></code></p>
+<blockquote>
+<div><p>特定のポイントからゾーンの空きmemblock領域を反復処理</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">i</span></code></dt><dd><p>ループ変数として使用されるu64</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">zone</span></code></dt><dd><p>すべてのメモリブロックが存在するゾーン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_start</span></code></dt><dd><p>範囲の開始アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_end</span></code></dt><dd><p>範囲の終了アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>特定ゾーンの空き（メモリ&amp;&amp;!予約）memblock領域を走査し、現在の位置から継続。memblockが初期化されると利用可能。</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.for_each_free_mem_range">
+<span class="sig-name descname"><span class="n"><span class="pre">for_each_free_mem_range</span></span></span><a class="headerlink" href="#c.for_each_free_mem_range" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">for_each_free_mem_range</span> <span class="pre">(i,</span> <span class="pre">nid,</span> <span class="pre">flags,</span> <span class="pre">p_start,</span> <span class="pre">p_end,</span> <span class="pre">p_nid)</span></code></p>
+<blockquote>
+<div><p>空きmemblock領域を反復処理</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">i</span></code></dt><dd><p>ループ変数として使用されるu64</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">nid</span></code></dt><dd><p>ノードセレクター、 <code class="docutils literal notranslate"><span class="pre">NUMA_NO_NODE</span></code> すべてのノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">flags</span></code></dt><dd><p>メモリ属性に基づいてブロックを選択</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_start</span></code></dt><dd><p>範囲の開始アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_end</span></code></dt><dd><p>範囲の終了アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_nid</span></code></dt><dd><p>範囲のnidのintへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>memblockの空き（メモリ&amp;&amp;!予約）領域を走査。memblockが初期化されると利用可能。</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.for_each_free_mem_range_reverse">
+<span class="sig-name descname"><span class="n"><span class="pre">for_each_free_mem_range_reverse</span></span></span><a class="headerlink" href="#c.for_each_free_mem_range_reverse" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">for_each_free_mem_range_reverse</span> <span class="pre">(i,</span> <span class="pre">nid,</span> <span class="pre">flags,</span> <span class="pre">p_start,</span> <span class="pre">p_end,</span> <span class="pre">p_nid)</span></code></p>
+<blockquote>
+<div><p>空きmemblock領域を逆順に反復処理</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">i</span></code></dt><dd><p>ループ変数として使用されるu64</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">nid</span></code></dt><dd><p>ノードセレクター、 <code class="docutils literal notranslate"><span class="pre">NUMA_NO_NODE</span></code> すべてのノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">flags</span></code></dt><dd><p>メモリ属性に基づいてブロックを選択</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_start</span></code></dt><dd><p>範囲の開始アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_end</span></code></dt><dd><p>範囲の終了アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">p_nid</span></code></dt><dd><p>範囲のnidのintへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>memblockの空き（メモリ&amp;&amp;!予約）領域を逆順に走査。memblockが初期化されると利用可能。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_set_current_limit">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_set_current_limit</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">制限</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_set_current_limit" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>現在の割当制限を設定し、起動中の現在のアクセス可能な領域に割当を制限する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">limit</span></code></dt><dd><p>新しい制限値（物理アドレス）</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_region_memory_base_pfn">
+<span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_region_memory_base_pfn</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_region" title="memblock_region"><span class="n"><span class="pre">memblock_region</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">reg</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_region_memory_base_pfn" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>メモリ領域の最低 pfn を取得</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">struct</span> <span class="pre">memblock_region</span> <span class="pre">*reg</span></code></dt><dd><p>memblock_region 構造体</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>メモリ領域と交差する最低 pfn</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_region_memory_end_pfn">
+<span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_region_memory_end_pfn</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_region" title="memblock_region"><span class="n"><span class="pre">memblock_region</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">reg</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_region_memory_end_pfn" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>メモリ領域の終端 pfn を取得</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">struct</span> <span class="pre">memblock_region</span> <span class="pre">*reg</span></code></dt><dd><p>memblock_region 構造体</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>予約領域の end_pfn</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_region_reserved_base_pfn">
+<span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_region_reserved_base_pfn</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_region" title="memblock_region"><span class="n"><span class="pre">memblock_region</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">reg</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_region_reserved_base_pfn" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>予約領域の最低 pfn を取得</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">struct</span> <span class="pre">memblock_region</span> <span class="pre">*reg</span></code></dt><dd><p>memblock_region 構造体</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>予約領域と交差する最低 pfn</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_region_reserved_end_pfn">
+<span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_region_reserved_end_pfn</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_region" title="memblock_region"><span class="n"><span class="pre">memblock_region</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">reg</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_region_reserved_end_pfn" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>予約領域の終端 pfn を取得</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">struct</span> <span class="pre">memblock_region</span> <span class="pre">*reg</span></code></dt><dd><p>memblock_region 構造体</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>予約領域の end_pfn</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.for_each_mem_region">
+<span class="sig-name descname"><span class="n"><span class="pre">for_each_mem_region</span></span></span><a class="headerlink" href="#c.for_each_mem_region" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">for_each_mem_region</span> <span class="pre">(region)</span></code></p>
+<blockquote>
+<div><p>メモリ領域を反復処理</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">region</span></code></dt><dd><p>ループ変数</p>
+</dd>
+</dl>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.for_each_reserved_mem_region">
+<span class="sig-name descname"><span class="n"><span class="pre">for_each_reserved_mem_region</span></span></span><a class="headerlink" href="#c.for_each_reserved_mem_region" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">for_each_reserved_mem_region</span> <span class="pre">(region)</span></code></p>
+<blockquote>
+<div><p>予約メモリ領域を反復処理</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">region</span></code></dt><dd><p>ループ変数</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.__memblock_find_range_bottom_up">
+<span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">__memblock_find_range_bottom_up</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">start</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">end</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">align</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nid</span></span>, <span class="k"><span class="pre">enum</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_flags" title="memblock_flags"><span class="n"><span class="pre">memblock_flags</span></span></a><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.__memblock_find_range_bottom_up" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>下から上へによる空き領域検索ユーティリティ</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">start</span></code></dt><dd><p>候補範囲の開始位置</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">end</span></code></dt><dd><p>候補範囲の終端位置（任意の値を指定可能） <code class="docutils literal notranslate"><span class="pre">MEMBLOCK_ALLOC_ANYWHERE</span></code> または
+<code class="docutils literal notranslate"><span class="pre">MEMBLOCK_ALLOC_ACCESSIBLE</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>検索する空き領域のサイズ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">align</span></code></dt><dd><p>検索する空き領域のアライメント</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nid</span></code></dt><dd><p>検索する空き領域の nid <code class="docutils literal notranslate"><span class="pre">NUMA_NO_NODE</span></code> 任意のノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">enum</span> <span class="pre">memblock_flags</span> <span class="pre">flags</span></code></dt><dd><p>メモリ属性に基づいてブロックを選択</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ユーティリティが呼ばれる場所 <a class="reference internal" href="#c.memblock_find_in_range_node" title="memblock_find_in_range_node"><code class="xref c c-func docutils literal notranslate"><span class="pre">memblock_find_in_range_node()</span></code></a>, 下から上へによる空き領域検索。</p>
+<p><strong>戻り値</strong></p>
+<p>成功時に見つかったアドレス、失敗時に 0</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.__memblock_find_range_top_down">
+<span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">__memblock_find_range_top_down</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">start</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">end</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">align</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nid</span></span>, <span class="k"><span class="pre">enum</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_flags" title="memblock_flags"><span class="n"><span class="pre">memblock_flags</span></span></a><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.__memblock_find_range_top_down" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>上から下へによる空き領域検索ユーティリティ</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">start</span></code></dt><dd><p>候補範囲の開始位置</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">end</span></code></dt><dd><p>候補範囲の終端位置（任意の値を指定可能） <code class="docutils literal notranslate"><span class="pre">MEMBLOCK_ALLOC_ANYWHERE</span></code> または
+<code class="docutils literal notranslate"><span class="pre">MEMBLOCK_ALLOC_ACCESSIBLE</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>検索する空き領域のサイズ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">align</span></code></dt><dd><p>検索する空き領域のアライメント</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nid</span></code></dt><dd><p>検索する空き領域の nid <code class="docutils literal notranslate"><span class="pre">NUMA_NO_NODE</span></code> 任意のノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">enum</span> <span class="pre">memblock_flags</span> <span class="pre">flags</span></code></dt><dd><p>メモリ属性に基づいてブロックを選択</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ユーティリティが呼ばれる場所 <a class="reference internal" href="#c.memblock_find_in_range_node" title="memblock_find_in_range_node"><code class="xref c c-func docutils literal notranslate"><span class="pre">memblock_find_in_range_node()</span></code></a>, 上から下へによる空き領域検索。</p>
+<p><strong>戻り値</strong></p>
+<p>成功時に見つかったアドレス、失敗時に 0</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_find_in_range_node">
+<span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_find_in_range_node</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">align</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">start</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">end</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nid</span></span>, <span class="k"><span class="pre">enum</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_flags" title="memblock_flags"><span class="n"><span class="pre">memblock_flags</span></span></a><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_find_in_range_node" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定された範囲とノード内の空き領域検索</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>検索する空き領域のサイズ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">align</span></code></dt><dd><p>検索する空き領域のアライメント</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">start</span></code></dt><dd><p>候補範囲の開始位置</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">end</span></code></dt><dd><p>候補範囲の終端位置（任意の値を指定可能） <code class="docutils literal notranslate"><span class="pre">MEMBLOCK_ALLOC_ANYWHERE</span></code> または
+<code class="docutils literal notranslate"><span class="pre">MEMBLOCK_ALLOC_ACCESSIBLE</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nid</span></code></dt><dd><p>検索する空き領域の nid <code class="docutils literal notranslate"><span class="pre">NUMA_NO_NODE</span></code> 任意のノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">enum</span> <span class="pre">memblock_flags</span> <span class="pre">flags</span></code></dt><dd><p>メモリ属性に基づいてブロックを選択</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>検索 <strong>size</strong> アライメントされた空き領域 <strong>align</strong> 指定された範囲およびノード内。</p>
+<p><strong>戻り値</strong></p>
+<p>成功時に見つかったアドレス、失敗時に 0</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_find_in_range">
+<span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_find_in_range</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">start</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">end</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">align</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_find_in_range" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定された範囲内で空き領域を検索</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">start</span></code></dt><dd><p>候補範囲の開始位置</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">end</span></code></dt><dd><p>候補範囲の終端位置（任意の値を指定可能） <code class="docutils literal notranslate"><span class="pre">MEMBLOCK_ALLOC_ANYWHERE</span></code> または
+<code class="docutils literal notranslate"><span class="pre">MEMBLOCK_ALLOC_ACCESSIBLE</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>検索する空き領域のサイズ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">align</span></code></dt><dd><p>検索する空き領域のアライメント</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>検索 <strong>size</strong> アライメントされた空き領域 <strong>align</strong> 指定された範囲内。</p>
+<p><strong>戻り値</strong></p>
+<p>成功時に見つかったアドレス、失敗時に 0</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_discard">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_discard</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_discard" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割り当てられたメモリおよび予約配列を破棄する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_double_array">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_double_array</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_type" title="memblock_type"><span class="n"><span class="pre">memblock_type</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">type</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">new_area_start</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">new_area_size</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_double_array" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>memblock regions配列のサイズを倍にする</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">memblock_type</span> <span class="pre">*type</span></code></dt><dd><p>倍にされるmemblock regions配列のタイプ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">new_area_start</span></code></dt><dd><p>重複を避けるために避けたいメモリ範囲の開始アドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">new_area_size</span></code></dt><dd><p>重複を避けるために避けたいメモリ範囲のサイズ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>regions配列のサイズを倍にする <strong>type</strong> memblockが新しい予約regions配列のメモリを割り当てるために使用されている場合、かつ以前に割り当てられたメモリ範囲[<strong>new_area_start</strong>, <strong>new_area_start</strong> + <strong>new_area_size</strong>]が予約待機中である場合、新しい配列が使用するメモリが重複しないようにする。</p>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、失敗時は-1。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_merge_regions">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_merge_regions</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_type" title="memblock_type"><span class="n"><span class="pre">memblock_type</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">type</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_merge_regions" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>隣接する互換性のあるregionsをマージ</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">memblock_type</span> <span class="pre">*type</span></code></dt><dd><p>スキャンするmemblockタイプ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>スキャン <strong>type</strong> 隣接する互換性のあるregionsをマージする。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_insert_region">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_insert_region</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_type" title="memblock_type"><span class="n"><span class="pre">memblock_type</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">type</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">idx</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">base</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nid</span></span>, <span class="k"><span class="pre">enum</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_flags" title="memblock_flags"><span class="n"><span class="pre">memblock_flags</span></span></a><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_insert_region" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>新しいmemblock regionsを挿入</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">memblock_type</span> <span class="pre">*type</span></code></dt><dd><p>挿入するmemblockタイプ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">idx</span></code></dt><dd><p>挿入位置のインデックス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">base</span></code></dt><dd><p>新しいregionsのベースアドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>新しいregionsのサイズ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nid</span></code></dt><dd><p>新しいregionsのノードID</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">enum</span> <span class="pre">memblock_flags</span> <span class="pre">flags</span></code></dt><dd><p>新しいregionsのフラグ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>新しいmemblock regions [<strong>base</strong>, <strong>base</strong> + <strong>size</strong>) を <strong>type</strong> に <strong>idx</strong>.
+<strong>type</strong> に挿入する際には、すでに新しいregionsを収容できる余白が確保されている必要があります。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_add_range">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_add_range</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_type" title="memblock_type"><span class="n"><span class="pre">memblock_type</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">type</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">base</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nid</span></span>, <span class="k"><span class="pre">enum</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_flags" title="memblock_flags"><span class="n"><span class="pre">memblock_flags</span></span></a><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_add_range" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>新しいmemblock regionsを追加</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">memblock_type</span> <span class="pre">*type</span></code></dt><dd><p>新しいregionsを追加するmemblockタイプ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">base</span></code></dt><dd><p>新しいregionsのベースアドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>新しいregionsのサイズ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nid</span></code></dt><dd><p>新規領域のノードID</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">enum</span> <span class="pre">memblock_flags</span> <span class="pre">flags</span></code></dt><dd><p>新しいregionsのフラグ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>新規memblock領域を[<strong>base</strong>, <strong>base</strong> + <strong>size</strong>) を <strong>type</strong>. 新規領域は既存の領域と重なってもよいです。重複は既存の領域に影響を与えません。  <strong>type</strong> 追加後、領域は最小限に保証されており（隣接する互換領域は統合されます）。</p>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、失敗時は-errnoを返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_add_node">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_add_node</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">base</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nid</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_add_node" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>NUMAノード内に新規memblock領域を追加</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">base</span></code></dt><dd><p>新しいregionsのベースアドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>新しいregionsのサイズ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nid</span></code></dt><dd><p>新規領域のノードID</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>新規memblock領域を[<strong>base</strong>, <strong>base</strong> + <strong>size</strong>)を「memory」タイプに追加します。詳細は <a class="reference internal" href="#c.memblock_add_range" title="memblock_add_range"><code class="xref c c-func docutils literal notranslate"><span class="pre">memblock_add_range()</span></code></a> モードの説明をご参照ください</p>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、失敗時は-errnoを返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_add">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_add</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">base</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_add" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>新しいmemblock regionsを追加</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">base</span></code></dt><dd><p>新しいregionsのベースアドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>新しいregionsのサイズ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>新規memblock領域を[<strong>base</strong>, <strong>base</strong> + <strong>size</strong>)を「memory」タイプに追加します。詳細は <a class="reference internal" href="#c.memblock_add_range" title="memblock_add_range"><code class="xref c c-func docutils literal notranslate"><span class="pre">memblock_add_range()</span></code></a> モードの説明をご参照ください</p>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、失敗時は-errnoを返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_isolate_range">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_isolate_range</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_type" title="memblock_type"><span class="n"><span class="pre">memblock_type</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">type</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">base</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">start_rgn</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">end_rgn</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_isolate_range" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定された範囲を離散的なmemblockに分離します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">memblock_type</span> <span class="pre">*type</span></code></dt><dd><p>分離するmemblockのタイプ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">base</span></code></dt><dd><p>分離する範囲のベースアドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>分離する範囲のサイズ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">*start_rgn</span></code></dt><dd><p>分離された領域の開始位置の出力パラメータ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">*end_rgn</span></code></dt><dd><p>分離された領域の終了位置の出力パラメータ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>走査 <strong>type</strong> と、領域が定義された境界を越えないようにします。境界を越えた領域は境界で分割され、最大で2つの新しい領域が生成されることがあります。範囲内の最初の領域のインデックスは<strong>base</strong>, <strong>base</strong> + <strong>size</strong>*start_rgn <strong>で返されます。終了位置は</strong> *end_rgn <strong>で返されます。</strong>.</p>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、失敗時は-errnoを返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_free">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_free</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">base</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_free" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ブートメモリブロックの解放</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">base</span></code></dt><dd><p>ブートメモリブロックの物理開始アドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>ブートメモリブロックのバイト数</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>memblock_alloc_xx() APIで以前に割り当てられたブートメモリブロックを解放します。解放されたメモリはbuddy allocatorに返却されません。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_setclr_flag">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_setclr_flag</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">base</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">set</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_setclr_flag" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>メモリ領域のフラグを設定またはクリア</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">base</span></code></dt><dd><p>リージョンのベースアドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>リージョンのサイズ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">set</span></code></dt><dd><p>フラグを設定またはクリアします</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">flag</span></code></dt><dd><p>更新するフラグ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この関数は領域[<strong>base</strong>, <strong>base</strong> + <strong>size</strong>)を分離し、フラグを設定またはクリアします</p>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、失敗時は-errnoを返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_mark_hotplug">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_mark_hotplug</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">base</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_mark_hotplug" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>フラグMEMBLOCK_HOTPLUGでホットプラグ可能なメモリをマークします。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">base</span></code></dt><dd><p>領域のベース物理アドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>領域のサイズ</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、失敗時は-errnoを返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_clear_hotplug">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_clear_hotplug</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">base</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_clear_hotplug" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定された領域のフラグ MEMBLOCK_HOTPLUG をクリアします。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">base</span></code></dt><dd><p>領域のベース物理アドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>領域のサイズ</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、失敗時は-errnoを返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_mark_mirror">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_mark_mirror</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">base</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_mark_mirror" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>フラグ MEMBLOCK_MIRROR でミラーメモリをマークします。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">base</span></code></dt><dd><p>領域のベース物理アドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>領域のサイズ</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、失敗時は-errnoを返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_mark_nomap">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_mark_nomap</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">base</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_mark_nomap" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>フラグ MEMBLOCK_NOMAP でメモリ領域をマークします。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">base</span></code></dt><dd><p>領域のベース物理アドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>領域のサイズ</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、失敗時は-errnoを返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_clear_nomap">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_clear_nomap</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">base</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_clear_nomap" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定された領域のフラグ MEMBLOCK_NOMAP をクリアします。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">base</span></code></dt><dd><p>領域のベース物理アドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>領域のサイズ</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、失敗時は-errnoを返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.__next_mem_range">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">__next_mem_range</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">u64</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">idx</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nid</span></span>, <span class="k"><span class="pre">enum</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_flags" title="memblock_flags"><span class="n"><span class="pre">memblock_flags</span></span></a><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_type" title="memblock_type"><span class="n"><span class="pre">memblock_type</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">type_a</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_type" title="memblock_type"><span class="n"><span class="pre">memblock_type</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">type_b</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">out_start</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">out_end</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">out_nid</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.__next_mem_range" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>次の関数は <a class="reference internal" href="#c.for_each_free_mem_range" title="for_each_free_mem_range"><code class="xref c c-func docutils literal notranslate"><span class="pre">for_each_free_mem_range()</span></code></a> など</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">u64</span> <span class="pre">*idx</span></code></dt><dd><p>u64 ループ変数へのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nid</span></code></dt><dd><p>ノードセレクター、 <code class="docutils literal notranslate"><span class="pre">NUMA_NO_NODE</span></code> すべてのノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">enum</span> <span class="pre">memblock_flags</span> <span class="pre">flags</span></code></dt><dd><p>メモリ属性に基づいてブロックを選択</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">memblock_type</span> <span class="pre">*type_a</span></code></dt><dd><p>範囲を取得する memblock_type へのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">memblock_type</span> <span class="pre">*type_b</span></code></dt><dd><p>範囲からメモリを除外する memblock_type へのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">*out_start</span></code></dt><dd><p>範囲の開始アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">*out_end</span></code></dt><dd><p>範囲の終了アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">*out_nid</span></code></dt><dd><p>範囲のnidのintへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>最初のエリアを*idxから検索し、出力パラメータを埋め、次のイテレーションのために更新します。 <strong>*idx</strong> 一致する <strong>nid</strong>、出力パラメータを埋め、次のイテレーションのために更新します。 <strong>*idx</strong> 次のイテレーションのために更新します。下位32ビットはtype_aのインデックスを表し、上位32ビットはtype_bの各領域前の領域をインデックスします。
+<strong>*idx</strong> たとえば、type_bの領域が次のようになっている場合、</p>
+<blockquote>
+<div><p>0:[0-16), 1:[32-48), 2:[128-130)</p>
+</div></blockquote>
+<p>上位32ビットは次の領域をインデックスします。</p>
+<blockquote>
+<div><p>0:[0-0), 1:[16-32), 2:[48-128), 3:[130-MAX)</p>
+</div></blockquote>
+<p>両方の領域配列がソートされているため、関数は2つのインデックスを同期して進めていき、それぞれの交差を返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.__next_mem_range_rev">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">__next_mem_range_rev</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">u64</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">idx</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nid</span></span>, <span class="k"><span class="pre">enum</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_flags" title="memblock_flags"><span class="n"><span class="pre">memblock_flags</span></span></a><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_type" title="memblock_type"><span class="n"><span class="pre">memblock_type</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">type_a</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_type" title="memblock_type"><span class="n"><span class="pre">memblock_type</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">type_b</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">out_start</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">out_end</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">out_nid</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.__next_mem_range_rev" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>for_each_*_range_rev()の汎用的な次の範囲取得関数</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">u64</span> <span class="pre">*idx</span></code></dt><dd><p>u64 ループ変数へのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nid</span></code></dt><dd><p>ノードセレクター、 <code class="docutils literal notranslate"><span class="pre">NUMA_NO_NODE</span></code> すべてのノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">enum</span> <span class="pre">memblock_flags</span> <span class="pre">flags</span></code></dt><dd><p>メモリ属性に基づいてブロックを選択</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">memblock_type</span> <span class="pre">*type_a</span></code></dt><dd><p>範囲を取得する memblock_type へのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">memblock_type</span> <span class="pre">*type_b</span></code></dt><dd><p>範囲からメモリを除外する memblock_type へのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">*out_start</span></code></dt><dd><p>範囲の開始アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">*out_end</span></code></dt><dd><p>範囲の終了アドレスのphys_addr_tへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">*out_nid</span></code></dt><dd><p>範囲のnidのintへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>type_aからtype_bで不適切とマークされていない次の範囲を取得します。</p>
+<p>の逆 <a class="reference internal" href="#c.__next_mem_range" title="__next_mem_range"><code class="xref c c-func docutils literal notranslate"><span class="pre">__next_mem_range()</span></code></a>.</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_set_node">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_set_node</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">base</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.memblock_type" title="memblock_type"><span class="n"><span class="pre">memblock_type</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">type</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nid</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_set_node" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>memblock領域にノードIDを設定</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">base</span></code></dt><dd><p>ノードIDを設定する領域のベース</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>ノードIDを設定する領域のサイズ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">memblock_type</span> <span class="pre">*type</span></code></dt><dd><p>ノードIDを設定するmemblockの種類</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nid</span></code></dt><dd><p>設定するノードID</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>memblock領域のnidを設定 <strong>type</strong> regions in [<strong>base</strong>, <strong>base</strong> + <strong>size</strong>) に <strong>nid</strong>. 領域境界を越える領域は必要に応じて分割されます。</p>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、失敗時は-errnoを返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.__next_mem_pfn_range_in_zone">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">__next_mem_pfn_range_in_zone</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">u64</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">idx</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.__next_mem_pfn_range_in_zone" title="zone"><span class="n"><span class="pre">zone</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">zone</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">out_spfn</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">out_epfn</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.__next_mem_pfn_range_in_zone" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>for_each_*_range_in_zone()用のイテレータ</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">u64</span> <span class="pre">*idx</span></code></dt><dd><p>u64 ループ変数へのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">zone</span> <span class="pre">*zone</span></code></dt><dd><p>すべてのメモリブロックが存在するゾーン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">*out_spfn</span></code></dt><dd><p>範囲の開始pfnのulongへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">*out_epfn</span></code></dt><dd><p>範囲の終了pfnのulongへのポインタ、使用可能 <code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この関数は、for_each_mem_range型イテレータのzone/pfnに特化したラッパーとして意図されており、特に遅延メモリ初期化ルーチンで使用されます。そのため、コード全体でこのロジックを複数回再実装していたため、複数の場所に分散しているのではなく、1つの新しいイテレータに集中させることでより効率的な処理が可能になると考えられます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_alloc_range_nid">
+<span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_alloc_range_nid</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">align</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">start</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">end</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nid</span></span>, <span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n"><span class="pre">exact_nid</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_alloc_range_nid" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ブートメモリブロックを割り当てる</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>割り当てられるメモリブロックのサイズ（バイト単位）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">align</span></code></dt><dd><p>領域およびブロックのサイズのアライメント</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">start</span></code></dt><dd><p>割り当てたいメモリ領域の下限（物理アドレス）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">end</span></code></dt><dd><p>割り当てたいメモリ領域の上限（物理アドレス）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nid</span></code></dt><dd><p>検索する空き領域の nid <code class="docutils literal notranslate"><span class="pre">NUMA_NO_NODE</span></code> 任意のノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">exact_nid</span></code></dt><dd><p>割り当てを他のノードにフォールバック制御</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>memblock.current_limitで制限されたメモリ領域から割り当てが行われます <strong>end</strong> == <code class="docutils literal notranslate"><span class="pre">MEMBLOCK_ALLOC_ACCESSIBLE</span></code>.</p>
+<p>指定されたノードが要求されたメモリを保持できない場合、 <strong>exact_nid</strong>
+falseの場合、割り当てはシステム内の任意のノードにフォールバックします。</p>
+<p>メモリミラーリングを持つシステムでは、まずミラーリングが有効な領域から割り当てを試行し、その後任意のメモリ領域から再試行します。</p>
+<p>さらに、関数は割り当てられたブートメモリブロックに対してkmemleak_alloc_physを使用してmin_countを0に設定し、リークとして報告されることを防ぎます。</p>
+<p><strong>戻り値</strong></p>
+<p>成功時の割り当てられたメモリブロックの物理アドレス、 <code class="docutils literal notranslate"><span class="pre">0</span></code> を返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_phys_alloc_range">
+<span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_phys_alloc_range</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">align</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">start</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">end</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_phys_alloc_range" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定された範囲内のメモリブロックを割り当てる</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>割り当てられるメモリブロックのサイズ（バイト単位）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">align</span></code></dt><dd><p>領域およびブロックのサイズのアライメント</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">start</span></code></dt><dd><p>割り当てたいメモリ領域の下限（物理アドレス）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">end</span></code></dt><dd><p>割り当てたいメモリ領域の上限（物理アドレス）</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>割り当てる <strong>size</strong> 〜の間にバイト <strong>start</strong> および <strong>end</strong>.</p>
+<p><strong>戻り値</strong></p>
+<p>成功時の割り当てられたメモリブロックの物理アドレス、
+<code class="docutils literal notranslate"><span class="pre">0</span></code> を返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_phys_alloc_try_nid">
+<span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_phys_alloc_try_nid</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">align</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nid</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_phys_alloc_try_nid" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定されたNUMAノードからメモリブロックを割り当てる</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>割り当てられるメモリブロックのサイズ（バイト単位）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">align</span></code></dt><dd><p>領域およびブロックのサイズのアライメント</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nid</span></code></dt><dd><p>検索する空き領域の nid <code class="docutils literal notranslate"><span class="pre">NUMA_NO_NODE</span></code> 任意のノード</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>指定されたNUMAノードからメモリブロックを割り当てます。ノードに利用可能なメモリがなければ、システム内の任意のノードから割り当てを試みます。</p>
+<p><strong>戻り値</strong></p>
+<p>成功時の割り当てられたメモリブロックの物理アドレス、
+<code class="docutils literal notranslate"><span class="pre">0</span></code> を返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_alloc_internal">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">memblock_alloc_internal</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">align</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">min_addr</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">max_addr</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nid</span></span>, <span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n"><span class="pre">exact_nid</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_alloc_internal" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ブートメモリブロックを割り当てる</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>割り当てられるメモリブロックのサイズ（バイト単位）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">align</span></code></dt><dd><p>領域およびブロックのサイズのアライメント</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">min_addr</span></code></dt><dd><p>割り当てたいメモリ領域の下限（物理アドレス）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">max_addr</span></code></dt><dd><p>割り当てたいメモリ領域の上限（物理アドレス）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nid</span></code></dt><dd><p>検索する空き領域の nid <code class="docutils literal notranslate"><span class="pre">NUMA_NO_NODE</span></code> 任意のノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">exact_nid</span></code></dt><dd><p>割り当てを他のノードにフォールバック制御</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>を使用してメモリブロックを割り当て、 <a class="reference internal" href="#c.memblock_alloc_range_nid" title="memblock_alloc_range_nid"><code class="xref c c-func docutils literal notranslate"><span class="pre">memblock_alloc_range_nid()</span></code></a> 返された物理アドレスを仮想アドレスに変換します。</p>
+<p>以下の <strong>min_addr</strong> 満たせない場合、制限は解除され、割り当ては制限以下のメモリからフォールバックします <strong>min_addr</strong>. その他の制約（ノードやミラーリングされたメモリなど）は、
+<a class="reference internal" href="#c.memblock_alloc_range_nid" title="memblock_alloc_range_nid"><code class="xref c c-func docutils literal notranslate"><span class="pre">memblock_alloc_range_nid()</span></code></a>.</p>
+<p><strong>戻り値</strong></p>
+<p>成功時の割り当てられたメモリブロックの仮想アドレス、失敗時はNULL。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_alloc_exact_nid_raw">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">memblock_alloc_exact_nid_raw</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">align</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">min_addr</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">max_addr</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nid</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_alloc_exact_nid_raw" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ブートメモリブロックを正確なノードに割り当て、メモリをゼロ化せずに</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>割り当てられるメモリブロックのサイズ（バイト単位）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">align</span></code></dt><dd><p>領域およびブロックのサイズのアライメント</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">min_addr</span></code></dt><dd><p>割当が好ましいメモリ領域の下限（物理アドレス）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">max_addr</span></code></dt><dd><p>割当が好ましいメモリ領域の上界（物理アドレス）、または <code class="docutils literal notranslate"><span class="pre">MEMBLOCK_ALLOC_ACCESSIBLE</span></code> memblock.current_limitの値で制限されたメモリからのみ割り当て</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nid</span></code></dt><dd><p>検索する空き領域の nid <code class="docutils literal notranslate"><span class="pre">NUMA_NO_NODE</span></code> 任意のノード</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>パブリック関数、追加のデバッグ情報（呼び出し元情報含む）を提供します（有効な場合）。割り当てられたメモリをゼロ化しません。</p>
+<p><strong>戻り値</strong></p>
+<p>成功時の割り当てられたメモリブロックの仮想アドレス、失敗時はNULL。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_alloc_try_nid_raw">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">memblock_alloc_try_nid_raw</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">align</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">min_addr</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">max_addr</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nid</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_alloc_try_nid_raw" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ブートメモリブロックをゼロ化せずに割り当て、panicしない</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>割り当てられるメモリブロックのサイズ（バイト単位）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">align</span></code></dt><dd><p>領域およびブロックのサイズのアライメント</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">min_addr</span></code></dt><dd><p>割当が好ましいメモリ領域の下限（物理アドレス）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">max_addr</span></code></dt><dd><p>割当が好ましいメモリ領域の上界（物理アドレス）、または <code class="docutils literal notranslate"><span class="pre">MEMBLOCK_ALLOC_ACCESSIBLE</span></code> memblock.current_limitの値で制限されたメモリからのみ割り当て</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nid</span></code></dt><dd><p>検索する空き領域の nid <code class="docutils literal notranslate"><span class="pre">NUMA_NO_NODE</span></code> 任意のノード</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>パブリック関数、追加のデバッグ情報（呼び出し元情報含む）を提供します（有効な場合）。割り当てられたメモリをゼロ化しません。要請が満たされない場合でもpanicしません。</p>
+<p><strong>戻り値</strong></p>
+<p>成功時の割り当てられたメモリブロックの仮想アドレス、失敗時はNULL。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_alloc_try_nid">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">memblock_alloc_try_nid</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">align</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">min_addr</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">max_addr</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nid</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_alloc_try_nid" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ブートメモリブロックを割り当てる</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>割り当てられるメモリブロックのサイズ（バイト単位）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">align</span></code></dt><dd><p>領域およびブロックのサイズのアライメント</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">min_addr</span></code></dt><dd><p>割当が好ましいメモリ領域の下限（物理アドレス）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">max_addr</span></code></dt><dd><p>割当が好ましいメモリ領域の上界（物理アドレス）、または <code class="docutils literal notranslate"><span class="pre">MEMBLOCK_ALLOC_ACCESSIBLE</span></code> memblock.current_limitの値で制限されたメモリからのみ割り当て</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nid</span></code></dt><dd><p>検索する空き領域の nid <code class="docutils literal notranslate"><span class="pre">NUMA_NO_NODE</span></code> 任意のノード</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>パブリック関数、追加のデバッグ情報（呼び出し元情報含む）を提供します（有効な場合）。この関数は割り当てられたメモリをゼロ化します。</p>
+<p><strong>戻り値</strong></p>
+<p>成功時の割り当てられたメモリブロックの仮想アドレス、失敗時はNULL。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.__memblock_free_late">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">__memblock_free_late</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">base</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.__memblock_free_late" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ページをバディアロケータに直接解放します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">base</span></code></dt><dd><p>ブートメモリブロックの物理開始アドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>ブートメモリブロックのバイト数</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>memblockアロケータがすでに破棄されていても、システムの初期化がまだ続く場合にのみ役立ちます。ページはバディアロケータに直接解放されます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_is_region_memory">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_is_region_memory</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">base</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_is_region_memory" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>領域がメモリのサブセットかどうかを確認します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">base</span></code></dt><dd><p>確認する領域のベース（開始位置）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>確認する領域のサイズ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>領域 [<strong>base</strong>, <strong>base</strong> + <strong>size</strong>) がメモリブロックのサブセットかどうかを確認します。</p>
+<p><strong>戻り値</strong></p>
+<p>偽の場合は0、真の場合は非ゼロ値</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_is_region_reserved">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="pre">__init_memblock</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_is_region_reserved</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">base</span></span>, <span class="n"><span class="pre">phys_addr_t</span></span><span class="w"> </span><span class="n"><span class="pre">size</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_is_region_reserved" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>領域が予約メモリと交差しているかを確認します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">base</span></code></dt><dd><p>確認する領域のベース（開始位置）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">phys_addr_t</span> <span class="pre">size</span></code></dt><dd><p>確認する領域のサイズ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>領域 [<strong>base</strong>, <strong>base</strong> + <strong>size</strong>) が予約メモリブロックと交差しているかを確認します。</p>
+<p><strong>戻り値</strong></p>
+<p>交差している場合は真、そうでない場合は偽</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.memblock_free_all">
+<span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">memblock_free_all</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.memblock_free_all" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>空きページをバディアロケータに解放します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>実際に解放されたページ数</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">コアAPIドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#core-utilities">Core utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#data-structures-and-low-level-utilities">Data structures and low-level utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#concurrency-primitives">Concurrency primitives</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#low-level-hardware-management">Low-level hardware management</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#memory-management">Memory management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#interfaces-for-kernel-debugging">Interfaces for kernel debugging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#everything-else">Everything else</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">コアAPIドキュメント</a><ul>
+<li>前へ: <a href="pin_user_pages.html" title="前章">pin_user_pages()関連の呼び出し</a></li>
+<li>次へ: <a href="gfp_mask-from-fs-io.html" title="次章">FS/IOコンテキストから使用されるGFPマスク</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/core-api/boot-time-mm.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

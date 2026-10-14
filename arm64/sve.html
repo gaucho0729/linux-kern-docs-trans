@@ -1,0 +1,515 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>AArch64 LinuxにおけるScalable Vector Extensionのサポート — Linux Kernelドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="tagged-address-abi.html" rel="next" title="AArch64 TAGGED ADDRESS ABI"/>
+<link href="silicon-errata.html" rel="prev" title="シリコンエラタとソフトウェアの回避策"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="scalable-vector-extension-support-for-aarch64-linux">
+<h1>AArch64 Linuxにおけるスケーラブルベクターエクステンション（SVE）サポート<a class="headerlink" href="#scalable-vector-extension-support-for-aarch64-linux" title="この見出しへのパーマリンク">¶</a></h1>
+<p>著者: Dave Martin &lt;<a class="reference external" href="mailto:Dave.Martin%40arm.com">Dave<span>.</span>Martin<span>@</span>arm<span>.</span>com</a>&gt;</p>
+<p>日付: 2017年8月4日</p>
+<p>このドキュメントは、LinuxがARM Scalable Vector Extension (SVE)の使用をサポートするためにユーザー空間に提供するインターフェースについて簡潔に説明しています。</p>
+<p>これは最も重要な機能と問題点のみを概説しており、網羅的な説明を目的としていません。</p>
+<p>このドキュメントはSVEアーキテクチャやプログラマーモデルの説明を目的としていません。理解を助けるため、SVEの関連するプログラマーモデルの特徴についての最小限の説明がAppendix Aに含まれています。</p>
+<section id="general">
+<h2>1. 一般<a class="headerlink" href="#general" title="この見出しへのパーマリンク">¶</a></h2>
+<ul>
+<li><p>SVEレジスタZ0..Z31、P0..P15およびFFRと現在のベクターレンジVLはスレッドごとに追跡されます。</p></li>
+<li><p>SVEの存在は、aux vectorのAT_HWCAPエントリにおけるHWCAP_SVEを通じてユーザー空間に報告されます。このフラグの存在はSVE命令およびレジスタの存在を示し、このドキュメントで説明するLinux固有のシステムインターフェースの存在も示します。SVEは/proc/cpuinfoで「sve」として報告されます。</p></li>
+<li><p>SVE命令の実行をユーザー空間でサポートしているかを検出するには、MRS命令でCPU IDレジスタID_AA64PFR0_EL1を読み取って、SVEフィールドの値がゼロでないことを確認します。[3]</p>
+<p>次のセクションで説明するシステムインターフェースの存在を保証しません。必要なソフトウェアはHWCAP_SVEを確認する必要があります。</p>
+</li>
+<li><p>SVE2拡張機能をサポートするハードウェアでは、AT_HWCAP2 aux vectorエントリでHWCAP2_SVE2も報告されます。さらに、以下のHWCAP2_SVE2 HWCAP2_SVEAES HWCAP2_SVEPMULL HWCAP2_SVEBITPERM HWCAP2_SVESHA3 HWCAP2_SVESM4の存在により、SVE2のオプション拡張機能が報告されることがあります。</p>
+<blockquote>
+<div><p>HWCAP2_SVE2 HWCAP2_SVEAES HWCAP2_SVEPMULL HWCAP2_SVEBITPERM HWCAP2_SVESHA3 HWCAP2_SVESM4</p>
+</div></blockquote>
+<p>このリストはSVEアーキテクチャが進化するにつれて拡充される可能性があります。</p>
+<p>これらの拡張機能は、ユーザー空間がMRS命令でID_AA64ZFR0_EL1レジスタを読み取ることで報告されます。詳細はelf_hwcaps.txtとcpu-feature-registers.txtを参照してください。</p>
+</li>
+<li><p>デバッガーはNT_ARM_SVE regsetを通じてターゲットとやり取りする必要があります。このregsetのサポートを検出する推奨方法は、まずターゲットプロセスに接続し、ptrace(PTRACE_GETREGSET, pid, NT_ARM_SVE, &amp;iov)を試みることです。</p></li>
+<li><p>ユーザー空間とカーネル間でSVEスケーラブルレジスタ値（Zn、Pn、FFR）がメモリで交換される際、レジスタ値はメモリ内でエンドイアンネスに依存しないレイアウトで符号化され、ビット[(8 * i + 7) : (8 * i)]はメモリ表現の開始位置からバイトオフセットiに配置される。これは例えばシグナルフレーム（struct sve_context）やptraceインターフェース（struct user_sve_header）および関連するデータに影響を与える。</p>
+<p>ビッグエンディアンシステムでは、FPSIMD Vレジスタ（128ビット単位でホストエンディアンとして保存される）とは異なるバイト順序が結果となることに注意せよ。FPSIMD Vレジスタのビット[(127 - 8 * i) : (120 - 8 * i)]はバイトオフセットiに配置される。（struct fpsimd_context、struct user_fpsimd_state）</p>
+</li>
+</ul>
+</section>
+<section id="vector-length-terminology">
+<h2>2. ベクターレンジ用語<a class="headerlink" href="#vector-length-terminology" title="この見出しへのパーマリンク">¶</a></h2>
+<p>SVEベクタ（Z）レジスタのサイズは「ベクターレンジ」と呼ばれる。</p>
+<p>ベクターレンジの単位に関する混乱を避けるため、カーネルは以下の規則を採用する：</p>
+<ul class="simple">
+<li><p>ベクターレンジ（VL）＝ Zレジスタのバイト数</p></li>
+<li><p>ベクターキュアワード（VQ）＝ Zレジスタの128ビット単位のサイズ</p></li>
+</ul>
+<p>（したがって VL＝16 × VQ）</p>
+<p>VQの規則は、データ構造定義など、基盤となる粒度が重要となる場面で使用される。ほとんどの他の状況ではVLの規則が使用される。これはSVEインストラクションセットアーキテクチャにおける「VL」擬似レジスタの意味と一致する。</p>
+</section>
+<section id="system-call-behaviour">
+<h2>3. システムコールの挙動<a class="headerlink" href="#system-call-behaviour" title="この見出しへのパーマリンク">¶</a></h2>
+<ul>
+<li><p>システムコール中にV0..V31は保持される（SVEなしの場合と同じ）。したがってZ0..Z31のビット[127:0]は保持される。システムコールからの戻り時にZ0..Z31の他のビット、およびP0..P15とFFRのすべては未定義となる。</p></li>
+<li><p>SVEレジスタはどのシステムコールにも引数として使用されたり、結果として返されたりしない。</p></li>
+<li><p>実際には、影響を受けるレジスタ/ビットはシステムコールからの戻り時に保持されるかゼロに置き換えられるが、ユーザー空間はこれを前提にすべきではない。カーネルの挙動はケースバイケースで異なる可能性がある。</p></li>
+<li><p>スレッドの他のすべてのSVE状態、包括して現在のベクターレンジ設定、PR_SVE_VL_INHERITフラグの状態、および遅延ベクターレンジ（存在する場合）は、section 6で説明するexecve()の特定の例外を除き、すべてのシステムコールで保持される。</p>
+<p>特に、fork()またはclone()からの戻り時に、親プロセスと新しい子プロセスまたはスレッドは、呼び出し前の親プロセスのSVE設定と一致する同じSVE設定を共有する。</p>
+</li>
+</ul>
+</section>
+<section id="signal-handling">
+<h2>4. シグナル処理<a class="headerlink" href="#signal-handling" title="この見出しへのパーマリンク">¶</a></h2>
+<ul class="simple">
+<li><p>新しいシグナルフレームレコード sve_context はシグナル送信時にSVEレジスタを符号化する。[1]</p></li>
+<li><p>このレコードはfpsimd_contextに補足情報を提供します。FPSRおよびFPCRレジスタはfpsimd_contextにのみ存在します。便利のため、V0..V3、の内容はsve_contextとfpsimd_contextの両方に複製されています。</p></li>
+<li><p>SVEのシグナルフレームレコードは常に基本的なメタデータを含み、特にスレッドのベクターレンジ（sve_context.vlに記録）を含みます。</p></li>
+<li><p>SVEレジスタは、スレッドでレジスタが有効かどうかによってレコードに含まれるかどうか異なります。レジスタが存在するのは次の条件を満たすときのみです：sve_context.head.size &gt;= SVE_SIG_CONTEXT_SIZE(sve_vq_from_vl(sve_context.vl))。</p></li>
+<li><p>レジスタが存在する場合、レコードの残りの部分はベクターレンジに依存したサイズとレイアウトを持ちます。マクロSVE_SIG_*は[1]で定義されており、メンバへのアクセスを容易にします。</p></li>
+<li><p>スケーラブルなレジスタ（Zn、Pn、FFR）は、エンドイアンネスに依存しないレイアウトで保存されます。ビット[(8 * i + 7) : (8 * i)]は、レジスタのメモリ表現の開始位置からのバイトオフセットiに格納されます。</p></li>
+<li><p>SVEコンテキストがsigcontext.__reserved[]に収まりきらない場合、スタックに追加の領域を確保し、__reserved[]にextra_contextレコードを書き込み、この領域を参照させます。sve_contextはその後、この追加領域に書き込まれます。このメカニズムの詳細については[1]を参照してください。</p></li>
+</ul>
+</section>
+<section id="signal-return">
+<h2>5. シグナルリターン<a class="headerlink" href="#signal-return" title="この見出しへのパーマリンク">¶</a></h2>
+<p>シグナルハンドラから戻る場合:</p>
+<ul class="simple">
+<li><p>シグナルフレームにsve_contextレコードが存在しない、または存在しても前記セクションで説明したようにレジスタデータを含まない場合、SVEレジスタ/ビットは非有効となり、未定義の値を取ります。</p></li>
+<li><p>sve_contextがシグナルフレームに存在し、完全なレジスタデータを含んでいる場合、SVEレジスタは有効となり、指定されたデータで初期化されます。ただし、後方互換性のため、Z0..Z31のビット[127:0]はsve_contextからではなく、fpsimd_context.vregs[]の対応するメンバから常に復元されます。残りのビットはsve_contextから復元されます。</p></li>
+<li><p>シグナルフレームにfpsimd_contextの包含は、sve_contextが存在するかどうかに関わらず必須です。</p></li>
+<li><p>ベクターレンジはシグナルリターンで変更できません。シグナルフレームのsve_context.vlが現在のベクターレンジと一致しない場合、シグナルリターンの試行は不正とみなされ、強制的なSIGSEGVが発生します。</p></li>
+</ul>
+</section>
+<section id="prctl-extensions">
+<h2>6. prctl拡張機能<a class="headerlink" href="#prctl-extensions" title="この見出しへのパーマリンク">¶</a></h2>
+<p>新しいprctl()呼び出しを追加し、プログラムがSVEベクターレンジを管理できるようにします:</p>
+<p>prctl(PR_SVE_SET_VL, unsigned long arg)</p>
+<blockquote>
+<div><p>呼び出し元スレッドのベクターレンジおよび関連するフラグを設定します。arg == vl | flags。呼び出し元プロセスの他のスレッドは影響を受けません。</p>
+<p>vlは望ましいベクターレンジで、sve_vl_valid(vl)が必須です。</p>
+<p>フラグ:</p>
+<blockquote>
+<div><p>PR_SVE_VL_INHERIT</p>
+<blockquote>
+<div><p>execve()の実行中に現在のベクターレンジを継承します。それ以外の場合、ベクターレンジはexecve()の実行時にシステムのデフォルト値に戻されます。(第9節を参照してください。)</p>
+</div></blockquote>
+<p>PR_SVE_SET_VL_ONEXEC</p>
+<blockquote>
+<div><p>このスレッドが実行する次のexecve()の際に、要求されたベクターレンジの変更を延期します。</p>
+<p>次のexecve()（ある場合）がスレッドによって実行された直後に、以下の呼び出しを暗黙的に実行する効果が等しいです：</p>
+<blockquote>
+<div><p>prctl(PR_SVE_SET_VL, arg &amp; ~PR_SVE_SET_VL_ONEXEC)</p>
+</div></blockquote>
+<p>これにより、呼び出し元の実行時副作用を回避しながら、異なるベクターレンジで新しいプログラムを起動することが可能になります。</p>
+<p>PR_SVE_SET_VL_ONEXECが指定されていない場合、要求された変更は即座に有効になります。</p>
+</div></blockquote>
+</div></blockquote>
+<dl class="simple">
+<dt>戻り値: 成功時は非負値、エラー時は負値:</dt><dd><dl class="simple">
+<dt>EINVAL: SVEがサポートされていない、または無効なベクターレンジが要求された場合、または</dt><dd><p>無効なフラグです。</p>
+</dd>
+</dl>
+</dd>
+</dl>
+<p>成功した場合:</p>
+<ul class="simple">
+<li><p>呼び出しスレッドのベクトル長または、次のexecve()で適用される遅延ベクトル長（PR_SVE_SET_VL_ONEXECフラグがargに存在するかどうかによります）が、vl以下のシステムでサポートされる最大値に設定されます。vlがSVE_VL_MAXの場合、設定される値はシステムがサポートする最大値です。</p></li>
+<li><p>呼び出しスレッドの未処理の遅延ベクトル長変更はキャンセルされます。</p></li>
+<li><p>返却値はPR_SVE_GET_VLと同様の形式で結果の構成を表します。この値のベクトル長は、argにPR_SVE_SET_VL_ONEXECフラグが存在しない場合、このスレッドの新しい現在ベクトル長を表します。存在する場合、報告されるベクトル長は、呼び出しスレッドが次のexecve()で適用する遅延ベクトル長を表します。</p></li>
+<li><p>ベクトル長の変更により、P0..P15、FFRおよびZ0..Z31のすべてのビット（Z0の[127:0]ビットからZ31の[127:0]ビットを除く）は未定義になります。PR_SVE_SET_VLを呼び出してvlをスレッドの現在ベクトル長と等しくする、またはPR_SVE_SET_VL_ONEXECフラグを指定して呼び出すことは、この目的でのベクトル長の変更とはみなされません。</p></li>
+</ul>
+</div></blockquote>
+<p>prctl(PR_SVE_GET_VL)</p>
+<blockquote>
+<div><p>呼び出しスレッドのベクトル長を取得します。</p>
+<p>次のフラグは結果にORで組み込むことができます:</p>
+<blockquote>
+<div><p>PR_SVE_VL_INHERIT</p>
+<blockquote>
+<div><p>ベクトル長はexecve()を跨って継承されます。</p>
+</div></blockquote>
+</div></blockquote>
+<p>未処理の遅延ベクトル長変更があるかどうかを確認する方法はありません（通常の使用ではfork()またはvfork()と対応するexecve()の間のみが該当します）。</p>
+<p>結果からベクトル長を抽出するには、PR_SVE_VL_LEN_MASKと論理積をとります。</p>
+<dl class="simple">
+<dt>戻り値: 成功した場合、非負の値を返します。エラーの場合、負の値を返します:</dt><dd><p>EINVAL: SVEがサポートされていません。</p>
+</dd>
+</dl>
+</div></blockquote>
+</section>
+<section id="ptrace-extensions">
+<h2>7. ptrace拡張<a class="headerlink" href="#ptrace-extensions" title="この見出しへのパーマリンク">¶</a></h2>
+<ul>
+<li><p>新しいregset NT_ARM_SVEが定義され、PTRACE_GETREGSETとPTRACE_SETREGSETで使用されます。</p>
+<p>定義については[2]を参照してください。</p>
+</li>
+</ul>
+<p>regsetデータはstruct user_sve_headerから始まり、以下のフィールドを含みます:</p>
+<blockquote>
+<div><p>size</p>
+<blockquote>
+<div><p>完全なregsetのサイズ（バイト単位）。これはvlに依存し、今後他の要素にも依存する可能性があります。</p>
+<p>PTRACE_GETREGSETの呼び出しがsizeの値よりも少ないデータを要求する場合、呼び出し元はより大きなバッファを割り当てて再試行することで、完全なregsetを読み取ることができます。</p>
+</div></blockquote>
+<p>max_size</p>
+<blockquote>
+<div><p>ターゲットスレッドのregsetが成長できる最大サイズ（バイト単位）。ターゲットスレッドがベクターレンジを変更しても、このサイズを超えることはありません。</p>
+</div></blockquote>
+<p>vl</p>
+<blockquote>
+<div><p>ターゲットスレッドの現在のベクターレンジ（バイト単位）。</p>
+</div></blockquote>
+<p>max_vl</p>
+<blockquote>
+<div><p>ターゲットスレッドの最大可能ベクターレンジ。</p>
+</div></blockquote>
+<p>フラグ</p>
+<blockquote>
+<div><p>どちらか一方</p>
+<blockquote>
+<div><p>SVE_PT_REGS_FPSIMD</p>
+<blockquote>
+<div><p>SVEレジスタは非アクティブ（GETREGSET）または非アクティブにされる（SETREGSET）。</p>
+<p>ペイロードの型はstruct user_fpsimd_stateで、NT_PRFPREGと同じ意味を持ち、user_sve_headerの開始位置からのSVE_PT_FPSIMD_OFFSETオフセットから開始します。</p>
+<p>今後、追加データが追加される可能性があります: ペイロードのサイズはSVE_PT_FPSIMD_SIZE(vq, flags)を使用して取得します。</p>
+<p>vqはsve_vq_from_vl(vl)を使用して取得します。</p>
+<p>または</p>
+</div></blockquote>
+<p>SVE_PT_REGS_SVE</p>
+<blockquote>
+<div><p>SVEレジスタはアクティブ（GETREGSET）またはアクティブにされる（SETREGSET）。</p>
+<p>ペイロードにはSVEレジスタデータが含まれ、user_sve_headerの開始位置からのSVE_PT_SVE_OFFSETオフセットから開始し、サイズはSVE_PT_SVE_SIZE(vq, flags)です;</p>
+</div></blockquote>
+</div></blockquote>
+<p>…以下のフラグのいずれか0個以上がORで組み合わされ、これらはPR_SET_VL_*フラグに対応するものと同じ意味と動作を持ちます:</p>
+<blockquote>
+<div><p>SVE_PT_VL_INHERIT</p>
+<p>SVE_PT_VL_ONEXEC (SETREGSET専用).</p>
+</div></blockquote>
+</div></blockquote>
+</div></blockquote>
+<ul>
+<li><p>ベクターレンジおよび/またはフラグの変更効果は、PR_SVE_SET_VLに記載されているものと同等です。</p>
+<p>SETREGSETによって実際に設定されたVLを知る必要がある場合、呼び出し元はさらにGETREGSETを呼び出す必要があります。ただし、事前にリクエストされたVLがサポートされていることがわかっている場合は除きます。</p>
+</li>
+<li><p>SVE_PT_REGS_SVEの場合、ペイロードのサイズとレイアウトはヘッダーフィールドに依存します。SVE_PT_SVE_*()マクロが提供されており、メンバへのアクセスを容易にしています。</p></li>
+<li><p>どちらの場合でも、SETREGSETではペイロードを省略することが許可されており、その場合、ベクターレンジとフラグのみが変更されます（その変更の結果も含む）。</p></li>
+<li><p>SETREGSETの場合、SVE_PT_REGS_SVEペイロードが存在し、要求されたVLがサポートされていない場合、ペイロードが省略された場合と同じ効果が得られますが、EIOエラーが報告されます。ペイロードデータを実際に設定されたベクターレンジの正しいレイアウトに変換する試みは行われません。スレッドのFPSIMD状態は保持されますが、SVEレジスタの残りのビットは未指定になります。呼び出し元がペイロードレイアウトを実際のVLに変換し、再試行する必要があります。</p></li>
+<li><p>部分的な、不完全なペイロードの書き込みの効果は未定義です。</p></li>
+</ul>
+</section>
+<section id="elf-coredump-extensions">
+<h2>8. ELFコアダンプ拡張機能<a class="headerlink" href="#elf-coredump-extensions" title="この見出しへのパーマリンク">¶</a></h2>
+<ul class="simple">
+<li><p>ダンプされたプロセスの各スレッドに対してNT_ARM_SVEノートがコアダンプに追加されます。コンテンツは、コアダンプ生成時に各スレッドに対してNT_ARM_SVEのPTRACE_GETREGSETが実行された場合に読み取られたデータと同等になります。</p></li>
+</ul>
+</section>
+<section id="system-runtime-configuration">
+<h2>9. システムランタイム構成<a class="headerlink" href="#system-runtime-configuration" title="この見出しへのパーマリンク">¶</a></h2>
+<ul class="simple">
+<li><p>シグナルフレームの拡張によるABI影響を軽減するため、管理者、ディストリビューションメンテナ、開発者向けに、ユーザー空間プロセスのデフォルトベクターレンジを設定するポリシーメカニズムが提供されます:</p></li>
+</ul>
+<p>/proc/sys/abi/sve_default_vector_length</p>
+<blockquote>
+<div><p>このファイルに整数のテキスト表現を書き込むと、システムデフォルトベクターレンジが指定された値に設定されます。ただし、指定値がシステムがサポートする最大ベクターレンジより大きい場合、デフォルトベクターレンジはその最大値に設定されます。</p>
+<p>結果はファイルを再開して内容を読み取ることで確認できます。</p>
+<p>起動時にデフォルトベクターレンジは64またはサポートされる最大ベクターレンジのうち小さい方で初期化されます。これはinitプロセス（PID 1）の初期ベクターレンジを決定します。</p>
+<p>このファイルを読み込むと、現在のシステムデフォルトベクターレンジが返されます。</p>
+</div></blockquote>
+<ul>
+<li><p>execve()呼び出しのたびに、新しいプロセスのベクターレンジがシステムデフォルトベクターレンジに設定されます。ただし、</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>呼び出しスレッドにPR_SVE_VL_INHERIT（または同等のSVE_PT_VL_INHERIT）が設定されている、または</p></li>
+<li><p>PR_SVE_SET_VL_ONEXECフラグ（またはSVE_PT_VL_ONEXEC）で待機中のベクターレンジ変更がある場合を除きます。</p></li>
+</ul>
+</div></blockquote>
+</li>
+<li><p>システムデフォルトベクターレンジを変更しても、execve()呼び出しを行わない既存のプロセスまたはスレッドのベクターレンジには影響しません。</p></li>
+</ul>
+<section id="appendix-a-sve-programmer-s-model-informative">
+<h3>付録A. SVEプログラマーモデル（情報的）<a class="headerlink" href="#appendix-a-sve-programmer-s-model-informative" title="この見出しへのパーマリンク">¶</a></h3>
+<p>このセクションでは、このドキュメントに関連するARMv8-AプログラマーモデルへのSVEの追加について簡潔な説明を提供します。</p>
+<p>注意: このセクションは情報提供を目的としたものであり、完全性を保証するものではなく、アーキテクチャ仕様の代替ではありません。</p>
+</section>
+</section>
+<section id="a-1-registers">
+<h2>A.1. レジスタ<a class="headerlink" href="#a-1-registers" title="この見出しへのパーマリンク">¶</a></h2>
+<p>A64状態では、SVEは以下の要素を追加します:</p>
+<ul>
+<li><p>32の8VLビットベクターレジスタ Z0..Z31。各Znについて、Znのビット[127:0]はARMv8-AベクターレジスタVnとアリアスします。</p>
+<p>Vnレジスタ名を使用してレジスタを書き込むと、対応するZnのすべてのビットをゼロにし、ビット[127:0]を除きます。</p>
+</li>
+<li><p>16のVLビット述語レジスタ P0..P15</p></li>
+<li><p>1のVLビット専用述語レジスタ FFR（「最初のエラーレジスタ」）</p></li>
+<li><p>VLの「擬似レジスタ」で、各ベクターレジスタのサイズを決定します。</p>
+<p>SVE命令セットアーキテクチャはVLを直接書き込む方法を提供していません。代わりに、EL1以上で適切なシステムレジスタに書き込むことでのみ変更可能です。</p>
+</li>
+<li><p>VLの値はEL1以上で実行時に行き、16 &lt;= VL &lt;= VLmaxの範囲で設定可能です。ただし、VLは16の倍数でなければなりません。</p></li>
+<li><p>最大ベクターレンジはハードウェアによって決定されます: 16 &lt;= VLmax &lt;= 256。</p>
+<p>(SVEアーキテクチャは256を指定していますが、今後のアーキテクチャの改訂によりこの制限を上げることが許可されています。)</p>
+</li>
+<li><p>FPSRおよびFPCRはARMv8-Aから保持され、SVE浮動小数点演算と同様にARMv8浮動小数点演算と相互作用します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>     8VL-1                       128               0  bit index
+    +----          ////            -----------------+
+ Z0 |                               :       V0      |
+  :                                          :
+ Z7 |                               :       V7      |
+ Z8 |                               :     * V8      |
+  :                                       :  :
+Z15 |                               :     *V15      |
+Z16 |                               :      V16      |
+  :                                          :
+Z31 |                               :      V31      |
+    +----          ////            -----------------+
+                                             31    0
+     VL-1                  0                +-------+
+    +----       ////      --+          FPSR |       |
+ P0 |                       |               +-------+
+  : |                       |         *FPCR |       |
+P15 |                       |               +-------+
+    +----       ////      --+
+FFR |                       |               +-----+
+    +----       ////      --+            VL |     |
+                                            +-----+
+</pre></div>
+</div>
+</li>
+</ul>
+<dl class="simple">
+<dt>(*) callee-save:</dt><dd><p>これはZ-/Vレジスタのビット[63:0]にのみ適用されます。FPCRにはcallee-saveおよびcaller-saveのビットが含まれます。詳細は[4]を参照してください。</p>
+</dd>
+</dl>
+</section>
+<section id="a-2-procedure-call-standard">
+<h2>A.2. プロシージャ呼び出し標準<a class="headerlink" href="#a-2-procedure-call-standard" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ARMv8-Aベースのプロシージャ呼び出し標準は、追加されたSVEレジスタ状態に関して以下のようになります:</p>
+<ul>
+<li><p>SVEレジスタのビットでFP/SIMDと共有されていないものはすべてcaller-saveです。</p></li>
+<li><p>Z8のビット[63:0]～Z15のビット[63:0]はcallee-saveです。</p>
+<p>これはこれらのビットがベースプロシージャ呼び出し標準でcaller-saveであるためです。</p>
+</li>
+</ul>
+<section id="appendix-b-armv8-a-fp-simd-programmer-s-model">
+<h3>付録B. ARMv8-A FP/SIMDプログラマーモデル<a class="headerlink" href="#appendix-b-armv8-a-fp-simd-programmer-s-model" title="この見出しへのパーマリンク">¶</a></h3>
+<p>注意: このセクションは情報提供を目的としたものであり、完全性を保証するものではなく、アーキテクチャ仕様の代替ではありません。</p>
+<p>詳細については[4]を参照してください。</p>
+<p>ARMv8-Aは以下の浮動小数点/SIMDレジスタ状態を定義しています:</p>
+<ul class="simple">
+<li><p>32の128ビットベクターレジスタ V0..V31</p></li>
+<li><p>2の32ビットステータス/コントロールレジスタ FPSR, FPCR</p></li>
+</ul>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>      127           0  bit index
+     +---------------+
+  V0 |               |
+   : :               :
+  V7 |               |
+* V8 |               |
+:  : :               :
+*V15 |               |
+ V16 |               |
+   : :               :
+ V31 |               |
+     +---------------+
+
+              31    0
+             +-------+
+        FPSR |       |
+             +-------+
+       *FPCR |       |
+             +-------+
+</pre></div>
+</div>
+<dl class="simple">
+<dt>(*) callee-save:</dt><dd><p>これはVレジスタのビット[63:0]にのみ適用されます。FPCRにはcallee-saveとcaller-saveのビットが混在しています。</p>
+</dd>
+</dl>
+</section>
+<section id="references">
+<h3>参考文献<a class="headerlink" href="#references" title="この見出しへのパーマリンク">¶</a></h3>
+<dl class="simple">
+<dt>[1] arch/arm64/include/uapi/asm/sigcontext.h</dt><dd><p>AArch64 Linux信号ABI定義</p>
+</dd>
+<dt>[2] arch/arm64/include/uapi/asm/ptrace.h</dt><dd><p>AArch64 Linux ptrace ABI定義</p>
+</dd>
+</dl>
+<p>[3] <a class="reference internal" href="cpu-feature-registers.html"><span class="doc">ARM64 CPU機能レジスタ</span></a></p>
+<dl class="simple">
+<dt>[4] ARM IHI0055C</dt><dd><p><a class="reference external" href="http://infocenter.arm.com/help/topic/com.arm.doc.ihi0055c/IHI0055C_beta_aapcs64.pdf">http://infocenter.arm.com/help/topic/com.arm.doc.ihi0055c/IHI0055C_beta_aapcs64.pdf</a>
+<a class="reference external" href="http://infocenter.arm.com/help/topic/com.arm.doc.subset.swdev.abi/index.html">http://infocenter.arm.com/help/topic/com.arm.doc.subset.swdev.abi/index.html</a>
+ARM 64ビットアーキテクチャ（AArch64）のプロシージャ呼び出し標準</p>
+</dd>
+</dl>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">ARM64アーキテクチャ</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="acpi_object_usage.html">ACPIテーブル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="amu.html">AArch64 Linuxにおけるアクティビティモニターユニット（AMU）拡張機能</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arm-acpi.html">ARMv8サーバーにおけるACPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="booting.html">AArch64 Linuxの起動</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cpu-feature-registers.html">ARM64 CPU機能レジスタ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="elf_hwcaps.html">ARM64 ELF hwcaps</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hugetlbpage.html">ARM64におけるHugeTLBページ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="legacy_instructions.html">レガシインストラクション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="memory.html">AArch64 Linuxにおけるメモリレイアウト</a></li>
+<li class="toctree-l2"><a class="reference internal" href="memory-tagging-extension.html">AArch64 Linuxにおけるメモリタグ拡張（MTE）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="perf.html">パフォーマンスイベント属性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pointer-authentication.html">AArch64 Linuxにおけるポインタ認証</a></li>
+<li class="toctree-l2"><a class="reference internal" href="silicon-errata.html">シリコンエラタとソフトウェアの回避策</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">AArch64 Linuxにおけるスケーラブルベクターエクステンション（SVE）サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tagged-address-abi.html">AArch64 TAGGED ADDRESS ABI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tagged-pointers.html">AArch64 Linuxにおけるタグ付き仮想アドレス</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">ARM64アーキテクチャ</a><ul>
+<li>前へ: <a href="silicon-errata.html" title="前章">シリコンエラタとソフトウェアの回避策</a></li>
+<li>次へ: <a href="tagged-address-abi.html" title="次章">AArch64 TAGGED ADDRESS ABI</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/arm64/sve.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

@@ -1,0 +1,609 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>padata並列実行メカニズム — Linux Kernelドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="../RCU/index.html" rel="next" title="RCU concepts"/>
+<link href="local_ops.html" rel="prev" title="ローカルアトミック操作のセマンティクス"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="the-padata-parallel-execution-mechanism">
+<h1>padata並列実行メカニズム<a class="headerlink" href="#the-padata-parallel-execution-mechanism" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">日付</dt>
+<dd class="field-odd"><p>2020年5月</p>
+</dd>
+</dl>
+<p>padataは、カーネルが複数のCPU上でジョブを並列に実行できるようにするメカニズムであり、必要に応じて順序を保持しながらジョブを分散処理できます。</p>
+<p>IPsecのために最初に開発され、大量のパケットを再配列せずに暗号化および復号処理を行う必要があるため、現在はpadataのシリアル化されたジョブサポートの唯一の利用者です。</p>
+<p>padataはまた、スレッド間でロードバランスを図りながらスレッド間で調整しながらジョブを均等に分割して実行するマルチスレッドジョブもサポートしています。</p>
+<section id="running-serialized-jobs">
+<h2>シリアル化されたジョブの実行<a class="headerlink" href="#running-serialized-jobs" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="initializing">
+<h3>初期化<a class="headerlink" href="#initializing" title="この見出しへのパーマリンク">¶</a></h3>
+<p>padataを用いてシリアル化されたジョブを実行するための最初のステップは、ジョブの実行方法を全体的に制御するためのpadata_instance構造体を設定することです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/padata.h&gt;
+
+struct padata_instance *padata_alloc(const char *name);
+</pre></div>
+</div>
+<p>‘name’は単にインスタンスを識別します。</p>
+<p>次に、padata_shellを割り当ててpadataの初期化を完了します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct padata_shell *padata_alloc_shell(struct padata_instance *pinst);
+</pre></div>
+</div>
+<p>padata_shellは、ジョブをpadataに送信するために使用され、複数のこのようなジョブを独立してシリアル化するためのものです。padata_instanceは、1つまたは複数のpadata_shellと関連付けられることができ、それぞれが別個のジョブ系列を許可します。</p>
+</section>
+<section id="modifying-cpumasks">
+<h3>cpumaskの変更<a class="headerlink" href="#modifying-cpumasks" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ジョブを実行するCPUは、2つの方法で変更できます: プログラム的に
+<a class="reference internal" href="#c.padata_set_cpumask" title="padata_set_cpumask"><code class="xref c c-func docutils literal notranslate"><span class="pre">padata_set_cpumask()</span></code></a> またはsysfs経由で。前者は次のように定義されています:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int padata_set_cpumask(struct padata_instance *pinst, int cpumask_type,
+                       cpumask_var_t cpumask);
+</pre></div>
+</div>
+<p>ここでcpumask_typeはPADATA_CPU_PARALLELまたはPADATA_CPU_SERIALのいずれかです。parallel cpumaskは、このインスタンスに送信されたジョブを並列に実行するためのプロセッサを記述し、serial cpumaskはシリアル化コールバックプロセッサとして使用可能なプロセッサを定義します。cpumaskは新しいcpumaskを指定します。</p>
+<p>インスタンスのcpumask用のsysfsファイルがある場合があります。たとえば、pcryptは/sys/kernel/pcrypt/&lt;instance-name&gt;にあります。インスタンスのディレクトリ内には、parallel_cpumaskとserial_cpumaskという2つのファイルがあり、ビットマスクをファイルにエコーバックすることで、どちらのcpumaskも変更できます。たとえば:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo f &gt; /sys/kernel/pcrypt/pencrypt/parallel_cpumask
+</pre></div>
+</div>
+<p>これらのファイルのいずれかを読み込むと、ユーザーが提供したcpumaskが表示され、これは‘usable’ cpumaskとは異なる場合があります。</p>
+<p>Padataは内部で2組のcpumasksを保持しており、ユーザーが提供したcpumasksと「利用可能な」cpumasksです。(各ペアは並列とシリアルのcpumaskから成り立っています。) ユーザーが提供したcpumasksはインスタンス割当時にすべての可能なCPUをデフォルトとしており、上記のように変更可能です。利用可能なcpumasksは常にユーザーが提供したcpumasksのサブセットであり、ユーザーが提供したマスク内のオンラインCPUのみを含みます。これらがpadataが実際に使用するcpumasksです。したがって、padataにオフラインCPUを含むcpumaskを提供しても問題ありません。ユーザーが提供したcpumask内のオフラインCPUがオンラインになった場合、padataはそのCPUを使用します。</p>
+<p>CPUマスクの変更はコストのかかる操作であるため、頻繁に行うべきではありません。</p>
+</section>
+<section id="running-a-job">
+<h3>ジョブの実行<a class="headerlink" href="#running-a-job" title="この見出しへのパーマリンク">¶</a></h3>
+<p>実際にpadataインスタンスに作業を送信するには、padata_priv構造体を作成する必要があります。これは1つのジョブを表します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct padata_priv {
+    /* Other stuff here... */
+    void                    (*parallel)(struct padata_priv *padata);
+    void                    (*serial)(struct padata_priv *padata);
+};
+</pre></div>
+</div>
+<p>この構造体はおそらく、実行する作業に特化したより大きな構造体の中に埋め込まれます。ほとんどのフィールドはpadata専用ですが、初期化時に構造体をゼロクリアする必要があります。また、parallel()とserial()関数を提供する必要があります。これらの関数は、後ほど見るように作業の実行中に呼び出されます。</p>
+<p>ジョブの送信は以下の通り行われます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int padata_do_parallel(struct padata_shell *ps,
+                       struct padata_priv *padata, int *cb_cpu);
+</pre></div>
+</div>
+<p>psとpadata構造体は上記のように設定する必要があります。cb_cpuはジョブが完了した際の最終コールバックに使用する推奨CPUを指し、現在のインスタンスのCPUマスク内に含まれていなければ、cb_cpuポインタは実際に選ばれたCPUを指すように更新されます。返却値は
+<a class="reference internal" href="#c.padata_do_parallel" title="padata_do_parallel"><code class="xref c c-func docutils literal notranslate"><span class="pre">padata_do_parallel()</span></code></a> 成功時はゼロとなり、ジョブが進行中であることを示します。-EBUSYはインスタンスのCPUマスクを別の場所で操作していることを示し、-EINVALはcb_cpuがシリアルcpumaskに含まれていない、または並列またはシリアルcpumasksにオンラインCPUが存在しない、または停止中のインスタンスを示します。</p>
+<p>各ジョブは、 <a class="reference internal" href="#c.padata_do_parallel" title="padata_do_parallel"><code class="xref c c-func docutils literal notranslate"><span class="pre">padata_do_parallel()</span></code></a> に送信され、それぞれ1つのCPUで上記のparallel()関数の呼び出しに渡されます。複数のジョブを送信することで真の並列性が達成されます。parallel()関数はソフトウェア割込みが無効になっている状態で実行されるため、スリープできません。parallel()関数はpadata_priv構造体のポインタを単一のパラメータとして受け取り、実際の作業に関する情報はおそらく
+<a class="reference internal" href="../driver-api/basics.html#c.container_of" title="container_of"><code class="xref c c-func docutils literal notranslate"><span class="pre">container_of()</span></code></a> を用いて包含する構造体を検索して取得します。</p>
+<p>parallel()は戻り値を持たないことに注意してください。padataサブシステムは、parallel()がこの時点でジョブの責任を引き受けることを想定しています。この呼び出し中にジョブが完了する必要はありませんが、parallel()が未処理の作業を残した場合、その作業が完了する前に新しいジョブを呼び出す準備が必要です。</p>
+</section>
+<section id="serializing-jobs">
+<h3>ジョブのシリアル化<a class="headerlink" href="#serializing-jobs" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ジョブが完了した場合、parallel()（または実際に作業を終了する関数）は、以下の関数を呼び出してpadataにその事実を通知する必要があります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void padata_do_serial(struct padata_priv *padata);
+</pre></div>
+</div>
+<p>将来のどこかの時点で、 <a class="reference internal" href="#c.padata_do_serial" title="padata_do_serial"><code class="xref c c-func docutils literal notranslate"><span class="pre">padata_do_serial()</span></code></a> が、padata_priv構造体内のserial()関数を呼び出します。この呼び出しは、初期のparallel()呼び出しで指定されたCPU上で行われます。 <a class="reference internal" href="#c.padata_do_parallel" title="padata_do_parallel"><code class="xref c c-func docutils literal notranslate"><span class="pre">padata_do_parallel()</span></code></a>この呼び出しも、ローカルソフトウェア割込みが無効になっている状態で実行されます。注意点として、この呼び出しは、padataコードがジョブを提出された順番に完了させるために慎重に遅延されることがあります。</p>
+</section>
+<section id="destroying">
+<h3>破壊<a class="headerlink" href="#destroying" title="この見出しへのパーマリンク">¶</a></h3>
+<p>padataインスタンスのクリーンアップは、割当順に逆順で対応する2つのfree関数を呼び出すことで予測可能です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void padata_free_shell(struct padata_shell *ps);
+void padata_free(struct padata_instance *pinst);
+</pre></div>
+</div>
+<p>ユーザーは、上記のいずれかを呼び出す前に、すべての未処理ジョブが完了していることを保証する責任があります。</p>
+</section>
+</section>
+<section id="running-multithreaded-jobs">
+<h2>マルチスレッドジョブの実行<a class="headerlink" href="#running-multithreaded-jobs" title="この見出しへのパーマリンク">¶</a></h2>
+<p>マルチスレッドジョブはメインスレッドとゼロ個以上のアシスタントスレッドを持ち、メインスレッドがジョブに参加した後、すべてのアシスタントスレッドが完了するのを待機します。padataはジョブを「チャンク」と呼ばれる単位に分割し、チャンクはスレッドが1回のスレッド関数呼び出しで完了するジョブの一部です。</p>
+<p>マルチスレッドジョブを実行するにはユーザーが行うべきことは3つあります。まず、padata_mt_job構造体を定義してジョブを説明します（インターフェースセクションで説明します）。これはスレッド関数へのポインタを含み、padataがスレッドにジョブチャンクを割り当てたときに呼び出します。次に、スレッド関数を定義します。これは3つの引数を受け取り、 <code class="docutils literal notranslate"><span class="pre">start</span></code>, <code class="docutils literal notranslate"><span class="pre">end</span></code>, and <code class="docutils literal notranslate"><span class="pre">arg</span></code>、ここで最初の2つはスレッドが処理する範囲を指定し、最後のものはジョブの共有状態へのポインタ（必要に応じて）です。共有状態を準備します。これは通常メインスレッドのスタック上に割り当てられます。最後に、
+<a class="reference internal" href="#c.padata_do_multithreaded" title="padata_do_multithreaded"><code class="xref c c-func docutils literal notranslate"><span class="pre">padata_do_multithreaded()</span></code></a>を呼び出します。ジョブが完了するとこの関数は戻ります。</p>
+</section>
+<section id="interface">
+<h2>インターフェース<a class="headerlink" href="#interface" title="この見出しへのパーマリンク">¶</a></h2>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.padata_priv">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">padata_priv</span></span></span><a class="headerlink" href="#c.padata_priv" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>1つのジョブを表します</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct padata_priv {
+  struct list_head        list;
+  struct parallel_data    *pd;
+  int cb_cpu;
+  unsigned int            seq_nr;
+  int info;
+  void (*parallel)(struct padata_priv *padata);
+  void (*serial)(struct padata_priv *padata);
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">list</span></code></dt><dd><p>リストエントリで、padataリストに接続するために使用します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">pd</span></code></dt><dd><p>内部制御構造体へのポインタです。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cb_cpu</span></code></dt><dd><p>シリアル化用コールバックCPU</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">seq_nr</span></code></dt><dd><p>並列処理されたデータオブジェクトのシーケンス番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">info</span></code></dt><dd><p>並列からシリアル関数に情報を渡すために使用します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">parallel</span></code></dt><dd><p>並列実行関数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">serial</span></code></dt><dd><p>シリアル完了関数</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.padata_list">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">padata_list</span></span></span><a class="headerlink" href="#c.padata_list" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>CPUごとに作業タイプごとに1つ</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct padata_list {
+  struct list_head        list;
+  spinlock_t lock;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">list</span></code></dt><dd><p>リストヘッド</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">lock</span></code></dt><dd><p>リストロック</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.padata_serial_queue">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">padata_serial_queue</span></span></span><a class="headerlink" href="#c.padata_serial_queue" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>CPUごとのpadataシリアルキュー</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct padata_serial_queue {
+  struct padata_list    serial;
+  struct work_struct    work;
+  struct parallel_data *pd;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">serial</span></code></dt><dd><p>再配置後のシリアル化を待つリスト。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">work</span></code></dt><dd><p>シリアル化用ワーク構造体。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">pd</span></code></dt><dd><p>内部制御構造体への逆参照ポインタ。</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.padata_cpumask">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">padata_cpumask</span></span></span><a class="headerlink" href="#c.padata_cpumask" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>並列/シリアルワーカー用のCPUマスク。</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct padata_cpumask {
+  cpumask_var_t pcpu;
+  cpumask_var_t cbcpu;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">pcpu</span></code></dt><dd><p>並列ワーカー用のCPUマスク。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cbcpu</span></code></dt><dd><p>シリアル（コールバック）ワーカー用のCPUマスク。</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.parallel_data">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">parallel_data</span></span></span><a class="headerlink" href="#c.parallel_data" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>内部制御構造体、使用中のCPUマスクに依存するすべての要素をカバー。</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct parallel_data {
+  struct padata_shell             *ps;
+  struct padata_list              __percpu *reorder_list;
+  struct padata_serial_queue      __percpu *squeue;
+  atomic_t refcnt;
+  unsigned int                    seq_nr;
+  unsigned int                    processed;
+  int cpu;
+  struct padata_cpumask           cpumask;
+  struct work_struct              reorder_work;
+  spinlock_t lock;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">ps</span></code></dt><dd><p>padata_shellオブジェクト。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">reorder_list</span></code></dt><dd><p>パーセルCPU再配置リスト。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">squeue</span></code></dt><dd><p>シリアル化用に使用されるパーセルCPU padataキュー。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">refcnt</span></code></dt><dd><p>このparallel_dataに参照を保持しているオブジェクトの数。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">seq_nr</span></code></dt><dd><p>並列処理されたデータオブジェクトのシーケンス番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">processed</span></code></dt><dd><p>すでに処理されたオブジェクトの数。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cpu</span></code></dt><dd><p>次に処理するCPU。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cpumask</span></code></dt><dd><p>並列およびシリアルワーカーで使用中のCPUマスク。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">reorder_work</span></code></dt><dd><p>再配置用ワーク構造体。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">lock</span></code></dt><dd><p>再配置ロック。</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.padata_shell">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">padata_shell</span></span></span><a class="headerlink" href="#c.padata_shell" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>Wrapper around <a class="reference internal" href="#c.parallel_data" title="parallel_data"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">parallel_data</span></code></a>、その目的は、RCUを用いて下位の制御構造体を飛ばし的に置き換えることを可能にする。</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct padata_shell {
+  struct padata_instance          *pinst;
+  struct parallel_data __rcu      *pd;
+  struct parallel_data            *opd;
+  struct list_head                list;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">pinst</span></code></dt><dd><p>padatインスタンス。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">pd</span></code></dt><dd><p>飛ばし的に置き換え可能な実際のparallel_data構造体。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">opd</span></code></dt><dd><p>padata_replaceで解放される古いpdへのポインタ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">list</span></code></dt><dd><p>padata_instanceリスト内のリストエントリ。</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.padata_mt_job">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">padata_mt_job</span></span></span><a class="headerlink" href="#c.padata_mt_job" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>1つのマルチスレッドジョブを表す。</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct padata_mt_job {
+  void (*thread_fn)(unsigned long start, unsigned long end, void *arg);
+  void *fn_arg;
+  unsigned long           start;
+  unsigned long           size;
+  unsigned long           align;
+  unsigned long           min_chunk;
+  int max_threads;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">thread_fn</span></code></dt><dd><p>padataスレッドが処理する各作業チャンクに対して呼ばれる。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">fn_arg</span></code></dt><dd><p>スレッド関数の引数。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">start</span></code></dt><dd><p>ジョブの開始位置（単位はジョブ固有）。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">size</span></code></dt><dd><p>このノードの作業サイズ（単位はジョブ固有）。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">align</span></code></dt><dd><p>スレッド関数に渡される範囲はこの境界に沿って配置され、ジョブの開始と終了を除く例外を除く。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">min_chunk</span></code></dt><dd><p>ジョブ固有単位での最小チャンクサイズ。クライアントが1つのワーカースレッドが一度に処理すべき適切な作業量を伝達するためのもの。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">max_threads</span></code></dt><dd><p>ジョブに使用する最大スレッド数、実際の数はタスクサイズと最小チャンクサイズに応じて少なくなる可能性がある。</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.padata_instance">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">padata_instance</span></span></span><a class="headerlink" href="#c.padata_instance" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>全体的な制御構造体。</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct padata_instance {
+  struct hlist_node               cpu_online_node;
+  struct hlist_node               cpu_dead_node;
+  struct workqueue_struct         *parallel_wq;
+  struct workqueue_struct         *serial_wq;
+  struct list_head                pslist;
+  struct padata_cpumask           cpumask;
+  struct kobject                   kobj;
+  struct mutex                     lock;
+  u8 flags;
+#define PADATA_INIT     1;
+#define PADATA_RESET    2;
+#define PADATA_INVALID  4;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">cpu_online_node</span></code></dt><dd><p>CPUオンラインコールバック用のリンク。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cpu_dead_node</span></code></dt><dd><p>CPUオフラインコールバック用のリンク。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">parallel_wq</span></code></dt><dd><p>並列作業用ワークキュー。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">serial_wq</span></code></dt><dd><p>シリアル作業用ワークキュー。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">pslist</span></code></dt><dd><p>このインスタンスにアタッチされているpadata_shellオブジェクトの一覧。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cpumask</span></code></dt><dd><p>並列およびシリアル作業用にユーザーが指定したcpumasks。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">kobj</span></code></dt><dd><p>padataインスタンスのカーネルオブジェクト。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">lock</span></code></dt><dd><p>padataインスタンスのロック。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">flags</span></code></dt><dd><p>padataフラグ。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.padata_do_parallel">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">padata_do_parallel</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.padata_shell" title="padata_shell"><span class="n"><span class="pre">padata_shell</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ps</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.padata_priv" title="padata_priv"><span class="n"><span class="pre">padata_priv</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">padata</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">cb_cpu</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.padata_do_parallel" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>padata並列化関数</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">padata_shell</span> <span class="pre">*ps</span></code></dt><dd><p>padatashell</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">padata_priv</span> <span class="pre">*padata</span></code></dt><dd><p>並列化されるオブジェクト</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">*cb_cpu</span></code></dt><dd><p>シリアル化コールバック関数が実行されるCPUへのポインタ。serial cpumaskの <strong>pinst</strong>
+(つまりcpumask.cbcpu)にない場合、この関数はフォールバックCPUを選択し、見つからない場合は-EINVALを返します。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>並列化コールバック関数はBH（Bottom Half）がオフの状態で実行されます。</p>
+<p><strong>注意</strong></p>
+<p>padata_do_parallelで並列化されるすべてのオブジェクトは、padata_do_serialによって見なされる必要があります。</p>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、エラー時は負のエラーコード。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.padata_do_serial">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">padata_do_serial</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.padata_priv" title="padata_priv"><span class="n"><span class="pre">padata_priv</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">padata</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.padata_do_serial" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>padataシリアル化関数</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">padata_priv</span> <span class="pre">*padata</span></code></dt><dd><p>シリアル化されるオブジェクト。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>padata_do_serialはすべての並列化されたオブジェクトに対して呼び出される必要があります。シリアル化コールバック関数はBHがオフの状態で実行されます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.padata_do_multithreaded">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">padata_do_multithreaded</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.padata_mt_job" title="padata_mt_job"><span class="n"><span class="pre">padata_mt_job</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ジョブ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.padata_do_multithreaded" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>マルチスレッドジョブを実行</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">padata_mt_job</span> <span class="pre">*job</span></code></dt><dd><p>ジョブの説明。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>以下の定義を参照してください <a class="reference internal" href="#c.padata_mt_job" title="padata_mt_job"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">padata_mt_job</span></code></a> 詳細についてはこちら。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.padata_set_cpumask">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">padata_set_cpumask</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.padata_instance" title="padata_instance"><span class="n"><span class="pre">padata_instance</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">pinst</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">cpumask_type</span></span>, <span class="n"><span class="pre">cpumask_var_t</span></span><span class="w"> </span><span class="n"><span class="pre">cpumask</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.padata_set_cpumask" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>以下のcpumaskを設定します <strong>cpumask_type</strong> cpumaskをpadataインスタンスに相当する値に設定します <strong>cpumask</strong>.</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">padata_instance</span> <span class="pre">*pinst</span></code></dt><dd><p>padataインスタンス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">cpumask_type</span></code></dt><dd><p>並列cpumaskに対応するPADATA_CPU_PARALLELまたはシリアルcpumaskに対応するPADATA_CPU_SERIAL</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cpumask_var_t</span> <span class="pre">cpumask</span></code></dt><dd><p>使用するcpumask</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、エラー時は負のエラーコード</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.padata_alloc">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.padata_instance" title="padata_instance"><span class="n"><span class="pre">padata_instance</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">padata_alloc</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="kt"><span class="pre">char</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">名前</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.padata_alloc" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>padataインスタンスを割り当てて初期化します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">char</span> <span class="pre">*name</span></code></dt><dd><p>インスタンスを識別するためのID</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>成功時は新しいインスタンス、エラー時はNULL</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.padata_free">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">padata_free</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.padata_instance" title="padata_instance"><span class="n"><span class="pre">padata_instance</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">pinst</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.padata_free" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>padataインスタンスを解放する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">padata_instance</span> <span class="pre">*pinst</span></code></dt><dd><p>解放するpadataインスタンス</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.padata_alloc_shell">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.padata_shell" title="padata_shell"><span class="n"><span class="pre">padata_shell</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">padata_alloc_shell</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.padata_instance" title="padata_instance"><span class="n"><span class="pre">padata_instance</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">pinst</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.padata_alloc_shell" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>padataシェルを割り当てて初期化する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">padata_instance</span> <span class="pre">*pinst</span></code></dt><dd><p>親のpadata_instanceオブジェクト。</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>成功時は新しいシェル、エラー時はNULL</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.padata_free_shell">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">padata_free_shell</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.padata_shell" title="padata_shell"><span class="n"><span class="pre">padata_shell</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ps</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.padata_free_shell" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>padataシェルを解放する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">padata_shell</span> <span class="pre">*ps</span></code></dt><dd><p>解放するpadataシェル</p>
+</dd>
+</dl>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">コアAPIドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#core-utilities">Core utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#data-structures-and-low-level-utilities">Data structures and low-level utilities</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#concurrency-primitives">Concurrency primitives</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#low-level-hardware-management">Low-level hardware management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#memory-management">Memory management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#interfaces-for-kernel-debugging">Interfaces for kernel debugging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#everything-else">Everything else</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">コアAPIドキュメント</a><ul>
+<li>前へ: <a href="local_ops.html" title="前章">ローカルアトミック操作のセマンティクス</a></li>
+<li>次へ: <a href="../RCU/index.html" title="次章">RCU concepts</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/core-api/padata.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

@@ -1,0 +1,333 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>ブロックI/Oの優先度 — Linuxカーネルドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="kyber-iosched.html" rel="next" title="Kyber I/Oスケジューラのチューニングパラメータ"/>
+<link href="inline-encryption.html" rel="prev" title="インライン暗号化"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="block-io-priorities">
+<h1>ブロックIOの優先度<a class="headerlink" href="#block-io-priorities" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="intro">
+<h2>はじめに<a class="headerlink" href="#intro" title="この見出しへのパーマリンク">¶</a></h2>
+<p>cfq v3（cfq-tsまたはタイムスライスされたcfq）の導入により、ファイルの読み取りに基本的なI/O優先度がサポートされています。これにより、ユーザーはCPUスケジューリングのように長年可能だったように、プロセスまたはプロセスグループのI/O優先度を設定できます。このドキュメントは主にcfqの現在の機能を説明しており、他のI/OスケジューラはまだI/O優先度をサポートしていません。</p>
+</section>
+<section id="scheduling-classes">
+<h2>スケジューリングクラス<a class="headerlink" href="#scheduling-classes" title="この見出しへのパーマリンク">¶</a></h2>
+<p>CFQはプロセスのI/Oをどのように処理するかを決定する3つの汎用的なスケジューリングクラスを実装しています。</p>
+<p>IOPRIO_CLASS_RT: これはリアルタイムI/Oクラスです。このスケジューリングクラスはシステム内の他のクラスよりも高い優先度が与えられ、このクラスのプロセスは常にディスクへの最初のアクセスを獲得します。そのため、注意深く使用する必要があります。1つのI/Oリアルタイムプロセスがシステム全体を食い尽くす可能性があります。RTクラス内では、プロセスがディスクにどのくらいの時間アクセスするかを決定する8段階のクラスデータがあります。今後はパフォーマンスに直接マッピングされるよう、望ましいデータレートを指定する形に変更される可能性があります。</p>
+<p>IOPRIO_CLASS_BE: これはベストエフォートスケジューリングクラスで、特定のI/O優先度を設定していないプロセスのデフォルトです。クラスデータはプロセスが取得するI/O帯域幅を決定し、CPUのniceレベルとほぼ同様に直接マッピングされていますが、より粗く実装されています。0は最高のBE優先度レベルで、7は最低です。CPU niceレベルとI/O niceレベルのマッピングは、io_nice = (cpu_nice + 20) / 5 で決定されます。</p>
+<p>IOPRIO_CLASS_IDLE: これはアイドルスケジューリングクラスで、このレベルで実行されているプロセスは、他のプロセスがディスクを使用していないときにのみI/O時間を受けます。アイドルクラスにはクラスデータが存在せず、ここでは適用されません。</p>
+</section>
+<section id="tools">
+<h2>ツール<a class="headerlink" href="#tools" title="この見出しへのパーマリンク">¶</a></h2>
+<p>以下にioniceツールのサンプルを示します。使用法:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># ionice -c&lt;class&gt; -n&lt;level&gt; -p&lt;pid&gt;
+</pre></div>
+</div>
+<p>pidが指定されていない場合、現在のプロセスが仮定されます。I/O優先度の設定はfork時に継承されるため、ioniceを使用してプロセスを特定のレベルで起動できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># ionice -c2 -n0 /bin/ls
+</pre></div>
+</div>
+<p>lsをベストエフォートスケジューリングクラスで最高優先度で実行します。すでに実行中のプロセスの場合、pidを指定できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># ionice -c1 -n2 -p100
+</pre></div>
+</div>
+<p>pid 100をリアルタイムスケジューリングクラスで優先度2で実行します。</p>
+<p>ionice.cツール:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;getopt.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/ptrace.h&gt;
+#include &lt;asm/unistd.h&gt;
+
+extern int sys_ioprio_set(int, int, int);
+extern int sys_ioprio_get(int, int);
+
+#if defined(__i386__)
+#define __NR_ioprio_set               289
+#define __NR_ioprio_get               290
+#elif defined(__ppc__)
+#define __NR_ioprio_set               273
+#define __NR_ioprio_get               274
+#elif defined(__x86_64__)
+#define __NR_ioprio_set               251
+#define __NR_ioprio_get               252
+#elif defined(__ia64__)
+#define __NR_ioprio_set               1274
+#define __NR_ioprio_get               1275
+#else
+#error "Unsupported arch"
+#endif
+
+static inline int ioprio_set(int which, int who, int ioprio)
+{
+      return syscall(__NR_ioprio_set, which, who, ioprio);
+}
+
+static inline int ioprio_get(int which, int who)
+{
+      return syscall(__NR_ioprio_get, which, who);
+}
+
+enum {
+      IOPRIO_CLASS_NONE,
+      IOPRIO_CLASS_RT,
+      IOPRIO_CLASS_BE,
+      IOPRIO_CLASS_IDLE,
+};
+
+enum {
+      IOPRIO_WHO_PROCESS = 1,
+      IOPRIO_WHO_PGRP,
+      IOPRIO_WHO_USER,
+};
+
+#define IOPRIO_CLASS_SHIFT    13
+
+const char *to_prio[] = { "none", "realtime", "best-effort", "idle", };
+
+int main(int argc, char *argv[])
+{
+      int ioprio = 4, set = 0, ioprio_class = IOPRIO_CLASS_BE;
+      int c, pid = 0;
+
+      while ((c = getopt(argc, argv, "+n:c:p:")) != EOF) {
+              switch (c) {
+              case 'n':
+                      ioprio = strtol(optarg, NULL, 10);
+                      set = 1;
+                      break;
+              case 'c':
+                      ioprio_class = strtol(optarg, NULL, 10);
+                      set = 1;
+                      break;
+              case 'p':
+                      pid = strtol(optarg, NULL, 10);
+                      break;
+              }
+      }
+
+      switch (ioprio_class) {
+              case IOPRIO_CLASS_NONE:
+                      ioprio_class = IOPRIO_CLASS_BE;
+                      break;
+              case IOPRIO_CLASS_RT:
+              case IOPRIO_CLASS_BE:
+                      break;
+              case IOPRIO_CLASS_IDLE:
+                      ioprio = 7;
+                      break;
+              default:
+                      printf("bad prio class %d\n", ioprio_class);
+                      return 1;
+      }
+
+      if (!set) {
+              if (!pid &amp;&amp; argv[optind])
+                      pid = strtol(argv[optind], NULL, 10);
+
+              ioprio = ioprio_get(IOPRIO_WHO_PROCESS, pid);
+
+              printf("pid=%d, %d\n", pid, ioprio);
+
+              if (ioprio == -1)
+                      perror("ioprio_get");
+              else {
+                      ioprio_class = ioprio &gt;&gt; IOPRIO_CLASS_SHIFT;
+                      ioprio = ioprio &amp; 0xff;
+                      printf("%s: prio %d\n", to_prio[ioprio_class], ioprio);
+              }
+      } else {
+              if (ioprio_set(IOPRIO_WHO_PROCESS, pid, ioprio | ioprio_class &lt;&lt; IOPRIO_CLASS_SHIFT) == -1) {
+                      perror("ioprio_set");
+                      return 1;
+              }
+
+              if (argv[optind])
+                      execvp(argv[optind], &amp;argv[optind]);
+      }
+
+      return 0;
+}
+</pre></div>
+</div>
+<p>2005年3月11日、Jens Axboe &lt;<a class="reference external" href="mailto:jens.axboe%40oracle.com">jens<span>.</span>axboe<span>@</span>oracle<span>.</span>com</a>&gt;</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">ブロック</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="bfq-iosched.html">BFQ（Budget Fair Queueing）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="biodoc.html">Linux 2.5におけるジェネリックブロックレイヤーの再実装に関するノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="biovecs.html">変更不可能なbiovecsとbiovecイテレータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blk-mq.html">マルチキュー・ブロックIOキューイングメカニズム (blk-mq)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="capability.html">ジェネリックブロックデバイスの機能</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cmdline-partition.html">埋め込みデバイスコマンドラインパーティション解析</a></li>
+<li class="toctree-l2"><a class="reference internal" href="data-integrity.html">データの整合性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deadline-iosched.html">デッドラインIOスケジューラのチューニングパラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="inline-encryption.html">インライン暗号化</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">ブロックIOの優先度</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kyber-iosched.html">Kyber I/Oスケジューラのチューニングパラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="null_blk.html">ヌルブロックデバイスドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pr.html">ブロックレイヤーによる永続的予約のサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="queue-sysfs.html">キュー・sysfsファイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="request.html">struct requestドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="stat.html">ブロックレイヤー統計情報は /sys/block/&lt;dev&gt;/stat にあります</a></li>
+<li class="toctree-l2"><a class="reference internal" href="switching-sched.html">スケジューラの切り替え</a></li>
+<li class="toctree-l2"><a class="reference internal" href="writeback_cache_control.html">明示的な揮発性ライトバックキャッシュ制御</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">ブロック</a><ul>
+<li>前へ: <a href="inline-encryption.html" title="前章">インライン暗号化</a></li>
+<li>次へ: <a href="kyber-iosched.html" title="次章">Kyber I/Oスケジューラのチューニングパラメータ</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/block/ioprio.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

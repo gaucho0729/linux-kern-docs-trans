@@ -1,0 +1,396 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>BFQ（Budget Fair Queueing）— Linuxカーネルドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="biodoc.html" rel="next" title="Linux 2.5におけるジェネリックブロックレイヤーの再実装に関するノート"/>
+<link href="index.html" rel="prev" title="ブロック"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="bfq-budget-fair-queueing">
+<h1>BFQ（Budget Fair Queueing）<a class="headerlink" href="#bfq-budget-fair-queueing" title="この見出しへのパーマリンク">¶</a></h1>
+<p>BFQは比例配分型のI/Oスケジューラであり、一部の追加の低遅延機能も備えています。cgroupsのサポート（blkioまたはioコントローラー）に加えて、BFQの主な機能は以下の通りです：</p>
+<ul class="simple">
+<li><p>BFQは高いシステムおよびアプリケーションの応答性を保証し、オーディオやビデオプレイヤーなどの時間敏感なアプリケーションにおける低遅延を実現します。</p></li>
+<li><p>BFQはプロセスやグループ間で帯域幅を配分し、時間の配分にとどまらず（必要に応じて帯域幅配分を時間配分に戻すことで通過量を維持します）。</p></li>
+</ul>
+<p>デフォルトの設定ではBFQは遅延を通過量よりも優先します。必要に応じて遅延を低減するために通過量が低下するスケジュールを構築します。あるデバイスにおいて常に最大可能通過量を達成する主なまたは唯一の目標である場合、そのデバイスのすべての低遅延ヒューリスティクスをオフに設定する必要があります。low_latencyを0に設定してください。セクション3で遅延と通過量のトレードオフを設定する方法、または通過量を最大化する方法について詳しく説明しています。</p>
+<p>すべてのI/Oスケジューラと同様に、BFQは各I/Oリクエスト処理に一部のオーバーヘッドを追加します。このオーバーヘッドの例として、BFQの各リクエスト処理時間（つまり、リクエストの挿入、配信、完了ハンドラの実行時間の合計）は、たとえばIntel Coreで1.9マイクロ秒です <a class="reference external" href="mailto:i7-2760QM%402.40GHz">i7-2760QM<span>@</span>2<span>.</span>40GHz</a>
+(ノートブック用の古くなったCPU；簡単なコードインストゥルメンテーションで測定し、Sスイートのthroughput-sync.shスクリプトを使用してパフォーマンスプロファイリングモードで測定)</p>
+<p>スケジューリングのオーバーヘッドは、CPUが処理可能な最大IOPSをさらに制限します（これはI/Oスタックの他の部分の実行によってすでに制限されています）。BFQにおける制限についての例として、遅いまたは平均的なCPUでは、以下の通りです。まず、フルな階層サポートが有効になっている場合（つまり、CONFIG_BFQ_GROUP_IOSCHEDが設定されている場合）、ただしCONFIG_BFQ_CGROUP_DEBUGが設定されていない場合（セクション4-2参照）：- Intel i7-4850HQ: 400 KIOPS - AMD A8-3850: 250 KIOPS - ARM CortexTM-A53 Octa-core: 80 KIOPS</p>
+<p>CONFIG_BFQ_CGROUP_DEBUGが設定されている場合（もちろん完全な階層サポートが有効になっている前提で）、BFQの持続可能なスループットは低下します。これはすべてのblkio.bfq*統計情報が作成および更新されるため（第4章2節参照）です。BFQでは、このような状況において、以下の最大持続可能なスループットが得られます（上記と同じシステム環境において）：- Intel i7-4850HQ: 310 KIOPS - AMD A8-3850: 200 KIOPS - ARM CortexTM-A53 Octa-core: 56 KIOPS</p>
+<p>BFQはマルチキューデバイスにも対応しています。</p>
+<section id="when-may-bfq-be-useful">
+<h2>1. BFQはどのような場合に役立ちますか？<a class="headerlink" href="#when-may-bfq-be-useful" title="この見出しへのパーマリンク">¶</a></h2>
+<p>BFQは個人用およびサーバー用システムにおいて以下の利点を提供します。</p>
+<section id="personal-systems">
+<h3>1-1 個人用システム<a class="headerlink" href="#personal-systems" title="この見出しへのパーマリンク">¶</a></h3>
+<section id="low-latency-for-interactive-applications">
+<h4>インタラクティブなアプリケーションにおける低レイテンシー<a class="headerlink" href="#low-latency-for-interactive-applications" title="この見出しへのパーマリンク">¶</a></h4>
+<p>バックグラウンドワークロードが実際にどのようなものであっても、BFQはインタラクティブなタスクにおいてストレージデバイスがアイドル状態と同様に応答性を保つようにします。例えば、以下のバックグラウンドワークロードが実行されている場合でも：</p>
+<ul class="simple">
+<li><p>1つ以上の大きなファイルが読み込まれたり、書き込まれたり、コピーされている、</p></li>
+<li><p>ソースファイルの木構造がコンパイルされている、</p></li>
+<li><p>1つ以上の仮想マシンがI/Oを実行している、</p></li>
+<li><p>ソフトウェアのアップデートが進行している、</p></li>
+<li><p>インデックスデーモンがファイルシステムをスキャンし、データベースを更新している、</p></li>
+</ul>
+<p>アプリケーション内でアプリケーションを起動するか、ファイルをロードする際の処理時間は、ストレージデバイスがアイドル状態である場合とほぼ同じです。一方、CFQ、NOOP、DEADLINEを使用した場合、同じ条件下でもバックグラウンドワークロードが終了するまでアプリケーションが高レイテンシーを経験するか、応答しなくなることがあります（SSDでも同様です）。</p>
+</section>
+<section id="low-latency-for-soft-real-time-applications">
+<h4>ソフトリアルタイムアプリケーションにおける低レイテンシー<a class="headerlink" href="#low-latency-for-soft-real-time-applications" title="この見出しへのパーマリンク">¶</a></h4>
+<p>音声や動画プレイヤー/ストリーマーなどのソフトリアルタイムアプリケーションも、バックグラウンドI/Oワークロードに関係なく低レイテンシーと低ドロップ率を享受します。その結果、これらのアプリケーションはバックグラウンドワークロードによってほぼすべてのギリギリの問題を経験しません。</p>
+</section>
+<section id="higher-speed-for-code-development-tasks">
+<h4>コード開発タスクにおける高速化<a class="headerlink" href="#higher-speed-for-code-development-tasks" title="この見出しへのパーマリンク">¶</a></h4>
+<p>他のワークロードが並行して実行されている場合でも、BFQはコンパイル、チェックアウト、マージなどの典型的なコード開発タスクのI/O関連コンポーネントをCFQ、NOOP、DEADLINEよりもはるかに高速に実行します。</p>
+</section>
+<section id="high-throughput">
+<h4>高スループット<a class="headerlink" href="#high-throughput" title="この見出しへのパーマリンク">¶</a></h4>
+<p>ハードディスクにおいて、BFQはCFQよりも最大で30％、DEADLINEおよびNOOPよりも最大で150％のスループットを達成します（テストで考慮したすべてのシーケンシャルワークロードにおいて）。ランダムなワークロードやフラッシュベースデバイス上のすべてのワークロードにおいては、BFQは他のスケジューラとほぼ同じスループットを達成します。</p>
+</section>
+<section id="strong-fairness-bandwidth-and-delay-guarantees">
+<h4>強い公平性、帯域幅および遅延の保証<a class="headerlink" href="#strong-fairness-bandwidth-and-delay-guarantees" title="この見出しへのパーマリンク">¶</a></h4>
+<p>BFQは、デバイスのスループットだけでなく、デバイスの時間も、I/Oに依存したアプリケーション間でその重みに応じて配分します。これは、どのようなワークロードでも、デバイスのパラメータに関係なく実現されます。この帯域幅の保証から、単純な式により、各I/Oリクエストごとの遅延の保証を計算することが可能です。BFQは、厳密なサービス保証が設定されていない場合、通過量の喪失を引き起こす可能性のあるアプリケーションに対して、時間ベースのリソース共有（のみ）に切り替わります。</p>
+</section>
+</section>
+<section id="server-systems">
+<h3>1-2 サーバーシステム<a class="headerlink" href="#server-systems" title="この見出しへのパーマリンク">¶</a></h3>
+<p>サーバーシステムにおける大多数の利点は、上述のサービス特性から得られます。特に、追加の重いワークロードが処理されているかどうかに関係なく、BFQは以下のものを保証します：</p>
+<ul class="simple">
+<li><p>ゼロまたは非常に低いジャイターとドロップレートでのオーディオおよびビデオストリーミング；</p></li>
+<li><p>WEBページおよび埋め込まれたオブジェクトの高速な取得；</p></li>
+<li><p>ライブダンプアプリケーションにおけるデータのリアルタイム記録（例：パケットログ）；</p></li>
+<li><p>ローカルおよびリモートアクセスにおけるサーバーの応答性。</p></li>
+</ul>
+</section>
+</section>
+<section id="how-does-bfq-work">
+<h2>2. BFQはどのように動作するか？<a class="headerlink" href="#how-does-bfq-work" title="この見出しへのパーマリンク">¶</a></h2>
+<p>BFQは比例配分型のI/Oスケジューラであり、その全体的な構造と多くのコードはCFQから借用されています。</p>
+<ul>
+<li><p>デバイス上でI/Oを実行する各プロセスは、重みと
+<cite>(bfq_)キュー</cite>.</p></li>
+<li><p>BFQは、デバイスに一時的に1つのキュー（プロセス）に排他的なアクセスを許可し、このサービスモデルを実現するために、各キューに予算（セクタ数で測定）を関連付けます。</p>
+<ul>
+<li><p>キューがデバイスへのアクセスを許可された後、各リクエスト送信ごとにそのキューの予算がリクエストのサイズ分減算されます。</p></li>
+<li><p>サービス中のキューは、以下のいずれかのイベントが発生した場合にのみ、期限切れとなり、そのサービスが中断されます：1）キューが予算を終了する、2）キューが空になる、3）「予算タイムアウト」が発生する。</p>
+<ul class="simple">
+<li><p>予算タイムアウトは、ランダムなI/Oを実行するプロセスがデバイスを長時間占有し、スループットを大幅に低下させるのを防ぎます。</p></li>
+<li><p>実際には、CFQと同様に、同期リクエストを発行するプロセスに関連付けられたキューが空になった時点で即座に期限切れとはなりません。代わりに、BFQはデバイスを短時間の間アイドル状態にし、プロセスが新しいリクエストをタイムリーに発行すれば、そのプロセスに再度サービスを提供します。デバイスのアイドル状態は、プロセスが同期的で順序的なI/Oを実行する場合、回転式デバイスや非キューイングのフラッシュベースデバイスにおいてスループットを向上させることが一般的です。さらに、BFQではデバイスのアイドル状態は、同期リクエストを発行するプロセスに望ましいスループット割合を保証するための重要な手段です（このドキュメントで「slice_idle」チューニングパラメータの説明、または[1, 2]を参照してください）</p>
+<ul>
+<li><p>サービス保証におけるアイドル状態の処理に関して、複数のプロセスが同時にデバイスを競争している場合でも、すべてのプロセスとグループが同じ重みを持つ場合、BFQはデバイスのアイドル状態を一切行わず、予想されるスループットの分布を保証します。この一般的なシナリオでは、スループットは最大限に高くなります。</p></li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<div><ul class="simple">
+<li><p>フラッシュベースのストレージで内部キューイングが行われる（通常はNCQ）デバイスでは、デバイスのアイドル状態はスループットに常に悪影響を及ぼします。したがって、このようなデバイスでは、BFQはサービス保証を厳密に保証する必要がある場合（つまり、低レイテンシーまたは公平性を保証する場合）にのみアイドル状態を実行します。このような場合、全体的なスループットは非最適になる可能性があります。内部キューイングを持つデバイスで、強いサービス保証と最適なスループットを同時に提供する解決策は現在存在していません。</p></li>
+</ul>
+</div></blockquote>
+</li>
+<li><p>低レイテンシーモードが有効になっている場合（デフォルト設定）、BFQはインタラクティブなアプリケーションやソフトリアルタイムアプリケーション（例：ビデオやオーディオプレイヤー/ストリーマー）を検出する特別なヒューリスティクスを実行し、それらのレイテンシーを削減します。この目標を達成するための最も重要な行動は、これらのアプリケーションに関連するキューに、公平な割合を超えるデバイススループットを提供することです。簡潔さのため、BFQがこれらのキューを優遇するために実行する一連の行動を「重みの増加」と呼びます。特に、BFQはインタラクティブなアプリケーションには穏やかな形式の重みの増加、ソフトリアルタイムアプリケーションにはより強い形式の重みの増加を提供します。</p></li>
+<li><p>BFQは、キュー作成のバーストで生成されたキューに対してアイドル状態を自動的に無効化します。実際、これらのキューは通常、高スループットを最も得 benefit するアプリケーションやサービスのプロセスに関連しています。例として、システム起動時のsystemdやgit grepが挙げられます。</p></li>
+<li><p>CFQと同様に、BFQはインターリーブされたI/O（ランダムなI/Oがマージされるとほぼシーケンシャルになる）を実行するキューをマージします。CFQとは異なり、BFQはより反応性の高いメカニズム、Early Queue Merge（EQM）を用いてこの目標を達成します。EQMはインターリーブされたI/O（協力的なプロセス）を検出するため非常に迅速であり、BFQがEQMを用いてキューのマージにより高スループットを達成できるようにします。これにより、CFQが異なるメカニズム（プリエンプション）を必要とするキューでも、BFQはEQMを用いて高スループットを達成できます。したがって、EQMはインターリーブされたI/Oで高スループットを達成するための統合されたメカニズムです。</p></li>
+<li><p>キューはWF2Q+の変種であるB-WF2Q+に基づいてスケジュールされ、augmented rb-treeを用いてO(log N)の全体的な計算複雑度を維持します。詳細については[2]を参照してください。B-WF2Q+は階層スケジューリングにも対応しており、詳細は第4章に記載されています。</p></li>
+<li><p>B-WF2Q+は、理想的で完全に公平で滑らかなサービスに対する偏差を厳密に保証します。特に、B-WF2Q+は、デバイスのスループットが変動しても、キューごとにその重みに比例したスループットを割り当てるよう保証します。これは、デバイスのパラメータ、現在のワークロード、キューに割り当てられた予算に関係なく成立します。</p></li>
+<li><p>最後に挙げた、予算依存性のない性質（最初はおそらく反直感的であると思われる）は、以下の理由から非常に有益です：</p>
+<ul class="simple">
+<li><p>まず、どの比例配分スケジューラにおいても、理想的なサービスに対する最大偏差は、キューに割り当てられた最大予算（スライス）に比例します。その結果、BFQはB-WF2Q+の正確なサービスだけでなく、BFQ自体が <em>必要としない</em>
+キューに高いスループット割合を受けるようにするためには、より大きな予算を割り当てる必要がありません。</p></li>
+<li><p>次に、BFQは、すべてのプロセス（キュー）に対して、プロセスのニーズに最も合った予算、またはプロセスのI/Oパターンを最大限に活用する予算を選択できます。特に、BFQは単純なフィードバックループアルゴリズムを用いてキューの予算を更新し、高いスループットを達成しながら、時間敏感なアプリケーションに対する遅延保証を厳密に維持します。キューのサービスが終了した際、このアルゴリズムは次の予算を計算して、以下のようになります：</p>
+<ul>
+<li><p>I/Oバウンドアプリケーションが順序的なI/Oを実行するキューに最終的に大規模な予算が割り当てられるようにする。実際、これらのアプリケーションがデバイスにアクセスした後、サービスを受ける時間が長いほどスループットは高くなります。</p></li>
+<li><p>時間敏感なアプリケーション（通常は間欠的で短いI/Oを実行）に関連するキューには最終的に小規模な予算が割り当てられるようにする。なぜなら、キューがサービスを待っている際の予算が小さいほど、B-WF2Q+がそのキューを早くサービス提供するからです（[2]のサブセクション3.3参照）。</p></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><p>複数のプロセスが同時にデバイスを競争しているが、すべてのプロセスおよびグループが同じ重みを持つ場合、BFQはデバイスをアイドル状態にすることなく、予期されるスループット分布を保証します。代わりにプリエンプションを使用します。この一般的なシナリオではスルットが大幅に向上します。</p></li>
+<li><p>ioprioのクラスは厳格な優先順位順に処理されます。つまり、より高い優先度を持つキューが存在する限り、低い優先度のキューは処理されません。同じクラス内のキューでは、各キューの重みに比例して帯域幅が配分されます。ただし、Idleクラスには極めて薄い追加帯域幅が保証され、それがstarving（処理が完全に停止）しないようにしています。</p></li>
+</ul>
+</section>
+<section id="what-are-bfq-s-tunables-and-how-to-properly-configure-bfq">
+<h2>3. BFQのチューニングパラメータとは何か？BFQを適切に設定する方法は？<a class="headerlink" href="#what-are-bfq-s-tunables-and-how-to-properly-configure-bfq" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ほとんどのBFQのチューニングパラメータはサービス保証（主にレイテンシーと公平性）に影響を与え、スループットにも関与します。サービス保証とスループットのバランスをどう選ぶかについては、slice_idle、strict_guarantees、low_latencyのパラメータを参照してください。スループットを最大化する方法についてはslice_idle、timeout_sync、max_budgetを参照してください。他のパフォーマンス関連パラメータはCFQから引き継いでおり、主にCFQとの互換性を維持するため残されています。これまでBFQでこれらのパラメータを変更してもパフォーマンス向上は報告されていません。</p>
+<p>back_seek-max、back_seek_penalty、fifo_expire_async、fifo_expire_syncなどのパラメータはCFQと同一です。その説明はCFQのそれからコピーされています。slice_idleの説明にも一部CFQからの内容が取り込まれています。</p>
+<section id="per-process-ioprio-and-weight">
+<h3>プロセスごとのioprioと重み<a class="headerlink" href="#per-process-ioprio-and-weight" title="この見出しへのパーマリンク">¶</a></h3>
+<p>cgroupsインターフェースを使用しない場合（「4. BFQグループスケジューリング」を参照）、プロセスに重みを割り当てるにはI/O優先度を通じて間接的に割り当てられ、関係式：weight = (IOPRIO_BE_NR - ioprio) * 10に従います。</p>
+<p>low-latencyが設定されている場合、BFQはインタラクティブおよびソフトリアルタイムアプリケーションに関連するキューの重みを自動的に上げます。重みを制御したい場合はこのチューニングパラメータを解除してください。</p>
+</section>
+<section id="slice-idle">
+<h3>slice_idle<a class="headerlink" href="#slice-idle" title="この見出しへのパーマリンク">¶</a></h3>
+<p>このパラメータは、特定の同期BFQキューが空になったときにBFQが次のI/Oリクエストを待つ時間を指定します。slice_idleのデフォルト値はゼロではありません。アイドル時間は二つの目的を持ちます：スループットの向上と、望ましいスループット配分を維持すること（BFQの仕組みの説明と、その参照先の論文を確認してください）。</p>
+<p>スループットに関しては、シークが多いメディア（例：単一スピンのSATA/SASディスク）ではアイドル時間により全体のシーク回数を削減し、スループットが向上する場合があります。</p>
+<p>slice_idleを0に設定すると、キューのアイドル状態がすべて解除され、複数のSATA/SASディスクをハードウェアRAID構成で使用するなど、高速なストレージデバイス（複数のSATA/SASディスクやフラッシュベースのストレージで内部コマンドキューイング（および並列性）を備えたもの）において全体的なスループットが向上する可能性があります。</p>
+<p>ストレージやワークロードによっては、slice_idle=0を設定することが有用な場合があります。一般的にSATA/SASディスクやSATA/SASディスクのソフトウェアRAIDを使用する場合、slice_idleを有効にした状態が有用です。複数のスピンナが単一のLUN（ホストベースのハードウェアRAIDコントローラーまたはストレージアレイの場合）の後ろにある、またはフラッシュベースの高速ストレージを使用する場合、slice_idle=0を設定することでスループットが向上し、受け入れ可能なレイテンシーが得られる可能性があります。</p>
+<p>アイドル状態は、差別化された重みや差別化されたI/Oリクエスト長がある場合にサービス保証を強制するために必要です。なぜなら、あるBFQキューAが他のキューBのリクエストごとに複数のI/Oリクエストを処理する必要がある場合、アイドル状態が確保することで、Aが空になった後で新しいI/Oリクエストをわずかに遅れて送信した場合でも、Bのリクエストが途中で処理されず、AがBの次のリクエストが処理される前にもう1つのリクエストを処理する可能性を失うことが防がれるからです。注意点として、アイドル状態はI/Oリクエストの処理順に限定してキューの差別化された扱いを保証します。実際のサービス順序が処理順と一致するようにするには、strict_guaranteesチューニングパラメータも設定する必要があります。</p>
+<p>アイドル状態には重要な反対側があります：上記のスループット向上に有益なケースに加えて、アイドル状態はスループットに深刻な影響を与えることがあります。重要なケースとしてランダムなワークロードがあります。この問題のため、BFQはスループットに有益でない場合でもアイドル状態をできるだけ避ける傾向があります（第2節で詳しく説明されています）。この挙動とstrict_guaranteesチューニングパラメータに関する他の問題により、短期間のサービス保証が偶発的に違反される可能性があります。また、一部のケースではこれらの保証が最大スループットを保証するよりも重要になる場合があります。たとえば、ビデオ再生/ストリーミングでは、非常に低いドロップレートが最大スループットより重要になることがあります。このようなケースではstrict_guaranteesパラメータを設定することを検討してください。</p>
+</section>
+<section id="slice-idle-us">
+<h3>slice_idle_us<a class="headerlink" href="#slice-idle-us" title="この見出しへのパーマリンク">¶</a></h3>
+<p>slice_idleと同じチューニングパラメータをマイクロ秒単位で制御します。どちらかのパラメータを使用してアイドル状態の挙動を設定した後、もう一方のパラメータはsysfsで新たに設定された値を反映します。</p>
+</section>
+<section id="strict-guarantees">
+<h3>strict_guarantees<a class="headerlink" href="#strict-guarantees" title="この見出しへのパーマリンク">¶</a></h3>
+<p>このパラメータが設定されている場合（デフォルト: 未設定）、BFQはインサービスキューが空になると常にアイドル動作を実行します。</p>
+<ul class="simple">
+<li><p>インサービスキューが空になると常にアイドル動作を実行します。</p></li>
+<li><p>デバイスが1つのI/Oリクエストずつ処理するように強制します。新しいリクエストをディスパッチする際には、未処理のリクエストが存在しない場合に限ります。</p></li>
+</ul>
+<p>差別化された重みやI/Oリクエストのサイズがある場合、上記の両条件が必要です。これは、BFQキューが帯域幅の割当を受けることを保証するためです。第一条件は、スライスアイドルチューニングの説明で述べた理由により必要です。第二条件は、現代のストレージデバイスが内部キューされたリクエストを再配置するため、I/Oスケジューラが強制するサービス保証を破損する可能性があるため必要です。</p>
+<p>strict_guaranteesを設定すると、通過量に明らかに影響を与える可能性があります。</p>
+</section>
+<section id="back-seek-max">
+<h3>back_seek_max<a class="headerlink" href="#back-seek-max" title="この見出しへのパーマリンク">¶</a></h3>
+<p>これは、バックシークの最大「距離」をキロバイト単位で指定します。距離は、現在のヘッド位置から逆方向にあるセクタまでの空間量を指します。</p>
+<p>このパラメータにより、スケジューラが逆方向のリクエストを予測し、現在のヘッド位置からこの距離内にある場合を次のリクエストとして考慮するようにします。</p>
+</section>
+<section id="back-seek-penalty">
+<h3>back_seek_penalty<a class="headerlink" href="#back-seek-penalty" title="この見出しへのパーマリンク">¶</a></h3>
+<p>このパラメータは、バックワードシークのコストを計算するために使用されます。リクエストのバックワード距離が「フロント」リクエストからの1/back_seek_penaltyの距離にちょうど一致する場合、2つのリクエストのシークコストは同等とみなされます。</p>
+<p>そのため、スケジューラはどちらか一方のリクエストに偏りを生じさせません（それ以外の場合、スケジューラはフロントリクエストに偏りを生じさせます）。back_seek_penaltyのデフォルト値は2です。</p>
+</section>
+<section id="fifo-expire-async">
+<h3>fifo_expire_async<a class="headerlink" href="#fifo-expire-async" title="この見出しへのパーマリンク">¶</a></h3>
+<p>このパラメータは非同期リクエストのタイムアウトを設定するために使用されます。このパラメータのデフォルト値は248msです。</p>
+</section>
+<section id="fifo-expire-sync">
+<h3>fifo_expire_sync<a class="headerlink" href="#fifo-expire-sync" title="この見出しへのパーマリンク">¶</a></h3>
+<p>このパラメータは同期リクエストのタイムアウトを設定するために使用されます。このパラメータのデフォルト値は124msです。非同期リクエストよりも同期リクエストを優先したい場合は、fifo_expire_asyncに対してこの値を小さく設定してください。</p>
+</section>
+<section id="low-latency">
+<h3>low_latency<a class="headerlink" href="#low-latency" title="この見出しへのパーマリンク">¶</a></h3>
+<p>このパラメータはBFQのロー・レイテンシモードを有効/無効にします。デフォルトではロー・レイテンシモードが有効になっています。有効な場合、インタラクティブなアプリケーションやソフトリアルタイムアプリケーションが優先され、より低いレイテンシーを体験します（BFQの動作仕様の説明で詳しく説明しています）。</p>
+<p>帯域幅の配分を完全に制御する必要がある場合はこのモードを無効にしてください。実際、有効な場合、BFQは優先アプリケーションの帯域幅割合を自動的に増加させ、それらに低いレイテンシーを保証する主な手段として機能します。</p>
+<p>また、このドキュメントの冒頭で既に強調した通り、目的が高スループットを達成することだけであれば、このモードを無効にしてください。実際、特定のアプリケーションのI/Oを他のものよりも優先する場合、全体のスループットが低下する可能性があります。非回転式デバイスで最高のスループットを達成するには、slice_idleを0に設定する必要があるかもしれません（ただし、公平性や低遅延に関する強い保証を放棄する代償が伴います）。</p>
+</section>
+<section id="timeout-sync">
+<h3>timeout_sync<a class="headerlink" href="#timeout-sync" title="この見出しへのパーマリンク">¶</a></h3>
+<p>タスク（キュー）がサービス対象に選ばれた後、そのタスクに割り当てられるデバイス時間の最大値です。コストのかかるシークを持つデバイスでは、この時間の増加は通常最大スループットの向上につながります。逆に、この時間を増やすと、特に次のパラメータがゼロに設定されている場合、短期間での帯域幅および遅延の保証の粒度が粗くなります。</p>
+</section>
+<section id="max-budget">
+<h3>max_budget<a class="headerlink" href="#max-budget" title="この見出しへのパーマリンク">¶</a></h3>
+<p>BFQキューがサービス対象に設定された後、提供可能なサービス量（セクター数で測定）の最大値です（上記のタイムアウトの制限内で）。アルゴリズムの説明で述べたように、より大きな値は順序的なI/Oリクエストの割合に比例してスループットを増加させます。ただし、より大きな値は短期間での帯域幅および遅延の保証の粒度を粗くするという代償があります。</p>
+<p>デフォルト値は0で、自動調整を有効にします。BFQはtimeout_syncの間に処理可能なセクター数の最大値をもとにmax_budgetを設定します。</p>
+<p>特定のデバイスでは、一部のユーザーがmax_budgetを明示的に設定することでスループットを向上させたと報告しています。つまり、max_budgetを0より高い値に設定した場合です。特に、BFQの自動調整で設定される値よりも高い値に設定しました。この目標を達成する別の方法は、timeout_syncの値を増やすことで、max_budgetを0のままにすることです。</p>
+</section>
+</section>
+<section id="group-scheduling-with-bfq">
+<h2>4. BFQでのグループスケジューリング<a class="headerlink" href="#group-scheduling-with-bfq" title="この見出しへのパーマリンク">¶</a></h2>
+<p>BFQはcgroups-v1およびcgroups-v2のioコントローラー（blkioおよびio）をサポートしています。特に、BFQは重みに基づく比例配分をサポートしています。cgroupsのサポートを有効にするには、BFQ_GROUP_IOSCHEDを設定してください。</p>
+<section id="service-guarantees-provided">
+<h3>4-1 提供されるサービス保証<a class="headerlink" href="#service-guarantees-provided" title="この見出しへのパーマリンク">¶</a></h3>
+<p>BFQでは、比例配分とはデバイス帯域幅の真の比例配分を指します。例えば、重みが200のグループは重みが100のグループに対して2倍の帯域幅を獲得します。時間の2倍というわけではありません。</p>
+<p>BFQは、任意の深さの階層（グループツリー）をサポートしています。帯域幅は、グループとプロセス間で予想される方法で配分されます。各グループに対して、そのグループの子グループがグループ全体の帯域幅を、重みに応じて割り当てられます。特に、これは、各葉グループに対して、グループ内のすべてのプロセスがグループ全体の帯域幅を同じ割合で受け取ることを意味します（ただし、プロセスのioprioが変更されている場合は除きます）。</p>
+<p>グループのリソース共有保証は、グループに帯域幅の保証を提供することによってスループットが極端に低下する場合、帯域幅から時間に部分的または完全に切り替わることがあります。この切り替えはプロセス単位で行われます：葉グループのプロセスが、帯域幅の割合を受けることでスループットが低下する場合、BFQはそのプロセスに対して時間ベースの比例割合に切り替わります。</p>
+</section>
+<section id="interface">
+<h3>4-2 インターフェース<a class="headerlink" href="#interface" title="この見出しへのパーマリンク">¶</a></h3>
+<p>特定のデバイスでBFQによる帯域幅の比例共有を実現するためには、BFQがそのデバイスのアクティブなスケジューラである必要があります。</p>
+<p>各グループディレクトリ内では、BFQ固有のcgroupパラメータおよび統計情報に関連するファイル名は「bfq.」という接頭辞で始まります。したがって、cgroups-v1またはcgroups-v2の場合、BFQ固有のファイルの完全な接頭辞は「blkio.bfq.」または「io.bfq.」です。例えば、BFQでグループの重みを設定するパラメータは「blkio.bfq.weight」または「io.bfq.weight」です。</p>
+<p>cgroups-v1（blkioコントローラー）の場合、CONFIG_BFQ_CGROUP_DEBUGが設定されているかどうかによって、生成される統計情報ファイルの種類が異なります。CONFIG_BFQ_CGROUP_DEBUGが設定されている場合、bfqは以下のドキュメントに記載されているすべての統計情報ファイルを生成します。
+<a class="reference internal" href="../admin-guide/cgroup-v1/blkio-controller.html"><span class="doc">ブロックIOコントローラー</span></a>逆に、CONFIG_BFQ_CGROUP_DEBUGが設定されていない場合、bfqは以下のファイルのみを生成します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>blkio.bfq.io_service_bytes
+blkio.bfq.io_service_bytes_recursive
+blkio.bfq.io_serviced
+blkio.bfq.io_serviced_recursive
+</pre></div>
+</div>
+<p>CONFIG_BFQ_CGROUP_DEBUGの設定値は、bfqによる最大スループットに大きな影響を与えます。これは、blkio.bfq.*の統計情報の更新がコストが高く、特にCONFIG_BFQ_CGROUP_DEBUGで有効化された統計情報については特にその傾向が強いからです。</p>
+</section>
+<section id="parameters-to-set">
+<h3>設定可能なパラメータ<a class="headerlink" href="#parameters-to-set" title="この見出しへのパーマリンク">¶</a></h3>
+<p>各グループには設定可能なパラメータは1つだけです。</p>
+<p>weight（つまりblkio.bfq.weightまたはio.bfq-weight）：グループの親グループ内での重み。有効な値：1..1000（デフォルトは100）。ioprioと重みの線形マッピングは、チューニングセクションの冒頭で説明したとおり有効ですが、IOPRIO_BE_NR*10より大きいすべての重みはioprio 0にマッピングされます。</p>
+<p>ロー・レイテンシーが設定されている場合、BFQはインタラクティブおよびソフトリアルタイムアプリケーションに関連するキューの重みを自動的に上げます。重みを制御したい場合はこのチューニングを解除してください。</p>
+<dl>
+<dt>[1]</dt><dd><p>P. Valente, A. Avanzini, 「BFQストレージI/Oスケジューラの進化」, 第1回モバイルシステム技術ワークショップ (MST-2015) 論文集, 2015年5月.</p>
+<p><a class="reference external" href="http://algogroup.unimore.it/people/paolo/disk_sched/mst-2015.pdf">http://algogroup.unimore.it/people/paolo/disk_sched/mst-2015.pdf</a></p>
+</dd>
+<dt>[2]</dt><dd><p>P. Valente および M. Andreolini, 「BFQディスクI/Oスケジューラを用いたアプリケーション応答性の改善」, 第5回国際システム・ストレージ会議 (SYSTOR ‘12) 論文集, 2012年6月.</p>
+<p>やや拡張版:</p>
+<p><a class="reference external" href="http://algogroup.unimore.it/people/paolo/disk_sched/bfq-v1-suite-results.pdf">http://algogroup.unimore.it/people/paolo/disk_sched/bfq-v1-suite-results.pdf</a></p>
+</dd>
+<dt>[3]</dt><dd><p><a class="reference external" href="https://github.com/Algodev-github/S">https://github.com/Algodev-github/S</a></p>
+</dd>
+</dl>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">ブロック</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">BFQ（Budget Fair Queueing）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="biodoc.html">Linux 2.5におけるジェネリックブロックレイヤーの再実装に関するノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="biovecs.html">変更不可能なbiovecsとbiovecイテレータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blk-mq.html">マルチキュー・ブロックIOキューイングメカニズム (blk-mq)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="capability.html">ジェネリックブロックデバイスの機能</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cmdline-partition.html">埋め込みデバイスコマンドラインパーティション解析</a></li>
+<li class="toctree-l2"><a class="reference internal" href="data-integrity.html">データの整合性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deadline-iosched.html">デッドラインIOスケジューラのチューニングパラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="inline-encryption.html">インライン暗号化</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ioprio.html">ブロックIOの優先度</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kyber-iosched.html">Kyber I/Oスケジューラのチューニングパラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="null_blk.html">ヌルブロックデバイスドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pr.html">ブロックレイヤーによる永続的予約のサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="queue-sysfs.html">キュー・sysfsファイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="request.html">struct requestドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="stat.html">ブロックレイヤー統計情報は /sys/block/&lt;dev&gt;/stat にあります</a></li>
+<li class="toctree-l2"><a class="reference internal" href="switching-sched.html">スケジューラの切り替え</a></li>
+<li class="toctree-l2"><a class="reference internal" href="writeback_cache_control.html">明示的な揮発性ライトバックキャッシュ制御</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">ブロック</a><ul>
+<li>前へ: <a href="index.html" title="前章">ブロック</a></li>
+<li>次へ: <a href="biodoc.html" title="次章">Linux 2.5におけるジェネリックブロックレイヤーの再実装に関するノート</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/block/bfq-iosched.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

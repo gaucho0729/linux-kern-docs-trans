@@ -1,0 +1,300 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>データの整合性 — Linux Kernel ドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="deadline-iosched.html" rel="next" title="デッドラインIOスケジューラのチューニングパラメータ"/>
+<link href="cmdline-partition.html" rel="prev" title="埋め込みデバイスコマンドラインパーティション解析"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="data-integrity">
+<h1>データの整合性<a class="headerlink" href="#data-integrity" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="introduction">
+<h2>1. はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>現代のファイルシステムはデータおよびメタデータのチェックサムを用いてデータ破損を防ぐ機能を備えています。しかし、破損の検出は読み込み時に実施されるため、データが書き込まれた数か月後になってから発覚する可能性があります。その時点でアプリケーションが書き込もうとした元データはほぼ確実に失われています。</p>
+<p>解決策は、ディスクがアプリケーションが意図したデータを実際に保存していることを保証することです。SCSIファミリプロトコル（SBC Data Integrity Field、SCC保護提案）およびSATA/T13（External Path Protection）においても、I/Oに整合性メタデータを追加することでこの問題を改善しようとしています。整合性メタデータ（SCSIでは保護情報と呼ばれる）には各セクタのチェックサムと、セクタが正しい順序で書き込まれることを保証するインクリメントカウンタが含まれます。一部の保護スキームでは、I/Oがディスク上の正しい場所に書き込まれることも保証されます。</p>
+<p>現在のストレージコントローラーおよびデバイスは、チェックサムやスクラブビングなどのさまざまな保護機能を実装しています。しかし、これらの技術はそれぞれ独立したドメインで動作しているか、あるいはI/Oパスの隣接ノード間でのみ動作しています。DIFやその他の整合性拡張機能の興味深い点は、保護フォーマットが明確に定義されており、I/OパスのすべてのノードがI/Oの整合性を検証し、破損を検出すれば拒否できる点です。これにより、データ破損の防止だけでなく、故障点の分離も可能になります。</p>
+</section>
+<section id="the-data-integrity-extensions">
+<h2>2. データの整合性拡張機能<a class="headerlink" href="#the-data-integrity-extensions" title="この見出しへのパーマリンク">¶</a></h2>
+<p>プロトコル拡張機能は現在、コントローラーとストレージデバイス間のパスを保護するように設計されています。しかし、多くのコントローラーはオペレーティングシステムが整合性メタデータ（IMD）と相互作用できるようにします。我々は複数のFC/SAS HBAベンダーと協力し、保護情報がそのコントローラーに送信・受信されるようにする機能を実装しています。</p>
+<p>SCSI Data Integrity Fieldは、各セクタに8バイトの保護情報を追加することで動作します。データ＋整合性メタデータはディスク上に520バイトのセクタとして保存されます。コントローラーとターゲット間でデータ＋IMDは交差して転送されます。T13の提案も同様です。</p>
+<p>オペレーティングシステムが520（および4104）バイトセクタを扱うのが非常に不便であるため、我々は複数のHBAベンダーに協力を求め、データと整合性メタデータのスキャッターガatherリストを分離できるようにする機能を実装するよう奨励しました。</p>
+<p>コントローラーは、書き込み時にバッファを交互に配置し、読み込み時に分割して処理します。これにより、Linuxはページキャッシュの変更なしにホストメモリとデータバッファ間でDMAを実行できます。</p>
+<p>また、SCSIおよびSATA仕様で義務付けられている16ビットCRCチェックサムの計算はソフトウェアでは比較的重い処理です。ベンチマークでは、このチェックサムの計算が複数のワークロードにおいてシステムパフォーマンスに大きな影響を与えることが確認されました。一部のコントローラーは、オペレーティングシステムとのインターフェースで軽量なチェックサムを使用できるようにしています。例えば、EmulexはTCP/IPチェックサムを使用します。OSから受信したIPチェックサムは、書き込み時に16ビットCRCに変換され、読み込み時には逆を行います。これにより、Linuxやアプリケーションが低コストで整合性メタデータを生成できるようになります（ソフトウェアRAID5と同等のコストです）。</p>
+<p>IPチェックサムはCRCよりもビット誤りの検出能力は弱いですが、データバッファと整合性メタデータの分離が本質的な強さです。これらの2つの異なるバッファは、I/Oが完了するためには一致しなければなりません。</p>
+<p>データと整合性メタデータのバッファを分離し、チェックサムの選択肢を提供する仕組みは「データ整合性拡張機能」と呼ばれます。これらの拡張機能はプロトコル本体（T10、T13）の範囲外であるため、Oracleおよびパートナーはストレージネットワーキング業界協会（SNIA）内で標準化を進めています。</p>
+</section>
+<section id="kernel-changes">
+<h2>3. カーネルの変更<a class="headerlink" href="#kernel-changes" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Linuxのデータ整合性フレームワークは、保護情報がI/Oに固定され、サポートするコントローラーと通信する際の送受信が可能になります。</p>
+<p>SCSIおよびSATAの整合性拡張機能の利点は、アプリケーションからストレージデバイスまでの全体パスを保護できる点です。しかし同時にこれが最大の欠点でもあります。つまり、保護情報はディスクが理解できる形式でなければなりません。</p>
+<p>一般的にLinux/POSIXアプリケーションは、アクセスしているストレージデバイスの詳細な仕様には無関心です。仮想ファイルシステムスイッチやブロックレイヤーによって、ハードウェアセクタサイズやトランスポートプロトコルなどの詳細はアプリケーションには完全に透明です。</p>
+<p>しかし、ディスクに保護情報を送信する際にはこのレベルの詳細が必要になります。したがって、端到端保護スキームという概念自体がレイヤーの違反です。アプリケーションがSCSIまたはSATAディスクにアクセスしているかを意識するというのは完全に現実的ではありません。</p>
+<p>Linuxで実装されたデータの整合性サポートは、アプリケーションからこの情報を隠蔽しています。アプリケーション（ある程度の範囲ではカーネルも）にとっては、整合性メタデータはI/Oに添付される不透明な情報とみなされます。</p>
+<p>現在の実装では、ブロックレイヤーが任意のI/Oに対して保護情報の自動生成を許可しています。最終的には、ユーザー空間に整合性メタデータの計算を移行する予定です。メタデータやカーネル内部から発生するその他のI/Oについては、自動生成インターフェースを引き続き使用します。</p>
+<p>一部のストレージデバイスでは、ハードウェアセクタごとに16ビットの値をタグとして割り当てることができます。このタグ領域の所有者はブロックデバイスの所有者（通常はファイルシステム）です。ファイルシステムは必要に応じてセクタにタグを自由に割り当てることができます。タグ領域は限られているため、ブロックインターフェースではインターリーブによってより大きなブロックにタグを割り当てることができます。これにより、通常の4KBファイルシステムブロックに8×16ビットの情報が添付されます。</p>
+<p>これにより、fsckやmkfsなどのアプリケーションもユーザー空間からタグを操作する必要があります。このための透過インターフェースの実装が進行中です。</p>
+</section>
+<section id="block-layer-implementation-details">
+<h2>4. ブロックレイヤーの実装詳細<a class="headerlink" href="#block-layer-implementation-details" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="bio">
+<h3>4.1 Bio<a class="headerlink" href="#bio" title="この見出しへのパーマリンク">¶</a></h3>
+<p>データの整合性パッチは、CONFIG_BLK_DEV_INTEGRITYが有効な場合、struct bioに新しいフィールドを追加します。bio_integrity(bio)は、struct bipへのポインタを返し、これは整合性ペイロードを含むstruct bioです。要するに、bipは簡略化されたstruct bioで、整合性メタデータを含むbio_vecと必要な管理情報（bvecプール、ベクター数など）を保持します。</p>
+<p>カーネルサブシステムは、bio_integrity_alloc(bio)を呼び出して、bioにデータ整合性保護を有効化できます。これにより、bipが割り当てられ、bioに添付されます。</p>
+<p>個々の整合性メタデータを含むページは、bio_integrity_add_page()を呼び出して後で添付できます。</p>
+<p>bio_free()は自動的にbipを解放します。</p>
+</section>
+<section id="block-device">
+<h3>4.2 ブロックデバイス<a class="headerlink" href="#block-device" title="この見出しへのパーマリンク">¶</a></h3>
+<p>保護データの形式は物理ディスクに依存するため、各ブロックデバイスにブロック整合性プロファイル（struct blk_integrity）が拡張されました。このオプションのプロファイルは、ブロックレイヤーに以下のように登録されます。 <a class="reference internal" href="../core-api/kernel-api.html#c.blk_integrity_register" title="blk_integrity_register"><code class="xref c c-func docutils literal notranslate"><span class="pre">blk_integrity_register()</span></code></a>.</p>
+<p>プロファイルには、保護データの生成・検証に使用するコールバック関数、アプリケーションタグの取得・設定に使用する関数が含まれます。また、整合性メタデータの完了・マージ・スプリットを支援するためのいくつかの定数も含まれています。</p>
+<p>レイヤードブロックデバイスは、すべてのサブデバイスに適したプロファイルを選択する必要があります。  <a class="reference internal" href="../core-api/kernel-api.html#c.blk_integrity_compare" title="blk_integrity_compare"><code class="xref c c-func docutils literal notranslate"><span class="pre">blk_integrity_compare()</span></code></a> その問題は解決できます。DMおよびMDのラインアライメント、RAID0およびRAID1は現在サポートされています。RAID4/5/6はアプリケーションタグのため追加の作業が必要です。</p>
+</section>
+</section>
+<section id="block-layer-integrity-api">
+<h2>5.0 ブロックレイヤー整合性API<a class="headerlink" href="#block-layer-integrity-api" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="normal-filesystem">
+<h3>5.1 通常のファイルシステム<a class="headerlink" href="#normal-filesystem" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>通常のファイルシステムは、基盤となるブロックデバイスが整合性メタデータを送受信できるという情報を把握していません。ブロックレイヤーがWRITE時のタイミングで自動的にIMDを生成します。 <a class="reference internal" href="../core-api/kernel-api.html#c.submit_bio" title="submit_bio"><code class="xref c c-func docutils literal notranslate"><span class="pre">submit_bio()</span></code></a> READリクエストは、完了時にI/O整合性を検証します。</p>
+<p>IMDの生成および検証は次のコマンジを使用して切り替えられます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/block/&lt;bdev&gt;/integrity/write_generate
+</pre></div>
+</div>
+<p>および：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/block/&lt;bdev&gt;/integrity/read_verify
+</pre></div>
+</div>
+<p>フラグを確認します。</p>
+</div></blockquote>
+</section>
+<section id="integrity-aware-filesystem">
+<h3>5.2 整合性を意識したファイルシステム<a class="headerlink" href="#integrity-aware-filesystem" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>整合性を意識したファイルシステムは、IMDを添付したI/Oを準備できます。ブロックデバイスがサポートする場合、アプリケーションタグ領域も利用可能です。</p>
+<p><cite>bool bio_integrity_prep(bio);</cite></p>
+<blockquote>
+<div><p>WRITE用のIMDを生成し、READ用のバッファを設定するには、ファイルシステムがbio_integrity_prep(bio)を呼び出す必要があります。</p>
+<p>この関数を呼び出す前に、bioデータの方向と開始セクタを設定し、bioにすべてのデータページを追加しておく必要があります。I/Oが進行中にbioが変更されないことを呼び出し元が保証する必要があります。準備に失敗した場合はエラーで完了するbioを返します。</p>
+</div></blockquote>
+</div></blockquote>
+</section>
+<section id="passing-existing-integrity-metadata">
+<h3>5.3 既存の整合性メタデータの渡し方<a class="headerlink" href="#passing-existing-integrity-metadata" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>自身で整合性メタデータを生成するか、ユーザー空間からIMDを転送できるファイルシステムは、以下の関数を使用できます：</p>
+<p><cite>struct bip * bio_integrity_alloc(bio, gfp_mask, nr_pages);</cite></p>
+<blockquote>
+<div><p>bioの整合性ペイロードを割り当て、bioに接続します。nr_pagesは、整合性bio_vecリストに保存する保護データのページ数を示します（bio_alloc()と同様）。</p>
+<p>整合性ペイロードはbio_free()のタイミングで解放されます。</p>
+</div></blockquote>
+<p><cite>int bio_integrity_add_page(bio, page, len, offset);</cite></p>
+<blockquote>
+<div><p>既存のbioに整合性メタデータを含むページを接続します。bioには既存のbipが必要であり、bio_integrity_alloc()が呼び出されている必要があります。WRITEの場合、ページ内の整合性メタデータはターゲットデバイスが理解できる形式でなければなりません。ただし、I/Oスタックを通過する際のセクタ番号は再マッピングされるため、この関数で追加したページはI/O中に変更される可能性があります！整合性メタデータの最初の参照タグはbip-&gt;bip_sectorの値を保つ必要があります。</p>
+<p>bip bio_vec配列に空きがある限り（nr_pages）、bio_integrity_add_page()を使用してページを追加できます。</p>
+<p>READ操作が完了した後、添付されたページにはストレージデバイスから受信した整合性メタデータが含まれます。整合性の検証は受信者が行い、操作完了時にデータの整合性を確認する必要があります。</p>
+</div></blockquote>
+</div></blockquote>
+</section>
+<section id="registering-a-block-device-as-capable-of-exchanging-integrity-metadata">
+<h3>5.4 ブロックデバイスを整合性メタデータの交換が可能なデバイスとして登録する<a class="headerlink" href="#registering-a-block-device-as-capable-of-exchanging-integrity-metadata" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>ブロックデバイスで整合性交換を有効にするには、gendiskがcapableとして登録する必要があります:</p>
+<p><cite>int blk_integrity_register(gendisk, blk_integrity);</cite></p>
+<blockquote>
+<div><p>blk_integrity構造体はテンプレートであり、以下の項目を含める必要があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static struct blk_integrity my_profile = {
+    .name                   = "STANDARDSBODY-TYPE-VARIANT-CSUM",
+    .generate_fn            = my_generate_fn,
+    .verify_fn              = my_verify_fn,
+    .tuple_size             = sizeof(struct my_tuple_size),
+    .tag_size               = &lt;tag bytes per hw sector&gt;,
+};
+</pre></div>
+</div>
+<p>「name」はsysfsで表示されるテキスト文字列です。これはユーザーランドAPIの一部なので、慎重に選び、変更してはいけません。形式は標準機関-型-変異体です。例: T10-DIF-TYPE1-IPやT13-EPP-0-CRCなど。</p>
+<p>「generate_fn」は適切な整合性メタデータ（WRITE用）を生成します。</p>
+<p>「verify_fn」はデータバッファが整合性メタデータと一致することを確認します。</p>
+<p>「tuple_size」はセクタあたりの整合性メタデータのサイズに合わせて設定する必要があります。つまり、DIFおよびEPPでは8です。</p>
+<p>「tag_size」はハードウェアセクタあたりに利用可能なタグ領域のバイト数を識別するため、設定する必要があります。DIFの場合、制御モードページのATOビットの値によって2または0になります。</p>
+</div></blockquote>
+</div></blockquote>
+<hr class="docutils"/>
+<p>2007-12-24 Martin K. Petersen &lt;<a class="reference external" href="mailto:martin.petersen%40oracle.com">martin<span>.</span>petersen<span>@</span>oracle<span>.</span>com</a>&gt;</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">ブロック</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="bfq-iosched.html">BFQ（Budget Fair Queueing）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="biodoc.html">Linux 2.5におけるジェネリックブロックレイヤーの再実装に関するノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="biovecs.html">変更不可能なbiovecsとbiovecイテレータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blk-mq.html">マルチキュー・ブロックIOキューイングメカニズム (blk-mq)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="capability.html">ジェネリックブロックデバイスの機能</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cmdline-partition.html">埋め込みデバイスコマンドラインパーティション解析</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">データの整合性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deadline-iosched.html">デッドラインIOスケジューラのチューニングパラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="inline-encryption.html">インライン暗号化</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ioprio.html">ブロックIOの優先度</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kyber-iosched.html">Kyber I/Oスケジューラのチューニングパラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="null_blk.html">ヌルブロックデバイスドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pr.html">ブロックレイヤーによる永続的予約のサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="queue-sysfs.html">キュー・sysfsファイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="request.html">struct requestドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="stat.html">ブロックレイヤー統計情報は /sys/block/&lt;dev&gt;/stat にあります</a></li>
+<li class="toctree-l2"><a class="reference internal" href="switching-sched.html">スケジューラの切り替え</a></li>
+<li class="toctree-l2"><a class="reference internal" href="writeback_cache_control.html">明示的な揮発性ライトバックキャッシュ制御</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">ブロック</a><ul>
+<li>前へ: <a href="cmdline-partition.html" title="前章">埋め込みデバイスコマンドラインパーティション解析</a></li>
+<li>次へ: <a href="deadline-iosched.html" title="次章">デッドラインIOスケジューラのチューニングパラメータ</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/block/data-integrity.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

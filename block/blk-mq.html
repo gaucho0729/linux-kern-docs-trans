@@ -1,0 +1,792 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>マルチキュー・ブロックIOキューイングメカニズム (blk-mq) — Linuxカーネルドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="capability.html" rel="next" title="ジェネリックブロックデバイスの機能"/>
+<link href="biovecs.html" rel="prev" title="変更不可能なbiovecsとbiovecイテレータ"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="multi-queue-block-io-queueing-mechanism-blk-mq">
+<h1>マルチキュー・ブロックIOキューイングメカニズム (blk-mq)<a class="headerlink" href="#multi-queue-block-io-queueing-mechanism-blk-mq" title="この見出しへのパーマリンク">¶</a></h1>
+<p>マルチキュー・ブロックIOキューイングメカニズムは、高速なストレージデバイスが、キューイングと同時にIOリクエストをブロックデバイスに送信することで、非常に高い入出力操作毎秒数(IOPS)を達成できるようにするAPIです。これは現代のストレージデバイスが提供する並列性を活用することで、パフォーマンスを向上させます。</p>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="background">
+<h3>背景<a class="headerlink" href="#background" title="この見出しへのパーマリンク">¶</a></h3>
+<p>磁気ディスクは、カーネル開発の初期から事実上の標準でした。ブロックIOサブシステムは、ランダムアクセス時の高いペナルティを考慮し、機械的な移動部品（非常に遅い）がボトルネックとなるため、ハードディスクのヘッドの現在位置に応じて読み書きリクエストを順序付けたりする最適化技術が採用されていました。</p>
+<p>しかし、機械式部品を持たず、ランダムアクセスのペナルティもないSSDやNVMが登場し、高並列アクセスが可能なようになった現在、ボトルネックはストレージデバイスからオペレーティングシステムへと移りました。これらのデバイスの設計における並列性を活用するため、マルチキュー機構が導入されました。</p>
+<p>以前の設計では、ブロックIOリクエストを1つのキューに格納し、1つのロックで制御していました。SMPシステムではキャッシュの汚染や複数プロセッサ間での1つのロックによるボトルネックのため、スケーラビリティが悪かったです。また、複数プロセス（または同じプロセスが異なるCPUに移動した場合）がブロックIOを実行しようとした際の混雑も問題でした。代わりにblk-mq APIは、CPUごとのローカルなエントリポイントを持つ複数のキューを生成し、ロックを必要としなくなりました。この仕組みの詳細については次のセクションで説明します（<a class="reference internal" href="#operation">操作</a>).</p>
+</section>
+<section id="operation">
+<h3>操作<a class="headerlink" href="#operation" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ユーザースペースがブロックデバイスにIOを実行する際（例えばファイルの読み書き）、blk-mqは動作します。ブロックデバイスへのIOリクエストを保存・管理し、ユーザースペース（およびファイルシステムがある場合）とブロックデバイスドライバーの間のミドルウェアとして機能します。</p>
+<p>blk-mqには2つのキューのグループがあります：ソフトウェアステージングキューとハードウェアディスパッチキュー。IOリクエストがブロックレイヤーに到達すると、最短の経路を取ってハードウェアキューに直接送信します。ただし、IOスケジューラがレイヤーに接続されている場合や、リクエストをマージしようとする場合などは、ソフトウェアキューに送信します。</p>
+<p>次に、ソフトウェアのキューによって処理されたリクエストはハードウェアキューに配置されます。これは、ハードウェアが直接リクエストを処理できる第二段階のキューです。ただし、ハードウェアが十分なリソースを持っていない場合、blk-mqはリクエストを一時キューに置き、今後ハードウェアが処理可能になったときに送信します。</p>
+<section id="software-staging-queues">
+<h4>ソフトウェアステージングキュー<a class="headerlink" href="#software-staging-queues" title="この見出しへのパーマリンク">¶</a></h4>
+<p>ブロックIOサブシステムは、ドライバに直接送信されないリクエストをソフトウェアステージングキュー（struct blk_mq_ctxで表される）に追加します。リクエストは1つまたは複数のBIOからなり、ブロックレイヤーではstruct bioというデータ構造を通じて到達します。その後、ブロックレイヤーは新しい構造体struct requestを作成し、デバイスドライバと通信するために使用します。各キューには独自のロックがあり、キューの数はCPUまたはノードごとに定義されます。</p>
+<p>ステージングキューは、隣接するセクターへのリクエストをマージするのに利用できます。例えば、セクター3-6、6-7、7-9へのリクエストは、3-9への1つのリクエストに統合されます。SSDやNVMへのランダムアクセスとシーケンシャルアクセスの応答時間は同じですが、シーケンシャルアクセスのグループ化されたリクエストは個別リクエストの数を減らします。このリクエストのマージ技術は「プラッギング」と呼ばれます。</p>
+<p>さらに、リクエストはIOスケジューラによって再配置され、システムリソースの公平性（例：アプリケーションが starvation から守られる）を確保したり、IOパフォーマンスを向上させたりします。</p>
+<section id="io-schedulers">
+<h5>IOスケジューラ<a class="headerlink" href="#io-schedulers" title="この見出しへのパーマリンク">¶</a></h5>
+<p>ブロックレイヤーは複数のスケジューラを実装しており、それぞれがIOパフォーマンスを向上させるためのヒューリスティックを追跡します。これらは「プラグイン可能」（plug and playの意味）であり、sysfsを介してランタイムに選択できます。LinuxのIOスケジューラについて詳しくは <a class="reference external" href="https://www.kernel.org/doc/html/latest/block/index.html">ここ</a>をご覧ください。スケジューリングは同じキュー内のリクエスト間でしか行われませんので、異なるキューからのリクエストをマージすることはできません。そうするとキャッシュの破壊が発生し、各キューにロックが必要になります。スケジューリング後、リクエストはハードウェアに送信可能になります。選択可能なスケジューラの1つはNONEスケジューラで、最もシンプルなスケジューラです。このスケジューラは、プロセスが実行されているソフトウェアキューにリクエストを直接配置します。ハードウェアキュー（ハードウェアキューを実行する）が処理を開始すると、そのハードウェアキューに関連するソフトウェアキューはマッピングに従って順番に空にされます。</p>
+</section>
+</section>
+<section id="hardware-dispatch-queues">
+<h4>ハードウェアディスパッチキュー<a class="headerlink" href="#hardware-dispatch-queues" title="この見出しへのパーマリンク">¶</a></h4>
+<p>ハードウェアキュー（ <a class="reference internal" href="#c.blk_mq_hw_ctx" title="blk_mq_hw_ctx"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">blk_mq_hw_ctx</span></code></a>）は、デバイスドライバがデバイスサブミッションキュー（またはデバイスDMAリングバッファ）をマッピングするために使用する構造体であり、ブロックレイヤーのサブミッションコードが低レベルのデバイスドライバがリクエストを所有する直前の最後のステップです。このキューを実行する際、ブロックレイヤーは関連するソフトウェアキューからリクエストを取り除き、ハードウェアにディスパッチしようとします。</p>
+<p>リクエストを直接ハードウェアに送信できない場合、これらはリンクリスト（<code class="docutils literal notranslate"><span class="pre">hctx-&gt;dispatch</span></code>）に追加されます。次にブロックレイヤーがキューを実行する際には、この
+<code class="docutils literal notranslate"><span class="pre">dispatch</span></code> リストに置かれたリクエストを優先的に送信し、最初に準備ができていたリクエストとの公平なディスパッチを確保します。ハードウェアキューの数はハードウェアとそのデバイスドライバがサポートするハードウェアコンテキストの数に依存しますが、システムのコア数を超えることはありません。この段階では再配列は行われず、各ソフトウェアキューは特定のハードウェアキューにリクエストを送信します。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>ブロックレイヤーやデバイスプロトコルはリクエストの完了順序を保証しません。この処理はファイルシステムなどの上位レイヤーで行います。</p>
+</div>
+</section>
+<section id="tag-based-completion">
+<h4>タグベースの完了<a class="headerlink" href="#tag-based-completion" title="この見出しへのパーマリンク">¶</a></h4>
+<p>リクエストが完了したことを示すために、すべてのリクエストは0からディスパッチキューのサイズまでの整数で識別されます。このタグはブロックレイヤーによって生成され、後でデバイスドライバが再利用することで、冗長な識別子を生成する必要がありません。ドライブでリクエストが完了した際、タグがブロックレイヤーに送信され、完了を通知します。これにより、どのIOが完了したかを線形検索する必要がありません。</p>
+</section>
+</section>
+<section id="further-reading">
+<h3>さらに読む<a class="headerlink" href="#further-reading" title="この見出しへのパーマリンク">¶</a></h3>
+<ul class="simple">
+<li><p><a class="reference external" href="http://kernel.dk/blk-mq.pdf">Linux Block IO: マルチコアシステムにおけるマルチキューSSDアクセスの紹介</a></p></li>
+<li><p><a class="reference external" href="https://en.wikipedia.org/wiki/Noop_scheduler">NOOPスケジューラ</a></p></li>
+<li><p><a class="reference external" href="https://www.kernel.org/doc/html/latest/block/null_blk.html">ヌルブロックデバイスドライバー</a></p></li>
+</ul>
+</section>
+</section>
+<section id="source-code-documentation">
+<h2>ソースコードドキュメンテーション<a class="headerlink" href="#source-code-documentation" title="この見出しへのパーマリンク">¶</a></h2>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.blk_mq_hw_ctx">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">blk_mq_hw_ctx</span></span></span><a class="headerlink" href="#c.blk_mq_hw_ctx" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ハードウェアブロックデバイス向けのハードウェアキューの状態</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct blk_mq_hw_ctx {
+  struct {
+    spinlock_t lock;
+    struct list_head        dispatch;
+    unsigned long           state;
+  };
+  struct delayed_work     run_work;
+  cpumask_var_t cpumask;
+  int next_cpu;
+  int next_cpu_batch;
+  unsigned long           flags;
+  void *sched_data;
+  struct request_queue    *queue;
+  struct blk_flush_queue  *fq;
+  void *driver_data;
+  struct sbitmap          ctx_map;
+  struct blk_mq_ctx       *dispatch_from;
+  unsigned int            dispatch_busy;
+  unsigned short          type;
+  unsigned short          nr_ctx;
+  struct blk_mq_ctx       **ctxs;
+  spinlock_t dispatch_wait_lock;
+  wait_queue_entry_t dispatch_wait;
+  atomic_t wait_index;
+  struct blk_mq_tags      *tags;
+  struct blk_mq_tags      *sched_tags;
+  unsigned long           queued;
+  unsigned long           run;
+#define BLK_MQ_MAX_DISPATCH_ORDER       7;
+  unsigned long           dispatched[BLK_MQ_MAX_DISPATCH_ORDER];
+  unsigned int            numa_node;
+  unsigned int            queue_num;
+  atomic_t nr_active;
+  struct hlist_node       cpuhp_online;
+  struct hlist_node       cpuhp_dead;
+  struct kobject          kobj;
+  unsigned long           poll_considered;
+  unsigned long           poll_invoked;
+  unsigned long           poll_success;
+#ifdef CONFIG_BLK_DEBUG_FS;
+  struct dentry           *debugfs_dir;
+  struct dentry           *sched_debugfs_dir;
+#endif;
+  struct list_head        hctx_list;
+  struct srcu_struct      srcu[];
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">{unnamed_struct}</span></code></dt><dd><p>匿名</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">lock</span></code></dt><dd><p>ディスパッチリストを保護します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dispatch</span></code></dt><dd><p>ハードウェアに送信できなかったが、リクエストが準備ができている状態を保持します（例：リソース不足など）。ドライバが新しいリクエストを送信できるようになったら、このリストのリクエストを優先的に送信して公平なディスパッチを行います。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">state</span></code></dt><dd><p>BLK_MQ_S_* フラグ。ハードウェアキューの状態（アクティブ、再起動予約、停止）を定義します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">run_work</span></code></dt><dd><p>後でハードウェアキューを実行するスケジューリングに使用されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cpumask</span></code></dt><dd><p>このhctxが実行可能なCPUのマップ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">next_cpu</span></code></dt><dd><p>blk_mq_hctx_next_cpu()がラウンドロビン方式でCPUを選択する際に使用されます。 <strong>cpumask</strong>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">next_cpu_batch</span></code></dt><dd><p>次のCPUに切り替える前のバッチに残っている作業数のカウンター。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">flags</span></code></dt><dd><p>BLK_MQ_F_* フラグ。キューの動作を定義します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">sched_data</span></code></dt><dd><p>リクエストキューに接続されたI/Oスケジューラが所有するポインタ。I/Oスケジューラがどのようにこのポインタを使用するかは、スケジューラの実装に依存します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">queue</span></code></dt><dd><p>このハードウェアコンテキストを所有するリクエストキューへのポインタ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">fq</span></code></dt><dd><p>フラッシュ操作を実行する必要があるリクエストのキュー。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">driver_data</span></code></dt><dd><p>このhctxを生成したブロックドライバーが所有するデータへのポインタ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ctx_map</span></code></dt><dd><p>ソフトウェアキューごとのビットマップ。ビットが立っている場合、そのソフトウェアキューに待機中のリクエストがあります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dispatch_from</span></code></dt><dd><p>スケジューラが選択されていない場合に使用するソフトウェアキュー。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dispatch_busy</span></code></dt><dd><p>blk_mq_update_dispatch_busy()が使用する数値。指数加重移動平均アルゴリズムにより、hw_queueがビジーかどうかを判定します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">type</span></code></dt><dd><p>HCTX_TYPE_* フラグ。ハードウェアキューのタイプ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">nr_ctx</span></code></dt><dd><p>ソフトウェアキューの数。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ctxs</span></code></dt><dd><p>ソフトウェアキューの配列。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dispatch_wait_lock</span></code></dt><dd><p>dispatch_waitキュー用のロック。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dispatch_wait</span></code></dt><dd><p>タグが利用不可な状態でリクエストを一時保存するための待機キュー。今後再度試みるために待機します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">wait_index</span></code></dt><dd><p>要求を挿入するための次の利用可能なdispatch_waitキューのインデックス。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">tags</span></code></dt><dd><p>ブロックドライバーが所有するタグ。リクエストがハードウェアキューからディスパッチされる際にのみ割り当てられます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">sched_tags</span></code></dt><dd><p>I/Oスケジューラが所有するタグ。リクエストキューにI/Oスケジューラが関連付けられている場合、リクエストが割り当てられる際にタグが割り当てられます。それ以外の場合はこのメンバは使用されません。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">queued</span></code></dt><dd><p>待機中のリクエストの数。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">run</span></code></dt><dd><p>ディスパッチされたリクエストの数。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dispatched</span></code></dt><dd><p>キューごとのディスパッチリクエスト数。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">numa_node</span></code></dt><dd><p>ストレージアダプターが接続されたNUMAノード。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">queue_num</span></code></dt><dd><p>このハードウェアキューのインデックス。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">nr_active</span></code></dt><dd><p>アクティブなリクエストの数。タグセットが複数のリクエストキューで共有されている場合にのみ使用されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cpuhp_online</span></code></dt><dd><p>CPUが終了する際、リクエストを一時保存するリスト。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cpuhp_dead</span></code></dt><dd><p>一部のCPUが終了した際、リクエストを一時保存するリスト。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">kobj</span></code></dt><dd><p>sysfs用のカーネルオブジェクト。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">poll_considered</span></code></dt><dd><p>呼び出し回数 <a class="reference internal" href="#c.blk_poll" title="blk_poll"><code class="xref c c-func docutils literal notranslate"><span class="pre">blk_poll()</span></code></a> が呼び出された回数。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">poll_invoked</span></code></dt><dd><p>リクエストの数 <a class="reference internal" href="#c.blk_poll" title="blk_poll"><code class="xref c c-func docutils literal notranslate"><span class="pre">blk_poll()</span></code></a> がポーリングされた回数。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">poll_success</span></code></dt><dd><p>ポーリングされたリクエストが完了した回数。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">debugfs_dir</span></code></dt><dd><p>このハードウェアキュー用のdebugfsディレクトリ。名前はcpu&lt;cpu_number&gt;とします。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">sched_debugfs_dir</span></code></dt><dd><p>スケジューラ用のdebugfsディレクトリ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">hctx_list</span></code></dt><dd><p>このhctxが使用されていない場合、これはq-&gt;unused_hctx_listのエントリです。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">srcu</span></code></dt><dd><p>スリープ可能なRCU。ハードウェアキューのタイプがブロッキング（BLK_MQ_F_BLOCKING）の場合にロックとして使用します。最後のメンバである必要があります - またblk_mq_hw_ctx_size()も参照してください。</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.blk_mq_queue_map">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">blk_mq_queue_map</span></span></span><a class="headerlink" href="#c.blk_mq_queue_map" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ソフトウェアキューをハードウェアキューにマッピングします。</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct blk_mq_queue_map {
+  unsigned int *mq_map;
+  unsigned int nr_queues;
+  unsigned int queue_offset;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">mq_map</span></code></dt><dd><p>CPU IDからハードウェアキューインデックスへのマッピング。これはnr_cpu_ids要素を持つ配列で、各要素の値は[<strong>queue_offset</strong>, <strong>queue_offset</strong> + <strong>nr_queues</strong>).</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">nr_queues</span></code></dt><dd><p>CPU IDをマッピングするハードウェアキューの数。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">queue_offset</span></code></dt><dd><p>マッピングする最初のハードウェアキュー。PCIe NVMeドライバーが各ハードウェアキュー型を（<a class="reference internal" href="#c.hctx_type" title="hctx_type"><code class="xref c c-enum docutils literal notranslate"><span class="pre">enum</span> <span class="pre">hctx_type</span></code></a>) にマッピングするために使用されます。</p>
+</dd>
+</dl>
+<dl class="c enum">
+<dt class="sig sig-object c" id="c.hctx_type">
+<span class="k"><span class="pre">enum</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">hctx_type</span></span></span><a class="headerlink" href="#c.hctx_type" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ハードウェアキューのタイプ</p>
+</dd></dl>
+<p><strong>定数</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">HCTX_TYPE_DEFAULT</span></code></dt><dd><p>他の手段でカウントされていないすべてのI/O。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">HCTX_TYPE_READ</span></code></dt><dd><p>読み込みI/O専用。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">HCTX_TYPE_POLL</span></code></dt><dd><p>すべての種類のポーリングI/O。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">HCTX_MAX_TYPES</span></code></dt><dd><p>hctxのタイプ数</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.blk_mq_tag_set">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">blk_mq_tag_set</span></span></span><a class="headerlink" href="#c.blk_mq_tag_set" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>リクエストキュー間で共有可能なタグセット</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct blk_mq_tag_set {
+  struct blk_mq_queue_map map[HCTX_MAX_TYPES];
+  unsigned int            nr_maps;
+  const struct blk_mq_ops *ops;
+  unsigned int            nr_hw_queues;
+  unsigned int            queue_depth;
+  unsigned int            reserved_tags;
+  unsigned int            cmd_size;
+  int numa_node;
+  unsigned int            timeout;
+  unsigned int            flags;
+  void *driver_data;
+  atomic_t active_queues_shared_sbitmap;
+  struct sbitmap_queue    __bitmap_tags;
+  struct sbitmap_queue    __breserved_tags;
+  struct blk_mq_tags      **tags;
+  struct mutex            tag_list_lock;
+  struct list_head        tag_list;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">map</span></code></dt><dd><p>1つまたは複数のctx -&gt; hctxマッピング。ドライバーがサポートするハードウェアキュー型（<a class="reference internal" href="#c.hctx_type" title="hctx_type"><code class="xref c c-enum docutils literal notranslate"><span class="pre">enum</span> <span class="pre">hctx_type</span></code></a>) ごとに1つのマップが存在します。マップのサイズが同じである必要はなく、型間でのマップの共有は完全に合法です。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">nr_maps</span></code></dt><dd><p>配列の <strong>map</strong> 要素数。範囲は[1, HCTX_MAX_TYPES]です。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ops</span></code></dt><dd><p>ブロックドライバーの動作を実装する関数ポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">nr_hw_queues</span></code></dt><dd><p>このデータ構造を所有するブロックドライバーがサポートするハードウェアキュー数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">queue_depth</span></code></dt><dd><p>ハードウェアキューごとのタグ数（予約タグを含む）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">reserved_tags</span></code></dt><dd><p>BLK_MQ_REQ_RESERVEDタグ割当に予約するタグ数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cmd_size</span></code></dt><dd><p>リクエストごとに割り当てる追加バイト数。ブロックドライバーがこれらの追加バイトを所有します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">numa_node</span></code></dt><dd><p>ストレージアダプターが接続されたNUMAノード。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">timeout</span></code></dt><dd><p>リクエスト処理のタイムアウト（ジャフィーズ単位）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">flags</span></code></dt><dd><p>ゼロまたは以上のBLK_MQ_F_*フラグ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">driver_data</span></code></dt><dd><p>このタグセットを生成したブロックドライバーが所有するデータへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">active_queues_shared_sbitmap</span></code></dt><dd><p>タグセットごとのアクティブなリクエストキュー数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">__bitmap_tags</span></code></dt><dd><p>すべてのhctxで共有されるタグのsbitmap</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">__breserved_tags</span></code></dt><dd><p>すべてのhctxで共有される予約タグのsbitmap</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">tags</span></code></dt><dd><p>タグセット。ハードウェアキューごとに1つのタグセット。持つ <strong>nr_hw_queues</strong>
+要素数。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">tag_list_lock</span></code></dt><dd><p>タグリストへのアクセスをシリアル化</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">tag_list</span></code></dt><dd><p>このタグセットを使用するリクエストキューの一覧。リクエストキュー.tag_set_listも参照してください。</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.blk_mq_queue_data">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">blk_mq_queue_data</span></span></span><a class="headerlink" href="#c.blk_mq_queue_data" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>キューに挿入されたリクエストに関するデータ</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct blk_mq_queue_data {
+  struct request *rq;
+  bool last;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">rq</span></code></dt><dd><p>リクエストポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">last</span></code></dt><dd><p>キュー内の最後のリクエストであるかどうか</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.blk_mq_ops">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">blk_mq_ops</span></span></span><a class="headerlink" href="#c.blk_mq_ops" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ブロックドライバーの動作を実装するコールバック関数</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct blk_mq_ops {
+  blk_status_t (*queue_rq)(struct blk_mq_hw_ctx *, const struct blk_mq_queue_data *);
+  void (*commit_rqs)(struct blk_mq_hw_ctx *);
+  bool (*get_budget)(struct request_queue *);
+  void (*put_budget)(struct request_queue *);
+  enum blk_eh_timer_return (*timeout)(struct request *, bool);
+  int (*poll)(struct blk_mq_hw_ctx *);
+  void (*complete)(struct request *);
+  int (*init_hctx)(struct blk_mq_hw_ctx *, void *, unsigned int);
+  void (*exit_hctx)(struct blk_mq_hw_ctx *, unsigned int);
+  int (*init_request)(struct blk_mq_tag_set *set, struct request *, unsigned int, unsigned int);
+  void (*exit_request)(struct blk_mq_tag_set *set, struct request *, unsigned int);
+  void (*initialize_rq_fn)(struct request *rq);
+  void (*cleanup_rq)(struct request *);
+  bool (*busy)(struct request_queue *);
+  int (*map_queues)(struct blk_mq_tag_set *set);
+#ifdef CONFIG_BLK_DEBUG_FS;
+  void (*show_rq)(struct seq_file *m, struct request *rq);
+#endif;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">queue_rq</span></code></dt><dd><p>ブロックI/Oから新しいリクエストをキューに登録する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">commit_rqs</span></code></dt><dd><p>ドライバーがbd-&gt;lastを使用してハードウェアへのリクエストを送信するタイミングを判断する場合、この関数を定義する必要があります。エラーによりリクエストの送信を停止する場合、このフックはハードウェアを再起動するための役割を果たします（最後のリクエストがそれを行うはずでした）。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">get_budget</span></code></dt><dd><p>.queue_rqが実行された後、予約された予算をドライバーが責任を持って解放する必要があります。また、.get_budgetの失敗処理を処理してI/Oのデッドロックを防ぐ必要があります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">put_budget</span></code></dt><dd><p>予約された予算を解放してください。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">timeout</span></code></dt><dd><p>リクエストのタイムアウト時に呼び出されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">poll</span></code></dt><dd><p>特定のタグの完了をポーリングするために呼び出されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">complete</span></code></dt><dd><p>リクエストを完了としてマークします。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">init_hctx</span></code></dt><dd><p>ハードウェアキューのブロックレイヤー側が設定されたときに呼び出され、ドライバがマッチング構造を割り当てるのを許可します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">exit_hctx</span></code></dt><dd><p>エクイット/テアダウントimingにも同様です。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">init_request</span></code></dt><dd><p>ブロックレイヤーが割り当てたすべてのコマンドに対して呼び出され、ドライバがドライバ固有データを設定するのを許可します。</p>
+<p>キュー_depth以上であるタグはフラッシュリクエストの設定に使用されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">exit_request</span></code></dt><dd><p>エクイット/テアダウントimingにも同様です。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">initialize_rq_fn</span></code></dt><dd><p>内部から呼び出されます <a class="reference internal" href="../core-api/kernel-api.html#c.blk_get_request" title="blk_get_request"><code class="xref c c-func docutils literal notranslate"><span class="pre">blk_get_request()</span></code></a>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cleanup_rq</span></code></dt><dd><p>完了していないリクエストを解放する前に呼び出され、通常はドライバプライベートデータの解放に使用されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">busy</span></code></dt><dd><p>設定されている場合、このキューが現在busyかどうかを返します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">map_queues</span></code></dt><dd><p>ドライバが自分のキュー割当を指定するには、setup-time関数を上書きしてmq_mapを構築するのを許可します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">show_rq</span></code></dt><dd><p>デバッグfs実装がリクエストに関するドライバ固有情報を表示するために使用されます。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.blk_mq_rq_state">
+<span class="k"><span class="pre">enum</span></span><span class="w"> </span><span class="n"><span class="pre">mq_rq_state</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">blk_mq_rq_state</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">リクエスト</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">rq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.blk_mq_rq_state" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>リクエストの現在のMQ_RQ_*状態を読み込みます</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">request</span> <span class="pre">*rq</span></code></dt><dd><p>ターゲットリクエスト。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.blk_mq_rq_from_pdu">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">リクエスト</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">blk_mq_rq_from_pdu</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">pdu</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.blk_mq_rq_from_pdu" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>PDUをリクエストにキャストします</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*pdu</span></code></dt><dd><p>キャストされるPDU（プロトコルデータユニット）</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>リクエスト</p>
+<p><strong>説明</strong></p>
+<p>ドライバコマンドデータはリクエストの直後にあります。リクエストサイズを引くことで元のリクエストに戻ります。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.blk_mq_rq_to_pdu">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">blk_mq_rq_to_pdu</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">リクエスト</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">rq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.blk_mq_rq_to_pdu" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>リクエストをPDUにキャストします</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">request</span> <span class="pre">*rq</span></code></dt><dd><p>キャストされるリクエスト</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>PDUへのポインタ</p>
+<p><strong>説明</strong></p>
+<p>ドライバコマンドデータはリクエストの直後にあります。リクエストに加算することでPDUを得ます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.blk_mq_quiesce_queue">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">blk_mq_quiesce_queue</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">request_queue</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">q</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.blk_mq_quiesce_queue" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>すべての進行中のディスパッチが完了するのを待機します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">request_queue</span> <span class="pre">*q</span></code></dt><dd><p>リクエストキュー。</p>
+</dd>
+</dl>
+<p><strong>注意</strong></p>
+<p>この関数は、struct requestのend_io()コールバック関数が呼び出されることを防ぐことはしません。この関数が返る後、キューがblk_mq_unquiesce_queue()でアンクイエスセッドされるまで、ディスパッチが起こらないことを保証します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.blk_mq_complete_request">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">blk_mq_complete_request</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">リクエスト</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">rq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.blk_mq_complete_request" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>リクエストのI/Oを終了します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">request</span> <span class="pre">*rq</span></code></dt><dd><p>処理中のリクエスト</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<blockquote>
+<div><p>-&gt;complete_rq操作をスケジュールしてリクエストを完了します。</p>
+</div></blockquote>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.blk_mq_start_request">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">blk_mq_start_request</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">リクエスト</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">rq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.blk_mq_start_request" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>リクエストの処理を開始します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">request</span> <span class="pre">*rq</span></code></dt><dd><p>開始されるリクエストへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>デバイスドライバがブロックレイヤーにリクエストが現在処理される通知を行うための関数で、ブロックレイヤーがタイムアウトタイマーや他の初期化処理を適切に行えるようにする。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.__blk_mq_run_hw_queue">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">__blk_mq_run_hw_queue</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.blk_mq_hw_ctx" title="blk_mq_hw_ctx"><span class="n"><span class="pre">blk_mq_hw_ctx</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">hctx</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.__blk_mq_run_hw_queue" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ハードウェアキューを実行する。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">blk_mq_hw_ctx</span> <span class="pre">*hctx</span></code></dt><dd><p>実行するハードウェアキューへのポインタ。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>待機中のリクエストをハードウェアに送信する。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.__blk_mq_delay_run_hw_queue">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">__blk_mq_delay_run_hw_queue</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.blk_mq_hw_ctx" title="blk_mq_hw_ctx"><span class="n"><span class="pre">blk_mq_hw_ctx</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">hctx</span></span>, <span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n"><span class="pre">非同期</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">ミリ秒</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.__blk_mq_delay_run_hw_queue" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ハードウェアキューを（スケジュールして）実行する。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">blk_mq_hw_ctx</span> <span class="pre">*hctx</span></code></dt><dd><p>実行するハードウェアキューへのポインタ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">async</span></code></dt><dd><p>キューを非同期で実行したい場合。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">msecs</span></code></dt><dd><p>キューを実行する前に待機する遅延時間（マイクロ秒単位）。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>もし <strong>!async</strong>, キューを即座に実行する。それ以外の場合は、キューを非同期で実行し、 <strong>ミリ秒</strong>.</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.blk_mq_delay_run_hw_queue">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">blk_mq_delay_run_hw_queue</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.blk_mq_hw_ctx" title="blk_mq_hw_ctx"><span class="n"><span class="pre">blk_mq_hw_ctx</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">hctx</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">ミリ秒</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.blk_mq_delay_run_hw_queue" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ハードウェアキューを非同期で実行する。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">blk_mq_hw_ctx</span> <span class="pre">*hctx</span></code></dt><dd><p>実行するハードウェアキューへのポインタ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">msecs</span></code></dt><dd><p>キューを実行する前に待機する遅延時間（マイクロ秒単位）。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ハードウェアキューを非同期で実行し、 <strong>ミリ秒</strong>.</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.blk_mq_run_hw_queue">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">blk_mq_run_hw_queue</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.blk_mq_hw_ctx" title="blk_mq_hw_ctx"><span class="n"><span class="pre">blk_mq_hw_ctx</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">hctx</span></span>, <span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n"><span class="pre">非同期</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.blk_mq_run_hw_queue" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ハードウェアキューの実行を開始する。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">blk_mq_hw_ctx</span> <span class="pre">*hctx</span></code></dt><dd><p>実行するハードウェアキューへのポインタ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">async</span></code></dt><dd><p>キューを非同期で実行したい場合。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>リクエストキューが停止状態でなければならず、送信すべき待機リクエストがある場合、キューを実行してハードウェアにリクエストを送信する。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.blk_mq_run_hw_queues">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">blk_mq_run_hw_queues</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">request_queue</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">q</span></span>, <span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n"><span class="pre">非同期</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.blk_mq_run_hw_queues" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>リクエストキュー内のすべてのハードウェアキューを実行する。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">request_queue</span> <span class="pre">*q</span></code></dt><dd><p>実行するリクエストキューへのポインタ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">async</span></code></dt><dd><p>キューを非同期で実行したい場合。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.blk_mq_delay_run_hw_queues">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">blk_mq_delay_run_hw_queues</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">request_queue</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">q</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">ミリ秒</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.blk_mq_delay_run_hw_queues" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>すべてのハードウェアキューを非同期で実行する。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">request_queue</span> <span class="pre">*q</span></code></dt><dd><p>実行するリクエストキューへのポインタ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">msecs</span></code></dt><dd><p>キューを実行する前に待機する遅延時間（マイクロ秒単位）。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.blk_mq_queue_stopped">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">blk_mq_queue_stopped</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">request_queue</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">q</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.blk_mq_queue_stopped" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>1つ以上のhctxが停止されているかを確認する。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">request_queue</span> <span class="pre">*q</span></code></dt><dd><p>リクエストキュー。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>呼び出し元は、blk_mq_{start,stop}_hw_queue()関数とこの関数をシリアル化して実行する責任がある。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.blk_mq_request_bypass_insert">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">blk_mq_request_bypass_insert</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">リクエスト</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">rq</span></span>, <span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n"><span class="pre">at_head</span></span>, <span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n"><span class="pre">run_queue</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.blk_mq_request_bypass_insert" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ディスパッチリストにリクエストを挿入する。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">request</span> <span class="pre">*rq</span></code></dt><dd><p>挿入するリクエストへのポインタ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">at_head</span></code></dt><dd><p>リクエストをリストの先頭に挿入する場合はtrue。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">run_queue</span></code></dt><dd><p>リクエストを挿入後にハードウェアキューを実行するかどうか。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>呼び出し元がターゲットデバイスのIOスケジューラをバイパスしたいことを知っている場合にのみ慎重に使用する。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.blk_mq_try_issue_directly">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">blk_mq_try_issue_directly</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.blk_mq_hw_ctx" title="blk_mq_hw_ctx"><span class="n"><span class="pre">blk_mq_hw_ctx</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">hctx</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">リクエスト</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">rq</span></span>, <span class="n"><span class="pre">blk_qc_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">cookie</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.blk_mq_try_issue_directly" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>デバイスドライバに直接リクエストを送信しようとします。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">blk_mq_hw_ctx</span> <span class="pre">*hctx</span></code></dt><dd><p>関連するハードウェアキューのポインタ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">request</span> <span class="pre">*rq</span></code></dt><dd><p>送信するリクエストのポインタ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">blk_qc_t</span> <span class="pre">*cookie</span></code></dt><dd><p>リクエストキュークッキー。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>デバイスが十分なリソースを有して新しいリクエストを受け入れることができる場合、直接デバイスドライバにリクエストを送信します。そうでない場合は、hctx-&gt;dispatchキューに挿入し、今後別のタイミングで送信を試みます。このキューに挿入されたリクエストは優先度が高いです。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.blk_mq_submit_bio">
+<span class="n"><span class="pre">blk_qc_t</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">blk_mq_submit_bio</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.blk_mq_submit_bio" title="bio"><span class="n"><span class="pre">bio</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">bio</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.blk_mq_submit_bio" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ブロックデバイスにリクエストを作成して送信します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">bio</span> <span class="pre">*bio</span></code></dt><dd><p>bioポインタ。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>リクエスト構造体を構築します <strong>q</strong> および <strong>bio</strong> デバイスに送信します。リクエストが他のリクエストとマージ可能である場合、またはこのキューにリクエストをプラグキューに配置して今後のマージを可能にしたい場合、またはこのキューにIOスケジューラがアクティブである場合、リクエストは直接ハードウェアキューにキュー込まれません。</p>
+<p>bioにエラーがある場合、またはリクエスト作成時にエラーがある場合、リクエストをキューに入れません。</p>
+<p><strong>戻り値</strong></p>
+<p>リクエストキュークッキー。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.blk_poll">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">blk_poll</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">request_queue</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">q</span></span>, <span class="n"><span class="pre">blk_qc_t</span></span><span class="w"> </span><span class="n"><span class="pre">cookie</span></span>, <span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n"><span class="pre">スピン</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.blk_poll" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>IO完了のポーリング</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">request_queue</span> <span class="pre">*q</span></code></dt><dd><p>キュー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">blk_qc_t</span> <span class="pre">cookie</span></code></dt><dd><p>IO送信時のクッキー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">spin</span></code></dt><dd><p>完了のポーリングを行うかどうか</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<blockquote>
+<div><p>渡されたキューの完了をポーリングします。見つかった完了したエントリ数を返します。もし <strong>スピン</strong> trueの場合、blk_pollは少なくとも1つの完了が見つかるまでループし続けます。ただし、タスクが他の方法で実行中としてマークされている場合（または再スケジューリングが必要な場合）は除きます。</p>
+</div></blockquote>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">ブロック</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="bfq-iosched.html">BFQ（Budget Fair Queueing）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="biodoc.html">Linux 2.5におけるジェネリックブロックレイヤーの再実装に関するノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="biovecs.html">変更不可能なbiovecsとbiovecイテレータ</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">マルチキュー・ブロックIOキューイングメカニズム (blk-mq)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="capability.html">ジェネリックブロックデバイスの機能</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cmdline-partition.html">埋め込みデバイスコマンドラインパーティション解析</a></li>
+<li class="toctree-l2"><a class="reference internal" href="data-integrity.html">データの整合性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deadline-iosched.html">デッドラインIOスケジューラのチューニングパラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="inline-encryption.html">インライン暗号化</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ioprio.html">ブロックIOの優先度</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kyber-iosched.html">Kyber I/Oスケジューラのチューニングパラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="null_blk.html">ヌルブロックデバイスドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pr.html">ブロックレイヤーによる永続的予約のサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="queue-sysfs.html">キュー・sysfsファイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="request.html">struct requestドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="stat.html">ブロックレイヤー統計情報は /sys/block/&lt;dev&gt;/stat にあります</a></li>
+<li class="toctree-l2"><a class="reference internal" href="switching-sched.html">スケジューラの切り替え</a></li>
+<li class="toctree-l2"><a class="reference internal" href="writeback_cache_control.html">明示的な揮発性ライトバックキャッシュ制御</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">ブロック</a><ul>
+<li>前へ: <a href="biovecs.html" title="前章">変更不可能なbiovecsとbiovecイテレータ</a></li>
+<li>次へ: <a href="capability.html" title="次章">ジェネリックブロックデバイスの機能</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/block/blk-mq.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

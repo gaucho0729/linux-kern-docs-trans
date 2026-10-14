@@ -1,0 +1,246 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>BPF ring buffer — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="../usb/index.html" rel="next" title="USBサポート"/>
+<link href="s390.html" rel="prev" title="s390でBPFをテストする"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="bpf-ring-buffer">
+<h1>BPFリングバッファ<a class="headerlink" href="#bpf-ring-buffer" title="この見出しへのパーマリンク">¶</a></h1>
+<p>このドキュメントでは、BPF ring bufferの設計、API、実装詳細について説明します。</p>
+<div class="contents local topic" id="contents">
+<ul class="simple">
+<li><p><a class="reference internal" href="#motivation" id="id1">動機</a></p></li>
+<li><p><a class="reference internal" href="#semantics-and-apis" id="id2">セマンティクスとAPI</a></p></li>
+<li><p><a class="reference internal" href="#design-and-implementation" id="id3">設計と実装</a></p></li>
+</ul>
+</div>
+<section id="motivation">
+<h2><a class="toc-backref" href="#id1">動機</a><a class="headerlink" href="#motivation" title="この見出しへのパーマリンク">¶</a></h2>
+<p>この作業の2つの主な動機は、既存のperf bufferでは満たされず、新しいring buffer実装の作成を促したものです。</p>
+<ul class="simple">
+<li><p>複数のCPU間でring bufferを共有することによりメモリ利用効率を向上させること;</p></li>
+<li><p>時間順に発生するイベントの順序を維持すること（複数のCPUをまたいでても、例えばタスクのfork/exec/exitイベントなど）。</p></li>
+</ul>
+<p>これらの2つの問題は独立していますが、perf bufferはどちらも満たしていません。どちらも、per-CPU perf ring bufferを選択した結果であり、どちらもMPSC（Multi-Producer Single-Consumer）実装のring bufferで解決可能です。順序問題は、カーネル内でのカウント処理で技術的にはperf bufferでも解決可能ですが、最初の問題を解決するにはMPSCバッファが必要であり、その解決策は自動的に2番目の問題も解決します。</p>
+</section>
+<section id="semantics-and-apis">
+<h2><a class="toc-backref" href="#id2">セマンティクスとAPI</a><a class="headerlink" href="#semantics-and-apis" title="この見出しへのパーマリンク">¶</a></h2>
+<p>BPFプログラムに対して提示される単一のring bufferは、BPFマップの一種としてインスタンス化されます <code class="docutils literal notranslate"><span class="pre">BPF_MAP_TYPE_RINGBUF</span></code>。他の2つの代替案は検討されましたが、結局採用されませんでした。</p>
+<p>一つの方法は、 <code class="docutils literal notranslate"><span class="pre">BPF_MAP_TYPE_PERF_EVENT_ARRAY</span></code>と同様に、
+<code class="docutils literal notranslate"><span class="pre">BPF_MAP_TYPE_RINGBUF</span></code> が配列型のring bufferを表すことができるようにするものですが、「同じCPUのみ」のルールを強制しません。これは既存のperf bufferの使用と互換性が高いインターフェースですが、アプリケーションが任意のキーでring bufferを検索するより高度なロジックを必要とする場合に失敗します。
+<code class="docutils literal notranslate"><span class="pre">BPF_MAP_TYPE_HASH_OF_MAPS</span></code> これは現在のアプローチで解決しています。さらに、BPF ringbufのパフォーマンスを考慮すると、多くのユースケースでは単純な全CPUで共有される単一のring bufferを選択し、その場合現在のアプローチは過剰な設計となります。</p>
+<p>別のアプローチは、BPFマップに加えて、汎用的な「コンテナ」オブジェクトを表す新たな概念を導入する方法です。これはキー/値インターフェースや検索/更新/削除操作を必要としない場合もあります。このアプローチは観測性や検証器のサポートに必要な大量のインフラストラクチャを追加する必要があり、BPF開発者に新たな概念やlibbpfの新しい構文などを習得させる必要があります。しかし、結果としてマップを使用するアプローチと比べて追加のメリットは得られません。  <code class="docutils literal notranslate"><span class="pre">BPF_MAP_TYPE_RINGBUF</span></code>
+検索/更新/削除操作をサポートしていませんが、これと同様の機能は他のいくつかのマップタイプ（例：キュー、スタック；配列は削除をサポートしませんなど）でもありません。</p>
+<p>選ばれたアプローチは、既存のBPFマップインフラストラクチャ（カーネル内のintrospection API、libbpfのサポートなど）を再利用できるという利点があり、ユーザーに新しいオブジェクトタイプを学ばせる必要がないという親しみやすい概念、および既存のツール（bpftool）を活用できるという特徴があります。複数のCPUで1つのリングバッファを使用する一般的なシナリオでは、専用の「コンテナ」オブジェクトを使用する場合と同様にシンプルで直感的な設計が可能です。一方で、マップとしての性質により、map-in-mapsを組み合わせることで、複雑なアーキテクチャを実現できます。 <code class="docutils literal notranslate"><span class="pre">ARRAY_OF_MAPS</span></code> および <code class="docutils literal notranslate"><span class="pre">HASH_OF_MAPS</span></code> 1つのCPUごとにリングバッファを使用する（例：perfバッファの代替として）、またはタスクのtgidをハッシュキーとして使用して順序を保持しつつ競合を減らすリングバッファのハッシュ/シャーディングなど、幅広いトポロジーを実装できます。</p>
+<p>キーやバリューのサイズはゼロに強制されます。 <code class="docutils literal notranslate"><span class="pre">max_entries</span></code> リングバッファのサイズを指定するために使用され、2の累乗値でなければなりません。</p>
+<p>perfバッファ（<code class="docutils literal notranslate"><span class="pre">BPF_MAP_TYPE_PERF_EVENT_ARRAY</span></code>)と新しいBPFリングバッファセマンティクスには、いくつかの類似点があります：</p>
+<ul class="simple">
+<li><p>可変長レコード;</p></li>
+<li><p>リングバッファに空きがなくなった場合、予約は失敗し、ブロッキングは行われません;</p></li>
+<li><p>ユーザー空間アプリケーションが高速かつ容易に消費できるメモリマッピング可能なデータ領域;</p></li>
+<li><p>新規データのepoll通知;</p></li>
+<li><p>ただし、必要に応じて最低遅延を達成するための忙しいポーリングも可能です。</p></li>
+</ul>
+<p>BPFリングバッファはBPFプログラムに対して2つのAPIセットを提供します：</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">bpf_ringbuf_output()</span></code> データを <em>コピー</em> リングバッファから別の場所に移動する機能があり、これに類似した <code class="docutils literal notranslate"><span class="pre">bpf_perf_event_output()</span></code>;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">bpf_ringbuf_reserve()</span></code>/<code class="docutils literal notranslate"><span class="pre">bpf_ringbuf_commit()</span></code>/<code class="docutils literal notranslate"><span class="pre">bpf_ringbuf_discard()</span></code>
+APIは全体の処理を2段階に分割します。まず固定量の領域を予約し、成功した場合、リングバッファデータ領域内のデータポインタが返されます。BPFプログラムは配列/ハッシュマップ内のデータと同様に使用できます。準備が整ったら、このメモリはコミットまたは破棄されます。破棄はコミットと似ていますが、消費者がレコードを無視するようにします。</p></li>
+</ul>
+<p><code class="docutils literal notranslate"><span class="pre">bpf_ringbuf_output()</span></code> メモリコピーの追加コストが生じるというデメリットがありますが、 verifierが事前に分からない長さのレコードを送信できるため、柔軟性が高まります。また、 <code class="docutils literal notranslate"><span class="pre">bpf_perf_event_output()</span></code>に非常に近い仕様なので、移行を大幅に簡素化します。</p>
+<p><code class="docutils literal notranslate"><span class="pre">bpf_ringbuf_reserve()</span></code> リングバッファメモリに直接メモリポインタを提供することで、追加のメモリコピーを回避します。多くの場合、レコードはBPFスタック領域の許容サイズを上回るため、多くのプログラムではCPUごとの配列を一時的なヒープとして使用してサンプルを準備しています。bpf_ringbuf_reserve()はこの必要性を完全に回避します。ただし、代償として、 verifierがBPFプログラムが予約したレコード領域外のメモリにアクセスできないことを検証できるように、予約可能なメモリサイズは事前に定数として指定しなければなりません。bpf_ringbuf_output()は、追加のメモリコピーによりやや遅くなるものの、一部の適切でない用途にも対応します。
+<code class="docutils literal notranslate"><span class="pre">bpf_ringbuf_reserve()</span></code>.</p>
+<p>コミットと破棄の違いは非常に小さく、破棄はレコードを破棄済みとしてマークするだけです。このようなレコードは消費者コードによって無視されるべきです。破棄は、すべてのレコードを一括して送信する必要があるなど、一部の高度な用途で役立ちます。あるいは、一時的な...
+<code class="docutils literal notranslate"><span class="pre">malloc()</span></code>/<code class="docutils literal notranslate"><span class="pre">free()</span></code> シングルBPFプログラム呼び出し内で。</p>
+<p>各予約レコードは、既存の参照トラッキングロジックを通じてverifierによって追跡されます。これはソケット参照トラッキングと同様です。したがって、レコードを予約した後で忘れてしまって（または破棄して）しまうことは不可能です。</p>
+<p><code class="docutils literal notranslate"><span class="pre">bpf_ringbuf_query()</span></code> ヘルパーはリングバッファのさまざまなプロパティを照会できます。現在は4つのプロパティがサポートされています：</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">BPF_RB_AVAIL_DATA</span></code> リングバッファ内の未消費データ量を返します;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">BPF_RB_RING_SIZE</span></code> リングバッファのサイズを返します;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">BPF_RB_CONS_POS</span></code>/<code class="docutils literal notranslate"><span class="pre">BPF_RB_PROD_POS</span></code> 消費者/プロデューサーの現在の論理的位置をそれぞれ返します。</p></li>
+</ul>
+<p>返された値はリングバッファ状態の一時的なスナップショットであり、ヘルパーが返るまでに状態が変化する可能性があるため、この機能はデバッグ/レポート目的や、一部の特性の変化が激しい性質を考慮したヒューリスティクスの実装にのみ使用すべきです。</p>
+<p>このようなヒューリスティクスは、リングバッファ内の新しいデータの可用性に関するpoll/epoll通知のより細かい制御を含む場合があります。これに加えて、
+<code class="docutils literal notranslate"><span class="pre">BPF_RB_NO_WAKEUP</span></code>/<code class="docutils literal notranslate"><span class="pre">BPF_RB_FORCE_WAKEUP</span></code> 出力/コミット/破棄ヘルパーのフラグを通じて、BPFプログラムは高い制御度を実現でき、例えばより効率的なバッチ通知を実現できます。ただし、デフォルトの自己バランス戦略はほとんどのアプリケーションにとって十分で、すでに信頼性と効率性が確保されています。</p>
+</section>
+<section id="design-and-implementation">
+<h2><a class="toc-backref" href="#id3">設計と実装</a><a class="headerlink" href="#design-and-implementation" title="この見出しへのパーマリンク">¶</a></h2>
+<p>この予約/コミットスキーマは、複数のプロデューサー（異なるCPU上でも、あるいは同じCPU/同じBPFプログラム内でも）が独立したレコードを予約し、他のプロデューサーの動作をブロックせずに処理できる自然な方法を提供します。これは、BPFプログラムが同じリングバッファを共有する他のBPFプログラムによって中断された場合でも、十分な空き容量があれば両方がレコードを予約し、それぞれ独立して処理・コミットできるということを意味します。これはNMI（非マスク可能割込み）コンテキストにも適用されますが、予約時にスピンロックを使用するため、NMIコンテキストでは <code class="docutils literal notranslate"><span class="pre">bpf_ringbuf_reserve()</span></code> ロックを取得できず、リングバッファが満杯でないにもかかわらず予約が失敗する可能性があります。</p>
+<p>リングバッファ自体は、2の累乗サイズの環状バッファとして内部的に実装されており、2つの論理的な増分を伴うカウンター（32ビットアーキテクチャではラップアラウンドする可能性がありますが、問題ではありません）を持っています：</p>
+<ul class="simple">
+<li><p>コンシューマー・カウンターは、コンシューマーがデータを消費した論理的な位置を示します；</p></li>
+<li><p>プロデューサー・カウンターは、すべてのプロデューサーが予約したデータ量を示します。</p></li>
+</ul>
+<p>レコードが予約されるたびに、そのレコードを「所有」するプロデューサーがプロデューサー・カウンターを成功裏に進めるため、データが実際に消費可能になるのはその時点ではありません。各レコードには8バイトのヘッダがあり、予約されたレコードの長さ、および2つの追加ビット（busyビットとdiscardビット）を含みます。busyビットはレコードがまだ処理中であることを示し、discardビットはコミット時にレコードが破棄された場合に設定される可能性があります。後者の場合、コンシューマーはそのレコードをスキップし、次のレコードに進む必要があります。レコードヘッダには、リングバッファのデータ領域の開始位置からの相対オフセット（ページ単位）もエンコードされており、これにより <code class="docutils literal notranslate"><span class="pre">bpf_ringbuf_commit()</span></code>/<code class="docutils literal notranslate"><span class="pre">bpf_ringbuf_discard()</span></code> レコード自体へのポインタのみを受信可能にし、リングバッファへのポインタを必要としなくなります。リングバッファのメモリ位置はレコードメタデータヘッダから復元されます。これにより検証器の複雑さが大幅に軽減され、APIの利用性も向上します。</p>
+<p>プロデューサー・カウンターのインクリメントはスピンロックの下でシリアル化されるため、予約には厳密な順序があります。一方、コミットは完全にロックレスで独立しています。すべてのレコードは、前のレコードがすでにコミットされた後にコンシューマーに利用可能になりますが、予約順序に従います。そのため、遅いプロデューサーが後続の予約をしたレコードを一時的に保持する可能性があります。</p>
+<p>データ領域が仮想メモリ内で連続して2回マッピングされる仕組みは、プロダクションとコンシューマーの実装を大幅に簡素化（速度も向上）させます。これにより、環状バッファのデータ領域末尾でラップするサンプルに対処する特別な処理が不要になります。最後のデータページの次のページが最初のデータページに戻るため、仮想メモリでは依然として連続した状態を保ちます。この仕組みを視覚的に示すASCII図とコメントを確認してください <code class="docutils literal notranslate"><span class="pre">bpf_ringbuf_area_alloc()</span></code>.</p>
+<p>BPF ringbufがperf ring bufferと異なる特徴の一つは、新規データの利用可能になるタイミングを自動調整する自己制御型の通知機能です。
+<code class="docutils literal notranslate"><span class="pre">bpf_ringbuf_commit()</span></code> 実装では、コンシューマーがコミットされたレコードまで追い付いた時点でのみ、新規レコードの利用可能通知を送信します。追い付いていない場合でもコンシューマーは自動的にデータを取得するため、追加のポーリング通知は不要です。ベンチマーク（tools/testing/selftests/bpf/benchs/bench_ringbufs.cを参照）では、perfバッファで必要となる「N番目のサンプルごとに通知する」ようなトリックを必要とせず、非常に高いスループットを達成できます。極端なケースでは、BPFプログラムが通知の手動制御を必要とする場合、commit/discard/outputヘルパ関数が受け取るフラグによってデータ利用可能通知を完全に制御できます <code class="docutils literal notranslate"><span class="pre">BPF_RB_NO_WAKEUP</span></code> および
+<code class="docutils literal notranslate"><span class="pre">BPF_RB_FORCE_WAKEUP</span></code> これらのフラグは通知制御に完全な自由度を提供しますが、APIの使用には注意と慎重な取り扱いが求められます</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">BPFドキュメンテーション</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#bpf-type-format-btf">BPF Type Format (BTF)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#frequently-asked-questions-faq">よくある質問 (FAQ)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#helper-functions">ヘルパー関数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#program-types">プログラムタイプ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#map-types">マップタイプ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#testing-and-debugging-bpf">BPFのテストとデバッグ</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#other">その他</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">BPFドキュメンテーション</a><ul>
+<li>前へ: <a href="s390.html" title="前章">s390でBPFをテストする</a></li>
+<li>次へ: <a href="../usb/index.html" title="次章">USBサポート</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/bpf/ringbuf.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

@@ -1,0 +1,427 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>メモリタグ拡張機能（MTE）のAArch64 Linuxにおける実装 — Linux Kernelドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="perf.html" rel="next" title="パフォーマンスイベント属性"/>
+<link href="memory.html" rel="prev" title="AArch64 Linuxにおけるメモリレイアウト"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="memory-tagging-extension-mte-in-aarch64-linux">
+<h1>AArch64 Linuxにおけるメモリタグ拡張（MTE）<a class="headerlink" href="#memory-tagging-extension-mte-in-aarch64-linux" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="simple">
+<dt>著者: Vincenzo Frascino &lt;<a class="reference external" href="mailto:vincenzo.frascino%40arm.com">vincenzo<span>.</span>frascino<span>@</span>arm<span>.</span>com</a>&gt;</dt><dd><p>Catalin Marinas &lt;<a class="reference external" href="mailto:catalin.marinas%40arm.com">catalin<span>.</span>marinas<span>@</span>arm<span>.</span>com</a>&gt;</p>
+</dd>
+</dl>
+<p>日付: 2020-02-25</p>
+<p>このドキュメントでは、AArch64 Linuxにおけるメモリタグ拡張機能（MTE）の実装について説明します。</p>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ARMv8.5ベースのプロセッサは、メモリタグ拡張機能（MTE）を導入しています。MTEはARMv8.0の仮想アドレスタグ付けTBI（Top Byte Ignore）機能に基づき構築され、ソフトウェアが物理アドレス空間の16バイト単位のグランルごとに4ビットの割当タグにアクセスできるようにします。このようなメモリ範囲はNormal-Taggedメモリ属性でマッピングする必要があります。論理タグは、メモリアクセスに使用される仮想アドレスのビット59〜56から導出されます。MTEが有効なCPUは論理タグと割当タグを比較し、システムレジスタの設定に応じて不一致時に例外を発生させることがあります。</p>
+</section>
+<section id="userspace-support">
+<h2>ユーザースペースのサポート<a class="headerlink" href="#userspace-support" title="この見出しへのパーマリンク">¶</a></h2>
+<p>が呼ばれるとき、modprobeは <code class="docutils literal notranslate"><span class="pre">CONFIG_ARM64_MTE</span></code> PROT_MTEフラグが選択され、ハードウェアがMTEをサポートしている場合、カーネルはユーザースペースにこの機能を宣伝します。 <code class="docutils literal notranslate"><span class="pre">HWCAP2_MTE</span></code>.</p>
+<section id="prot-mte">
+<h3>PROT_MTE<a class="headerlink" href="#prot-mte" title="この見出しへのパーマリンク">¶</a></h3>
+<p>割当タグにアクセスするには、ユーザープロセスは新しいフラグを使用してアドレス範囲にタグメモリ属性を有効にする必要があります。 <code class="docutils literal notranslate"><span class="pre">prot</span></code> フラグ
+<code class="docutils literal notranslate"><span class="pre">mmap()</span></code> および <code class="docutils literal notranslate"><span class="pre">mprotect()</span></code>:</p>
+<p><code class="docutils literal notranslate"><span class="pre">PROT_MTE</span></code> - ページはMTE割当タグにアクセスできます。</p>
+<p>このようなページがユーザーアドレス空間に最初にマッピングされる際、割当タグは0に設定され、コピーオンライト時に保持されます。 <code class="docutils literal notranslate"><span class="pre">MAP_SHARED</span></code> 共有がサポートされ、プロセス間で割当タグを共有できます。</p>
+<p><strong>注意</strong>: <code class="docutils literal notranslate"><span class="pre">PROT_MTE</span></code> はのみサポートされており、 <code class="docutils literal notranslate"><span class="pre">MAP_ANONYMOUS</span></code> RAMベースのファイルマッピング（<code class="docutils literal notranslate"><span class="pre">tmpfs</span></code>, <code class="docutils literal notranslate"><span class="pre">memfd</span></code>）にのみ適用されます。他のマッピングタイプに渡すと、 <code class="docutils literal notranslate"><span class="pre">-EINVAL</span></code> がこれらのシステムコールによって返されます。</p>
+<p><strong>注意</strong>: フラグ（および対応するメモリタイプ）は、 <code class="docutils literal notranslate"><span class="pre">PROT_MTE</span></code> メモリ範囲で <code class="docutils literal notranslate"><span class="pre">mprotect()</span></code>.</p>
+<p><strong>注意</strong>: <code class="docutils literal notranslate"><span class="pre">madvise()</span></code> を持つメモリ範囲は、システムコール後いつでも割当タグがクリアされる（0に設定される）可能性があります。 <code class="docutils literal notranslate"><span class="pre">MADV_DONTNEED</span></code> および
+<code class="docutils literal notranslate"><span class="pre">MADV_FREE</span></code> タグチェックエラー</p>
+</section>
+<section id="tag-check-faults">
+<h3>アドレス範囲でMTEが有効化されており、アクセス時に論理タグと割当タグの不一致が発生した場合、3つの設定可能な動作があります：<a class="headerlink" href="#tag-check-faults" title="この見出しへのパーマリンク">¶</a></h3>
+<p>が呼ばれるとき、modprobeは <code class="docutils literal notranslate"><span class="pre">PROT_MTE</span></code> 無視</p>
+<ul class="simple">
+<li><p><em>- これはデフォルトモードです。CPU（およびカーネル）はタグチェックエラーを無視します。</em> 同期的</p></li>
+<li><p><em>- カーネルは、</em> を同期的に発生させ、 <code class="docutils literal notranslate"><span class="pre">SIGSEGV</span></code> で処理します。メモリアクセスは実行されません。もし
+<code class="docutils literal notranslate"><span class="pre">.si_code</span> <span class="pre">=</span> <span class="pre">SEGV_MTESERR</span></code> および <code class="docutils literal notranslate"><span class="pre">.si_addr</span> <span class="pre">=</span> <span class="pre">&lt;fault-address&gt;</span></code>が無視されたり、違反スレッドによってブロックされたりすれば、含むプロセスは <code class="docutils literal notranslate"><span class="pre">SIGSEGV</span></code> で終了します。
+<code class="docutils literal notranslate"><span class="pre">coredump</span></code>.</p></li>
+<li><p><em>非同期的</em> を同期的に発生させ、 <code class="docutils literal notranslate"><span class="pre">SIGSEGV</span></code>、違反スレッドで、1つまたは複数のタグチェックエラー後に非同期的に発生します。このとき、 <code class="docutils literal notranslate"><span class="pre">.si_code</span> <span class="pre">=</span> <span class="pre">SEGV_MTEAERR</span></code> および <code class="docutils literal notranslate"><span class="pre">.si_addr</span> <span class="pre">=</span> <span class="pre">0</span></code> （エラー発生アドレスは不明です）。</p></li>
+</ul>
+<p>ユーザーは、以下のモードをスレッドごとにシステムコールで選択できます。
+<code class="docutils literal notranslate"><span class="pre">prctl(PR_SET_TAGGED_ADDR_CTRL,</span> <span class="pre">flags,</span> <span class="pre">0,</span> <span class="pre">0,</span> <span class="pre">0)</span></code> システムコールで <code class="docutils literal notranslate"><span class="pre">flags</span></code>
+以下の値のうち、任意の数を含む <code class="docutils literal notranslate"><span class="pre">PR_MTE_TCF_MASK</span></code>
+ビットフィールド:</p>
+<ul class="simple">
+<li><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">PR_MTE_TCF_NONE</span></code>  - <em>- これはデフォルトモードです。CPU（およびカーネル）はタグチェックエラーを無視します。</em> タグチェックエラー</dt><dd><p>(他のオプションと組み合わせた場合、無視されます)</p>
+</dd>
+</dl>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">PR_MTE_TCF_SYNC</span></code>  - <em>- カーネルは、</em> タグチェックエラーモード</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">PR_MTE_TCF_ASYNC</span></code> - <em>非同期的</em> タグチェックエラーモード</p></li>
+</ul>
+<p>モードが指定されていない場合、タグチェックエラーは無視されます。単一のモードが指定されている場合、プログラムはそのモードで実行されます。複数のモードが指定されている場合、下記の「各CPUごとの推奨タグチェックモード」セクションで説明するようにモードが選択されます。</p>
+<p>現在のタグチェックエラーモードは、
+<code class="docutils literal notranslate"><span class="pre">prctl(PR_GET_TAGGED_ADDR_CTRL,</span> <span class="pre">0,</span> <span class="pre">0,</span> <span class="pre">0,</span> <span class="pre">0)</span></code> システムコールで読み取ることができます。</p>
+<p>ユーザースレッドに対してタグチェックを無効化することも、
+<code class="docutils literal notranslate"><span class="pre">PSTATE.TCO</span></code> ビットを設定することで可能です。 <code class="docutils literal notranslate"><span class="pre">MSR</span> <span class="pre">TCO,</span> <span class="pre">#1</span></code>.</p>
+<p><strong>注意</strong>: シグナルハンドラは常に <code class="docutils literal notranslate"><span class="pre">PSTATE.TCO</span> <span class="pre">=</span> <span class="pre">0</span></code>で呼び出されます。中断されたコンテキストとは関係ありません。 <code class="docutils literal notranslate"><span class="pre">PSTATE.TCO</span></code> は、
+<code class="docutils literal notranslate"><span class="pre">sigreturn()</span></code>.</p>
+<p><strong>注意</strong>: ユーザーアプリケーションに割り当て可能な <em>マッチアリの</em> 論理タグは存在しません。</p>
+<p><strong>注意</strong>: カーネルがユーザーアドレス空間（例: <code class="docutils literal notranslate"><span class="pre">read()</span></code>
+システムコール）にアクセスする際、ユーザースレッドのタグチェックモードが
+<code class="docutils literal notranslate"><span class="pre">PR_MTE_TCF_NONE</span></code> または <code class="docutils literal notranslate"><span class="pre">PR_MTE_TCF_ASYNC</span></code>の場合、チェックが行われません。タグチェックモードが
+<code class="docutils literal notranslate"><span class="pre">PR_MTE_TCF_SYNC</span></code>カーネルはユーザー アドレス アクセスを最大限の努力でチェックしますが、常に保証することはできません。ユーザー アドレスへのアクセスは常に有効値がゼロで行われます。 <code class="docutils literal notranslate"><span class="pre">PSTATE.TCO</span></code>
+ユーザーの設定に関係なく、有効値がゼロです。</p>
+</section>
+<section id="excluding-tags-in-the-irg-addg-and-subg-instructions">
+<h3>インストラクションにおけるタグの除外 <code class="docutils literal notranslate"><span class="pre">IRG</span></code>, <code class="docutils literal notranslate"><span class="pre">ADDG</span></code> および <code class="docutils literal notranslate"><span class="pre">SUBG</span></code> インストラクション<a class="headerlink" href="#excluding-tags-in-the-irg-addg-and-subg-instructions" title="この見出しへのパーマリンク">¶</a></h3>
+<p>アーキテクチャは、レジスタ ビットフィールドを介して特定のタグをランダムに生成して除外することを許可します。デフォルトでは、Linux は 0 以外のすべてのタグを除外します。ユーザー スレッドは、ランダムに生成されたセット内で特定のタグを有効にすることができます。 <code class="docutils literal notranslate"><span class="pre">GCR_EL1.Exclude</span></code> ビットフィールドにタグ ビットマップを含みます。 <code class="docutils literal notranslate"><span class="pre">prctl(PR_SET_TAGGED_ADDR_CTRL,</span>
+<span class="pre">flags,</span> <span class="pre">0,</span> <span class="pre">0,</span> <span class="pre">0)</span></code> システムコールで <code class="docutils literal notranslate"><span class="pre">flags</span></code> ハードウェアは除外マスクを使用しますが、インターフェースはインクルードマスクを提供します。インクルードマスクの <code class="docutils literal notranslate"><span class="pre">PR_MTE_TAG_MASK</span></code> (除外マスク</p>
+<p><strong>注意</strong>) は CPU が常にタグを生成する結果になります。 <code class="docutils literal notranslate"><span class="pre">prctl()</span></code>
+Per-CPU 推奨タグチェックモード <code class="docutils literal notranslate"><span class="pre">0</span></code> 一部の CPU では、MTE の厳格なタグチェックモードのパフォーマンスは、緩いタグチェックモードとほぼ同じです。これにより、緩いチェックモードが要求される場合でも、厳格なチェックのエラー検出の利点を得るため、厳格なチェックを有効にするのが有益です。このシナリオをサポートするために、特権ユーザーは CPU の推奨タグチェックモードとして厳格なチェックモードを設定できます。 <code class="docutils literal notranslate"><span class="pre">0xffff</span></code>各 CPU の推奨タグチェックモードは <code class="docutils literal notranslate"><span class="pre">0</span></code>.</p>
+</section>
+<section id="per-cpu-preferred-tag-checking-mode">
+<h3>に制御され、特権ユーザーはその値を設定できます。<a class="headerlink" href="#per-cpu-preferred-tag-checking-mode" title="この見出しへのパーマリンク">¶</a></h3>
+<p>各 CPU のデフォルトの推奨モードは</p>
+<p>プログラムが CPU の推奨タグチェックモードで実行される可能性を許可するには、ユーザー プログラムは、
+<code class="docutils literal notranslate"><span class="pre">/sys/devices/system/cpu/cpu&lt;N&gt;/mte_tcf_preferred</span></code>引数に複数のタグチェックエラー モード ビットを設定できます。 <code class="docutils literal notranslate"><span class="pre">async</span></code> または <code class="docutils literal notranslate"><span class="pre">sync</span></code>引数に複数のタグチェックエラー モード ビットを設定できます。 <code class="docutils literal notranslate"><span class="pre">async</span></code>.</p>
+<p>引数に複数のタグチェックエラー モード ビットを設定できます。 <code class="docutils literal notranslate"><span class="pre">flags</span></code> 引数に複数のタグチェックエラー モード ビットを設定できます。 <code class="docutils literal notranslate"><span class="pre">prctl(PR_SET_TAGGED_ADDR_CTRL,</span>
+<span class="pre">flags,</span> <span class="pre">0,</span> <span class="pre">0,</span> <span class="pre">0)</span></code> システムコール。CPUの好ましいタグチェックモードがタスクの提供されたタグチェックモードのセットに含まれている場合（現在は常にそのようになりますが、今後はカーネルがより多くのモードをサポートする可能性があります）、そのモードが選択されます。そうでない場合、タスクのモードセット内のモードのうちの1つが現在未定義の方法で選択されます。</p>
+</section>
+<section id="initial-process-state">
+<h3>初期プロセス状態<a class="headerlink" href="#initial-process-state" title="この見出しへのパーマリンク">¶</a></h3>
+<p>オン <code class="docutils literal notranslate"><span class="pre">execve()</span></code>、新しいプロセスは以下の設定を持ちます：</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">PR_TAGGED_ADDR_ENABLE</span></code> 0に設定（無効）</p></li>
+<li><p>タグチェックモードが選択されていない（タグチェックエラーは無視される）</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">PR_MTE_TAG_MASK</span></code> 0に設定（すべてのタグが除外される）</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">PSTATE.TCO</span></code> 0に設定</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">PROT_MTE</span></code> 初期メモリマップのいずれにも設定されていない</p></li>
+</ul>
+<p>オン <code class="docutils literal notranslate"><span class="pre">fork()</span></code>、新しいプロセスは親プロセスの設定とメモリマップ属性を継承します（ただし、 <code class="docutils literal notranslate"><span class="pre">madvise()</span></code> 範囲の <code class="docutils literal notranslate"><span class="pre">MADV_WIPEONFORK</span></code> はデータとタグがクリアされ（0に設定される）ます。</p>
+</section>
+<section id="the-ptrace-interface">
+<h3>以下の <code class="docutils literal notranslate"><span class="pre">ptrace()</span></code> インターフェース<a class="headerlink" href="#the-ptrace-interface" title="この見出しへのパーマリンク">¶</a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">PTRACE_PEEKMTETAGS</span></code> および <code class="docutils literal notranslate"><span class="pre">PTRACE_POKEMTETAGS</span></code> トレーサーがトレース対象プロセスのアドレス空間からタグを読み取るか、タグを設定できるようにします。この
+<code class="docutils literal notranslate"><span class="pre">ptrace()</span></code> システムコールは、 <code class="docutils literal notranslate"><span class="pre">ptrace(request,</span> <span class="pre">pid,</span> <span class="pre">addr,</span>
+<span class="pre">data)</span></code> where:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">request</span></code> - トレース対象プロセスのPIDのうちの1つ。 <code class="docutils literal notranslate"><span class="pre">PTRACE_PEEKMTETAGS</span></code> または <code class="docutils literal notranslate"><span class="pre">PTRACE_POKEMTETAGS</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">pid</span></code> - トレース対象プロセスのアドレス空間内のアドレス。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">addr</span></code> - トレース対象プロセスのアドレス空間内のアドレス。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">data</span></code> - トレース対象プロセスのアドレス空間内のアドレス。 <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">iovec</span></code> オプションを指定する必要があります。形式は以下の通りです： <code class="docutils literal notranslate"><span class="pre">iov_base</span></code> はトレース対象プロセスのアドレス空間内のアドレスを指します。 <code class="docutils literal notranslate"><span class="pre">iov_len</span></code> バッファの長さはトレース対象プロセスのアドレス空間内にあります。</p></li>
+</ul>
+<p>トレース対象プロセスのアドレス空間内のタグは、トレース元のバッファ内の4ビットのタグごとに1バイトとして表現され、トレース対象プロセスのアドレス空間内の16バイトのMTEタググランルに対応します。 <code class="docutils literal notranslate"><span class="pre">iov_base</span></code> ：もし</p>
+<p><strong>注意</strong>が16バイトのグランルにアライメントされていない場合、カーネルは対応するアライメントされたアドレスを使用します。 <code class="docutils literal notranslate"><span class="pre">addr</span></code> 戻り値：</p>
+<p><code class="docutils literal notranslate"><span class="pre">ptrace()</span></code> 0 - タグがコピーされ、トレース元の</p>
+<ul class="simple">
+<li><p>がコピーされたタグ数に更新されます。これは、トレース対象プロセスまたはトレース元のアドレス空間内の指定されたアドレス範囲がアクセス可能でない、または有効なタグを持たない場合、リクエストされた <code class="docutils literal notranslate"><span class="pre">iov_len</span></code> より小さくなる可能性があります。
+<code class="docutils literal notranslate"><span class="pre">iov_len</span></code> - 指定されたプロセスをトレースできません。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">-EPERM</span></code> - トレース対象プロセスのアドレス範囲がアクセスできません（例：無効なアドレス）で、タグがコピーされませんでした。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">-EIO</span></code> は更新されません。 <code class="docutils literal notranslate"><span class="pre">iov_len</span></code> - トレース元のメモリ（</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">-EFAULT</span></code> バッファ）にアクセスする際のエラー（<code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">iovec</span></code>
+または <code class="docutils literal notranslate"><span class="pre">iov_base</span></code> ）で、タグがコピーされませんでした。 <code class="docutils literal notranslate"><span class="pre">iov_len</span></code> - トレース元のメモリ（</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">-EOPNOTSUPP</span></code> - トレース対象プロセスのアドレスに有効なタグがありません（ <code class="docutils literal notranslate"><span class="pre">PROT_MTE</span></code> フラグでマップされていない）。 <code class="docutils literal notranslate"><span class="pre">iov_len</span></code> - トレース元のメモリ（</p></li>
+</ul>
+<p><strong>注意</strong>：上記のリクエストには一時的なエラーはなく、ユーザーのプログラムはシステムコールの戻り値がゼロでない場合でも再試行すべきではありません。</p>
+<p><code class="docutils literal notranslate"><span class="pre">PTRACE_GETREGSET</span></code> および <code class="docutils literal notranslate"><span class="pre">PTRACE_SETREGSET</span></code> with <code class="docutils literal notranslate"><span class="pre">addr</span> <span class="pre">==</span>
+<span class="pre">``NT_ARM_TAGGED_ADDR_CTRL</span></code> allow <code class="docutils literal notranslate"><span class="pre">ptrace()</span></code> プロセスのタグアドレスABI制御およびMTE設定へのアクセスを許可します。これは、
+<code class="docutils literal notranslate"><span class="pre">prctl()</span></code> で説明した
+<a class="reference internal" href="tagged-address-abi.html"><span class="doc">AArch64 TAGGED ADDRESS ABI</span></a> のオプションに従います。対応する
+<code class="docutils literal notranslate"><span class="pre">regset</span></code> は8バイトの要素1です(<code class="docutils literal notranslate"><span class="pre">sizeof(long))</span></code>).</p>
+</section>
+</section>
+<section id="example-of-correct-usage">
+<h2>正しい使用例<a class="headerlink" href="#example-of-correct-usage" title="この見出しへのパーマリンク">¶</a></h2>
+<p><em>MTE コード例</em></p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="cm">/*</span>
+<span class="cm"> * To be compiled with -march=armv8.5-a+memtag</span>
+<span class="cm"> */</span><span class="w"></span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;errno.h&gt;</span><span class="cp"></span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdint.h&gt;</span><span class="cp"></span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdio.h&gt;</span><span class="cp"></span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdlib.h&gt;</span><span class="cp"></span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;unistd.h&gt;</span><span class="cp"></span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;sys/auxv.h&gt;</span><span class="cp"></span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;sys/mman.h&gt;</span><span class="cp"></span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;sys/prctl.h&gt;</span><span class="cp"></span>
+
+<span class="cm">/*</span>
+<span class="cm"> * From arch/arm64/include/uapi/asm/hwcap.h</span>
+<span class="cm"> */</span><span class="w"></span>
+<span class="cp">#define HWCAP2_MTE              (1 &lt;&lt; 18)</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * From arch/arm64/include/uapi/asm/mman.h</span>
+<span class="cm"> */</span><span class="w"></span>
+<span class="cp">#define PROT_MTE                 0x20</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * From include/uapi/linux/prctl.h</span>
+<span class="cm"> */</span><span class="w"></span>
+<span class="cp">#define PR_SET_TAGGED_ADDR_CTRL 55</span>
+<span class="cp">#define PR_GET_TAGGED_ADDR_CTRL 56</span>
+<span class="cp"># define PR_TAGGED_ADDR_ENABLE  (1UL &lt;&lt; 0)</span>
+<span class="cp"># define PR_MTE_TCF_SHIFT       1</span>
+<span class="cp"># define PR_MTE_TCF_NONE        (0UL &lt;&lt; PR_MTE_TCF_SHIFT)</span>
+<span class="cp"># define PR_MTE_TCF_SYNC        (1UL &lt;&lt; PR_MTE_TCF_SHIFT)</span>
+<span class="cp"># define PR_MTE_TCF_ASYNC       (2UL &lt;&lt; PR_MTE_TCF_SHIFT)</span>
+<span class="cp"># define PR_MTE_TCF_MASK        (3UL &lt;&lt; PR_MTE_TCF_SHIFT)</span>
+<span class="cp"># define PR_MTE_TAG_SHIFT       3</span>
+<span class="cp"># define PR_MTE_TAG_MASK        (0xffffUL &lt;&lt; PR_MTE_TAG_SHIFT)</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Insert a random logical tag into the given pointer.</span>
+<span class="cm"> */</span><span class="w"></span>
+<span class="cp">#define insert_random_tag(ptr) ({                       \</span>
+<span class="cp">        uint64_t __val;                                 \</span>
+<span class="cp">        asm("irg %0, %1" : "=r" (__val) : "r" (ptr));   \</span>
+<span class="cp">        __val;                                          \</span>
+<span class="cp">})</span>
+
+<span class="cm">/*</span>
+<span class="cm"> * Set the allocation tag on the destination address.</span>
+<span class="cm"> */</span><span class="w"></span>
+<span class="cp">#define set_tag(tagged_addr) do {                                      \</span>
+<span class="cp">        asm volatile("stg %0, [%0]" : : "r" (tagged_addr) : "memory"); \</span>
+<span class="cp">} while (0)</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"></span>
+<span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">a</span><span class="p">;</span><span class="w"></span>
+<span class="w">        </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">page_sz</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">sysconf</span><span class="p">(</span><span class="n">_SC_PAGESIZE</span><span class="p">);</span><span class="w"></span>
+<span class="w">        </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">hwcap2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">getauxval</span><span class="p">(</span><span class="n">AT_HWCAP2</span><span class="p">);</span><span class="w"></span>
+
+<span class="w">        </span><span class="cm">/* check if MTE is present */</span><span class="w"></span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="n">hwcap2</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="n">HWCAP2_MTE</span><span class="p">))</span><span class="w"></span>
+<span class="w">                </span><span class="k">return</span><span class="w"> </span><span class="n">EXIT_FAILURE</span><span class="p">;</span><span class="w"></span>
+
+<span class="w">        </span><span class="cm">/*</span>
+<span class="cm">         * Enable the tagged address ABI, synchronous or asynchronous MTE</span>
+<span class="cm">         * tag check faults (based on per-CPU preference) and allow all</span>
+<span class="cm">         * non-zero tags in the randomly generated set.</span>
+<span class="cm">         */</span><span class="w"></span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">prctl</span><span class="p">(</span><span class="n">PR_SET_TAGGED_ADDR_CTRL</span><span class="p">,</span><span class="w"></span>
+<span class="w">                  </span><span class="n">PR_TAGGED_ADDR_ENABLE</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">PR_MTE_TCF_SYNC</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">PR_MTE_TCF_ASYNC</span><span class="w"> </span><span class="o">|</span><span class="w"></span>
+<span class="w">                  </span><span class="p">(</span><span class="mh">0xfffe</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="n">PR_MTE_TAG_SHIFT</span><span class="p">),</span><span class="w"></span>
+<span class="w">                  </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">))</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">                </span><span class="n">perror</span><span class="p">(</span><span class="s">"prctl() failed"</span><span class="p">);</span><span class="w"></span>
+<span class="w">                </span><span class="k">return</span><span class="w"> </span><span class="n">EXIT_FAILURE</span><span class="p">;</span><span class="w"></span>
+<span class="w">        </span><span class="p">}</span><span class="w"></span>
+
+<span class="w">        </span><span class="n">a</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mmap</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">page_sz</span><span class="p">,</span><span class="w"> </span><span class="n">PROT_READ</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">PROT_WRITE</span><span class="p">,</span><span class="w"></span>
+<span class="w">                 </span><span class="n">MAP_PRIVATE</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">MAP_ANONYMOUS</span><span class="p">,</span><span class="w"> </span><span class="mi">-1</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span><span class="w"></span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">a</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">MAP_FAILED</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">                </span><span class="n">perror</span><span class="p">(</span><span class="s">"mmap() failed"</span><span class="p">);</span><span class="w"></span>
+<span class="w">                </span><span class="k">return</span><span class="w"> </span><span class="n">EXIT_FAILURE</span><span class="p">;</span><span class="w"></span>
+<span class="w">        </span><span class="p">}</span><span class="w"></span>
+
+<span class="w">        </span><span class="cm">/*</span>
+<span class="cm">         * Enable MTE on the above anonymous mmap. The flag could be passed</span>
+<span class="cm">         * directly to mmap() and skip this step.</span>
+<span class="cm">         */</span><span class="w"></span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">mprotect</span><span class="p">(</span><span class="n">a</span><span class="p">,</span><span class="w"> </span><span class="n">page_sz</span><span class="p">,</span><span class="w"> </span><span class="n">PROT_READ</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">PROT_WRITE</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">PROT_MTE</span><span class="p">))</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">                </span><span class="n">perror</span><span class="p">(</span><span class="s">"mprotect() failed"</span><span class="p">);</span><span class="w"></span>
+<span class="w">                </span><span class="k">return</span><span class="w"> </span><span class="n">EXIT_FAILURE</span><span class="p">;</span><span class="w"></span>
+<span class="w">        </span><span class="p">}</span><span class="w"></span>
+
+<span class="w">        </span><span class="cm">/* access with the default tag (0) */</span><span class="w"></span>
+<span class="w">        </span><span class="n">a</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span><span class="w"></span>
+<span class="w">        </span><span class="n">a</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span><span class="w"></span>
+
+<span class="w">        </span><span class="n">printf</span><span class="p">(</span><span class="s">"a[0] = %hhu a[1] = %hhu</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">a</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span><span class="w"> </span><span class="n">a</span><span class="p">[</span><span class="mi">1</span><span class="p">]);</span><span class="w"></span>
+
+<span class="w">        </span><span class="cm">/* set the logical and allocation tags */</span><span class="w"></span>
+<span class="w">        </span><span class="n">a</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="p">)</span><span class="n">insert_random_tag</span><span class="p">(</span><span class="n">a</span><span class="p">);</span><span class="w"></span>
+<span class="w">        </span><span class="n">set_tag</span><span class="p">(</span><span class="n">a</span><span class="p">);</span><span class="w"></span>
+
+<span class="w">        </span><span class="n">printf</span><span class="p">(</span><span class="s">"%p</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">a</span><span class="p">);</span><span class="w"></span>
+
+<span class="w">        </span><span class="cm">/* non-zero tag access */</span><span class="w"></span>
+<span class="w">        </span><span class="n">a</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span><span class="w"></span>
+<span class="w">        </span><span class="n">printf</span><span class="p">(</span><span class="s">"a[0] = %hhu a[1] = %hhu</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">a</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span><span class="w"> </span><span class="n">a</span><span class="p">[</span><span class="mi">1</span><span class="p">]);</span><span class="w"></span>
+
+<span class="w">        </span><span class="cm">/*</span>
+<span class="cm">         * If MTE is enabled correctly the next instruction will generate an</span>
+<span class="cm">         * exception.</span>
+<span class="cm">         */</span><span class="w"></span>
+<span class="w">        </span><span class="n">printf</span><span class="p">(</span><span class="s">"Expecting SIGSEGV...</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span><span class="w"></span>
+<span class="w">        </span><span class="n">a</span><span class="p">[</span><span class="mi">16</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0xdd</span><span class="p">;</span><span class="w"></span>
+
+<span class="w">        </span><span class="cm">/* this should not be printed in the PR_MTE_TCF_SYNC mode */</span><span class="w"></span>
+<span class="w">        </span><span class="n">printf</span><span class="p">(</span><span class="s">"...haven't got one</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span><span class="w"></span>
+
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">EXIT_FAILURE</span><span class="p">;</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</pre></div>
+</div>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">ARM64アーキテクチャ</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="acpi_object_usage.html">ACPIテーブル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="amu.html">AArch64 Linuxにおけるアクティビティモニターユニット（AMU）拡張機能</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arm-acpi.html">ARMv8サーバーにおけるACPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="booting.html">AArch64 Linuxの起動</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cpu-feature-registers.html">ARM64 CPU機能レジスタ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="elf_hwcaps.html">ARM64 ELF hwcaps</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hugetlbpage.html">ARM64におけるHugeTLBページ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="legacy_instructions.html">レガシインストラクション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="memory.html">AArch64 Linuxにおけるメモリレイアウト</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">AArch64 Linuxにおけるメモリタグ拡張（MTE）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="perf.html">パフォーマンスイベント属性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pointer-authentication.html">AArch64 Linuxにおけるポインタ認証</a></li>
+<li class="toctree-l2"><a class="reference internal" href="silicon-errata.html">シリコンエラタとソフトウェアの回避策</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sve.html">AArch64 Linuxにおけるスケーラブルベクターエクステンション（SVE）サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tagged-address-abi.html">AArch64 TAGGED ADDRESS ABI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tagged-pointers.html">AArch64 Linuxにおけるタグ付き仮想アドレス</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">ARM64アーキテクチャ</a><ul>
+<li>前へ: <a href="memory.html" title="前章">AArch64 Linuxにおけるメモリレイアウト</a></li>
+<li>次へ: <a href="perf.html" title="次章">パフォーマンスイベント属性</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/arm64/memory-tagging-extension.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

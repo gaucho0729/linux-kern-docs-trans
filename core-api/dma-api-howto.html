@@ -1,0 +1,755 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>ダイナミックDMAマッピングガイド — The Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="dma-attributes.html" rel="next" title="DMA属性"/>
+<link href="dma-api.html" rel="prev" title="汎用デバイスを使用した動的DMAマッピング"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="dynamic-dma-mapping-guide">
+<h1>動的DMAマッピングガイド<a class="headerlink" href="#dynamic-dma-mapping-guide" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>David S. Miller &lt;<a class="reference external" href="mailto:davem%40redhat.com">davem<span>@</span>redhat<span>.</span>com</a>&gt;</p>
+</dd>
+<dt class="field-even">著者</dt>
+<dd class="field-even"><p>Richard Henderson &lt;<a class="reference external" href="mailto:rth%40cygnus.com">rth<span>@</span>cygnus<span>.</span>com</a>&gt;</p>
+</dd>
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Jakub Jelinek &lt;<a class="reference external" href="mailto:jakub%40redhat.com">jakub<span>@</span>redhat<span>.</span>com</a>&gt;</p>
+</dd>
+</dl>
+<p>デバイスドライバ開発者向けにDMA APIの使用方法を説明したガイドで、例として擬似コードも含まれます。APIの簡潔な説明についてはDMA-API.txtを参照してください。</p>
+<section id="cpu-and-dma-addresses">
+<h2>CPUとDMAアドレス<a class="headerlink" href="#cpu-and-dma-addresses" title="この見出しへのパーマリンク">¶</a></h2>
+<p>DMA APIには複数のアドレス種類が関与しており、その違いを理解することが重要です。</p>
+<p>カーネルは通常仮想アドレスを使用します。任意のアドレスが
+<a class="reference internal" href="mm-api.html#c.kmalloc" title="kmalloc"><code class="xref c c-func docutils literal notranslate"><span class="pre">kmalloc()</span></code></a>, <a class="reference internal" href="mm-api.html#c.vmalloc" title="vmalloc"><code class="xref c c-func docutils literal notranslate"><span class="pre">vmalloc()</span></code></a>、および類似のインターフェースから返されるのは仮想アドレスであり、これを <code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*</span></code>.</p>
+<p>に保存できます。仮想メモリシステム（TLB、ページテーブルなど）は仮想アドレスをCPU物理アドレスに変換し、これは「phys_addr_t」または「resource_size_t」型として保存されます。カーネルはレジスタなどのデバイスリソースを物理アドレスとして管理します。これらは/proc/iomemに表示されるアドレスです。物理アドレスはドライバにとって直接的に有用ではありません。ドライバは <a class="reference internal" href="../driver-api/device-io.html#c.ioremap" title="ioremap"><code class="xref c c-func docutils literal notranslate"><span class="pre">ioremap()</span></code></a> を使用して領域をマッピングし、仮想アドレスを生成する必要があります。</p>
+<p>I/Oデバイスは第三のアドレス種類「バスアドレス」を使用します。デバイスがMMIOアドレスにあるレジスタを持つ場合、またはDMAでシステムメモリを読み書きする場合、デバイスが使用するアドレスはバスアドレスです。一部のシステムではバスアドレスがCPU物理アドレスと一致しますが、一般的には一致しません。IOMMUやホストブリッジは物理アドレスとバスアドレスの任意のマッピングを生成できます。</p>
+<p>デバイスの観点からはDMAはバスアドレス空間を使用しますが、その空間のサブセットに制限されることがあります。たとえば、システムがメインメモリやPCI BARに64ビットアドレスをサポートしていても、IOMMUを使用してデバイスが32ビットDMAアドレスのみを使用するようにする場合があります。</p>
+<p>以下に図と例を示します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>             CPU                  CPU                  Bus
+           Virtual              Physical             Address
+           Address              Address               Space
+            Space                Space
+
+          +-------+             +------+             +------+
+          |       |             |MMIO  |   Offset    |      |
+          |       |  Virtual    |Space |   applied   |      |
+        C +-------+ --------&gt; B +------+ ----------&gt; +------+ A
+          |       |  mapping    |      |   by host   |      |
++-----+   |       |             |      |   bridge    |      |   +--------+
+|     |   |       |             +------+             |      |   |        |
+| CPU |   |       |             | RAM  |             |      |   | Device |
+|     |   |       |             |      |             |      |   |        |
++-----+   +-------+             +------+             +------+   +--------+
+          |       |  Virtual    |Buffer|   Mapping   |      |
+        X +-------+ --------&gt; Y +------+ &lt;---------- +------+ Z
+          |       |  mapping    | RAM  |   by IOMMU
+          |       |             |      |
+          |       |             |      |
+          +-------+             +------+
+</pre></div>
+</div>
+<p>エナメーションプロセス中に、カーネルはI/OデバイスとそのMMIO領域、およびそれらをシステムに接続するホストブリッジについて学習します。たとえば、PCIデバイスがBARを持つ場合、カーネルはBARからバスアドレス（A）を読み取り、これをCPU物理アドレス（B）に変換します。アドレスBはstruct resourceに保存され、通常/proc/iomem経由で公開されます。ドライバがデバイスを要求する際には、通常 <a class="reference internal" href="../driver-api/device-io.html#c.ioremap" title="ioremap"><code class="xref c c-func docutils literal notranslate"><span class="pre">ioremap()</span></code></a> を使用して物理アドレスBを仮想アドレス（C）にマッピングし、その後ioread32(C)などを使ってバスアドレスAにあるデバイスレジスタにアクセスします。</p>
+<p>デバイスがDMAをサポートする場合、ドライバは <a class="reference internal" href="mm-api.html#c.kmalloc" title="kmalloc"><code class="xref c c-func docutils literal notranslate"><span class="pre">kmalloc()</span></code></a> または、仮想アドレス(X)を返す類似のインターフェースもあります。仮想メモリシステムはXをシステムRAM内の物理アドレス(Y)にマッピングします。ドライバーは仮想アドレスXを使用してバッファにアクセスできますが、デバイス自体はDMAがCPUの仮想メモリシステムを通じて行われないためアクセスできません。</p>
+<p>一部のシンプルなシステムでは、デバイスが物理アドレスYに直接DMAを行うことができます。しかし多くのシステムでは、DMAアドレスを物理アドレスに変換するIOMMUハードウェアがあります。たとえば、ZをYに変換します。これはDMA APIが必要な理由の一つです。ドライバーはdma_map_single()などのインターフェースに仮想アドレスXを渡すことで、必要なIOMMUマッピングを設定しDMAアドレスZを返します。その後、ドライバーはデバイスにZへのDMAを実行するよう指示し、IOMMUはシステムRAM内のアドレスYにあるバッファにマッピングします。</p>
+<p>Linuxが動的DMAマッピングを使用できるようにするには、ドライバーからサポートが必要です。つまり、DMAアドレスは実際に使用される時間だけマッピングされ、DMA転送後にはアンマッピングする必要があります。</p>
+<p>以下のAPIは、このようなハードウェアが存在しないプラットフォームでも動作します。</p>
+<p>DMA APIは、基盤となるマイクロプロセッサアーキテクチャとは関係なく、任意のバスで動作します。バス固有のDMA APIではなく、DMA APIを使用すべきです。つまり、dma_map_*()インターフェースを使用するべきで、pci_map_*()インターフェースは使用しないでください。</p>
+<p>まず、以下の点を確認してください:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/dma-mapping.h&gt;
+</pre></div>
+</div>
+<p>ドライバー内に存在するdma_addr_tの定義を提供しています。この型はプラットフォームの有効なDMAアドレスを保持でき、DMAマッピング関数から返されたDMAアドレスを保持する際には常にこの型を使用する必要があります。</p>
+</section>
+<section id="what-memory-is-dma-able">
+<h2>DMAが使用可能なメモリはどのようなものですか？<a class="headerlink" href="#what-memory-is-dma-able" title="この見出しへのパーマリンク">¶</a></h2>
+<p>最初に把握しておくべき情報は、DMAマッピング機能で使用可能なカーネルメモリです。これまではこの点に関する非公式なルールがありましたが、このテキストではそれらを明確に記載することを目的としています。</p>
+<p>ページアロケータ（つまり__get_free_page*()）や汎用メモリアロケータ（つまり <a class="reference internal" href="mm-api.html#c.kmalloc" title="kmalloc"><code class="xref c c-func docutils literal notranslate"><span class="pre">kmalloc()</span></code></a> または <a class="reference internal" href="mm-api.html#c.kmem_cache_alloc" title="kmem_cache_alloc"><code class="xref c c-func docutils literal notranslate"><span class="pre">kmem_cache_alloc()</span></code></a>)でメモリを取得した場合、そのメモリとアドレスから、これらの関数が返すアドレスを使用してDMAを実行できます。</p>
+<p>これは、以下の関数から取得したメモリ/アドレスはDMAには使用できませんということを意味します。 <a class="reference internal" href="mm-api.html#c.vmalloc" title="vmalloc"><code class="xref c c-func docutils literal notranslate"><span class="pre">vmalloc()</span></code></a> このメモリがマッピングされた <a class="reference internal" href="mm-api.html#c.vmalloc" title="vmalloc"><code class="xref c c-func docutils literal notranslate"><span class="pre">vmalloc()</span></code></a> 領域の下層メモリにDMAを行うことは可能です。ただし、これはページテーブルをたどって物理アドレスを取得し、その後、__va()などの手段でそれぞれのページをカーネルアドレスに戻す必要があります。[編集: Gerd Knorr氏の汎用コードを統合する際にはこの記述を更新してください。]</p>
+<p>このルールは、DMAに使用できないアドレスとして、カーネルイメージアドレス（データ/テキスト/BSSセグメント内の項目）、モジュールイメージアドレス、スタックアドレスも含まれます。これらは、物理メモリの他の部分とは全く異なる場所にマッピングされる可能性があります。これらのメモリクラスが物理的にDMAと動作可能であっても、I/Oバッファがキャッシュラインアライメントを確保する必要があります。その条件を満たさない場合、DMAインコハーレントキャッシュを持つCPUではキャッシュライン共有の問題（データ破壊）が発生します。（CPUが1ワードを書き込み、DMAが同じキャッシュライン内の別のワードを書き込むと、どちらかが上書きされる可能性があります。）</p>
+<p>また、kmap()呼び出しの戻り値をDMAの送受信に使用することはできません。これは以下の内容と似ています。 <a class="reference internal" href="mm-api.html#c.vmalloc" title="vmalloc"><code class="xref c c-func docutils literal notranslate"><span class="pre">vmalloc()</span></code></a>.</p>
+<p>ブロックI/Oおよびネットワーキングバッファについてはどうでしょうか？ブロックI/Oおよびネットワーキングサブシステムは、DMA送受信に使用可能なバッファを確保しています。</p>
+</section>
+<section id="dma-addressing-capabilities">
+<h2>DMAアドレスング能力<a class="headerlink" href="#dma-addressing-capabilities" title="この見出しへのパーマリンク">¶</a></h2>
+<p>デフォルトでは、カーネルはデバイスが32ビットのDMAアドレスングをサポートしていると仮定しています。64ビット対応デバイスではこの値を増やす必要がありますし、制限のあるデバイスでは減らす必要があります。</p>
+<p>PCIに関する特別な注意点：PCI-X仕様では、PCI-Xデバイスがすべてのトランザクションで64ビットアドレスング（DAC）をサポートする必要があります。少なくとも1つのプラットフォーム（SGI SN2）では、IOバスがPCI-Xモードの場合に64ビット一貫性アロケーションが必要です。</p>
+<p>正しく動作させるためには、DMAマスクを設定してカーネルにデバイスのDMAアドレスング能力を通知する必要があります。</p>
+<p>これはdma_set_mask_and_coherent()呼び出しを通じて行われます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int dma_set_mask_and_coherent(struct device *dev, u64 mask);
+</pre></div>
+</div>
+<p>これはストリーミングおよびコヒーレントAPIの両方のマスクを設定します。特別な要件がある場合は、以下の2つの別個の呼び出しを使用できます：</p>
+<blockquote>
+<div><p>ストリーミングマッピングの設定はdma_set_mask()呼び出しを通じて行われます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int dma_set_mask(struct device *dev, u64 mask);
+</pre></div>
+</div>
+<p>一貫性アロケーションの設定はdma_set_coherent_mask()呼び出しを通じて行われます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int dma_set_coherent_mask(struct device *dev, u64 mask);
+</pre></div>
+</div>
+</div></blockquote>
+<p>ここでdevはデバイス構造体へのポインタで、maskはデバイスがサポートするアドレスビットを表すビットマスクです。通常、デバイス構造体はバス固有のデバイス構造体に埋め込まれています。例えば、&amp;pdev-&gt;devはPCIデバイスのデバイス構造体へのポインタ（pdevはデバイス構造体へのポインタ）です。</p>
+<p>これらの呼び出しは通常、提供したアドレスマスクにより機器が指定されたマシンでDMAを適切に実行可能であることを示すゼロを返しますが、マスクが指定されたシステムでサポート可能なサイズより小さすぎる場合、エラーを返す可能性があります。ゼロ以外の値が返された場合、そのデバイスがこのプラットフォームでDMAを適切に実行できず、DMAを試行すると未定義の動作が発生します。dma_set_maskファミリの関数が成功を返さない限り、このデバイスでDMAを使用してはなりません。</p>
+<p>失敗した場合、選択肢は2つあります:</p>
+<ol class="arabic simple">
+<li><p>可能であれば、DMAモード以外のデータ転送モードを使用してください。</p></li>
+<li><p>このデバイスを無視し、初期化しないという選択肢もあります。</p></li>
+</ol>
+<p>DMAマスクの設定に失敗した際、ドライバーがカーネルのKERN_WARNINGメッセージを出力することをお勧めします。これにより、ユーザーがパフォーマンスが悪い、またはデバイスが検出されないといった報告をした場合、カーネルメッセージを入手して正確な原因を特定できます。</p>
+<p>標準的な64ビットアドレス指定デバイスは次のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>if (dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64))) {
+        dev_warn(dev, "mydev: No suitable DMA available\n");
+        goto ignore_this_device;
+}
+</pre></div>
+</div>
+<p>デバイスがコヒーレント割当のディスクリプタに32ビットアドレス指定のみをサポートし、ストリーミングマッピングではフルの64ビットをサポートする場合、以下のように表示されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>if (dma_set_mask(dev, DMA_BIT_MASK(64))) {
+        dev_warn(dev, "mydev: No suitable DMA available\n");
+        goto ignore_this_device;
+}
+</pre></div>
+</div>
+<p>コヒーレントマスクは常にストリーミングマスクと同じかそれより小さいマスクを設定できます。ただし、デバイスドライバーがのみコンシステント割当を使用する極めてまれなケースでは、dma_set_coherent_mask()の戻り値を確認する必要があります。</p>
+<p>最後に、デバイスがアドレスの下位24ビットのみを駆動できる場合、以下のようにします:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>if (dma_set_mask(dev, DMA_BIT_MASK(24))) {
+        dev_warn(dev, "mydev: 24-bit DMA addressing not available\n");
+        goto ignore_this_device;
+}
+</pre></div>
+</div>
+<p>dma_set_mask()またはdma_set_mask_and_coherent()が成功しゼロを返した場合、カーネルは提供したマスクを保存します。後続のDMAマッピングを行う際にこの情報が使用されます。</p>
+<p>現在知っているケースとして、このドキュメンテーションで言及すべきことがあります。デバイスが複数の機能をサポートしている場合（例：サウンドカードが再生と録音機能を提供）、さまざまな機能が異なるDMAアドレス指定制限を持つ場合、各マスクを検出し、マシンが処理可能な機能のみを提供することを検討すべきです。最後のdma_set_mask()呼び出しは最も具体的なマスクで行う必要があります。</p>
+<p>以下はこれを実現する擬似コードの例です:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#define PLAYBACK_ADDRESS_BITS   DMA_BIT_MASK(32)
+#define RECORD_ADDRESS_BITS     DMA_BIT_MASK(24)
+
+struct my_sound_card *card;
+struct device *dev;
+
+...
+if (!dma_set_mask(dev, PLAYBACK_ADDRESS_BITS)) {
+        card-&gt;playback_enabled = 1;
+} else {
+        card-&gt;playback_enabled = 0;
+        dev_warn(dev, "%s: Playback disabled due to DMA limitations\n",
+               card-&gt;name);
+}
+if (!dma_set_mask(dev, RECORD_ADDRESS_BITS)) {
+        card-&gt;record_enabled = 1;
+} else {
+        card-&gt;record_enabled = 0;
+        dev_warn(dev, "%s: Record disabled due to DMA limitations\n",
+               card-&gt;name);
+}
+</pre></div>
+</div>
+<p>ここではサウンドカードが例として使われましたが、この種のPCIデバイスはISAチップがPCIフロントエンドに与えられたため、ISAの16MB DMAアドレス指定制限を保持していると考えられます。</p>
+</section>
+<section id="types-of-dma-mappings">
+<h2>DMAマッピングの種類<a class="headerlink" href="#types-of-dma-mappings" title="この見出しへのパーマリンク">¶</a></h2>
+<p>DMAマッピングには2つの種類があります:</p>
+<ul>
+<li><p>ドライバ初期化時にマッピングされ、終了時にアンマッピングされる一貫したDMAマッピングは、ハードウェアがデバイスとCPUがデータを並列にアクセスでき、お互いの更新を即座に認識できるように保証する必要があります。</p>
+<p>「一貫した（consistent）」は「同期的（synchronous）」または「整合性を保つ（coherent）」と捉えてください。</p>
+<p>現在のデフォルトではDMA領域の低32ビットに一貫したメモリが割り当てられています。ただし、今後の互換性を考慮して、このデフォルトがドライバに合っていようと、一貫したマスクを設定することをお勧めします。</p>
+<p>一貫したマッピングを使用すべき例は以下の通りです：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>ネットワークカードのDMAリング記述子。</p></li>
+<li><p>SCSIアダプターのメールボックスコマンドデータ構造。</p></li>
+<li><p>メインメモリから実行されるデバイスファームウェアのマイクロコード。</p></li>
+</ul>
+</div></blockquote>
+<p>これらの例が共通して必要とする不変性は、CPUのメモリへのストアが即座にデバイスに見えること、逆もまた然りです。一貫したマッピングはこの条件を保証します。</p>
+<div class="admonition important">
+<p class="admonition-title">重要です。</p>
+<p>一貫したDMAメモリは適切なメモリバリアの使用を妨げません。CPUは一貫したメモリへのストアを通常のメモリと同様に再配置する可能性があります。例えば、デバイスが記述子の最初のワードの更新を第二のワードの更新より前に認識する必要がある場合、以下のように明示的に操作する必要があります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>desc-&gt;word0 = address;
+wmb();
+desc-&gt;word1 = DESC_VALID;
+</pre></div>
+</div>
+<p>すべてのプラットフォームで正しい動作を確保するためです。</p>
+<p>また、一部のプラットフォームではドライバがCPUのライトバッファをフラッシュする必要があり、PCIブリッジなどのライトバッファをフラッシュするのと同じように、レジスタの値を書き込んだ後に読み取ることで実現できます。</p>
+</div>
+</li>
+<li><p>ストリーミングDMAマッピングは通常1回のDMA転送にマッピングされ、転送後すぐにアンマッピングされる（dma_sync_*を用いる場合を除く）もので、ハードウェアがシーケンシャルなアクセスを最適化できるようにします。</p>
+<p>「ストリーミング（streaming）」は「非同期的（asynchronous）」または「整合性ドメイン外（outside the coherency domain）」と捉えてください。</p>
+<p>ストリーミングマッピングを使用すべき例は以下の通りです：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>デバイスが送受信するネットワークバッファ。</p></li>
+<li><p>SCSIデバイスが読み書きするファイルシステムバッファ。</p></li>
+</ul>
+</div></blockquote>
+<p>この種のマッピングを扱うインターフェースは、ハードウェアが許す限りどのようなパフォーマンス最適化も可能に設計されています。したがって、このようなマッピングを使用する際には、望む動作を明示的に指定する必要があります。</p>
+</li>
+</ul>
+<p>どちらのDMAマッピングにもバスの下層から来るアライメント制限はなく、ただし一部のデバイスではこのような制限があるかもしれません。また、DMA整合性を持たないキャッシュを持つシステムでは、下層のバッファが他のデータとキャッシュラインを共有しない方が動作が良くなります。</p>
+</section>
+<section id="using-consistent-dma-mappings">
+<h2>一貫したDMAマッピングの使用<a class="headerlink" href="#using-consistent-dma-mappings" title="この見出しへのパーマリンク">¶</a></h2>
+<p>大規模な（PAGE_SIZE程度の）一貫したDMA領域を割り当ててマッピングするには、以下を行います：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dma_addr_t dma_handle;
+
+cpu_addr = dma_alloc_coherent(dev, size, &amp;dma_handle, gfp);
+</pre></div>
+</div>
+<p>デバイスは <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">device</span> <span class="pre">*</span></code>これは割り込みコンテキストでGFP_ATOMICフラグを指定して呼び出される可能性があります。</p>
+<p>サイズは、割り当てたい領域のバイト数を示します。</p>
+<p>この関数はその領域にRAMを割り当てるので、__get_free_pages()と似ています（ただし、ページオーダーではなくサイズを指定します）。ドライバがページより小さい領域を必要とする場合、下記で説明するdma_poolインターフェースを使用することを検討してください。</p>
+<p>一貫したDMAマッピングインターフェースは、デフォルトで32ビットアドレス可能なDMAアドレスを返します。デバイスがDMAマスクを通じて上位32ビットをアドレス可能であることを示していても、一貫した割り当てではdma_set_coherent_mask()で明示的にマスクを変更しない限り、DMAアドレスは32ビットを超えるものにはなりません。dma_poolインターフェースも同様です。</p>
+<p>dma_alloc_coherent()は2つの値を返します：CPUからアクセスするための仮想アドレスと、カードに渡すDMAハンドル。</p>
+<p>CPU仮想アドレスとDMAアドレスは、要求されたサイズよりも大きいまたは等しい最小のPAGE_SIZEオーダーにアライメントされています。この不変性（例：64キロバイト以下の領域を割り当てた場合、受信するバッファの範囲が64K境界を越えないことを保証するなど）が存在します。</p>
+<p>このようなDMA領域をアンマップして解放するには、以下のように呼び出します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dma_free_coherent(dev, size, cpu_addr, dma_handle);
+</pre></div>
+</div>
+<p>dev、sizeは上記の呼び出しと同じで、cpu_addrとdma_handleはdma_alloc_coherent()が返した値です。この関数は割り込みコンテキストでは呼び出せません。</p>
+<p>ドライバが多数の小さなメモリ領域を必要とする場合、dma_alloc_coherent()が返すページをカスタムコードで分割するか、dma_pool APIを使用できます。dma_poolはkmem_cacheに似ていますが、__get_free_pages()ではなくdma_alloc_coherent()を使用します。また、キューヘッドなどのハードウェアのアライメント制約を理解しています。</p>
+<p>dma_poolを以下のように作成します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct dma_pool *pool;
+
+pool = dma_pool_create(name, dev, size, align, boundary);
+</pre></div>
+</div>
+<p>「name」は診断用（kmem_cache名のように）で、devとsizeは上記と同じです。デバイスのハードウェアアライメント要件は「align」（バイト単位で、2の累乗である必要があります）です。デバイスに境界を超える制限がない場合は、境界に0を指定します。4096を指定すると、このプールから割り当てたメモリが4Kバイト境界を越えないことになります（ただし、その時点でdma_alloc_coherent()を直接使用する方が望ましい場合があります）。</p>
+<p>DMAプールからメモリを割り当てます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>cpu_addr = dma_pool_alloc(pool, flags, &amp;dma_handle);
+</pre></div>
+</div>
+<p>ブロッキングが許可されている場合（not in_interrupt かつ SMP ロックを保持していない場合）は flags が GFP_KERNEL となり、それ以外は GFP_ATOMIC です。dma_alloc_coherent() と同様に、この関数は cpu_addr と dma_handle の2つの値を返します。</p>
+<p>dma_pool から割当されたメモリを解放するには、次のようにします：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dma_pool_free(pool, cpu_addr, dma_handle);
+</pre></div>
+</div>
+<p>where pool は what you passed to <a class="reference internal" href="mm-api.html#c.dma_pool_alloc" title="dma_pool_alloc"><code class="xref c c-func docutils literal notranslate"><span class="pre">dma_pool_alloc()</span></code></a>、cpu_addr と dma_handle は返された値です。 <a class="reference internal" href="mm-api.html#c.dma_pool_alloc" title="dma_pool_alloc"><code class="xref c c-func docutils literal notranslate"><span class="pre">dma_pool_alloc()</span></code></a> この関数は割込みコンテキストで呼び出すことができます。</p>
+<p>dma_pool を破壊するには、次のように呼び出します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dma_pool_destroy(pool);
+</pre></div>
+</div>
+<p>すべてのメモリを割当たせた後に、 <a class="reference internal" href="mm-api.html#c.dma_pool_free" title="dma_pool_free"><code class="xref c c-func docutils literal notranslate"><span class="pre">dma_pool_free()</span></code></a> プールを破壊してください。この関数は割込みコンテキストで呼び出すことはできません。</p>
+</section>
+<section id="dma-direction">
+<h2>DMA 方向<a class="headerlink" href="#dma-direction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このドキュメントの後続のセクションで説明するインターフェースは、DMA 方向を指定する整数型の引数を取り、以下のいずれかの値をとります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>DMA_BIDIRECTIONAL
+DMA_TO_DEVICE
+DMA_FROM_DEVICE
+DMA_NONE
+</pre></div>
+</div>
+<p>DMAの方向を正確に指定する必要があります。</p>
+<p>DMA_TO_DEVICEは「主記憶からデバイスへのDMA」を意味し、DMA_FROM_DEVICEは「デバイスから主記憶へのDMA」を意味します。これはDMA転送中にデータが移動する方向を示します。</p>
+<p>この値を可能な限り正確に指定することを強く推奨します。</p>
+<p>DMA転送の方向が全く分からない場合、DMA_BIDIRECTIONALを指定してください。これはDMAが両方向で動作可能を意味します。プラットフォームはこの指定を合法的に行えることを保証しており、動作も保証しますが、パフォーマンス低下などのコストが生じる可能性があります。</p>
+<p>DMA_NONEはデバッグ用に指定します。正確な方向が分からないうちにデータ構造に保持し、方向追跡ロジックが正しく設定されていない場合を検出するのに役立ちます。</p>
+<p>この値を正確に指定するもう一つの利点（プラットフォーム固有の最適化を除く）はデバッグです。一部のプラットフォームではDMAマッピングに書き込み許可のブール値を設定でき、ユーザープログラムアドレス空間のページ保護と同様です。このようなプラットフォームでは、DMAコントローラハードウェアが許可設定の違反を検出すると、カーネルログにエラーを報告します。</p>
+<p>ストリーミングマッピングのみ方向を指定します。一貫したマッピングは方向属性がDMA_BIDIRECTIONALに設定されているとみなされます。</p>
+<p>SCSIサブシステムは、ドライバーが処理しているSCSIコマンドの'sc_data_direction'メンバで使用する方向を指定します。</p>
+<p>ネットワークドライバーでは、送信パケットにはDMA_TO_DEVICEを、受信パケットにはDMA_FROM_DEVICEを指定します。</p>
+</section>
+<section id="using-streaming-dma-mappings">
+<h2>ストリーミングDMAマッピングの使用<a class="headerlink" href="#using-streaming-dma-mappings" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ストリーミングDMAマッピングルーチンは割り込みコンテキストから呼び出すことができます。各マッピング/アンマッピングには2つのバージョンがあり、1つのメモリ領域をマッピング/アンマッピングするものと、スクラットリスト全体をマッピング/アンマッピングするものがあります。</p>
+<p>単一の領域をマッピングするには、以下のようにします:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct device *dev = &amp;my_dev-&gt;dev;
+dma_addr_t dma_handle;
+void *addr = buffer-&gt;ptr;
+size_t size = buffer-&gt;len;
+
+dma_handle = dma_map_single(dev, addr, size, direction);
+if (dma_mapping_error(dev, dma_handle)) {
+        /*
+         * reduce current DMA mapping usage,
+         * delay and try again later or
+         * reset driver.
+         */
+        goto map_error_handling;
+}
+</pre></div>
+</div>
+<p>およびアンマッピングするには:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dma_unmap_single(dev, dma_handle, size, direction);
+</pre></div>
+</div>
+<p>dma_map_single()が失敗してエラーを返す可能性があるため、dma_mapping_error()を呼び出す必要があります。これにより、すべてのDMA実装でマッピングコードが正しく動作し、実装の詳細に依存することなく動作します。エラーをチェックせずに返されたアドレスを使用すると、パニックから静的なデータ破壊に至るまでさまざまな失敗が発生する可能性があります。dma_map_page()にも同様の適用がされます。</p>
+<p>DMA活動が完了したとき、つまりDMA転送が完了したことを通知した割り込みから、dma_unmap_single()を呼び出す必要があります。</p>
+<p>単一マッピングにCPUポインタを使用する場合の欠点は、HIGHMEMメモリをこの方法で参照できないことです。そのため、dma_{map,unmap}_single()に似たマッピング/アンマッピングインターフェースがあります。これらのインターフェースはCPUポインタではなくページ/オフセットペアを扱います。具体的には:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct device *dev = &amp;my_dev-&gt;dev;
+dma_addr_t dma_handle;
+struct page *page = buffer-&gt;page;
+unsigned long offset = buffer-&gt;offset;
+size_t size = buffer-&gt;len;
+
+dma_handle = dma_map_page(dev, page, offset, size, direction);
+if (dma_mapping_error(dev, dma_handle)) {
+        /*
+         * reduce current DMA mapping usage,
+         * delay and try again later or
+         * reset driver.
+         */
+        goto map_error_handling;
+}
+
+...
+
+dma_unmap_page(dev, dma_handle, size, direction);
+</pre></div>
+</div>
+<p>ここで、「offset」は指定されたページ内のバイトオフセットを指します。</p>
+<p>dma_map_page()が失敗してエラーを返す可能性があるため、dma_mapping_error()を呼び出す必要があります。これはdma_map_single()の議論で説明した通りです。</p>
+<p>DMA活動が完了したとき、つまりDMA転送が完了したことを通知した割り込みから、dma_unmap_page()を呼び出す必要があります。</p>
+<p>スクラットリストを使用する場合、複数の領域から集めた領域をマッピングするには:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int i, count = dma_map_sg(dev, sglist, nents, direction);
+struct scatterlist *sg;
+
+for_each_sg(sglist, sg, count, i) {
+        hw_address[i] = sg_dma_address(sg);
+        hw_len[i] = sg_dma_len(sg);
+}
+</pre></div>
+</div>
+<p>ここで、nentsはsglist内のエントリ数を表します。</p>
+<p>実装は連続するsglistエントリを1つに統合することが可能です（例：DMAマッピングがPAGE_SIZEの粒度で行われる場合、連続するsglistエントリは1つに統合できます。ただし、最初のエントリがページ境界で終了し、次のエントリがページ境界で開始する必要があります。実際これは、スクラットガatherを実行できないカードやスクラットガatherエントリ数が極めて少ないカードにとって大きな利点です）。実際のマッピングに使用したsgエントリ数を返します。失敗した場合は0が返されます。</p>
+<p>次にcount回ループします（注意：これはnents回よりも少ない場合があります）。以前にsg-&gt;addressとsg-&gt;lengthにアクセスした場所で、sg_dma_address()とsg_dma_len()マクロを使用してください。</p>
+<p>スクラットリストをアンマッピングするには、以下のように呼び出します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dma_unmap_sg(dev, sglist, nents, direction);
+</pre></div>
+</div>
+<p>再度、DMA活動がすでに完了していることを確認してください。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>dma_unmap_sg呼び出しのnents引数は、dma_map_sg呼び出しに渡した同じ値でなければなりません。countがdma_map_sg呼び出しで返された値ではありません。</p>
+</div>
+<p>dma_map_{single,sg}()の呼び出しは必ずdma_unmap_{single,sg}()の対応処理を持つ必要があります。DMAアドレス空間は共有リソースであり、すべてのDMAアドレスを消費することで機器を動作不能にすることがあります。</p>
+<p>同じストリーミングDMA領域を複数回使用し、DMA転送の間でデータを操作する必要がある場合、CPUとデバイスがDMAバッファの最新かつ正しいコピーを確認できるように、バッファを適切に同期する必要があります。</p>
+<p>まずdma_map_{single,sg}()でマッピングし、各DMA転送後に以下のいずれかを呼び出してください。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dma_sync_single_for_cpu(dev, dma_handle, size, direction);
+</pre></div>
+</div>
+<p>または:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dma_sync_sg_for_cpu(dev, sglist, nents, direction);
+</pre></div>
+</div>
+<p>適切な処理を行ってください。</p>
+<p>デバイスがDMA領域に再度アクセスできるようにするには、CPUがデータにアクセスを終了した後、ハードウェアにバッファを渡す直前に以下のいずれかを呼び出してください。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dma_sync_single_for_device(dev, dma_handle, size, direction);
+</pre></div>
+</div>
+<p>または:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dma_sync_sg_for_device(dev, sglist, nents, direction);
+</pre></div>
+</div>
+<p>適切な処理を行ってください。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>dma_sync_sg_for_cpu()およびdma_sync_sg_for_device()の'nents'引数は、dma_map_sg()に渡した値と一致させる必要があります。これはdma_map_sg()が返すカウントとは異なります。</p>
+</div>
+<p>最後のDMA転送後、dma_unmap_{single,sg}()のいずれかを呼び出してください。最初のdma_map_*()呼び出しからdma_unmap_*()呼び出しまでデータにアクセスしなかった場合、dma_sync_*()の呼び出しは一切不要です。</p>
+<p>dma_sync_*()インターフェースを使用する必要がある状況を示す擬似コードです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>my_card_setup_receive_buffer(struct my_card *cp, char *buffer, int len)
+{
+        dma_addr_t mapping;
+
+        mapping = dma_map_single(cp-&gt;dev, buffer, len, DMA_FROM_DEVICE);
+        if (dma_mapping_error(cp-&gt;dev, mapping)) {
+                /*
+                 * reduce current DMA mapping usage,
+                 * delay and try again later or
+                 * reset driver.
+                 */
+                goto map_error_handling;
+        }
+
+        cp-&gt;rx_buf = buffer;
+        cp-&gt;rx_len = len;
+        cp-&gt;rx_dma = mapping;
+
+        give_rx_buf_to_card(cp);
+}
+
+...
+
+my_card_interrupt_handler(int irq, void *devid, struct pt_regs *regs)
+{
+        struct my_card *cp = devid;
+
+        ...
+        if (read_card_status(cp) == RX_BUF_TRANSFERRED) {
+                struct my_card_header *hp;
+
+                /* Examine the header to see if we wish
+                 * to accept the data.  But synchronize
+                 * the DMA transfer with the CPU first
+                 * so that we see updated contents.
+                 */
+                dma_sync_single_for_cpu(&amp;cp-&gt;dev, cp-&gt;rx_dma,
+                                        cp-&gt;rx_len,
+                                        DMA_FROM_DEVICE);
+
+                /* Now it is safe to examine the buffer. */
+                hp = (struct my_card_header *) cp-&gt;rx_buf;
+                if (header_is_ok(hp)) {
+                        dma_unmap_single(&amp;cp-&gt;dev, cp-&gt;rx_dma, cp-&gt;rx_len,
+                                         DMA_FROM_DEVICE);
+                        pass_to_upper_layers(cp-&gt;rx_buf);
+                        make_and_setup_new_rx_buf(cp);
+                } else {
+                        /* CPU should not write to
+                         * DMA_FROM_DEVICE-mapped area,
+                         * so dma_sync_single_for_device() is
+                         * not needed here. It would be required
+                         * for DMA_BIDIRECTIONAL mapping if
+                         * the memory was modified.
+                         */
+                        give_rx_buf_to_card(cp);
+                }
+        }
+}
+</pre></div>
+</div>
+<p>このインターフェースに完全に移行したドライバでは、virt_to_bus()やbus_to_virt()の使用は不要です。一部のドライバは変更が必要ですが、動的DMAマッピングスキームではbus_to_virt()に相当するものはありません。常にdma_alloc_coherent()が返すDMAアドレスをドライバ構造体やカードレジスタに保存する必要があります。 <a class="reference internal" href="mm-api.html#c.dma_pool_alloc" title="dma_pool_alloc"><code class="xref c c-func docutils literal notranslate"><span class="pre">dma_pool_alloc()</span></code></a>dma_map_single()呼び出し（dma_map_sg()はプラットフォームがハードウェアで動的DMAマッピングをサポートする場合、scatterlist自身に保存します）のDMAアドレスをドライバ構造体およびカードレジスタに保存してください。</p>
+<p>すべてのドライバはこれらのインターフェースを使用する必要があります。virt_to_bus()およびbus_to_virt()は完全に非推奨であり、今後完全に削除される予定です。一部のポートではすでに提供されていません。正しくサポートすることは不可能です。</p>
+</section>
+<section id="handling-errors">
+<h2>エラー処理<a class="headerlink" href="#handling-errors" title="この見出しへのパーマリンク">¶</a></h2>
+<p>一部のアーキテクチャではDMAアドレス空間が制限されており、割当失敗は以下の方法で判定できます：</p>
+<ul>
+<li><p>dma_alloc_coherent()がNULLを返すか、dma_map_sg()が0を返すかを確認してください</p></li>
+<li><p>dma_map_single()およびdma_map_page()から返されるdma_addr_tをdma_mapping_error()を使用して確認してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dma_addr_t dma_handle;
+
+dma_handle = dma_map_single(dev, addr, size, direction);
+if (dma_mapping_error(dev, dma_handle)) {
+        /*
+         * reduce current DMA mapping usage,
+         * delay and try again later or
+         * reset driver.
+         */
+        goto map_error_handling;
+}
+</pre></div>
+</div>
+</li>
+<li><p>複数ページのマッピング試行中にマッピングエラーが発生した場合、すでにマッピングされているページをアンマップしてください。これらはdma_map_page()にも適用されます。</p></li>
+</ul>
+<p>例1：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dma_addr_t dma_handle1;
+dma_addr_t dma_handle2;
+
+dma_handle1 = dma_map_single(dev, addr, size, direction);
+if (dma_mapping_error(dev, dma_handle1)) {
+        /*
+         * reduce current DMA mapping usage,
+         * delay and try again later or
+         * reset driver.
+         */
+        goto map_error_handling1;
+}
+dma_handle2 = dma_map_single(dev, addr, size, direction);
+if (dma_mapping_error(dev, dma_handle2)) {
+        /*
+         * reduce current DMA mapping usage,
+         * delay and try again later or
+         * reset driver.
+         */
+        goto map_error_handling2;
+}
+
+...
+
+map_error_handling2:
+        dma_unmap_single(dma_handle1);
+map_error_handling1:
+</pre></div>
+</div>
+<p>例2：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/*
+ * if buffers are allocated in a loop, unmap all mapped buffers when
+ * mapping error is detected in the middle
+ */
+
+dma_addr_t dma_addr;
+dma_addr_t array[DMA_BUFFERS];
+int save_index = 0;
+
+for (i = 0; i &lt; DMA_BUFFERS; i++) {
+
+        ...
+
+        dma_addr = dma_map_single(dev, addr, size, direction);
+        if (dma_mapping_error(dev, dma_addr)) {
+                /*
+                 * reduce current DMA mapping usage,
+                 * delay and try again later or
+                 * reset driver.
+                 */
+                goto map_error_handling;
+        }
+        array[i].dma_addr = dma_addr;
+        save_index++;
+}
+
+...
+
+map_error_handling:
+
+for (i = 0; i &lt; save_index; i++) {
+
+        ...
+
+        dma_unmap_single(array[i].dma_addr);
+}
+</pre></div>
+</div>
+<p>ネットワーキングドライバは、送信ハンドラ(ndo_start_xmit)でDMAマッピングが失敗した場合、socket bufferを解放するためにdev_kfree_skb()を呼び出し、NETDEV_TX_OKを返す必要があります。これは、失敗した場合、socket bufferが破棄されるということを意味します。</p>
+<p>SCSIドライバは、queuecommandハンドラでDMAマッピングが失敗した場合、SCSI_MLQUEUE_HOST_BUSYを返す必要があります。これは、SCSIサブシステムが後でドライバにコマンドを再送信するということを意味します。</p>
+</section>
+<section id="optimizing-unmap-state-space-consumption">
+<h2>Unmap状態空間の消費を最適化<a class="headerlink" href="#optimizing-unmap-state-space-consumption" title="この見出しへのパーマリンク">¶</a></h2>
+<p>多くのプラットフォームでは、dma_unmap_{single,page}()は単なるnopです。そのため、マッピングアドレスと長さを追跡するのは空間の無駄です。このような問題を「回避」するためにifdefsなどを使用してドライバを埋め込むのではなく（これはポータブルAPIの目的を台無しにしてしまいます）、以下の機能が提供されています。</p>
+<p>マクロを個別に説明する代わりに、例を用いて説明します。</p>
+<ol class="arabic">
+<li><p>ステートセービング構造体でDEFINE_DMA_UNMAP_{ADDR,LEN}を使用します。例、以前のコード:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct ring_state {
+        struct sk_buff *skb;
+        dma_addr_t mapping;
+        __u32 len;
+};
+</pre></div>
+</div>
+<p>後:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct ring_state {
+        struct sk_buff *skb;
+        DEFINE_DMA_UNMAP_ADDR(mapping);
+        DEFINE_DMA_UNMAP_LEN(len);
+};
+</pre></div>
+</div>
+</li>
+<li><p>dma_unmap_{addr,len}_set()を使用してこれらの値を設定します。例、以前のコード:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>ringp-&gt;mapping = FOO;
+ringp-&gt;len = BAR;
+</pre></div>
+</div>
+<p>後:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dma_unmap_addr_set(ringp, mapping, FOO);
+dma_unmap_len_set(ringp, len, BAR);
+</pre></div>
+</div>
+</li>
+<li><p>dma_unmap_{addr,len}()を使用してこれらの値にアクセスします。例、以前のコード:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dma_unmap_single(dev, ringp-&gt;mapping, ringp-&gt;len,
+                 DMA_FROM_DEVICE);
+</pre></div>
+</div>
+<p>後:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>dma_unmap_single(dev,
+                 dma_unmap_addr(ringp, mapping),
+                 dma_unmap_len(ringp, len),
+                 DMA_FROM_DEVICE);
+</pre></div>
+</div>
+</li>
+</ol>
+<p>これは自明の通りです。ADDRとLENを分離して扱うのは、実装がunmap操作にアドレスのみを必要とする可能性があるためです。</p>
+</section>
+<section id="platform-issues">
+<h2>プラットフォームに関する問題<a class="headerlink" href="#platform-issues" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Linuxドライバのみを書いている場合で、カーネルのアーキテクチャポートをメンテナンスしていない場合は、「クロージング」セクションまでスキップしてかまいません。</p>
+<ol class="arabic">
+<li><p>scatterlistの要件</p>
+<p>アーキテクチャがIOMMU（ソフトウェアIOMMUを含む）をサポートする場合、CONFIG_NEED_SG_DMA_LENGTHを有効にする必要があります。</p>
+</li>
+<li><p>ARCH_DMA_MINALIGN</p>
+<p>アーキテクチャは、kmallocされたバッファがDMA安全であることを保証しなければなりません。ドライバやサブシステムはこれに依存しています。アーキテクチャが完全なDMA一貫性（CPUキャッシュ内のデータと主記憶内のデータが一致することをハードウェアが保証しない）でない場合、ARCH_DMA_MINALIGNを設定して、メモリ割当がkmallocされたバッファが他のバッファとキャッシュラインを共有しないようにしなければなりません。例としてarch/arm/include/asm/cache.hを参照してください。</p>
+<p>ARCH_DMA_MINALIGNはDMAメモリのアライメント制約に関するものであり、アーキテクチャのデータアライメント制約（例：64bitオブジェクトに関するアライメント制約）については心配する必要がありません。</p>
+</li>
+</ol>
+</section>
+<section id="closing">
+<h2>クロージング<a class="headerlink" href="#closing" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このドキュメントおよびAPI自体は、多数の個人からのフィードバックと提案がなければ現在の形にはなりませんでした。特に以下の人物を挙げて感謝します（順不同）:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Russell King &lt;rmk@arm.linux.org.uk&gt;
+Leo Dagum &lt;dagum@barrel.engr.sgi.com&gt;
+Ralf Baechle &lt;ralf@oss.sgi.com&gt;
+Grant Grundler &lt;grundler@cup.hp.com&gt;
+Jay Estabrook &lt;Jay.Estabrook@compaq.com&gt;
+Thomas Sailer &lt;sailer@ife.ee.ethz.ch&gt;
+Andrea Arcangeli &lt;andrea@suse.de&gt;
+Jens Axboe &lt;jens.axboe@oracle.com&gt;
+David Mosberger-Tang &lt;davidm@hpl.hp.com&gt;
+</pre></div>
+</div>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">コアAPIドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#core-utilities">Core utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#data-structures-and-low-level-utilities">Data structures and low-level utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#concurrency-primitives">Concurrency primitives</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#low-level-hardware-management">Low-level hardware management</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#memory-management">Memory management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#interfaces-for-kernel-debugging">Interfaces for kernel debugging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#everything-else">Everything else</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">コアAPIドキュメント</a><ul>
+<li>前へ: <a href="dma-api.html" title="前章">汎用デバイスを使用した動的DMAマッピング</a></li>
+<li>次へ: <a href="dma-attributes.html" title="次章">DMA属性</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/core-api/dma-api-howto.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

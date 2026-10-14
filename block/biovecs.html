@@ -1,0 +1,262 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>変更不可なbiovecsとbiovecイテレータ — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="blk-mq.html" rel="next" title="マルチキュー・ブロックIOキューイングメカニズム (blk-mq)"/>
+<link href="biodoc.html" rel="prev" title="Linux 2.5におけるジェネリックブロックレイヤーの再実装に関するノート"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="immutable-biovecs-and-biovec-iterators">
+<h1>変更不可能なbiovecsとbiovecイテレータ<a class="headerlink" href="#immutable-biovecs-and-biovec-iterators" title="この見出しへのパーマリンク">¶</a></h1>
+<p>Kent Overstreet &lt;<a class="reference external" href="mailto:kmo%40daterainc.com">kmo<span>@</span>daterainc<span>.</span>com</a>&gt;</p>
+<p>3.13以降、bioが送信された後はbiovecsを変更してはいけません。代わりに、biovecの範囲を表す新しい構造体bvec_iterがあります。このイテレータはbioが完了するにつれて変更され、biovec自体は変更されません。</p>
+<p>以前のコードでは、bioを部分的に完了させる必要があった場合、bi_sectorとbi_sizeを更新し、bi_idxを次のbiovecに進める必要がありました。途中でbiovecを完了した場合、bv_offsetをインクリメントし、bv_lenをそのbiovecで完了したバイト数分デクリメントしていました。</p>
+<p>新しい仕様では、bioを部分的に完了させるために変更が必要なすべての項目がstruct bvec_iterに分離されています。bi_sector、bi_size、bi_idxはこの構造体に移動し、bv_offsetとbv_lenの代わりに、struct bvec_iterにはbi_bvec_doneというフィールドがあり、現在のbvecで完了したバイト数を表します。</p>
+<p>複数の補助マクロが新たに導入され、詳細な処理を隠蔽しています。特に、部分的に完了したbiovecsの仮想的な表示を提供し、通常のコードがbi_bvec_doneを扱う必要を減らしています。</p>
+<blockquote>
+<div><ul>
+<li><p>ドライバコードはもはやbiovecsを直接参照すべきではありません。代わりに、bio_iovec()とbio_iter_iovec()というマクロが導入され、raw biovecsから構築されながらbi_bvec_doneとbi_sizeを考慮したstruct biovecsを返します。</p>
+<p>bio_for_each_segment()は以前の整数（bi_idxに対応）ではなく、bvec_iter引数を取るようになりました。多くのコードでは、bio_for_each_segment()の引数の型を変更するだけで変換可能です。</p>
+</li>
+<li><p>bvec_iterを進めるにはbio_advance_iter()を使用します； <a class="reference internal" href="../filesystems/api-summary.html#c.bio_advance" title="bio_advance"><code class="xref c c-func docutils literal notranslate"><span class="pre">bio_advance()</span></code></a> bio-&gt;bi_iterを操作するラッパーであり、存在するbio integrityのイテレータも同時に進める機能があります。</p>
+<p>より低レベルの進める関数としてbvec_iter_advance()があり、これはbioではなくbiovecへのポインタを引数に取り、bio integrityコードで使用されます。</p>
+</li>
+</ul>
+</div></blockquote>
+<section id="what-s-all-this-get-us">
+<h2>これにより得られるものは何ですか？<a class="headerlink" href="#what-s-all-this-get-us" title="この見出しへのパーマリンク">¶</a></h2>
+<p>実際のイテレータを持ち、biovecsを変更不可にすることで、いくつかの利点があります：</p>
+<blockquote>
+<div><ul>
+<li><p>以前は、1つのbvecずつ処理しない場合、bioを反復処理するのが非常に複雑でした。例えば、 <a class="reference internal" href="../filesystems/api-summary.html#c.bio_copy_data" title="bio_copy_data"><code class="xref c c-func docutils literal notranslate"><span class="pre">bio_copy_data()</span></code></a> block/bio.cで、1つのbioの内容を別のbioにコピーする処理では、biovecsのサイズが必ずしも同じでないため、古いコードは複数のbioを同時に処理し、それぞれのbi_idxと現在のbiovecへのオフセットを保持する必要がありました。</p>
+<p>新しいコードははるかにわかりやすくなっています - 確認してみてください。このようなパターンは多くの場所で見られ、以前は多くのドライバが実質的にbvecイテレータをオープンコードで実装しており、共通の実装により多くのコードが大幅に簡略化されています。</p>
+</li>
+<li><p>以前は、bioが完了した後でもbiovecを使用する必要があるコード（データを別の場所にコピーする場合やエラー時に別の場所に再送信する場合など）では、常に全体のbvec配列を保存する必要がありました。これは多くの場所で行われていました。</p></li>
+<li><p>biovecは複数のbio間で共有可能であり、bvecイテレータは既存のbiovecの任意の範囲（biovecの途中から開始し、途中で終了する範囲も含む）を表すことができます。これは任意のbioを効率的に分割する機能を可能にしています。注意点として、bioの終端を判定する際にはbi_sizeのみを使用し、bi_vcntは使用しません。また、bio_iovec()マクロはbiovecの構築時にbi_sizeを考慮します。</p></li>
+<li><p>bioの分割は今でははるかに簡単になりました。以前の <a class="reference internal" href="../filesystems/api-summary.html#c.bio_split" title="bio_split"><code class="xref c c-func docutils literal notranslate"><span class="pre">bio_split()</span></code></a> は単一のbvecを持つbioしか処理できませんでした！現在は、新しいbioが古いbioのbiovecを共有できるため、任意のサイズのbioを効率的に分割できます。</p>
+<p>分割されたbioがまだ使用している間、biovecが解放されないように注意する必要があります。もともとのbioが先に完了する可能性があるためです。この問題を解決するのに役立つのは、
+<a class="reference internal" href="../filesystems/api-summary.html#c.bio_chain" title="bio_chain"><code class="xref c c-func docutils literal notranslate"><span class="pre">bio_chain()</span></code></a> の使用です。</p>
+</li>
+<li><p>部分的に完了したbioの送信は今では問題ありません。これはスタック型ブロックドライバやさまざまなコード（例：mdやbcache）でたまに発生し、かつてはいくつかの不格好な回避策が用意されていました。</p>
+<p>以前は、部分的に完了したbioの送信がほとんどのデバイスで問題なく動作しましたが、raw bvec配列へのアクセスが一般的だったため、すべてのドライバがbi_idxを尊重するとは限りませんでした。そのため、一部のドライバが破損していました。現在は、すべてのドライバがbvecイテレータを通じて処理する必要があり、その点を検証済みであるため、部分的に完了したbioの送信は問題ありません。</p>
+</li>
+</ul>
+</div></blockquote>
+</section>
+<section id="other-implications">
+<h2>その他の影響:<a class="headerlink" href="#other-implications" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><ul>
+<li><p>ほぼすべてのbi_idxの使用は現在不適切であり、削除されています。以前はbi_idxを使用していた場所では、今ではbvec_iterを使用し、ヘルパーマクロのいずれかに渡すことが一般的です。</p>
+<p>つまり、bio_iovec_idx()（またはbio-&gt;bi_iovec[bio-&gt;bi_idx]）を使用していた場所では、今ではbio_iter_iovec()を使用します。これはbvec_iterを受け取り、raw biovecから即座に構築されるstruct bio_vecを返しますが、bi_bvec_done（およびbi_size）を考慮します。</p>
+</li>
+<li><p>bi_vcntはドライバーコードによって信頼してはいけません。つまり、実際にbioを所有していないコード（例：ドライバーなど）では信頼できません。理由は二つあります。まず第一に、bioをイテレーションする必要はもうありません。現在はbi_sizeのみを使用しています。第二に、bioをクローンして元のbioのbiovecの一部を再利用する際、新しいbioのbi_vcntを計算するには新しいbio内のすべてのbiovecをイテレーションしなければならないため、これは冗長です。</p>
+<p>それ以来、bi_vcntは使用しないでください。</p>
+</li>
+<li><p>現在のインターフェースではブロックレイヤーが必要に応じてbioを分割できるため、スタックドドライバーにおける複雑さを大幅に削減できます。bioを生成するコードは必要に応じて任意のサイズのbioを生成でき、さらに重要的是スタックドドライバーは自身のbioサイズ制限と下位デバイスの制限を同時に考慮する必要がありません。したがって、個々のブロックドライバーに-&gt;merge_bvec_fn()コールバックを定義する必要はありません。</p></li>
+</ul>
+</div></blockquote>
+</section>
+<section id="usage-of-helpers">
+<h2>ヘルパー関数の使用:<a class="headerlink" href="#usage-of-helpers" title="この見出しへのパーマリンク">¶</a></h2>
+<ul class="simple">
+<li><p>次のヘルパー関数は名前のサフィックスに <cite>_all</cite> が付いているもので、これらは非-BIO_CLONED bioのみで使用可能です。これらは通常ファイルシステムコードによって使用され、ドライバーは使用すべきではありません。bioがドライバーに到達する前にすでに分割されている可能性があるためです。</p></li>
+</ul>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>bio_for_each_segment_all()
+bio_for_each_bvec_all()
+bio_first_bvec_all()
+bio_first_page_all()
+bio_last_bvec_all()
+</pre></div>
+</div>
+<ul>
+<li><p>次のヘルパー関数は単一ページセグメントをイテレーションします。イテレーション中に渡される'struct bio_vec'は単一ページのIOベクタを含みます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>bio_for_each_segment()
+bio_for_each_segment_all()
+</pre></div>
+</div>
+</li>
+<li><p>次のヘルパー関数はマルチページbvecをイテレーションします。イテレーション中に渡される'struct bio_vec'はマルチページのIOベクタを含みます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>bio_for_each_bvec()
+bio_for_each_bvec_all()
+rq_for_each_bvec()
+</pre></div>
+</div>
+</li>
+</ul>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">ブロック</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="bfq-iosched.html">BFQ（Budget Fair Queueing）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="biodoc.html">Linux 2.5におけるジェネリックブロックレイヤーの再実装に関するノート</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">変更不可能なbiovecsとbiovecイテレータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blk-mq.html">マルチキュー・ブロックIOキューイングメカニズム (blk-mq)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="capability.html">ジェネリックブロックデバイスの機能</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cmdline-partition.html">埋め込みデバイスコマンドラインパーティション解析</a></li>
+<li class="toctree-l2"><a class="reference internal" href="data-integrity.html">データの整合性</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deadline-iosched.html">デッドラインIOスケジューラのチューニングパラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="inline-encryption.html">インライン暗号化</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ioprio.html">ブロックIOの優先度</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kyber-iosched.html">Kyber I/Oスケジューラのチューニングパラメータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="null_blk.html">ヌルブロックデバイスドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pr.html">ブロックレイヤーによる永続的予約のサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="queue-sysfs.html">キュー・sysfsファイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="request.html">struct requestドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="stat.html">ブロックレイヤー統計情報は /sys/block/&lt;dev&gt;/stat にあります</a></li>
+<li class="toctree-l2"><a class="reference internal" href="switching-sched.html">スケジューラの切り替え</a></li>
+<li class="toctree-l2"><a class="reference internal" href="writeback_cache_control.html">明示的な揮発性ライトバックキャッシュ制御</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">ブロック</a><ul>
+<li>前へ: <a href="biodoc.html" title="前章">Linux 2.5におけるジェネリックブロックレイヤーの再実装に関するノート</a></li>
+<li>次へ: <a href="blk-mq.html" title="次章">マルチキュー・ブロックIOキューイングメカニズム (blk-mq)</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/block/biovecs.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

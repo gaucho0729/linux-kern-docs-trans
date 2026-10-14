@@ -1,0 +1,358 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>this_cpu操作 — Linux Kernelドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="timekeeping.html" rel="next" title="ktime accessors"/>
+<link href="bus-virt-phys-mapping.html" rel="prev" title="デバイスドライバー内からI/Oマッピングメモリにアクセスする方法"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="this-cpu-operations">
+<h1>this_cpu操作<a class="headerlink" href="#this-cpu-operations" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Christoph Lameter, 2014年8月4日</p>
+</dd>
+<dt class="field-even">著者</dt>
+<dd class="field-even"><p>Pranith Kumar, 2014年8月2日</p>
+</dd>
+</dl>
+<p>this_cpu操作は、現在実行中のプロセッサに関連するper-CPU変数へのアクセスを最適化する方法です。 <em>現在</em> 実行中のプロセッサ。これはセグメントレジスタ（または特定のプロセッサ用のper-CPU領域の開始位置を永続的に保持する専用レジスタ）を用いて実現されます。</p>
+<p>this_cpu操作は、プロセッサ固有のper-CPUベースにper-CPU変数のオフセットを加算し、その操作をper-CPU変数に関する命令にエンコードします。</p>
+<p>これにより、オフセット計算とデータ操作の間にアトミック性の問題が生じません。そのため、プリエンプションや割込みを無効化する必要はありません。</p>
+<p>読み込み-変更-書き込み（RMW）操作は特に重要です。多くのプロセッサは、通常の同期オーバーヘッドなしで動作するが、緩いアトミック性を保証する特別な低レイテンシ命令を備えています。たとえばx86では、lockプレフィックスを省略したinc/dec/cmpxchgなどのRMW命令を実行できます。</p>
+<p>lockプレフィックスを省略したアクセスは同期されませんが、同期は不要です。なぜなら、現在実行中のプロセッサに特有のper-CPUデータにアクセスしているからです。他のプロセッサからのアクセスは発生しないため、競合状態がありません。</p>
+<p>リモートプロセッサによるper-CPU領域へのアクセスは例外的な状況であり、ローカルRMW操作のパフォーマンスや正しさ（リモート書き込み操作）に影響を与える可能性があります。</p>
+<p>this_cpu操作の主な用途はカウンタ操作の最適化です。</p>
+<p>以下のthis_cpu()操作はプリエンプション保護が暗黙的に含まれており、プリエンプションや割込みを気にせず使用できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>this_cpu_read(pcp)
+this_cpu_write(pcp, val)
+this_cpu_add(pcp, val)
+this_cpu_and(pcp, val)
+this_cpu_or(pcp, val)
+this_cpu_add_return(pcp, val)
+this_cpu_xchg(pcp, nval)
+this_cpu_cmpxchg(pcp, oval, nval)
+this_cpu_cmpxchg_double(pcp1, pcp2, oval1, oval2, nval1, nval2)
+this_cpu_sub(pcp, val)
+this_cpu_inc(pcp)
+this_cpu_dec(pcp)
+this_cpu_sub_return(pcp, val)
+this_cpu_inc_return(pcp)
+this_cpu_dec_return(pcp)
+</pre></div>
+</div>
+<section id="inner-working-of-this-cpu-operations">
+<h2>this_cpu操作の内部仕組み<a class="headerlink" href="#inner-working-of-this-cpu-operations" title="この見出しへのパーマリンク">¶</a></h2>
+<p>x86ではfs:またはgs:セグメントレジスタがper-CPU領域のベースを保持しています。これにより、セグメントオーバーライドを用いてper-CPU相対アドレスを正しいper-CPU領域に再配置できます。したがって、per-CPUベースへの再配置はセグメントレジスタプレフィックスを用いた命令にエンコードされます。</p>
+<p>例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>DEFINE_PER_CPU(int, x);
+int z;
+
+z = this_cpu_read(x);
+</pre></div>
+</div>
+<p>結果として、単一の命令になります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>mov ax, gs:[x]
+</pre></div>
+</div>
+<p>CPUごとの計算結果を取得するためのアドレス計算とそのアドレスからの取得処理ではなく、per-CPU操作が行われます。この_cpu_opsの前には、プリエンプションの無効化/有効化が必要で、計算が行われる間、カーネルがスレッドを別のプロセッサに移動しないようにする必要があります。</p>
+<p>以下のthis_cpu操作を考慮してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>this_cpu_inc(x)
+</pre></div>
+</div>
+<p>上記の結果は以下の単一の命令（ロックプレフィックスなし！）になります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>inc gs:[x]
+</pre></div>
+</div>
+<p>セグメントレジスタが存在しない場合に必要な以下の操作と比較します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int *y;
+int cpu;
+
+cpu = get_cpu();
+y = per_cpu_ptr(&amp;x, cpu);
+(*y)++;
+put_cpu();
+</pre></div>
+</div>
+<p>これらの操作は特定のプロセッサに割り当てられたper-CPUデータにのみ使用可能です。周囲のコードでプリエンプションを無効にしていない場合、this_cpu_inc()はper-CPUカウンタのうちどれか1つが正しくインクリメントされることを保証しますが、OSがthis_cpu命令の実行前後でプロセスを移動させる可能性があるため、個々のプロセッサのカウンタ値は意味を持たず、すべてのper-CPUカウンタの合計値のみが重要です。</p>
+<p>パフォーマンス向上のためper-CPU変数が使用されます。複数のプロセッサが同じコードパスを同時に通過する場合、キャッシュラインのバウンスを回避できます。各プロセッサが独自のper-CPU変数を持つため、同時にキャッシュラインの更新が行われません。この最適化の代償として、カウンタの値が必要なときにper-CPUカウンタを合計する必要があります。</p>
+</section>
+<section id="special-operations">
+<h2>特殊な操作<a class="headerlink" href="#special-operations" title="この見出しへのパーマリンク">¶</a></h2>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>y = this_cpu_ptr(&amp;x)
+</pre></div>
+</div>
+<p>per-CPU変数（&amp;x !）のオフセットを取得し、現在実行中のプロセッサに属するper-CPU変数のアドレスを返します。this_cpu_ptrはcommon get_cpu/put_cpuシーケンスが要求する複数のステップを回避します。プロセッサ番号は利用できません。代わりに、ローカルなper-CPU領域のオフセットを単純にper-CPUオフセットに加算します。</p>
+<p>この操作は通常、プリエンプションが無効化されたコードセグメントで使用されます。その場合、ポインタはクリティカルセクションでローカルなper-CPUデータにアクセスするために使用されます。プリエンプションが再有効になると、このポインタはもはや現在のプロセッサのper-CPUデータを指さなくなるため、通常は使いません。</p>
+</section>
+<section id="per-cpu-variables-and-offsets">
+<h2>Per cpu変数とオフセット<a class="headerlink" href="#per-cpu-variables-and-offsets" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Per cpu変数は <em>オフセット</em> per cpu領域の開始位置へのオフセットを持ち、コードではアドレスのように見えますが実際にはアドレスではありません。オフセットは直接デリファレンスできません。有効なアドレスを形成するには、プロセッサのper cpu領域のベースポインタにオフセットを加算する必要があります。</p>
+<p>したがって、per cpu操作の文脈外でxまたは&amp;xを使用することは無効であり、一般的にNULLポインタデリファレンスと同様に扱われます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>DEFINE_PER_CPU(int, x);
+</pre></div>
+</div>
+<p>per cpu操作の文脈では、上記はxがper cpu変数であることを意味します。ほとんどのthis_cpu操作はcpu変数を引数とします。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int __percpu *p = &amp;x;
+</pre></div>
+</div>
+<p>&amp;xおよびpはper cpu変数の <em>オフセット</em> オフセットです。this_cpu_ptr()はper cpu変数のオフセットを取るため、この表現は少し不自然に見えます。</p>
+</section>
+<section id="operations-on-a-field-of-a-per-cpu-structure">
+<h2>per cpu構造体のフィールドに対する操作<a class="headerlink" href="#operations-on-a-field-of-a-per-cpu-structure" title="この見出しへのパーマリンク">¶</a></h2>
+<p>例えば、以下のようなpercpu構造体があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct s {
+        int n,m;
+};
+
+DEFINE_PER_CPU(struct s, p);
+</pre></div>
+</div>
+<p>これらのフィールドに対する操作はシンプルです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>this_cpu_inc(p.m)
+
+z = this_cpu_cmpxchg(p.m, 0, 1);
+</pre></div>
+</div>
+<p>struct sへのオフセットがある場合:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct s __percpu *ps = &amp;p;
+
+this_cpu_dec(ps-&gt;m);
+
+z = this_cpu_inc_return(ps-&gt;n);
+</pre></div>
+</div>
+<p>ポインタの計算にはthis_cpu_ptr()の使用が必要かもしれません。後述のthis_cpu操作を用いない場合、特にフィールドを操作する際には:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct s *pp;
+
+pp = this_cpu_ptr(&amp;p);
+
+pp-&gt;m--;
+
+z = pp-&gt;n++;
+</pre></div>
+</div>
+</section>
+<section id="variants-of-this-cpu-ops">
+<h2>this_cpu操作の変種<a class="headerlink" href="#variants-of-this-cpu-ops" title="この見出しへのパーマリンク">¶</a></h2>
+<p>this_cpu操作は割込み安全ですが、一部のアーキテクチャではこれらのper cpuローカル操作をサポートしていません。その場合、割込みを無効にしてアトミックな操作を実行し、その後割込みを再有効にするコードで置き換える必要があります。これはコストが高いため、スケジューラが実行中のプロセッサを変更できない理由がある場合以外では割込みを無効にする必要はありません。その目的のために以下の__this_cpu操作が提供されています。</p>
+<p>これらの操作は割込みやプリエンプションに対する排他性を保証しません。per cpu変数が割込みコンテキストで使用されず、スケジューラがプリエンプションできない場合、これらは安全です。操作中に割込みが発生し、その割込みが変数を変更する場合、RMW（読み取り-変更-書き込み）操作の安全性が保証されません:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>__this_cpu_read(pcp)
+__this_cpu_write(pcp, val)
+__this_cpu_add(pcp, val)
+__this_cpu_and(pcp, val)
+__this_cpu_or(pcp, val)
+__this_cpu_add_return(pcp, val)
+__this_cpu_xchg(pcp, nval)
+__this_cpu_cmpxchg(pcp, oval, nval)
+__this_cpu_cmpxchg_double(pcp1, pcp2, oval1, oval2, nval1, nval2)
+__this_cpu_sub(pcp, val)
+__this_cpu_inc(pcp)
+__this_cpu_dec(pcp)
+__this_cpu_sub_return(pcp, val)
+__this_cpu_inc_return(pcp)
+__this_cpu_dec_return(pcp)
+</pre></div>
+</div>
+<p>xをインクリメントし、アドレス再配置と同一指令内でのRead-Modify-Write操作を通じたアトミック性が達成できないプラットフォームでは割込みを無効にするコードへのフォールバックを行いません。</p>
+</section>
+<section id="this-cpu-ptr-pp-n-vs-this-cpu-ptr-pp-n">
+<h2>&amp;this_cpu_ptr(pp)-&gt;n vs this_cpu_ptr(&amp;pp-&gt;n)<a class="headerlink" href="#this-cpu-ptr-pp-n-vs-this-cpu-ptr-pp-n" title="この見出しへのパーマリンク">¶</a></h2>
+<p>最初の操作はオフセットを取得してアドレスを形成し、その後nフィールドのオフセットを加算します。これによりコンパイラが2つのアディション命令を生成する可能性があります。</p>
+<p>二つ目の操作はまず2つのオフセットを加算し、その後再配置を行います。私の意見では、二つ目の形式の方が見やすく、()の扱いも簡単です。また、この形式はthis_cpu_read()などの使用方法と整合性があります。</p>
+</section>
+<section id="remote-access-to-per-cpu-data">
+<h2>per cpuデータのリモートアクセス<a class="headerlink" href="#remote-access-to-per-cpu-data" title="この見出しへのパーマリンク">¶</a></h2>
+<p>per cpuデータ構造体は1つのCPU専用に設計されており、変数を意図通りに使用する場合、this_cpu_ops()は「アトミック」であると保証されます。他のCPUがこれらのデータ構造にアクセスできないためです。</p>
+<p>パーコアデータ構造にリモートでアクセスする必要がある特別なケースがあります。通常、リモート読み取りは安全であり、カウンタの集計などに頻繁に使用されます。一方、リモート書き込みは問題になる可能性があり、this_cpu操作はロックセマンティクスを持っていません。リモート書き込みはthis_cpu RMW操作と干渉する可能性があります。</p>
+<p>パーコアデータ構造へのリモート書き込みは、絶対に必要がない限り強く推奨されません。代替として、IPI（Inter-Processor Interrupt）でリモートCPUを起こし、そのパーコア領域の更新を行うことを検討してください。</p>
+<p>パーコアデータ構造にリモートでアクセスする際には、通常per_cpu_ptr()関数が使用されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>DEFINE_PER_CPU(struct data, datap);
+
+struct data *p = per_cpu_ptr(&amp;datap, cpu);
+</pre></div>
+</div>
+<p>これは、パーコア領域にリモートでアクセスしようとしていることを明示しています。</p>
+<p>以下の方法でも、データオフセットをアドレスに変換できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct data *p = this_cpu_ptr(&amp;datap);
+</pre></div>
+</div>
+<p>ただし、this_cpu_ptrで計算されたポインタを他のCPUに渡すのは異常で、避けるべきです。</p>
+<p>リモートアクセスは通常、他のCPUのパーコアデータの状態を読み取るためのものであり、書き込みは緩い同期要件により一意の問題を引き起こす可能性があります。</p>
+<p>書き込み操作に関する懸念を示す例として、以下のシナリオがあります。これは、2つのパーコア変数がキャッシュラインを共有しているにもかかわらず、緩い同期がキャッシュラインを更新するプロセスにのみ適用されるためです。</p>
+<p>以下の例を考慮してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct test {
+        atomic_t a;
+        int b;
+};
+
+DEFINE_PER_CPU(struct test, onecacheline);
+</pre></div>
+</div>
+<p>フィールド'a'が1つのプロセッサからリモートで更新され、ローカルプロセッサがthis_cpu操作でフィールド'b'を更新する場合の動作に懸念があります。同じキャッシュライン内のデータへの同時アクセスを避ける必要があります。また、コストのかかる同期が求められる場合もあります。このようなシナリオでは、リモートプロセッサのパーコア領域へのリモート書き込みではなく、IPIの使用が一般的に推奨されます。</p>
+<p>リモート書き込みがまれな場合でも、リモート書き込みにより、最もアクセスする可能性のあるプロセッサのキャッシュラインが追い出される可能性があります。プロセッサが起動してローカルキャッシュラインが見つからないと、パフォーマンスに影響を与え、起動時間も遅くなる可能性があります。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">コアAPIドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#core-utilities">Core utilities</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#data-structures-and-low-level-utilities">Data structures and low-level utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#concurrency-primitives">Concurrency primitives</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#low-level-hardware-management">Low-level hardware management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#memory-management">Memory management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#interfaces-for-kernel-debugging">Interfaces for kernel debugging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#everything-else">Everything else</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">コアAPIドキュメント</a><ul>
+<li>前へ: <a href="bus-virt-phys-mapping.html" title="前章">デバイスドライバー内からI/Oマッピングメモリにアクセスする方法</a></li>
+<li>次へ: <a href="timekeeping.html" title="次章">ktime accessors</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/core-api/this_cpu_ops.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

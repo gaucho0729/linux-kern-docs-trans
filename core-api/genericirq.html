@@ -1,0 +1,2247 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Linux ジェネリック IRQ ハンドリング — The Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="protection-keys.html" rel="next" title="Memory Protection Keys"/>
+<link href="memory-hotplug.html" rel="prev" title="メモリホットプラグ"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="linux-generic-irq-handling">
+<h1>Linux ジェネリック IRQ ハンドリング<a class="headerlink" href="#linux-generic-irq-handling" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著作権</dt>
+<dd class="field-odd"><p>© 2005-2010: Thomas Gleixner</p>
+</dd>
+<dt class="field-even">著作権</dt>
+<dd class="field-even"><p>© 2005-2006: Ingo Molnar</p>
+</dd>
+</dl>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ジェネリック割込みハンドリングレイヤーは、デバイスドライバが割込み処理を抽象化できるように設計されています。さまざまな割込みコントローラハードウェアのタイプを処理可能です。デバイスドライバはジェネリックAPI関数を使用して割込みをリクエスト、有効化、無効化、解放します。ドライバは割込みハードウェアの詳細について何も知る必要がなく、コード変更なしでさまざまなプラットフォームで使用可能です。</p>
+<p>このドキュメンテーションは、ジェネリックIRQハンドリングレイヤーの支援を受けてアーキテクチャごとの割込みサブシステムを実装したい開発者向けに提供されています。</p>
+</section>
+<section id="rationale">
+<h2>理由<a class="headerlink" href="#rationale" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Linuxにおける元の割込みハンドリング実装は、すべての割込み論理を処理可能な__do_IRQ()スーパーハンドラを使用していました。</p>
+<p>当初、Russell KingはARM割込みハンドラ実装（Linux 2.5/2.6）のために、さまざまなハンドラタイプを識別し、比較的汎用的なセットを作成しました。彼は以下のように区別しました：</p>
+<ul class="simple">
+<li><p>レベルタイプ</p></li>
+<li><p>エッジタイプ</p></li>
+<li><p>シンプルタイプ</p></li>
+</ul>
+<p>実装中に別のタイプが識別されました：</p>
+<ul class="simple">
+<li><p>ファストEOIタイプ</p></li>
+</ul>
+<p>__do_IRQ()スーパーハンドラのSMP世界では別のタイプが識別されました：</p>
+<ul class="simple">
+<li><p>パーセパーセルタイプ</p></li>
+</ul>
+<p>高レベルIRQハンドラの分割実装により、各割込みタイプごとの処理フローを最適化できます。これにより特定のコードパスの複雑さが減らされ、特定のタイプの最適化処理が可能になります。</p>
+<p>元の一般的IRQ実装はhw_interrupt_type構造体とその <code class="docutils literal notranslate"><span class="pre">-&gt;ack</span></code>, <code class="docutils literal notranslate"><span class="pre">-&gt;end</span></code> [etc.]コールバック関数を使用してスーパーハンドラ内のフローロジックを区別していました。これによりフローロジックと低レベルハードウェアロジックが混在し、不要なコードの複製が生じました：例えばi386では、低レベル詳細は似ていますがフローハンドリングが異なる <code class="docutils literal notranslate"><span class="pre">ioapic_level_irq</span></code> そして
+<code class="docutils literal notranslate"><span class="pre">ioapic_edge_irq</span></code> IRQタイプがあります。</p>
+<p>より自然な抽象化は「割込みフロー」と「チップ詳細」の明確な分離です。</p>
+<p>いくつかのアーキテクチャのIRQサブシステム実装を分析すると、ほとんどのアーキテクチャがジェネリックな「割込みフロー」メソッドを使用し、チップレベルの特定コードを追加するだけで十分であることがわかります。この分離は、チップ詳細には影響を与えず、割込みフロー自体に特定のクイックが必要な（サブ）アーキテクチャにも価値があり、より透明なIRQサブシステム設計を提供します。</p>
+<p>各割込み記述子には、通常は汎用実装のいずれかが割り当てられる高レベルフローハンドラが割り当てられます。(この高レベルフローハンドラの実装により、さまざまなアーキテクチャの埋め込みプラットフォームで見られるデマルチプレクスハンドラの提供も簡単になります。)</p>
+<p>この分離により、汎用割込み処理レイヤーはより柔軟で拡張性が高くなります。たとえば、(サブ)アーキテクチャは「レベル型」割込みに汎用IRQフロー実装を使用し、「エッジ型」割込みに(サブ)アーキテクチャ固有の実装を追加することができます。</p>
+<p>既存の実装の破損を防ぎ、新しいモデルへの移行を容易にするため、__do_IRQ()スーパーハンドラは引き続き利用可能です。これにより、一時的に二重構造が存在します。時間とともに新しいモデルがより多くのアーキテクチャで使用されるようになり、これによりより小型で整ったIRQサブシステムが実現されます。この機能は3年前から非推奨になっており、現在は削除される予定です。</p>
+</section>
+<section id="known-bugs-and-assumptions">
+<h2>既知のバグと仮定<a class="headerlink" href="#known-bugs-and-assumptions" title="この見出しへのパーマリンク">¶</a></h2>
+<p>なし（木を叩く）。</p>
+</section>
+<section id="abstraction-layers">
+<h2>抽象レイヤー<a class="headerlink" href="#abstraction-layers" title="この見出しへのパーマリンク">¶</a></h2>
+<p>割込みコードには3つの主な抽象レベルがあります：</p>
+<ol class="arabic simple">
+<li><p>高レベルドライバAPI</p></li>
+<li><p>高レベルIRQフローハンドラ</p></li>
+<li><p>チップレベルハードウェアのカプセル化</p></li>
+</ol>
+<section id="interrupt-control-flow">
+<h3>割込み制御フロー<a class="headerlink" href="#interrupt-control-flow" title="この見出しへのパーマリンク">¶</a></h3>
+<p>各割込みはirq_desc構造体で記述され、割込みは「unsigned int」の数値で参照され、この数値はディスクリプタ構造体配列内の対応する割込み記述子構造体を選択します。ディスクリプタ構造体にはステータス情報と、この割込みに割り当てられた割込みフローメソッドと割込みチップ構造体へのポインタが含まれています。</p>
+<p>割込みがトリガーされた際、低レベルアーキテクチャコードはdesc-&gt;handle_irq()を呼び出して汎用割込みコードに呼び出します。この高レベルIRQ処理関数は、割り当てられたチップ記述子構造体で参照されるdesc-&gt;irq_data.chipのプリミティブのみを使用します。</p>
+</section>
+<section id="high-level-driver-api">
+<h3>高レベルドライバAPI<a class="headerlink" href="#high-level-driver-api" title="この見出しへのパーマリンク">¶</a></h3>
+<p>高レベルドライバAPIには以下の関数が含まれます：</p>
+<ul class="simple">
+<li><p><a class="reference internal" href="#c.request_irq" title="request_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">request_irq()</span></code></a></p></li>
+<li><p><a class="reference internal" href="#c.request_threaded_irq" title="request_threaded_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">request_threaded_irq()</span></code></a></p></li>
+<li><p><a class="reference internal" href="#c.free_irq" title="free_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">free_irq()</span></code></a></p></li>
+<li><p><a class="reference internal" href="#c.disable_irq" title="disable_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">disable_irq()</span></code></a></p></li>
+<li><p><a class="reference internal" href="#c.enable_irq" title="enable_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">enable_irq()</span></code></a></p></li>
+<li><p><a class="reference internal" href="#c.disable_irq_nosync" title="disable_irq_nosync"><code class="xref c c-func docutils literal notranslate"><span class="pre">disable_irq_nosync()</span></code></a> (SMP専用)</p></li>
+<li><p><a class="reference internal" href="#c.synchronize_irq" title="synchronize_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">synchronize_irq()</span></code></a> (SMP専用)</p></li>
+<li><p><a class="reference internal" href="#c.irq_set_irq_type" title="irq_set_irq_type"><code class="xref c c-func docutils literal notranslate"><span class="pre">irq_set_irq_type()</span></code></a></p></li>
+<li><p><a class="reference internal" href="#c.irq_set_irq_wake" title="irq_set_irq_wake"><code class="xref c c-func docutils literal notranslate"><span class="pre">irq_set_irq_wake()</span></code></a></p></li>
+<li><p><a class="reference internal" href="#c.irq_set_handler_data" title="irq_set_handler_data"><code class="xref c c-func docutils literal notranslate"><span class="pre">irq_set_handler_data()</span></code></a></p></li>
+<li><p><a class="reference internal" href="#c.irq_set_chip" title="irq_set_chip"><code class="xref c c-func docutils literal notranslate"><span class="pre">irq_set_chip()</span></code></a></p></li>
+<li><p><a class="reference internal" href="#c.irq_set_chip_data" title="irq_set_chip_data"><code class="xref c c-func docutils literal notranslate"><span class="pre">irq_set_chip_data()</span></code></a></p></li>
+</ul>
+<p>詳細については自動生成された関数ドキュメンテーションを参照してください。</p>
+</section>
+<section id="high-level-irq-flow-handlers">
+<h3>高レベルIRQフローハンドラ<a class="headerlink" href="#high-level-irq-flow-handlers" title="この見出しへのパーマリンク">¶</a></h3>
+<p>汎用レイヤーは事前に定義されたirqフローメソッドのセットを提供します：</p>
+<ul class="simple">
+<li><p><a class="reference internal" href="#c.handle_level_irq" title="handle_level_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">handle_level_irq()</span></code></a></p></li>
+<li><p><a class="reference internal" href="#c.handle_edge_irq" title="handle_edge_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">handle_edge_irq()</span></code></a></p></li>
+<li><p><a class="reference internal" href="#c.handle_fasteoi_irq" title="handle_fasteoi_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">handle_fasteoi_irq()</span></code></a></p></li>
+<li><p><a class="reference internal" href="#c.handle_simple_irq" title="handle_simple_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">handle_simple_irq()</span></code></a></p></li>
+<li><p><a class="reference internal" href="#c.handle_percpu_irq" title="handle_percpu_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">handle_percpu_irq()</span></code></a></p></li>
+<li><p><a class="reference internal" href="#c.handle_edge_eoi_irq" title="handle_edge_eoi_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">handle_edge_eoi_irq()</span></code></a></p></li>
+<li><p><a class="reference internal" href="#c.handle_bad_irq" title="handle_bad_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">handle_bad_irq()</span></code></a></p></li>
+</ul>
+<p>割込みフローハンドラ(事前に定義されたか、アーキテクチャ固有のもの)は、アーキテクチャが起動時またはデバイス初期化時に特定の割込みに割り当てられます。</p>
+<section id="default-flow-implementations">
+<h4>デフォルトフロー実装<a class="headerlink" href="#default-flow-implementations" title="この見出しへのパーマリンク">¶</a></h4>
+<section id="helper-functions">
+<h5>ヘルパー関数<a class="headerlink" href="#helper-functions" title="この見出しへのパーマリンク">¶</a></h5>
+<p>補助関数はチッププリミティブを呼び出し、デフォルトフロー実装で使用されます。以下の補助関数が実装されています(簡略化された抜粋)：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>default_enable(struct irq_data *data)
+{
+    desc-&gt;irq_data.chip-&gt;irq_unmask(data);
+}
+
+default_disable(struct irq_data *data)
+{
+    if (!delay_disable(data))
+        desc-&gt;irq_data.chip-&gt;irq_mask(data);
+}
+
+default_ack(struct irq_data *data)
+{
+    chip-&gt;irq_ack(data);
+}
+
+default_mask_ack(struct irq_data *data)
+{
+    if (chip-&gt;irq_mask_ack) {
+        chip-&gt;irq_mask_ack(data);
+    } else {
+        chip-&gt;irq_mask(data);
+        chip-&gt;irq_ack(data);
+    }
+}
+
+noop(struct irq_data *data))
+{
+}
+</pre></div>
+</div>
+</section>
+</section>
+<section id="default-flow-handler-implementations">
+<h4>デフォルトフローハンドラ実装<a class="headerlink" href="#default-flow-handler-implementations" title="この見出しへのパーマリンク">¶</a></h4>
+<section id="default-level-irq-flow-handler">
+<h5>デフォルトレベルIRQフローハンドラ<a class="headerlink" href="#default-level-irq-flow-handler" title="この見出しへのパーマリンク">¶</a></h5>
+<p>handle_level_irqはレベルトリガー型割り込みのための汎用的な実装を提供します。</p>
+<p>以下に示す制御フローが実装されています（簡略化された抜粋）：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>desc-&gt;irq_data.chip-&gt;irq_mask_ack();
+handle_irq_event(desc-&gt;action);
+desc-&gt;irq_data.chip-&gt;irq_unmask();
+</pre></div>
+</div>
+</section>
+<section id="default-fast-eoi-irq-flow-handler">
+<h5>デフォルトの高速EOI割り込みフローハンドラ<a class="headerlink" href="#default-fast-eoi-irq-flow-handler" title="この見出しへのパーマリンク">¶</a></h5>
+<p>handle_fasteoi_irqは、ハンドラの終わりにEOIのみが必要な割り込みのための汎用的な実装を提供します。</p>
+<p>以下に示す制御フローが実装されています（簡略化された抜粋）：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>handle_irq_event(desc-&gt;action);
+desc-&gt;irq_data.chip-&gt;irq_eoi();
+</pre></div>
+</div>
+</section>
+<section id="default-edge-irq-flow-handler">
+<h5>デフォルトのエッジ割り込みフローハンドラ<a class="headerlink" href="#default-edge-irq-flow-handler" title="この見出しへのパーマリンク">¶</a></h5>
+<p>handle_edge_irqはエッジトリガー型割り込みのための汎用的な実装を提供します。</p>
+<p>以下に示す制御フローが実装されています（簡略化された抜粋）：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>if (desc-&gt;status &amp; running) {
+    desc-&gt;irq_data.chip-&gt;irq_mask_ack();
+    desc-&gt;status |= pending | masked;
+    return;
+}
+desc-&gt;irq_data.chip-&gt;irq_ack();
+desc-&gt;status |= running;
+do {
+    if (desc-&gt;status &amp; masked)
+        desc-&gt;irq_data.chip-&gt;irq_unmask();
+    desc-&gt;status &amp;= ~pending;
+    handle_irq_event(desc-&gt;action);
+} while (status &amp; pending);
+desc-&gt;status &amp;= ~running;
+</pre></div>
+</div>
+</section>
+<section id="default-simple-irq-flow-handler">
+<h5>デフォルトのシンプルな割り込みフローハンドラ<a class="headerlink" href="#default-simple-irq-flow-handler" title="この見出しへのパーマリンク">¶</a></h5>
+<p>handle_simple_irqはシンプルな割り込みのための汎用的な実装を提供します。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>シンプルなフローハンドラは、ハンドラ/チップのプリミティブを呼び出しません。</p>
+</div>
+<p>以下に示す制御フローが実装されています（簡略化された抜粋）：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>handle_irq_event(desc-&gt;action);
+</pre></div>
+</div>
+</section>
+<section id="default-per-cpu-flow-handler">
+<h5>デフォルトのパーセルCPUフローハンドラ<a class="headerlink" href="#default-per-cpu-flow-handler" title="この見出しへのパーマリンク">¶</a></h5>
+<p>handle_percpu_irqはパーセルCPU割り込みのための汎用的な実装を提供します。</p>
+<p>パーセルCPU割り込みはSMPでのみ利用可能で、ハンドラはロックなしの簡略化されたバージョンを提供します。</p>
+<p>以下に示す制御フローが実装されています（簡略化された抜粋）：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>if (desc-&gt;irq_data.chip-&gt;irq_ack)
+    desc-&gt;irq_data.chip-&gt;irq_ack();
+handle_irq_event(desc-&gt;action);
+if (desc-&gt;irq_data.chip-&gt;irq_eoi)
+    desc-&gt;irq_data.chip-&gt;irq_eoi();
+</pre></div>
+</div>
+</section>
+<section id="eoi-edge-irq-flow-handler">
+<h5>EOIエッジ割り込みフローハンドラ<a class="headerlink" href="#eoi-edge-irq-flow-handler" title="この見出しへのパーマリンク">¶</a></h5>
+<p>handle_edge_eoi_irqは、powerpc/cellの壊れたIRQコントローラーを制御するために単独で使用されるエッジハンドラの変異形を提供します。</p>
+</section>
+<section id="bad-irq-flow-handler">
+<h5>不良なIRQフローハンドラ<a class="headerlink" href="#bad-irq-flow-handler" title="この見出しへのパーマリンク">¶</a></h5>
+<p>handle_bad_irqは、実際のハンドラが割り当てられていない偽の割り込みに使用されます。</p>
+</section>
+</section>
+<section id="quirks-and-optimizations">
+<h4>クイックと最適化<a class="headerlink" href="#quirks-and-optimizations" title="この見出しへのパーマリンク">¶</a></h4>
+<p>汎用的な関数は、「クリーン」なアーキテクチャおよびチップ（プラットフォーム固有のIRQハンドリングクイックを持たないもの）のために設計されています。アーキテクチャが「フロー」レベルでクイックを実装する必要がある場合、ハイレベルのirq-flowハンドラをオーバーライドすることで実現できます。</p>
+</section>
+<section id="delayed-interrupt-disable">
+<h4>遅延された割り込み無効化<a class="headerlink" href="#delayed-interrupt-disable" title="この見出しへのパーマリンク">¶</a></h4>
+<p>この割り込みごとの選択可能な機能は、Russell KingがARM割り込み実装で導入したもので、ハードウェアレベルでの割り込みの無効化は行われません。 <a class="reference internal" href="#c.disable_irq" title="disable_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">disable_irq()</span></code></a> 呼び出される。割り込みは有効のまま維持され、割り込みイベントが発生した際にフローハンドラで無効化されます。これにより、ハードウェアが割り込みイベントを無効化されている間保存しない場合、エッジ割り込みが失われることを防ぎます。IRQ_DISABLEDフラグが設定されている間割り込みが到達した場合、ハードウェアレベルで割り込みが無効化され、IRQ_PENDINGビットが設定されます。割り込みが再有効化される際には、
+<a class="reference internal" href="#c.enable_irq" title="enable_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">enable_irq()</span></code></a> 待機ビットが確認され、設定されている場合、ハードウェアまたはソフトウェアの再送メカニズムを介して割り込みが再送信されます。(遅延された割り込み無効化機能を使用したい場合、ハードウェアが割り込みを再トリガーできない場合は、CONFIG_HARDIRQS_SW_RESENDを有効にする必要があります。) 遅延された割り込み無効化は設定可能ではありません。</p>
+</section>
+</section>
+<section id="chip-level-hardware-encapsulation">
+<h3>チップレベルハードウェアのカプセル化<a class="headerlink" href="#chip-level-hardware-encapsulation" title="この見出しへのパーマリンク">¶</a></h3>
+<p>チップレベルのハードウェア記述子構造体 <a class="reference internal" href="#c.irq_chip" title="IRQチップ"><code class="xref c c-type docutils literal notranslate"><span class="pre">irq_chip</span></code></a> チップに関連するすべての直接的な関数を含み、irqフロー実装で利用できます。</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">irq_ack</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">irq_mask_ack</span></code> - オプション、パフォーマンス向上のために推奨</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">irq_mask</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">irq_unmask</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">irq_eoi</span></code> - オプション（EOIフローハンドラが必要）</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">irq_retrigger</span></code> - オプション</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">irq_set_type</span></code> - オプション</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">irq_set_wake</span></code> - オプション</p></li>
+</ul>
+<p>これらのプリミティブは、まさにその意味を厳密に意味するように設計されています。ACKはACK、IRQラインのマスキングはマスティングなどです。フローエンドハンドラがこれらの低レベル機能の基本単位を適切に使用する必要があります。</p>
+</section>
+</section>
+<section id="do-irq-entry-point">
+<h2>__do_IRQエントリポイント<a class="headerlink" href="#do-irq-entry-point" title="この見出しへのパーマリンク">¶</a></h2>
+<p>元の実装__do_IRQ()は、すべての種類の割込みに対する代替エントリポイントでしたが、現在は存在しなくなりました。</p>
+<p>このハンドラはすべての割込みハードウェアに適切でなかったため、エッジ/レベル/シンプル/ペルCPU割込みに分離された機能で再実装されました。これは単なる機能最適化にとどまらず、割込み処理のコードパスを短縮する効果もあります。</p>
+</section>
+<section id="locking-on-smp">
+<h2>SMPでのロック<a class="headerlink" href="#locking-on-smp" title="この見出しへのパーマリンク">¶</a></h2>
+<p>チップレジスタのロックは、チッププリミティブを定義するアーキテクチャの責任です。パーセルIRQ構造体は、ジェネリックレイヤーによってdesc-&gt;lockで保護されます。</p>
+</section>
+<section id="generic-interrupt-chip">
+<h2>ジェネリック割込みチップ<a class="headerlink" href="#generic-interrupt-chip" title="この見出しへのパーマリンク">¶</a></h2>
+<p>同じIRQチップの実装を複製することを避けるため、コアは構成可能なジェネリック割込みチップの実装を提供します。開発者は、ジェネリックチップが自身のニーズに合致するかを慎重に確認した上で、同じ機能をわずかに異なる方法で実装すべきではありません。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_gc_mask_set_bit">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_gc_mask_set_bit</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">d</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_gc_mask_set_bit" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>マスキングチップをマスキングレジスタのビット設定により実行</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*d</span></code></dt><dd><p>irq_data</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>チップは単一のマスキングレジスタを持ちます。このレジスタの値はgc-&gt;lockによってキャッシュされ保護されています</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_gc_mask_clr_bit">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_gc_mask_clr_bit</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">d</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_gc_mask_clr_bit" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>マスキングレジスタのビットクリアによりマスキングチップを実行</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*d</span></code></dt><dd><p>irq_data</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>チップは単一のマスキングレジスタを持ちます。このレジスタの値はgc-&gt;lockによってキャッシュされ保護されています</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_gc_ack_set_bit">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_gc_ack_set_bit</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">d</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_gc_ack_set_bit" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ビット設定により待機中の割込みをACK</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*d</span></code></dt><dd><p>irq_data</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_gc_set_wake">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_gc_set_wake</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">d</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">on</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_gc_set_wake" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割込みのウェイクビットを設定/クリア</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*d</span></code></dt><dd><p>irq_data</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">on</span></code></dt><dd><p>ウェイクビットが設定されるべきか、クリアされるべきかを示します</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ウェイクがスリープから機能する機能が別個のレジスタに設定されていないチップで、ウェイクアクティブ状態はビットマスクで保存されています。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_alloc_generic_chip">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_chip_generic" title="irq_chip_generic"><span class="n"><span class="pre">irq_chip_generic</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">irq_alloc_generic_chip</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="kt"><span class="pre">char</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">名前</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">num_ct</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq_base</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="pre">__iomem</span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">reg_base</span></span>, <span class="n"><span class="pre">irq_flow_handler_t</span></span><span class="w"> </span><span class="n"><span class="pre">handler</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_alloc_generic_chip" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ジェネリックチップを割り当てて初期化します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">char</span> <span class="pre">*name</span></code></dt><dd><p>irqチップの名前</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">num_ct</span></code></dt><dd><p>このチップに関連するirq_chip_typeインスタンスの数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq_base</span></code></dt><dd><p>このチップの割込みベース番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">__iomem</span> <span class="pre">*reg_base</span></code></dt><dd><p>レジスタベースアドレス（仮想）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_flow_handler_t</span> <span class="pre">handler</span></code></dt><dd><p>このチップに関連するデフォルトのフローエンドハンドラ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>初期化されたirq_chip_generic構造体を返します。チップはデフォルトでプライマリ（インデックス0）irq_chip_typeに設定され、 <strong>handler</strong></p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.__irq_alloc_domain_generic_chips">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">__irq_alloc_domain_generic_chips</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_domain</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">d</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irqs_per_chip</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">num_ct</span></span>, <span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="kt"><span class="pre">char</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">名前</span></span>, <span class="n"><span class="pre">irq_flow_handler_t</span></span><span class="w"> </span><span class="n"><span class="pre">handler</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">clr</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">set</span></span>, <span class="k"><span class="pre">enum</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_gc_flags" title="irq_gc_flags"><span class="n"><span class="pre">irq_gc_flags</span></span></a><span class="w"> </span><span class="n"><span class="pre">gcflags</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.__irq_alloc_domain_generic_chips" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>IRQドメイン用の汎用チップを割り当てます</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_domain</span> <span class="pre">*d</span></code></dt><dd><p>チップを割り当てるIRQドメイン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">irqs_per_chip</span></code></dt><dd><p>チップが処理する割り込み数（最大32）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">num_ct</span></code></dt><dd><p>このチップに関連するirq_chip_typeインスタンスの数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">char</span> <span class="pre">*name</span></code></dt><dd><p>irqチップの名前</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_flow_handler_t</span> <span class="pre">handler</span></code></dt><dd><p>これらのチップに関連するデフォルトのフローハンドラ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">clr</span></code></dt><dd><p>マッピング関数でクリアするIRQ_*ビット</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">set</span></code></dt><dd><p>マッピング関数で設定するIRQ_*ビット</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">enum</span> <span class="pre">irq_gc_flags</span> <span class="pre">gcflags</span></code></dt><dd><p>汎用チップ固有の設定フラグ</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_get_domain_generic_chip">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_chip_generic" title="irq_chip_generic"><span class="n"><span class="pre">irq_chip_generic</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">irq_get_domain_generic_chip</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_domain</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">d</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">hw_irq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_get_domain_generic_chip" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>hw_irqの汎用チップへのポインタを取得します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_domain</span> <span class="pre">*d</span></code></dt><dd><p>IRQドメインポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">hw_irq</span></code></dt><dd><p>ハードウェア割り込み番号</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_setup_generic_chip">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_setup_generic_chip</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_chip_generic" title="irq_chip_generic"><span class="n"><span class="pre">irq_chip_generic</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">gc</span></span>, <span class="n"><span class="pre">u32</span></span><span class="w"> </span><span class="n"><span class="pre">msk</span></span>, <span class="k"><span class="pre">enum</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_gc_flags" title="irq_gc_flags"><span class="n"><span class="pre">irq_gc_flags</span></span></a><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">clr</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">set</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_setup_generic_chip" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>汎用チップで割り込み範囲を設定します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_chip_generic</span> <span class="pre">*gc</span></code></dt><dd><p>すべてのデータを保持する汎用割り込みチップ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">u32</span> <span class="pre">msk</span></code></dt><dd><p>gc-&gt;irq_baseに関する初期化対象のIRQを保持するビットマスク</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">enum</span> <span class="pre">irq_gc_flags</span> <span class="pre">flags</span></code></dt><dd><p>初期化フラグ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">clr</span></code></dt><dd><p>クリアするIRQ_*ビット</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">set</span></code></dt><dd><p>設定するIRQ_*ビット</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>gc-&gt;irq_baseから最大32個の割り込みを設定します。注意：これはすべての割り込みをプライマリのirq_chip_typeおよび関連するハンドラに初期化します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_setup_alt_chip">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_setup_alt_chip</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">d</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">type</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_setup_alt_chip" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>代替チップへの切り替え</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*d</span></code></dt><dd><p>この割り込みのirq_data</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">type</span></code></dt><dd><p>初期化するフロータイプ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>chip-&gt;irq_set_type()コールバックからのみ呼び出してください。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_remove_generic_chip">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_remove_generic_chip</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_chip_generic" title="irq_chip_generic"><span class="n"><span class="pre">irq_chip_generic</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">gc</span></span>, <span class="n"><span class="pre">u32</span></span><span class="w"> </span><span class="n"><span class="pre">msk</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">clr</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">set</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_remove_generic_chip" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>チップの削除</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_chip_generic</span> <span class="pre">*gc</span></code></dt><dd><p>すべてのデータを保持する汎用割り込みチップ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">u32</span> <span class="pre">msk</span></code></dt><dd><p>gc-&gt;irq_baseに関する初期化対象のIRQを保持するビットマスク</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">clr</span></code></dt><dd><p>クリアするIRQ_*ビット</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">set</span></code></dt><dd><p>設定するIRQ_*ビット</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>gc-&gt;irq_baseから最大32個の割り込みを削除します。</p>
+</section>
+<section id="structures">
+<h2>構造体<a class="headerlink" href="#structures" title="この見出しへのパーマリンク">¶</a></h2>
+<p>この章は、汎用IRQレイヤーで使用される構造体の自動生成ドキュメンテーションを含んでいます。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.irq_common_data">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_common_data</span></span></span><a class="headerlink" href="#c.irq_common_data" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>すべてのirqchipが共有する各割り込みデータ</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct irq_common_data {
+  unsigned int            __private state_use_accessors;
+#ifdef CONFIG_NUMA;
+  unsigned int            node;
+#endif;
+  void *handler_data;
+  struct msi_desc         *msi_desc;
+  cpumask_var_t affinity;
+#ifdef CONFIG_GENERIC_IRQ_EFFECTIVE_AFF_MASK;
+  cpumask_var_t effective_affinity;
+#endif;
+#ifdef CONFIG_GENERIC_IRQ_IPI;
+  unsigned int            ipi_offset;
+#endif;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">state_use_accessors</span></code></dt><dd><p>irqチップ関数のステータス情報。アクセサ関数を使用して操作してください</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">node</span></code></dt><dd><p>バランスに役立つノードインデックス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">handler_data</span></code></dt><dd><p>irq_chipメソッド用の各割り込みデータ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">msi_desc</span></code></dt><dd><p>MSIデスクリプタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">affinity</span></code></dt><dd><p>SMPにおけるIRQのアフィニティ。これはIPI関連のIRQの場合、IPIを送信可能なCPUのマスクです。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">effective_affinity</span></code></dt><dd><p>SMPにおける有効なIRQアフィニティ。一部のIRQチップは複数のCPU宛てを許可しないため、その一部として <strong>アフィニティ</strong>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ipi_offset</span></code></dt><dd><p>最初のIPI宛CPUのオフセット <strong>アフィニティ</strong>オプション。</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.irq_data">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_data</span></span></span><a class="headerlink" href="#c.irq_data" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>チップ関数に渡される各IRQチップのデータ</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct irq_data {
+  u32 mask;
+  unsigned int            irq;
+  unsigned long           hwirq;
+  struct irq_common_data  *common;
+  struct irq_chip         *chip;
+  struct irq_domain       *domain;
+#ifdef CONFIG_IRQ_DOMAIN_HIERARCHY;
+  struct irq_data         *parent_data;
+#endif;
+  void *chip_data;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">mask</span></code></dt><dd><p>チップレジスタへのアクセスに使用する事前計算されたビットマスク</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq</span></code></dt><dd><p>割り込み番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">hwirq</span></code></dt><dd><p>割り込みドメイン内でのローカルなハードウェア割り込み番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">common</span></code></dt><dd><p>すべてのIRQチップで共有されるデータへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">chip</span></code></dt><dd><p>低レベルの割り込みハードウェアアクセス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">domain</span></code></dt><dd><p>割り込み変換ドメイン；ハードウェア割り込み番号とLinux割り込み番号のマッピングを担当します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">parent_data</span></code></dt><dd><p>親へのポインタ <a class="reference internal" href="#c.irq_data" title="irq_data"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span></code></a> 階層的なirq_domainをサポートするため</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">chip_data</span></code></dt><dd><p>プラットフォーム固有の各チップのプライベートデータ。チップメソッドで共有チップ実装を許可します</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.irq_chip">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">IRQチップ</span></span></span><a class="headerlink" href="#c.irq_chip" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ハードウェア割り込みチップの記述子</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct irq_chip {
+  struct device   *parent_device;
+  const char      *name;
+  unsigned int    (*irq_startup)(struct irq_data *data);
+  void (*irq_shutdown)(struct irq_data *data);
+  void (*irq_enable)(struct irq_data *data);
+  void (*irq_disable)(struct irq_data *data);
+  void (*irq_ack)(struct irq_data *data);
+  void (*irq_mask)(struct irq_data *data);
+  void (*irq_mask_ack)(struct irq_data *data);
+  void (*irq_unmask)(struct irq_data *data);
+  void (*irq_eoi)(struct irq_data *data);
+  int (*irq_set_affinity)(struct irq_data *data, const struct cpumask *dest, bool force);
+  int (*irq_retrigger)(struct irq_data *data);
+  int (*irq_set_type)(struct irq_data *data, unsigned int flow_type);
+  int (*irq_set_wake)(struct irq_data *data, unsigned int on);
+  void (*irq_bus_lock)(struct irq_data *data);
+  void (*irq_bus_sync_unlock)(struct irq_data *data);
+  void (*irq_cpu_online)(struct irq_data *data);
+  void (*irq_cpu_offline)(struct irq_data *data);
+  void (*irq_suspend)(struct irq_data *data);
+  void (*irq_resume)(struct irq_data *data);
+  void (*irq_pm_shutdown)(struct irq_data *data);
+  void (*irq_calc_mask)(struct irq_data *data);
+  void (*irq_print_chip)(struct irq_data *data, struct seq_file *p);
+  int (*irq_request_resources)(struct irq_data *data);
+  void (*irq_release_resources)(struct irq_data *data);
+  void (*irq_compose_msi_msg)(struct irq_data *data, struct msi_msg *msg);
+  void (*irq_write_msi_msg)(struct irq_data *data, struct msi_msg *msg);
+  int (*irq_get_irqchip_state)(struct irq_data *data, enum irqchip_irq_state which, bool *state);
+  int (*irq_set_irqchip_state)(struct irq_data *data, enum irqchip_irq_state which, bool state);
+  int (*irq_set_vcpu_affinity)(struct irq_data *data, void *vcpu_info);
+  void (*ipi_send_single)(struct irq_data *data, unsigned int cpu);
+  void (*ipi_send_mask)(struct irq_data *data, const struct cpumask *dest);
+  int (*irq_nmi_setup)(struct irq_data *data);
+  void (*irq_nmi_teardown)(struct irq_data *data);
+  unsigned long   flags;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">parent_device</span></code></dt><dd><p>IRQチップの親デバイスへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">name</span></code></dt><dd><p>/proc/interruptsの名前</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_startup</span></code></dt><dd><p>割り込みを起動する（NULLの場合は-&gt;enableにデフォルト）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_shutdown</span></code></dt><dd><p>割り込みをシャットダウンする（NULLの場合は-&gt;disableにデフォルト）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_enable</span></code></dt><dd><p>割り込みを有効にする（NULLの場合はchip-&gt;unmaskにデフォルト）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_disable</span></code></dt><dd><p>割り込みを無効にする</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_ack</span></code></dt><dd><p>新しい割り込みの開始</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_mask</span></code></dt><dd><p>割り込みソースをマスクする</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_mask_ack</span></code></dt><dd><p>割り込みソースをアサーションし、マスクする</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_unmask</span></code></dt><dd><p>割り込みソースをマスク解除する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_eoi</span></code></dt><dd><p>割り込みの終了</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_set_affinity</span></code></dt><dd><p>SMPマシンにおけるCPUアフィニティを設定する。force引数がtrueの場合、ドライバにアフィニティ設定を無条件で適用するように指示します。提供されたアフィニティマスクに対する健全性チェックは不要です。これはCPUホットプラグでターゲットCPUがcpu_online_maskにまだ設定されていない場合に使用されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_retrigger</span></code></dt><dd><p>IRQをCPUに再送信する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_set_type</span></code></dt><dd><p>IRQのフロー型（IRQ_TYPE_LEVEL/etc.）を設定する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_set_wake</span></code></dt><dd><p>IRQの電源管理Wake-onを有効/無効にする</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_bus_lock</span></code></dt><dd><p>低速バス（I2C）チップへのアクセスをロックする関数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_bus_sync_unlock</span></code></dt><dd><p>低速バス（I2C）チップの同期とロック解除を行う関数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_cpu_online</span></code></dt><dd><p>セカンドCPU用の割り込みソースを設定する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_cpu_offline</span></code></dt><dd><p>セカンドCPU用の割り込みソースを解除する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_suspend</span></code></dt><dd><p>コアコードがチップごとにスリープ時に割り込みがインストールされているときに呼ばれる関数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_resume</span></code></dt><dd><p>コアコードがチップごとに再起動時に割り込みがインストールされているときに呼ばれる関数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_pm_shutdown</span></code></dt><dd><p>コアコードがチップごとにシャットダウン時に呼ばれる関数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_calc_mask</span></code></dt><dd><p>特殊なケースのためにirq_data.maskを設定するオプション関数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_print_chip</span></code></dt><dd><p>show_interruptsで特殊なチップ情報を印刷するオプション</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_request_resources</span></code></dt><dd><p>このIRQに関連する他のコールバックを呼び出す前にリソースを要求するオプション</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_release_resources</span></code></dt><dd><p>irq_request_resourcesで取得したリソースを解放するオプション</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_compose_msi_msg</span></code></dt><dd><p>MSI用のメッセージ内容を組み立てるオプション</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_write_msi_msg</span></code></dt><dd><p>MSI用のメッセージ内容を書くオプション</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_get_irqchip_state</span></code></dt><dd><p>割り込みの内部状態を返す</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_set_irqchip_state</span></code></dt><dd><p>割り込みの内部状態を設定する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_set_vcpu_affinity</span></code></dt><dd><p>仮想マシン内のvCPUをターゲットにするオプション</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ipi_send_single</span></code></dt><dd><p>宛先CPUに単一のIPIを送信する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ipi_send_mask</span></code></dt><dd><p>cpumask内の宛先CPUにIPIを送信する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_nmi_setup</span></code></dt><dd><p>NMIを有効にする前にコアコードから呼ばれる関数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_nmi_teardown</span></code></dt><dd><p>NMIを無効にする後にコアコードから呼ばれる関数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">flags</span></code></dt><dd><p>チップ固有のフラグ</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.irq_chip_regs">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_regs</span></span></span><a class="headerlink" href="#c.irq_chip_regs" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>struct irq_gci用のレジスタオフセット</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct irq_chip_regs {
+  unsigned long           enable;
+  unsigned long           disable;
+  unsigned long           mask;
+  unsigned long           ack;
+  unsigned long           eoi;
+  unsigned long           type;
+  unsigned long           polarity;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">enable</span></code></dt><dd><p>有効化レジスタオフセットをreg_baseに</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">disable</span></code></dt><dd><p>無効化レジスタオフセットをreg_baseに</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mask</span></code></dt><dd><p>マスクレジスタオフセットをreg_baseに</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ack</span></code></dt><dd><p>アッカーレジスタオフセットをreg_baseに</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">eoi</span></code></dt><dd><p>EOIレジスタオフセットをreg_baseに</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">type</span></code></dt><dd><p>タイプ構成レジスタオフセットをreg_baseに</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">polarity</span></code></dt><dd><p>極性構成レジスタオフセットをreg_baseに</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.irq_chip_type">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_type</span></span></span><a class="headerlink" href="#c.irq_chip_type" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>フロー型に対応するジェネリック割り込みチップインスタンス</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct irq_chip_type {
+  struct irq_chip         chip;
+  struct irq_chip_regs    regs;
+  irq_flow_handler_t handler;
+  u32 type;
+  u32 mask_cache_priv;
+  u32 *mask_cache;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">chip</span></code></dt><dd><p>コールバックを提供する実際の割り込みチップ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">regs</span></code></dt><dd><p>このチップのレジスタオフセット</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">handler</span></code></dt><dd><p>このチップに関連するフローハンドラ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">type</span></code></dt><dd><p>このチップが処理可能なフロータイプ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mask_cache_priv</span></code></dt><dd><p>チップタイプ専用のキャッシュされたマスクレジスタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mask_cache</span></code></dt><dd><p>キャッシュされたマスクレジスタへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>irq_generic_chipは、異なるフロータイプに応じて異なる機能とレジスタオフセットを持つ複数のirq_chip_typeインスタンスを持つことができる。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.irq_chip_generic">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_generic</span></span></span><a class="headerlink" href="#c.irq_chip_generic" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ジェネリックIRQチップデータ構造</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct irq_chip_generic {
+  raw_spinlock_t lock;
+  void __iomem            *reg_base;
+  u32 (*reg_readl)(void __iomem *addr);
+  void (*reg_writel)(u32 val, void __iomem *addr);
+  void (*suspend)(struct irq_chip_generic *gc);
+  void (*resume)(struct irq_chip_generic *gc);
+  unsigned int            irq_base;
+  unsigned int            irq_cnt;
+  u32 mask_cache;
+  u32 type_cache;
+  u32 polarity_cache;
+  u32 wake_enabled;
+  u32 wake_active;
+  unsigned int            num_ct;
+  void *private;
+  unsigned long           installed;
+  unsigned long           unused;
+  struct irq_domain       *domain;
+  struct list_head        list;
+  struct irq_chip_type    chip_types[];
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">lock</span></code></dt><dd><p>レジスタおよびキャッシュデータへのアクセスを保護するロック</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">reg_base</span></code></dt><dd><p>レジスタベースアドレス（仮想）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">reg_readl</span></code></dt><dd><p>代替I/Oアクセッサ（NULLの場合はreadlにデフォルト）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">reg_writel</span></code></dt><dd><p>代替I/Oアクセッサ（NULLの場合はwritelにデフォルト）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">suspend</span></code></dt><dd><p>チップごとにスリープ時にコアコードから呼ばれる関数；irq_chip::suspendよりも、割り込みが使用されていない場合でもチップの詳細を処理するために役立つ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">resume</span></code></dt><dd><p>チップごとにリスロー時にコアコードから呼ばれる関数；irq_chip::suspendよりも、割り込みが使用されていない場合でもチップの詳細を処理するために役立つ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_base</span></code></dt><dd><p>このチップの割込みベース番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_cnt</span></code></dt><dd><p>このチップが処理する割り込みの数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mask_cache</span></code></dt><dd><p>すべてのチップタイプで共有されるキャッシュされたマスクレジスタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">type_cache</span></code></dt><dd><p>キャッシュされたタイプレジスタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">polarity_cache</span></code></dt><dd><p>キャッシュされた極性レジスタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">wake_enabled</span></code></dt><dd><p>割込みはスリープからの復帰を可能にする</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">wake_active</span></code></dt><dd><p>割込みがスリープからの復帰ソースとしてマークされている</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">num_ct</span></code></dt><dd><p>利用可能なirq_chip_typeインスタンスの数（通常は1）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">private</span></code></dt><dd><p>汎用チップコールバックに使用するプライベートデータ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">installed</span></code></dt><dd><p>インストールされた割込みを示すビットフィールド</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unused</span></code></dt><dd><p>未使用の割込みを示すビットフィールド</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">domain</span></code></dt><dd><p>IRQドメインポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">list</span></code></dt><dd><p>インスタンスを追跡するリストヘッド</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">chip_types</span></code></dt><dd><p>割込みirq_chip_types配列</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>注意: irq_chip_genericは複数のirq_chip_type実装を持つことができ、これらはirq_chip_genericインスタンスの特定の割込みラインに関連付けることができます。これにより、irq_chip_genericインスタンス内で異なるフロー機構（レベル/エッジ）を実装する際に状態を共有および保護できます。</p>
+<dl class="c enum">
+<dt class="sig sig-object c" id="c.irq_gc_flags">
+<span class="k"><span class="pre">enum</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_gc_flags</span></span></span><a class="headerlink" href="#c.irq_gc_flags" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>汎用割込みチップの初期化フラグ</p>
+</dd></dl>
+<p><strong>定数</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">IRQ_GC_INIT_MASK_CACHE</span></code></dt><dd><p>マスクレジスタを読み込んでマスクキャッシュを初期化する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">IRQ_GC_INIT_NESTED_LOCK</span></code></dt><dd><p>親割込みに対してirq_set_wake()を呼び出す必要がある割込みチップの割込みロッククラスをネストに設定する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">IRQ_GC_MASK_CACHE_PER_TYPE</span></code></dt><dd><p>マスクキャッシュはチップタイプ固有</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">IRQ_GC_NO_MASK</span></code></dt><dd><p>irq_data-&gt;maskの計算を行わない</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">IRQ_GC_BE_IO</span></code></dt><dd><p>ビッグエンディアンレジスタアクセスを使用する（デフォルト: レトルト）</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.irqaction">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irqaction</span></span></span><a class="headerlink" href="#c.irqaction" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>各割込みアクション記述子</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct irqaction {
+  irq_handler_t handler;
+  void *dev_id;
+  void __percpu           *percpu_dev_id;
+  struct irqaction        *next;
+  irq_handler_t thread_fn;
+  struct task_struct      *thread;
+  struct irqaction        *secondary;
+  unsigned int            irq;
+  unsigned int            flags;
+  unsigned long           thread_flags;
+  unsigned long           thread_mask;
+  const char              *name;
+  struct proc_dir_entry   *dir;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">handler</span></code></dt><dd><p>割込みハンドラ関数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dev_id</span></code></dt><dd><p>デバイスを識別するクッキー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">percpu_dev_id</span></code></dt><dd><p>デバイスを識別するクッキー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">next</span></code></dt><dd><p>共有割込み用の次のirqactionへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">thread_fn</span></code></dt><dd><p>スレッド割込み用のハンドラ関数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">thread</span></code></dt><dd><p>スレッド割込み用のスレッドポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">secondary</span></code></dt><dd><p>セカンドary irqactionへのポインタ（強制スレッディング）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq</span></code></dt><dd><p>割り込み番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">flags</span></code></dt><dd><p>フラグ（IRQF_*を参照）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">thread_flags</span></code></dt><dd><p>スレッドに関連するフラグ <strong>ビットマスクで追跡する</strong></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">thread_mask</span></code></dt><dd><p>アクティビティ <strong>ビットマスクで追跡する</strong> デバイスの名前</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">name</span></code></dt><dd><p>デバイス生成元の名前</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dir</span></code></dt><dd><p>proc/irq/NN/nameエントリへのポインタ</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.request_irq">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">request_irq</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="n"><span class="pre">irq_handler_t</span></span><span class="w"> </span><span class="n"><span class="pre">handler</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span>, <span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="kt"><span class="pre">char</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">名前</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dev</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.request_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割込みライン用のハンドラを追加する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>割り当てを行う割込みライン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_handler_t</span> <span class="pre">handler</span></code></dt><dd><p>IRQが発生した際に呼び出される関数。スレッド割込みのプライマリハンドラ。NULLの場合はデフォルトのプライマリハンドラがインストールされる</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">flags</span></code></dt><dd><p>ハンドリングフラグ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">char</span> <span class="pre">*name</span></code></dt><dd><p>この割込みを生成するデバイスの名前</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*dev</span></code></dt><dd><p>ハンドラ関数に渡されるクッキー</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この呼び出しは割込みを割り当ててハンドラを設定します。詳しくは <a class="reference internal" href="#c.request_threaded_irq" title="request_threaded_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">request_threaded_irq()</span></code></a> 詳しくは以下をご参照ください。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.irq_affinity_notify">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_affinity_notify</span></span></span><a class="headerlink" href="#c.irq_affinity_notify" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>IRQアフィニティ変更に関する通知のコンテキスト</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct irq_affinity_notify {
+  unsigned int irq;
+  struct kref kref;
+  struct work_struct work;
+  void (*notify)(struct irq_affinity_notify *, const cpumask_t *mask);
+  void (*release)(struct kref *ref);
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">irq</span></code></dt><dd><p>通知が適用される割り込み</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">kref</span></code></dt><dd><p>内部使用の参照カウント</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">work</span></code></dt><dd><p>内部使用の作業項目</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">notify</span></code></dt><dd><p>変更時に呼び出す関数。これはプロセスコンテキストで呼び出されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">release</span></code></dt><dd><p>解放時に呼び出す関数。これはプロセスコンテキストで呼び出されます。登録後、この関数が呼ばれるかそれ以降にのみ構造体を解放する必要があります。</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.irq_affinity">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_affinity</span></span></span><a class="headerlink" href="#c.irq_affinity" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>自動IRQアフィニティ割当の説明</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct irq_affinity {
+  unsigned int    pre_vectors;
+  unsigned int    post_vectors;
+  unsigned int    nr_sets;
+  unsigned int    set_size[IRQ_AFFINITY_MAX_SETS];
+  void (*calc_sets)(struct irq_affinity *, unsigned int nvecs);
+  void *priv;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">pre_vectors</span></code></dt><dd><p>アフィニティを適用しない <strong>pre_vectors</strong> MSI(-X)ベクタースペースの開始位置</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">post_vectors</span></code></dt><dd><p>アフィニティを適用しない <strong>post_vectors</strong> MSI(-X)ベクタースペースの終了位置</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">nr_sets</span></code></dt><dd><p>アフィニティ分散が必要な割り込みセットの数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">set_size</span></code></dt><dd><p>各割り込みセットのサイズを保持する配列</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">calc_sets</span></code></dt><dd><p>割り込みセットの数とサイズを計算するコールバック</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">priv</span></code></dt><dd><p>使用に際してプライベートデータ <strong>calc_sets</strong>通常はドライバ/デバイス固有のデータへのポインタ。</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.irq_affinity_desc">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_affinity_desc</span></span></span><a class="headerlink" href="#c.irq_affinity_desc" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割り込みアフィニティ記述子</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct irq_affinity_desc {
+  struct cpumask  mask;
+  unsigned int    is_managed : 1;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">mask</span></code></dt><dd><p>アフィニティ割当を保持するCPUマスク</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">is_managed</span></code></dt><dd><p>割り込みが内部で管理される場合は1</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_set_affinity">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_set_affinity</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_set_affinity" title="cpumask"><span class="n"><span class="pre">cpumask</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">cpumask</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_set_affinity" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定されたIRQのアフィニティを設定する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>アフィニティを設定する割り込み</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">struct</span> <span class="pre">cpumask</span> <span class="pre">*cpumask</span></code></dt><dd><p>cpumask</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>cpumaskにオンラインCPUが含まれていない場合、失敗します</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_force_affinity">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_force_affinity</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_force_affinity" title="cpumask"><span class="n"><span class="pre">cpumask</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">cpumask</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_force_affinity" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定されたIRQのアフィニティを強制的に設定する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>アフィニティを設定する割り込み</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">struct</span> <span class="pre">cpumask</span> <span class="pre">*cpumask</span></code></dt><dd><p>cpumask</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>irq_set_affinityと同様ですが、オンラインCPUのマスクを確認しません</p>
+<p>低レベルのCPUホットプラグコード専用で、CPUがオンラインになる前に各CPU割り込みをアフィニティに設定する場合に使用します</p>
+</section>
+<section id="public-functions-provided">
+<h2>公開関数<a class="headerlink" href="#public-functions-provided" title="この見出しへのパーマリンク">¶</a></h2>
+<p>この章は、エクスポートされるカーネルAPI関数の自動生成ドキュメンテーションを含んでいます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.synchronize_hardirq">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">synchronize_hardirq</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.synchronize_hardirq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>他のCPUでの待機中のハードIRQハンドラを待機する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>待機する割り込み番号</p>
+<p>この関数は、指定された割り込みの待機中のハードIRQハンドラが完了するのを待ってから戻ります。リソースを保持しながらこの関数を使用するとデッドロックする可能性があります。スレッドハンドラは考慮されません。</p>
+<p>すべての部分（ハードIRQハンドラとスレッドハンドラ）が完了することを確実にするシャットダウンシナリオでは使用しないでください。</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>スレッドハンドラがアクティブな場合はfalse</p>
+<blockquote>
+<div><p>この関数は、注意を払ってIRQコンテキストから呼び出すことができます。</p>
+<p>ハードウェアレベルで割込みが進行中であるかを確認せず、未処理の割込みが存在する可能性があるため、割込みが無効化されている状態で呼び出されるとデッドロックを引き起こす可能性がある。</p>
+</div></blockquote>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.synchronize_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">synchronize_irq</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.synchronize_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>他のCPUでの未処理IRQハンドラの待機</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>待機する割り込み番号</p>
+<p>この関数は、この割込みの未処理IRQハンドラが完了するのを待ってから戻る。リソースを保持しながらこの関数を使用すると、IRQハンドラがそのリソースを必要とするためデッドロックする可能性がある。</p>
+<p>割込みスレッドが関連付けられている場合、スリープする可能性があるため、プリエンプション可能なコードからしか呼び出せない。 <strong>irq</strong>.</p>
+<p>割込みチップがそのメソッドをサポートする場合、割込みがどのCPUにも未処理で待機していないことをオプションで確認する。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_can_set_affinity">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_can_set_affinity</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_can_set_affinity" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定された割込みのアフィニティが設定可能かを確認</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>確認する割込み</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_can_set_affinity_usr">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_can_set_affinity_usr</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_can_set_affinity_usr" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割込みのアフィニティがユーザー空間から設定可能かを確認</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>確認する割込み</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>例え <a class="reference internal" href="#c.irq_can_set_affinity" title="irq_can_set_affinity"><code class="xref c c-func docutils literal notranslate"><span class="pre">irq_can_set_affinity()</span></code></a> 上記とは同様だが、AFFINITY_MANAGEDフラグの確認も行う。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_set_thread_affinity">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_set_thread_affinity</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_desc</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">desc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_set_thread_affinity" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割込みスレッドにアフィニティ調整を通知</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_desc</span> <span class="pre">*desc</span></code></dt><dd><p>アフィニティが変更された割込みディスクリプタ</p>
+<p>我々はIRQTF_AFFINITYを設定し、割込みスレッド自身にアフィニティ設定を委譲する。desc-&gt;lockを保持しているため、ここではset_cpus_allowed_ptr()を呼び出すことはできない。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_set_affinity_notifier">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_set_affinity_notifier</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_affinity_notify" title="irq_affinity_notify"><span class="n"><span class="pre">irq_affinity_notify</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">notify</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_set_affinity_notifier" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>IRQアフィニティ変更の通知制御</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>通知を有効/無効にする割込み</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_affinity_notify</span> <span class="pre">*notify</span></code></dt><dd><p>通知のコンテキスト、または <code class="docutils literal notranslate"><span class="pre">NULL</span></code> 通知を無効にする。関数ポインタは初期化されなければならない。他のフィールドはこの関数によって初期化される。</p>
+<blockquote>
+<div><p>プロセスコンテキストで呼び出さなければならない。通知を有効にするには割込みが割り当てられていなければならないし、割込みが解放される前に通知を無効にする必要がある。 <a class="reference internal" href="#c.free_irq" title="free_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">free_irq()</span></code></a>.</p>
+</div></blockquote>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_set_vcpu_affinity">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_set_vcpu_affinity</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">vcpu_info</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_set_vcpu_affinity" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割込みのvCPUアフィニティを設定</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>アフィニティを設定する割込み番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*vcpu_info</span></code></dt><dd><p>vCPU固有データまたは、percpu_devid割込み用のpercpu配列へのポインタ</p>
+<blockquote>
+<div><p>この関数は、KVMから提供されるvCPU固有データを使用して割込みのvCPUアフィニティを設定する。コードパスの例は以下の通り: KVM -&gt; IOMMU -&gt; <a class="reference internal" href="#c.irq_set_vcpu_affinity" title="irq_set_vcpu_affinity"><code class="xref c c-func docutils literal notranslate"><span class="pre">irq_set_vcpu_affinity()</span></code></a>.</p>
+</div></blockquote>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.disable_irq_nosync">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">disable_irq_nosync</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.disable_irq_nosync" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>待機せずに割込みを無効化</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>無効化する割込み</p>
+<p>選択された割込みラインを無効化。無効化と有効化はネストされる。 unlike <a class="reference internal" href="#c.disable_irq" title="disable_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">disable_irq()</span></code></a>、この関数は戻る前に既存のIRQハンドラのインスタンスが完了していることを保証しない。</p>
+<p>この関数はIRQコンテキストから呼び出せる。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.disable_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">disable_irq</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.disable_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割込みを無効化し、完了を待機する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>無効化する割込み</p>
+<p>選択した割り込みラインを無効にします。有効化と無効化はネストされます。この関数は、この割り込みの待機中のIRQハンドラが完了するのを待ってから戻ります。リソースを保持しながらこの関数を使用すると、IRQハンドラがリソースを必要として deadlock する可能性があります。</p>
+<p>この関数は、注意を払ってIRQコンテキストから呼び出すことができます。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.disable_hardirq">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">disable_hardirq</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.disable_hardirq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割り込みを無効にし、ハード割り込みの完了を待つ</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>無効化する割込み</p>
+<p>選択した割り込みラインを無効にします。有効化と無効化はネストされます。この関数は、この割り込みの待機中のハードIRQハンドラが完了するのを待ってから戻ります。リソースを保持しながらこの関数を使用すると、ハードIRQハンドラがリソースを必要として deadlock する可能性があります。</p>
+<p>アトミックコンテキストから割り込みを楽観的に無効にする場合、戻り値を確認する必要があります。</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>スレッドハンドラがアクティブな場合はfalse</p>
+<blockquote>
+<div><p>この関数は、注意を払ってIRQコンテキストから呼び出すことができます。</p>
+</div></blockquote>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.disable_nmi_nosync">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">disable_nmi_nosync</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.disable_nmi_nosync" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>NMIを無効にしないで待機</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>無効化する割込み</p>
+<p>選択した割り込みラインを無効にします。無効化と有効化はネストされます。無効にする割り込みはrequest_nmiで要求されていなければなりません。disable_nmi()とは異なり、この関数はIRQハンドラの既存のインスタンスが完了しているかを保証しません。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.enable_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">enable_irq</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.enable_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割り込みの処理を有効にする</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>有効にする割り込み</p>
+<p>disable()の1回呼び出しの効果を解除します <a class="reference internal" href="#c.disable_irq" title="disable_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">disable_irq()</span></code></a>。この呼び出しは最後の無効化と一致する場合、このIRQラインの割り込み処理が再び有効になります。</p>
+<p>この関数は、desc-&gt;irq_data.chip-&gt;bus_lockとdesc-&gt;chip-&gt;bus_sync_unlockがNULLである場合にのみIRQコンテキストから呼び出すことができます！</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.enable_nmi">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">enable_nmi</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.enable_nmi" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>NMIの処理を有効にする</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>有効にする割り込み</p>
+<p>割り込みを有効にする必要がありますrequest_nmiで要求されていなければなりません。disable_nmi()の1回呼び出しの効果を解除します。この呼び出しは最後の無効化と一致する場合、このIRQラインの割り込み処理が再び有効になります。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_set_irq_wake">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_set_irq_wake</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">on</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_set_irq_wake" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割り込みの電源管理 wakeup を制御</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>制御する割り込み</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">on</span></code></dt><dd><p>電源管理 wakeup の有効/無効</p>
+<p>電源管理 wakeup モードを有効/無効にします（デフォルトでは無効）。有効/無効は非 wakeup モードサポートと同様に一致する必要があります。</p>
+<p>wakeup モードはこのIRQが「スリープ状態」からシステムを起動するのを許可します。</p>
+</dd>
+</dl>
+<p><strong>注意</strong></p>
+<dl class="simple">
+<dt>割り込みの有効/無効状態は、割り込み wakeup の有効/無効状態とは完全に正規直交です</dt><dd><p>割り込みを無効にしても <a class="reference internal" href="#c.disable_irq" title="disable_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">disable_irq()</span></code></a> 割り込みがwakeupを有効にしている限りシステムを起動できます。この条件が満たされない場合、基盤となる割り込みチップと関連するドライバーを調査する必要があります。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_wake_thread">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_wake_thread</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dev_id</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_wake_thread" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>dev_idで識別されるアクションの割り込みスレッドを起動</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>割り込みライン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*dev_id</span></code></dt><dd><p>スレッドを起動すべきデバイスの識別情報</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.free_irq">
+<span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">free_irq</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dev_id</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.free_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>request_irqで割り当てられた割り込みを解放</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>解放する割り込みライン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*dev_id</span></code></dt><dd><p>解放するデバイスの識別情報</p>
+<p>割込みハンドラを削除します。ハンドラが削除され、どのドライバも使用していない場合、割込みラインが無効になります。共有IRQの場合、呼び出し元はこの関数を呼び出す前に、ドライバが駆動するカードで割込みを無効にする必要があります。この関数は、このIRQの実行中の割込みがすべて完了するまで戻りません。</p>
+<p>この関数は割込みコンテキストから呼び出すことはできません。</p>
+<p>request_irqに渡されたdevname引数を返します。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.request_threaded_irq">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">request_threaded_irq</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="n"><span class="pre">irq_handler_t</span></span><span class="w"> </span><span class="n"><span class="pre">handler</span></span>, <span class="n"><span class="pre">irq_handler_t</span></span><span class="w"> </span><span class="n"><span class="pre">thread_fn</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">irqflags</span></span>, <span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="kt"><span class="pre">char</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">devname</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dev_id</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.request_threaded_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割込みラインを割り当てる</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>割り当てる割込みライン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_handler_t</span> <span class="pre">handler</span></code></dt><dd><p>IRQが発生したときに呼び出される関数。スレッド型割込みの主なハンドラ。NULLの場合、thread_fnがNULLでない場合はデフォルトの主ハンドラがインストールされます</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_handler_t</span> <span class="pre">thread_fn</span></code></dt><dd><p>割込みハンドラスレッドから呼び出される関数。NULLの場合、割込みスレッドが作成されません</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">irqflags</span></code></dt><dd><p>割込みタイプのフラグ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">char</span> <span class="pre">*devname</span></code></dt><dd><p>割り当てられたデバイスのASCII名</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*dev_id</span></code></dt><dd><p>ハンドラ関数に返されるクッキー</p>
+<p>この関数は割込みリソースを割り当て、割込みラインとIRQ処理を有効にします。この関数が呼ばれた時点で、ハンドラ関数が呼び出される可能性があります。ハンドラ関数はボードが発生させる割込みをクリアする必要がありますので、ハードウェアの初期化と割込みハンドラの設定の順序を正しく行う必要があります。</p>
+<p>デバイス用にスレッド型割込みハンドラを設定する場合は、以下を提供する必要があります <strong>handler</strong> および <strong>thread_fn</strong>. <strong>handler</strong> ハード割込みコンテキストでまだ呼び出され、割込みがデバイスから発生しているかを確認する必要があります。はいの場合、デバイスで割込みを無効にしてIRQ_WAKE_THREADを返す必要があります。これによりハンドラスレッドが起動し、処理が実行されます
+<strong>thread_fn</strong>この分割ハンドラ設計は共有割込みをサポートするため必要です。</p>
+<p>dev_idはグローバルに一意でなければなりません。通常、デバイスデータ構造のアドレスがクッキーとして使用されます。ハンドラがこの値を受け取るため、この値を使用するのが自然です。</p>
+<p>割込みが共有されている場合、割り当て解除時に必要となるため、dev_idはNULLでない必要があります。</p>
+<p>フラグ:</p>
+<p>IRQF_SHARED 割込みが共有、IRQF_TRIGGER_* 有効エッジまたはレベルを指定</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.request_any_context_irq">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">request_any_context_irq</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="n"><span class="pre">irq_handler_t</span></span><span class="w"> </span><span class="n"><span class="pre">handler</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span>, <span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="kt"><span class="pre">char</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">名前</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dev_id</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.request_any_context_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割込みラインを割り当てる</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>割り当てる割込みライン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_handler_t</span> <span class="pre">handler</span></code></dt><dd><p>IRQが発生したときに呼び出される関数。スレッド型割込みのハンドラ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">flags</span></code></dt><dd><p>割込みタイプのフラグ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">char</span> <span class="pre">*name</span></code></dt><dd><p>割り当てられたデバイスのASCII名</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*dev_id</span></code></dt><dd><p>ハンドラ関数に返されるクッキー</p>
+<p>この関数は割込みリソースを割り当て、割込みラインとIRQ処理を有効にします。コンテキストに応じてハード割込みまたはスレッド型処理のいずれかを選択します。</p>
+<p>失敗時は負の値を、成功時はIRQC_IS_HARDIRQまたはIRQC_IS_NESTEDを返します。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.request_nmi">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">request_nmi</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="n"><span class="pre">irq_handler_t</span></span><span class="w"> </span><span class="n"><span class="pre">handler</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">irqflags</span></span>, <span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="kt"><span class="pre">char</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">名前</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dev_id</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.request_nmi" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>NMI配信用の割込みラインを割り当てる</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>割り当てる割込みライン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_handler_t</span> <span class="pre">handler</span></code></dt><dd><p>IRQが発生したときに呼び出される関数。スレッド型割込みのハンドラ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">irqflags</span></code></dt><dd><p>割込みタイプのフラグ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">char</span> <span class="pre">*name</span></code></dt><dd><p>割り当てられたデバイスのASCII名</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*dev_id</span></code></dt><dd><p>ハンドラ関数に返されるクッキー</p>
+<p>この関数は割り込みリソースを割り当て、割り込みラインとIRQ処理を有効化します。IRQラインをNMIとして処理するように設定します。</p>
+<p>NMIを送信する割り込みラインは共有できませんし、IRQ処理はスレッド化できません。</p>
+<p>NMI送信のために要求された割り込みラインは、パーセルCPUの割り込みを生成し、自動有効化設定を無効にする必要があります。</p>
+<p>dev_idはグローバルに一意でなければなりません。通常、デバイスデータ構造のアドレスがクッキーとして使用されます。ハンドラがこの値を受け取るため、この値を使用するのが自然です。</p>
+<p>割り込みラインがNMIを送信できません場合、関数は失敗し負の値を返します。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_percpu_is_enabled">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_percpu_is_enabled</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_percpu_is_enabled" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>パーセルCPUの割り込みが有効かどうかを確認します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>確認するLinuxの割り込み番号</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>非移動可能なコンテキストから呼び出さなければなりません。現在のCPUのパーセルCPU割り込みの有効状態を返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.remove_percpu_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">remove_percpu_irq</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irqaction" title="irqaction"><span class="n"><span class="pre">irqaction</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">act</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.remove_percpu_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>パーセルCPU割り込みを解放します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>解放する割り込みライン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irqaction</span> <span class="pre">*act</span></code></dt><dd><p>割り込みのirqaction</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>早期起動プロセスで静的に設定された割り込みを削除するために使用します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.free_percpu_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">free_percpu_irq</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="pre">__percpu</span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dev_id</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.free_percpu_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>request_percpu_irqで割り当てられた割り込みを解放します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>解放する割り込みライン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">__percpu</span> <span class="pre">*dev_id</span></code></dt><dd><p>解放するデバイスの識別情報</p>
+<p>パーセルCPU割り込みハンドラを削除します。ハンドラは削除されますが、割り込みラインは無効化されません。この関数を呼び出す前に各CPUでこの関数を実行しなければなりません。この関数は、このIRQの実行中の割り込みが完了するまで戻りません。</p>
+<p>この関数は割込みコンテキストから呼び出すことはできません。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.setup_percpu_irq">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">setup_percpu_irq</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irqaction" title="irqaction"><span class="n"><span class="pre">irqaction</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">act</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.setup_percpu_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>パーセルCPU割り込みを設定します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>設定する割り込みライン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irqaction</span> <span class="pre">*act</span></code></dt><dd><p>割り込みのirqaction</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>早期起動プロセスでパーセルCPU割り込みを静的に設定するために使用します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.__request_percpu_irq">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">__request_percpu_irq</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="n"><span class="pre">irq_handler_t</span></span><span class="w"> </span><span class="n"><span class="pre">handler</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span>, <span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="kt"><span class="pre">char</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">devname</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="pre">__percpu</span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dev_id</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.__request_percpu_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>パーセルCPU割り込みラインを割り当てます</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>割り当てる割込みライン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_handler_t</span> <span class="pre">handler</span></code></dt><dd><p>IRQが発生した際に呼び出される関数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">flags</span></code></dt><dd><p>割り込みタイプフラグ（IRQF_TIMERのみ）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">char</span> <span class="pre">*devname</span></code></dt><dd><p>割り当てられたデバイスのASCII名</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">__percpu</span> <span class="pre">*dev_id</span></code></dt><dd><p>ハンドラ関数に返されるパーセルCPUのクッキー</p>
+<p>この関数は割り込みリソースを割り当て、ローカルCPUでの割り込みを有効化します。割り込みが他のCPUで有効化される場合は、各CPUでenable_percpu_irq()を呼び出す必要があります。</p>
+<p>Dev_idはグローバルに一意でなければなりません。これはパーセルCPU変数であり、ハンドラは中断されたCPUのその変数のインスタンスを引数として受け取ります。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.request_percpu_nmi">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">request_percpu_nmi</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="n"><span class="pre">irq_handler_t</span></span><span class="w"> </span><span class="n"><span class="pre">handler</span></span>, <span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="kt"><span class="pre">char</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">名前</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="pre">__percpu</span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dev_id</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.request_percpu_nmi" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>NMI送信用のパーセルCPU割り込みラインを割り当てます</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>割り当てる割込みライン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_handler_t</span> <span class="pre">handler</span></code></dt><dd><p>IRQが発生した際に呼び出される関数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">char</span> <span class="pre">*name</span></code></dt><dd><p>割り当てられたデバイスのASCII名</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">__percpu</span> <span class="pre">*dev_id</span></code></dt><dd><p>ハンドラ関数に返されるパーセルCPUのクッキー</p>
+<p>この関数はパーセルCPU用NMIの割り込みリソースを割り当てます。パーセルCPU用NMIは、各CPUで以下の関数を呼び出すことで設定しなければなりません <a class="reference internal" href="#c.prepare_percpu_nmi" title="prepare_percpu_nmi"><code class="xref c c-func docutils literal notranslate"><span class="pre">prepare_percpu_nmi()</span></code></a> 同じCPUで有効化する前にenable_percpu_nmi()を使用して有効化する必要があります。</p>
+<p>Dev_idはグローバルに一意でなければなりません。これはパーセルCPU変数であり、ハンドラは中断されたCPUのその変数のインスタンスを引数として受け取ります。</p>
+<p>NMI送信のために要求された割り込みラインは自動有効化設定を無効にする必要があります。</p>
+<p>割り込みラインがNMIを送信できません場合、関数は失敗し負の値を返します。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.prepare_percpu_nmi">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">prepare_percpu_nmi</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.prepare_percpu_nmi" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>NMI送信のCPUローカル設定を行います</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>NMI送信用に準備する割り込みライン</p>
+<p>この関数は、割り込みラインがenable_percpu_nmi()で有効化される前に、現在のCPUでNMIを送信するように割り込みラインを準備します。</p>
+<p>CPUローカル操作として、非プリエンプションコンテキストから呼び出す必要があります。</p>
+<p>割り込みラインがNMIを送信できません場合、関数は失敗し負の値を返します。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.teardown_percpu_nmi">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">teardown_percpu_nmi</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.teardown_percpu_nmi" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>NMIのIRQラインの設定を解除します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>CPUローカルNMI設定を削除するIRQライン</p>
+<blockquote>
+<div><p>この呼び出しは、以下の関数で行われた設定を解除します <a class="reference internal" href="#c.prepare_percpu_nmi" title="prepare_percpu_nmi"><code class="xref c c-func docutils literal notranslate"><span class="pre">prepare_percpu_nmi()</span></code></a>.</p>
+<p>現在のCPUでは、IRQラインが有効になってはいけません。</p>
+<p>CPUローカル操作として、非プリエンプションコンテキストから呼び出す必要があります。</p>
+</div></blockquote>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_get_irqchip_state">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_get_irqchip_state</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="k"><span class="pre">enum</span></span><span class="w"> </span><span class="n"><span class="pre">irqchip_irq_state</span></span><span class="w"> </span><span class="n"><span class="pre">以下の</span></span>, <span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">状態</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_get_irqchip_state" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割り込みのirqchip状態を返します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>仮想マシンに転送される割り込みライン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">enum</span> <span class="pre">irqchip_irq_state</span> <span class="pre">which</span></code></dt><dd><p>callerが知りたいIRQCHIP_STATE_*の一つ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">*state</span></code></dt><dd><p>状態を保存するためのポインタ</p>
+<p>この呼び出しは、割り込みの内部irqchip状態をスナップショットを取り、 <strong>状態</strong> ステージに対応するビット <strong>以下の</strong></p>
+<p>割り込みコントローラーがper-cpuレジスタを持つ場合、プリエンプションを無効にしてこの関数を呼び出す必要があります。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_set_irqchip_state">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_set_irqchip_state</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="k"><span class="pre">enum</span></span><span class="w"> </span><span class="n"><span class="pre">irqchip_irq_state</span></span><span class="w"> </span><span class="n"><span class="pre">以下の</span></span>, <span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n"><span class="pre">val</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_set_irqchip_state" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>転送された割り込みの状態を設定します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>仮想マシンに転送される割り込みライン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">enum</span> <span class="pre">irqchip_irq_state</span> <span class="pre">which</span></code></dt><dd><p>復元する状態（IRQCHIP_STATE_*の一つ）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">val</span></code></dt><dd><p>対応する値 <strong>以下の</strong></p>
+<p>この呼び出しは、値に応じて割り込みの内部irqchip状態を設定します <strong>以下の</strong>.</p>
+<p>割り込みコントローラーがper-cpuレジスタを持つ場合、プリエンプションを無効にしてこの関数を呼び出す必要があります。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_set_chip">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_set_chip</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_chip" title="IRQチップ"><span class="n"><span class="pre">IRQチップ</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">チップ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_set_chip" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割り込みのirqチップを設定します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>割り込み番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_chip</span> <span class="pre">*chip</span></code></dt><dd><p>irqチップの説明構造体へのポインタ</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_set_irq_type">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_set_irq_type</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">type</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_set_irq_type" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割り込みのトリガー型を設定します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>割り込み番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">type</span></code></dt><dd><p>IRQ_TYPE_{LEVEL,EDGE}_*値 - include/linux/irq.hを参照</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_set_handler_data">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_set_handler_data</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_set_handler_data" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割り込みのハンドラデータを設定します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>割り込み番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+<p>割り込みのハードウェアIRQコントローラーデータを設定します</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_set_chip_data">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_set_chip_data</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_set_chip_data" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割り込みのIRQチップデータを設定します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>割り込み番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*data</span></code></dt><dd><p>チップ固有データへのポインタ</p>
+<p>割り込みのハードウェアIRQチップデータを設定します</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.handle_simple_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">handle_simple_irq</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_desc</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">desc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.handle_simple_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>シンプルでソフトウェアでデコードされた割り込み</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_desc</span> <span class="pre">*desc</span></code></dt><dd><p>この割り込みの割り込み説明構造体</p>
+<p>シンプルな割り込みは、デマルチプレクサの割り込みハンドラから送信されるか、ハードウェアから送信される。ハードウェアの割り込み制御が不要な場合もある。</p>
+</dd>
+</dl>
+<p><strong>注意</strong></p>
+<dl class="simple">
+<dt>呼び出し元は、ACK、クリア、マスクおよび</dt><dd><p>アンマスクの処理を必要に応じて行うことが期待される。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.handle_untracked_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">handle_untracked_irq</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_desc</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">desc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.handle_untracked_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>シンプルでソフトウェアでデコードされた割り込み</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_desc</span> <span class="pre">*desc</span></code></dt><dd><p>この割り込みの割り込み説明構造体</p>
+<p>未追跡割り込みは、デマルチプレクサがどのデバイスのマルチプレクサドメインが割り込みを生成したかを知らない場合に、デマルチプレクサの割り込みハンドラから送信される。ここで処理されるIRQは、統計の追跡、ランダム性、または偽割り込みの検出を受けることはない。</p>
+</dd>
+</dl>
+<p><strong>注意</strong></p>
+<dl class="simple">
+<dt>handle_simple_irqと同様に、呼び出し元は、</dt><dd><p>ACK、クリア、マスクおよびアンマスクの処理を必要に応じて行うことが期待される。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.handle_level_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">handle_level_irq</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_desc</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">desc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.handle_level_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>レベル型割り込みハンドラ</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_desc</span> <span class="pre">*desc</span></code></dt><dd><p>この割り込みの割り込み説明構造体</p>
+<p>レベル型割り込みは、ハードウェアのラインがアクティブなレベルを保持している間有効となる。これには、関連するハンドラがデバイスを確認した後、割り込みラインを再無効化するためにマスクを解除する必要がある場合がある。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.handle_fasteoi_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">handle_fasteoi_irq</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_desc</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">desc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.handle_fasteoi_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>透過的コントローラー用の割り込みハンドラ</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_desc</span> <span class="pre">*desc</span></code></dt><dd><p>この割り込みの割り込み説明構造体</p>
+<p>チップに対しては、割り込みが処理されたときに-&gt;eoi()コールバックが1回だけ発行される。これにより、ハードウェアでフローの詳細を透明に処理する現代の割り込みハンドラのサポートが可能になる。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.handle_fasteoi_nmi">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">handle_fasteoi_nmi</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_desc</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">desc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.handle_fasteoi_nmi" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>NMI割り込みライン用の割り込みハンドラ</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_desc</span> <span class="pre">*desc</span></code></dt><dd><p>この割り込みの割り込み説明構造体</p>
+<p>request_nmiの制限を考慮したシンプルなNMI安全ハンドラ</p>
+<p>チップに対しては、割り込みが処理されたときに-&gt;eoi()コールバックが1回だけ発行される。これにより、ハードウェアでフローの詳細を透明に処理する現代の割り込みハンドラのサポートが可能になる。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.handle_edge_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">handle_edge_irq</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_desc</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">desc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.handle_edge_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>エッジ型IRQハンドラ</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_desc</span> <span class="pre">*desc</span></code></dt><dd><p>この割り込みの割り込み説明構造体</p>
+<p>ハードウェア信号の降下エッジおよび/または上昇エッジで割り込みが発生する。発生した割り込みはIRQ制御回路にキャッシュされ、再有効化のためにACKを必要とする。ACK後、関連するイベントハンドラが処理される前に同じソースからのもう一つの割り込みが発生する可能性がある。このような場合、コントローラハードウェアに応じて割り込みを無効化（マスク）する必要があるかもしれない。この処理は、ハンドラが実行されている間、到着した割り込みを処理するループ内で割り込みを再有効化する必要がある。すべての待機中の割り込みが処理されたら、ループは終了する。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.handle_fasteoi_ack_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">handle_fasteoi_ack_irq</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_desc</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">desc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.handle_fasteoi_ack_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>透過的コントローラーにスタックされたエッジ階層用の割り込みハンドラ</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_desc</span> <span class="pre">*desc</span></code></dt><dd><p>この割り込みの割り込み説明構造体</p>
+<p>例え <a class="reference internal" href="#c.handle_fasteoi_irq" title="handle_fasteoi_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">handle_fasteoi_irq()</span></code></a>、ただし、IRQチップにも-&gt;irq_ack()関数を呼び出す必要がある階層での使用を想定している。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.handle_fasteoi_mask_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">handle_fasteoi_mask_irq</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_desc</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">desc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.handle_fasteoi_mask_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>透過的コントローラーにスタックされたレベル階層用の割り込みハンドラ</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_desc</span> <span class="pre">*desc</span></code></dt><dd><p>この割り込みの割り込み説明構造体</p>
+<p>例え <a class="reference internal" href="#c.handle_fasteoi_irq" title="handle_fasteoi_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">handle_fasteoi_irq()</span></code></a>、ただし、IRQチップにも-&gt;irq_mask_ack()関数を呼び出す必要がある階層での使用を想定している。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_chip_set_parent_state">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_set_parent_state</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span>, <span class="k"><span class="pre">enum</span></span><span class="w"> </span><span class="n"><span class="pre">irqchip_irq_state</span></span><span class="w"> </span><span class="n"><span class="pre">以下の</span></span>, <span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n"><span class="pre">val</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_chip_set_parent_state" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>親割り込みの状態を設定する。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">enum</span> <span class="pre">irqchip_irq_state</span> <span class="pre">which</span></code></dt><dd><p>復元する状態（IRQCHIP_STATE_*の一つ）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">val</span></code></dt><dd><p>対応する値 <strong>以下の</strong></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>基盤となるIRQチップがこれを実装していない場合、条件付き成功となる。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_chip_get_parent_state">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_get_parent_state</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span>, <span class="k"><span class="pre">enum</span></span><span class="w"> </span><span class="n"><span class="pre">irqchip_irq_state</span></span><span class="w"> </span><span class="n"><span class="pre">以下の</span></span>, <span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">状態</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_chip_get_parent_state" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>親割り込みの状態を取得します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">enum</span> <span class="pre">irqchip_irq_state</span> <span class="pre">which</span></code></dt><dd><p>callerが知りたいIRQCHIP_STATE_*のうちの1つ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">*state</span></code></dt><dd><p>状態を保存するためのブール値へのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>基盤となるIRQチップがこれを実装していない場合、条件付き成功となる。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_chip_enable_parent">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_enable_parent</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_chip_enable_parent" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>親割り込みを有効化します（NULLの場合、デフォルトでunmaskされます）</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_chip_disable_parent">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_disable_parent</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_chip_disable_parent" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>親割り込みを無効化します（NULLの場合、デフォルトでmaskされます）</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_chip_ack_parent">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_ack_parent</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_chip_ack_parent" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>親割り込みを確認します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_chip_mask_parent">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_mask_parent</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_chip_mask_parent" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>親割り込みをマスクします</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_chip_mask_ack_parent">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_mask_ack_parent</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_chip_mask_ack_parent" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>親割り込みをマスクして確認します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_chip_unmask_parent">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_unmask_parent</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_chip_unmask_parent" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>親割り込みをアンマスクします</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_chip_eoi_parent">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_eoi_parent</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_chip_eoi_parent" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>親割り込みにEOIを呼び出します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_chip_set_affinity_parent">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_set_affinity_parent</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span>, <span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">cpumask</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dest</span></span>, <span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n"><span class="pre">force</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_chip_set_affinity_parent" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>親割り込みのアフィニティを設定します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">struct</span> <span class="pre">cpumask</span> <span class="pre">*dest</span></code></dt><dd><p>設定するアフィニティマスク</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">force</span></code></dt><dd><p>設定を強制するフラグ（オンラインチェックを無効にする）</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>条件付きです。親チップが実装していない可能性があるため</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_chip_set_type_parent">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_set_type_parent</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">type</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_chip_set_type_parent" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>親割り込みのIRQタイプを設定します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">type</span></code></dt><dd><p>IRQ_TYPE_{LEVEL,EDGE}_*値 - include/linux/irq.hを参照</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>条件付きです。親チップが実装していない可能性があるため</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_chip_retrigger_hierarchy">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_retrigger_hierarchy</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_chip_retrigger_hierarchy" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ハードウェアで割り込みを再トリガーします</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>割り込みのドメイン階層を走査し、hw再トリガー関数が存在するか確認します。存在する場合、呼び出します</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_chip_set_vcpu_affinity_parent">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_set_vcpu_affinity_parent</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">vcpu_info</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_chip_set_vcpu_affinity_parent" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>親割り込みのvcpuアフィニティを設定します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*vcpu_info</span></code></dt><dd><p>vcpuアフィニティ情報</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_chip_set_wake_parent">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_set_wake_parent</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">on</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_chip_set_wake_parent" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>親割り込みのウェイクアップを設定/リセットします</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">on</span></code></dt><dd><p>この割り込みのウェイクアップ機能を設定するかリセットするか</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>条件付きです。親チップが実装していない可能性があるため</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_chip_request_resources_parent">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_request_resources_parent</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_chip_request_resources_parent" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>親割り込みのリソースを要求します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_chip_release_resources_parent">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_release_resources_parent</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_chip_release_resources_parent" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>親割り込みのリソースを解放します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+</dd>
+</dl>
+</section>
+<section id="internal-functions-provided">
+<h2>提供される内部関数<a class="headerlink" href="#internal-functions-provided" title="この見出しへのパーマリンク">¶</a></h2>
+<p>この章には、内部関数の自動生成ドキュメンテーションが含まれています。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.generic_handle_irq">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">generic_handle_irq</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.generic_handle_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>特定のIRQのハンドラを呼び出す</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>処理するIRQ番号</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.__handle_domain_irq">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">__handle_domain_irq</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_domain</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ドメイン</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">hwirq</span></span>, <span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n"><span class="pre">lookup</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pt_regs</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">regs</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.__handle_domain_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ドメインに属するHW IRQのハンドラを呼び出す</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_domain</span> <span class="pre">*domain</span></code></dt><dd><p>検索を実行するドメイン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">hwirq</span></code></dt><dd><p>論理的なIRQ番号に変換するHW IRQ番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">lookup</span></code></dt><dd><p>ドメイン検索を実行するかどうか</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pt_regs</span> <span class="pre">*regs</span></code></dt><dd><p>低レベルハンドリングコードから取得したレジスタファイル</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、変換に失敗した場合は-EINVALを返す</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.handle_domain_nmi">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">handle_domain_nmi</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_domain</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ドメイン</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">hwirq</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pt_regs</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">regs</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.handle_domain_nmi" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ドメインに属するHW IRQのハンドラを呼び出す</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_domain</span> <span class="pre">*domain</span></code></dt><dd><p>検索を実行するドメイン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">hwirq</span></code></dt><dd><p>論理的なIRQ番号に変換するHW IRQ番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pt_regs</span> <span class="pre">*regs</span></code></dt><dd><p>低レベルハンドリングコードから取得したレジスタファイル</p>
+<p>この関数はNMIコンテキストから呼び出す必要があります。</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、変換に失敗した場合は-EINVALを返す</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_free_descs">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_free_descs</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">from</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">cnt</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_free_descs" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>IRQディスクリプタを解放する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">from</span></code></dt><dd><p>ディスクリプタ範囲の開始位置</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">cnt</span></code></dt><dd><p>解放する連続するIRQの数</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.__irq_alloc_descs">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="pre">__ref</span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">__irq_alloc_descs</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">from</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">cnt</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">node</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">module</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">owner</span></span>, <span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_affinity_desc" title="irq_affinity_desc"><span class="n"><span class="pre">irq_affinity_desc</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">アフィニティ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.__irq_alloc_descs" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>IRQディスクリプタの範囲を割り当てて初期化する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>IRQ &gt;= 0の場合、特定のIRQ番号を割り当てる</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">from</span></code></dt><dd><p>このIRQ番号から検索を開始する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">cnt</span></code></dt><dd><p>割り当てる連続するIRQの数。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">node</span></code></dt><dd><p>IRQディスクリプタが割り当てられる推奨ノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">module</span> <span class="pre">*owner</span></code></dt><dd><p>所有するモジュール（NULLでも可）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">struct</span> <span class="pre">irq_affinity_desc</span> <span class="pre">*affinity</span></code></dt><dd><p>IRQディスクリプタの割り当て先をヒントするアフィニティマスク配列へのオプションポインタ <strong>cnt</strong> 割り当て先とデフォルトアフィニティを指定する</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>最初のIRQ番号またはエラーコードを返す</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_alloc_hwirqs">
+<span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_alloc_hwirqs</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">cnt</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">node</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_alloc_hwirqs" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>IRQディスクリプタを割り当ててハードウェアを初期化する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">cnt</span></code></dt><dd><p>割り当てる割り込みの数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">node</span></code></dt><dd><p>割り当てを行うノード</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>割り当てに失敗した場合は0を返す</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_free_hwirqs">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_free_hwirqs</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">from</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">cnt</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_free_hwirqs" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割り込みデスクリプタを解放し、ハードウェアをクリーンアップする</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">from</span></code></dt><dd><p>割り込み番号から解放する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">cnt</span></code></dt><dd><p>解放する割り込みの数</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_get_next_irq">
+<span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_get_next_irq</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">オフセット</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_get_next_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>次の割り込み番号を取得する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">offset</span></code></dt><dd><p>検索を開始する位置</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>オフセット後の次の割り込み番号を返します。見つからない場合はnr_irqsを返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.kstat_irqs_cpu">
+<span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kstat_irqs_cpu</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">CPU</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.kstat_irqs_cpu" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>CPU上の割り込みの統計情報を取得する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>割り込み番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">cpu</span></code></dt><dd><p>CPU番号</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>起動以来の割り込みカウントの合計を返します <strong>CPU</strong> 起動以来の
+<strong>irq</strong>. 呼び出し元は、割り込みが同時に削除されないことを確認する必要があります。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.kstat_irqs">
+<span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kstat_irqs</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.kstat_irqs" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割り込みの統計情報を取得する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>割り込み番号</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>起動以来のすべてのCPUでの割り込みカウントの合計を返します
+<strong>irq</strong>. 呼び出し元は、割り込みが同時に削除されないことを確認する必要があります。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.kstat_irqs_usr">
+<span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kstat_irqs_usr</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.kstat_irqs_usr" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割り込みの統計情報を取得する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>割り込み番号</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>起動以来のすべてのCPUでの割り込みカウントの合計を返します <strong>irq</strong>. これとは異なり <a class="reference internal" href="#c.kstat_irqs" title="kstat_irqs"><code class="xref c c-func docutils literal notranslate"><span class="pre">kstat_irqs()</span></code></a> これは任意のコンテキストから呼び出すことができます。並行して割り込みデスクリプタが削除される場合、delayed_free_desc()/irq_kobj_release()の前にRCUのgrace periodを観測しているため、RCUを使用しています。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.handle_bad_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">handle_bad_irq</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_desc</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">desc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.handle_bad_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>不正な割り込みおよび未処理の割り込みを処理する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_desc</span> <span class="pre">*desc</span></code></dt><dd><p>割り込みの説明</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>不正な割り込みおよび未処理のIRQを処理します。また、デバッグメッセージも出力します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_set_msi_desc_off">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_set_msi_desc_off</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq_base</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">割り込みオフセット</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">msi_desc</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">エントリ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_set_msi_desc_off" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>オフセット位置の割り込みにMSIデスクリプタデータを設定する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq_base</span></code></dt><dd><p>割り込み番号ベース</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq_offset</span></code></dt><dd><p>割り込み番号オフセット</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">msi_desc</span> <span class="pre">*entry</span></code></dt><dd><p>MSIデスクリプタデータへのポインタ</p>
+<p>オフセット位置の割り込みにMSIデスクリプタエントリを設定する</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_set_msi_desc">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_set_msi_desc</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">irq</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">msi_desc</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">エントリ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_set_msi_desc" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割り込みにMSIデスクリプタデータを設定する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">irq</span></code></dt><dd><p>割り込み番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">msi_desc</span> <span class="pre">*entry</span></code></dt><dd><p>MSIデスクリプタデータへのポインタ</p>
+<p>割り込みにMSIデスクリプタエントリを設定する</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_disable">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_disable</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_desc</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">desc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_disable" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割り込みを無効化する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_desc</span> <span class="pre">*desc</span></code></dt><dd><p>無効化するべき割り込みデスクリプタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>チップがirq_disableコールバックを実装していない場合、ラズィーな無効化アプローチを使用します。つまり、割り込みを無効化するマークを残しますが、ハードウェアはアンマスクのままにします。これは、割り込みが無効化された後で発生しないという一般的なケースでハードウェアアクセスを避けるための最適化です。割り込みが発生した場合、割り込みフローハンドラがハードウェアレベルでラインをマスクし、それを待機状態にします。</p>
+<p>割り込みチップがirq_disableコールバックを実装していない場合、ドライバは特定の割り込みラインに対して「irq_set_status_flags(irq, IRQ_DISABLE_UNLAZY)」を呼び出して、ラズィアプローチを無効化できます。これは、特定の状況においてデバイスレベルで割り込みを無効化できないデバイスで、代わりにdisable_irq[_nosync]を使用する必要がある場合に利用されます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.handle_edge_eoi_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">handle_edge_eoi_irq</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_desc</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">desc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.handle_edge_eoi_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>エッジEOI型IRQハンドラ</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_desc</span> <span class="pre">*desc</span></code></dt><dd><p>この割り込みの割り込み説明構造体</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>上記のhandle_edge_irqと同様ですが、EOIを使用し、マスク/アンマスクの論理を省略しています。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.handle_percpu_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">handle_percpu_irq</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_desc</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">desc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.handle_percpu_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>パーセルCPUローカルIRQハンドラ</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_desc</span> <span class="pre">*desc</span></code></dt><dd><p>この割り込みの割り込み説明構造体</p>
+<p>ロック不要なSMPマシンにおけるパーセルCPU割り込み</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.handle_percpu_devid_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">handle_percpu_devid_irq</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_desc</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">desc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.handle_percpu_devid_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>パーセルCPUローカルIRQハンドラで、パーセルCPUデバイドIDをサポートしています</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_desc</span> <span class="pre">*desc</span></code></dt><dd><p>この割り込みの割り込み説明構造体</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>パーセルCPUローカルIRQハンドラで、パーセルCPUデバイドIDをサポートしています。SMPマシンにおけるロック不要なパーセルCPU割り込み。上記と同じですが、以下の追加機能があります:
+<a class="reference internal" href="#c.handle_percpu_irq" title="handle_percpu_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">handle_percpu_irq()</span></code></a> 上記と同じですが、以下の追加機能があります:</p>
+<p>action-&gt;percpu_dev_idは、このハンドラが呼び出されたCPUの実際のデバイスIDを含むパーセルCPU変数へのポインタです</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.handle_percpu_devid_fasteoi_ipi">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">handle_percpu_devid_fasteoi_ipi</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_desc</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">desc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.handle_percpu_devid_fasteoi_ipi" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>パーセルCPUローカルIPIハンドラで、パーセルCPUデバイドIDをサポートしています</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_desc</span> <span class="pre">*desc</span></code></dt><dd><p>この割り込みの割り込み説明構造体</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>IRQバージョンとの最大の違いは、割り込みがEOIが早めに実行される点です。IPIがコンテキストスイッチを引き起こする可能性があるため、IPIが再び発生できるようにする必要があります。また、アーキテクチャコードがアクションを登録していると仮定しています。登録されていない場合、我々は間違いなく破滅します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.handle_percpu_devid_fasteoi_nmi">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">handle_percpu_devid_fasteoi_nmi</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">irq_desc</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">desc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.handle_percpu_devid_fasteoi_nmi" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>パーセルCPUローカルNMIハンドラで、パーセルCPUデバイドIDをサポートしています</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_desc</span> <span class="pre">*desc</span></code></dt><dd><p>この割り込みの割り込み説明構造体</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>handle_fasteoi_nmiと同様ですが、dev_idクッキーをパーセルCPUポインタとして扱います。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_cpu_online">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_cpu_online</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_cpu_online" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>すべてのirq_cpu_online関数を呼び出します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<blockquote>
+<div><p>すべての割り込みを走査し、チップを呼び出します。<a class="reference internal" href="#c.irq_cpu_online" title="irq_cpu_online"><code class="xref c c-func docutils literal notranslate"><span class="pre">irq_cpu_online()</span></code></a>
+それぞれに対して。</p>
+</div></blockquote>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_cpu_offline">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_cpu_offline</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_cpu_offline" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>すべてのirq_cpu_offline関数を呼び出します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<blockquote>
+<div><p>すべての割り込みを走査し、チップを呼び出します。<a class="reference internal" href="#c.irq_cpu_offline" title="irq_cpu_offline"><code class="xref c c-func docutils literal notranslate"><span class="pre">irq_cpu_offline()</span></code></a>
+それぞれに対して。</p>
+</div></blockquote>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_chip_compose_msi_msg">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_compose_msi_msg</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">msi_msg</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">msg</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_chip_compose_msi_msg" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割り込みチップ用のMSIメッセージを組み立てます</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">msi_msg</span> <span class="pre">*msg</span></code></dt><dd><p>MSIメッセージへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>階層型ドメインでは、MSIメッセージを実装する最初のチップを検索します。非階層型では、トップレベルチップを使用します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_chip_pm_get">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_pm_get</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_chip_pm_get" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>IRQチップの電源を有効にします</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>割り込みデータ構造で参照されるIRQチップの電源を有効にします。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.irq_chip_pm_put">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">irq_chip_pm_put</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.irq_data" title="irq_data"><span class="n"><span class="pre">irq_data</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.irq_chip_pm_put" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>IRQチップの電源を無効にします</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">irq_data</span> <span class="pre">*data</span></code></dt><dd><p>割り込み固有データへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>割り込みデータ構造で参照されるIRQチップの電源を無効にします。注意点は、この関数がすべてのIRQで呼び出された後、電源が無効化されるということです。 <a class="reference internal" href="#c.irq_chip_pm_get" title="irq_chip_pm_get"><code class="xref c c-func docutils literal notranslate"><span class="pre">irq_chip_pm_get()</span></code></a>.</p>
+</section>
+<section id="credits">
+<h2>貢献者<a class="headerlink" href="#credits" title="この見出しへのパーマリンク">¶</a></h2>
+<p>以下の人物がこのドキュメントの作成に直接または間接的に貢献しています：</p>
+<ol class="arabic simple">
+<li><p>Thomas Gleixner <a class="reference external" href="mailto:tglx%40linutronix.de">tglx<span>@</span>linutronix<span>.</span>de</a></p></li>
+<li><p>Ingo Molnar <a class="reference external" href="mailto:mingo%40elte.hu">mingo<span>@</span>elte<span>.</span>hu</a></p></li>
+</ol>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">コアAPIドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#core-utilities">Core utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#data-structures-and-low-level-utilities">Data structures and low-level utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#concurrency-primitives">Concurrency primitives</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#low-level-hardware-management">Low-level hardware management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#memory-management">Memory management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#interfaces-for-kernel-debugging">Interfaces for kernel debugging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#everything-else">Everything else</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">コアAPIドキュメント</a><ul>
+<li>前へ: <a href="memory-hotplug.html" title="前章">メモリホットプラグ</a></li>
+<li>次へ: <a href="protection-keys.html" title="次章">Memory Protection Keys</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/core-api/genericirq.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

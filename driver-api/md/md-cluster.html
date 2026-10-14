@@ -1,0 +1,555 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>MD Cluster — The Linux Kernel documentation</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="raid5-cache.html" rel="next" title="RAID 4/5/6キャッシュ"/>
+<link href="index.html" rel="prev" title="RAID"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="md-cluster">
+<h1>MDクラスタ<a class="headerlink" href="#md-cluster" title="この見出しへのパーマリンク">¶</a></h1>
+<p>クラスタMDは、クラスタ用の共有デバイスRAIDです。サポートしているレベルはraid1とraid10（制限付きサポート）です。</p>
+<section id="on-disk-format">
+<h2>1. ディスク上の形式<a class="headerlink" href="#on-disk-format" title="この見出しへのパーマリンク">¶</a></h2>
+<p>各クラスタノードに対して個別のwrite-intent-bitmapが使用されます。これらのbitmapは、そのノードで開始されたがまだ完了していないすべての書き込みを記録します。ディスク上のレイアウトは以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>0                    4k                     8k                    12k
+-------------------------------------------------------------------
+| idle                | md super            | bm super [0] + bits |
+| bm bits[0, contd]   | bm super[1] + bits  | bm bits[1, contd]   |
+| bm super[2] + bits  | bm bits [2, contd]  | bm super[3] + bits  |
+| bm bits [3, contd]  |                     |                     |
+</pre></div>
+</div>
+<p>「通常」動作中は、ファイルシステムが任意のブロックに対して同時に1つのノードのみが書き込みを行うことを保証すると仮定します。そのため、書き込み要求は</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>適切なビットを設定します（すでに設定されている場合は除く）</p></li>
+<li><p>すべてのミラーノードに書き込みをコミットします</p></li>
+<li><p>タイムアウト後にビットをクリアするスケジュールを設定します。</p></li>
+</ul>
+</div></blockquote>
+<p>読み取りは通常通り処理されます。ファイルシステムが、他のノード（または同じノード）が書き込み中の場所から読み取らないように保証する必要があります。</p>
+</section>
+<section id="dlm-locks-for-management">
+<h2>2. 管理用DLMロック<a class="headerlink" href="#dlm-locks-for-management" title="この見出しへのパーマリンク">¶</a></h2>
+<p>デバイスを管理するためのロックグループは3つあります：</p>
+<section id="bitmap-lock-resource-bm-lockres">
+<h3>2.1 ビットマップロックリソース（bm_lockres）<a class="headerlink" href="#bitmap-lock-resource-bm-lockres" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>bm_lockresは個々のノードのビットマップを保護します。これらはbitmap000（ノード1）、bitmap001（ノード2）などと名付けられます。ノードがクラスタに参加する際には、PWモードでロックを取得し、クラスタに所属している間はその状態を維持します。ロックリソース番号はDLMサブシステムが返すスロット番号に基づいています。DLMはノードカウントを1から開始するのに対し、ビットマップスロットは0から開始するため、DLMスロット番号から1を引いた値がビットマップスロット番号になります。</p>
+<p>特定のノードのビットマップロックのLVB（Lock Value Block）は、そのノードが再同期しているセクター範囲を記録します。他のノードはこれらのセクターに書き込みできません。これは新しいノードがクラスタに参加するときに使用されます。</p>
+</div></blockquote>
+</section>
+<section id="message-passing-locks">
+<h3>2.2 メッセージ送信ロック<a class="headerlink" href="#message-passing-locks" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>各ノードは、再同期の開始または終了、およびメタデータスーパーブロックの更新時に他のノードと通信する必要があります。この通信は、「token」、「message」、「ack」の3つのロックを通じて管理され、さらに「message」ロックの1つに属するLock Value Block（LVB）も使用されます。</p>
+</div></blockquote>
+</section>
+<section id="new-device-management">
+<h3>2.3 新しいデバイスの管理<a class="headerlink" href="#new-device-management" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>単一のロック「no-new-dev」が新しいデバイスの追加を調整するために使用されます。これは配列全体で同期する必要があります。通常、すべてのノードがこのデバイスに対してコンカレンテッドリードロックを保持します。</p>
+</div></blockquote>
+</section>
+</section>
+<section id="communication">
+<h2>3. 通信<a class="headerlink" href="#communication" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><p>メッセージはすべてのノードにブロードキャストされ、送信者はすべての他のノードがメッセージを確認するのを待ってから進みます。一度に1つのメッセージのみを処理できます。</p>
+</div></blockquote>
+<section id="message-types">
+<h3>3.1 メッセージタイプ<a class="headerlink" href="#message-types" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>6種類のメッセージが送信されます：</p>
+</div></blockquote>
+<section id="metadata-updated">
+<h4>3.1.1 METADATA_UPDATED<a class="headerlink" href="#metadata-updated" title="この見出しへのパーマリンク">¶</a></h4>
+<blockquote>
+<div><p>他のノードにメタデータが更新されたことを通知し、ノードはmdスーパーブロックを再読み込む必要があります。これは同期的に実行されます。主にデバイス障害を通知するために使用されます。</p>
+</div></blockquote>
+</section>
+<section id="resyncing">
+<h4>3.1.2 リスynchronize<a class="headerlink" href="#resyncing" title="この見出しへのパーマリンク">¶</a></h4>
+<blockquote>
+<div><p>リスynchronizeの開始または終了を他のノードに通知し、各ノードが領域の停止または再開を可能にするためのメッセージです。各リスynchronizeメッセージは、送信ノードがリスynchronizeするデバイスの範囲を指定します。このメッセージは、そのノードからの以前の通知を上書きします。1つのノードあたり、一度に1つの範囲のみリスynchronizeできます。</p>
+</div></blockquote>
+</section>
+<section id="newdisk">
+<h4>3.1.3 NEWDISK<a class="headerlink" href="#newdisk" title="この見出しへのパーマリンク">¶</a></h4>
+<blockquote>
+<div><p>デバイスが配列に追加されていることを他のノードに通知します。メッセージにはそのデバイスの識別子が含まれます。詳細については下記を参照してください。</p>
+</div></blockquote>
+</section>
+<section id="remove">
+<h4>3.1.4 REMOVE<a class="headerlink" href="#remove" title="この見出しへのパーマリンク">¶</a></h4>
+<blockquote>
+<div><blockquote>
+<div><p>故障したか、代替として使用されていたデバイスが配列から削除されています。メッセージにはそのデバイスのスロット番号が含まれます。</p>
+</div></blockquote>
+<p>3.1.5 RE_ADD:</p>
+<blockquote>
+<div><p>故障したデバイスが再活性化されています。このデバイスが再び正常に動作していると判断されていることを前提としています。</p>
+</div></blockquote>
+<p>3.1.6 BITMAP_NEEDS_SYNC:</p>
+<blockquote>
+<div><p>ノードがローカルで停止しているが、ビットマップがクリーンでない場合、他のノードにリスynchronizeの所有権を取得するよう通知します。</p>
+</div></blockquote>
+</div></blockquote>
+</section>
+</section>
+<section id="communication-mechanism">
+<h3>3.2 通信メカニズム<a class="headerlink" href="#communication-mechanism" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>DLM LVBはクラスタ内のノード間で通信するために使用されます。この目的で使用されるリソースは以下の3つです：</p>
+</div></blockquote>
+<section id="token">
+<h4>3.2.1 token<a class="headerlink" href="#token" title="この見出しへのパーマリンク">¶</a></h4>
+<blockquote>
+<div><p>通信システム全体を保護するリソース。tokenリソースを持つノードのみ通信が許可されます。</p>
+</div></blockquote>
+</section>
+<section id="message">
+<h4>3.2.2 message<a class="headerlink" href="#message" title="この見出しへのパーマリンク">¶</a></h4>
+<blockquote>
+<div><p>通信に使用されるロックリソースで、データを運搬します。</p>
+</div></blockquote>
+</section>
+<section id="ack">
+<h4>3.2.3 ack<a class="headerlink" href="#ack" title="この見出しへのパーマリンク">¶</a></h4>
+<blockquote>
+<div><p>メッセージがクラスタ内のすべてのノードによって確認されたことを示すリソース。このリソースのBASTは、受信ノードにノードが通信を希望していることを通知します。</p>
+</div></blockquote>
+<p>アルゴリズムは以下の通りです：</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>ステータスを受信 - すべてのノードが「ack」にコンカレンタルリーダーロックを保持しています：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>sender                         receiver                 receiver
+"ack":CR                       "ack":CR                 "ack":CR
+</pre></div>
+</div>
+</li>
+<li><p>送信者が「token」にEXを取得し、「message」にEXを取得します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>sender                        receiver                 receiver
+"token":EX                    "ack":CR                 "ack":CR
+"message":EX
+"ack":CR
+</pre></div>
+</div>
+<p>送信者がまだメッセージを送る必要があるかを確認します。トークンを待っている間受け取ったメッセージや他のイベントにより、このメッセージが不適切または冗長になる可能性があります。</p>
+</li>
+<li><p>送信者がLVBを書き込みます</p>
+<p>送信者が「message」をEXからCWに下位変換します</p>
+<p>送信者が「ack」のEXを取得しようとします</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span> [ wait until all receivers have *processed* the "message" ]
+
+                                  [ triggered by bast of "ack" ]
+                                  receiver get CR on "message"
+                                  receiver read LVB
+                                  receiver processes the message
+                                  [ wait finish ]
+                                  receiver releases "ack"
+                                  receiver tries to get PR on "message"
+
+sender                         receiver                  receiver
+"token":EX                     "message":CR              "message":CR
+"message":CW
+"ack":EX
+</pre></div>
+</div>
+</li>
+<li><p>「ack」のEXが許可されたら（すべての受信者がメッセージを処理したことを示す）</p>
+<p>送信者が「ack」をEXからCRに下位変換します</p>
+<p>送信者が「message」を解放します</p>
+<p>送信者が「token」を解放します</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>                            receiver upconvert to PR on "message"
+                            receiver get CR of "ack"
+                            receiver release "message"
+
+sender                      receiver                   receiver
+"ack":CR                    "ack":CR                   "ack":CR
+</pre></div>
+</div>
+</li>
+</ol>
+</div></blockquote>
+</section>
+</section>
+</section>
+<section id="handling-failures">
+<h2>4. フェールオーバーの処理<a class="headerlink" href="#handling-failures" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="node-failure">
+<h3>4.1 ノードフェールオーバー<a class="headerlink" href="#node-failure" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>ノードが故障した場合、DLMはクラスタにスロット番号で通知します。ノードはクラスタ回復スレッドを開始します。クラスタ回復スレッドは以下の処理を行います：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>故障したノードのbitmap&lt;number&gt;ロックを取得します</p></li>
+<li><p>bitmapを開きます</p></li>
+<li><p>故障したノードのbitmapを読み込みます</p></li>
+<li><p>設定されたbitmapをローカルノードにコピーします</p></li>
+<li><p>失敗したノードのビットマップをクリーンする</p></li>
+<li><p>失敗したノードのbitmap&lt;number&gt; ロックを解放する</p></li>
+<li><p>現在のノードでビットマップの再同期を開始します。recover_bitmaps内でmd_check_recoveryが呼び出され、md_check_recovery -&gt; metadata_update_start/finishが実行されると、lock_commによって通信がロックされます。これは、1つのノードが再同期している間、配列全体のどこにも他のノードが書けないようにするためです。</p></li>
+</ul>
+</div></blockquote>
+<p>再同期プロセスは通常のmd再同期です。ただしクラスタ環境では、再同期を実行する際には、他のノードに停止領域を通知する必要があります。再同期開始前に、ノードはRESYNCINGメッセージを送信し、停止する領域の(lo, hi)範囲を指定します。各ノードはsuspend_listを保持し、受信したRESYNCINGメッセージに応じて範囲を追加します。再同期が完了したノードは、空の範囲でRESYNCINGを送信し、他のノードがsuspend_listから該当のエントリを削除します。</p>
+<p>area_resyncing()関数を使用して、特定のI/O範囲が停止すべきかどうかを確認できます。</p>
+</div></blockquote>
+</section>
+</section>
+<section id="device-failure">
+<h2>4.2 デバイスの障害<a class="headerlink" href="#device-failure" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><p>デバイスの障害はメタデータ更新ルーチンで処理され通知されます。ノードがデバイス障害を検出すると、他のノードが承認するまでそのデバイスへの書き込みを禁止します。</p>
+</div></blockquote>
+<section id="adding-a-new-device">
+<h3>5. 新しいデバイスの追加<a class="headerlink" href="#adding-a-new-device" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>新しいデバイスを追加するには、すべてのノードが新しいデバイスを認識する必要があります。そのため、以下のアルゴリズムが使用されます：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>ノード1はmdadm –manage /dev/mdX –add /dev/sdYYを実行し、ioctl(ADD_NEW_DISKでdisc.stateをMD_DISK_CLUSTER_ADDに設定)を発行します</p></li>
+<li><p>ノード1はuuidとスロット番号を含むNEWDISKメッセージを送信します</p></li>
+<li><p>他のノードはuuidとスロット番号を用いてkobject_uevent_envを実行します（ステップ4、5はudevルールとして扱うこともできます）</p></li>
+<li><p>ユーザースペースでは、ノードはblkid -t SUB_UUID=””などを用いてディスクを検索します</p></li>
+<li><p>ディスクが見つかった場合、他のノードはioctl(ADD_NEW_DISKでdisc.stateをMD_DISK_CANDIDATEに設定し、disc.numberをスロット番号に設定)を実行するか、ioctl(CLUSTERED_DISK_NACK)を実行します</p></li>
+<li><p>ディスクが見つかった場合、他のノードは「no-new-devs」（CR）のロックを解除します</p></li>
+<li><p>ノード1は「no-new-dev」のEXロックを取得しようとします</p></li>
+<li><p>ノード1がロックを取得した場合、ディスクをSpareLocalから解除した後にMETADATA_UPDATEDを送信します</p></li>
+<li><p>ロックを取得できなかった場合（「no-new-dev」ロックを取得できなかった場合）、操作を失敗させMETADATA_UPDATEDを送信します</p></li>
+<li><p>他のノードはMETADATA_UPDATEDを通じてディスクが追加されたかどうかの情報を取得します</p></li>
+</ol>
+</div></blockquote>
+</div></blockquote>
+</section>
+</section>
+<section id="module-interface">
+<h2>6. モジュールインターフェース<a class="headerlink" href="#module-interface" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><p>mdコアがクラスターモジュールに対して行えるコールバックは17個あります。これらを理解することで、全体のプロセスについて良い概要を得ることができます。</p>
+</div></blockquote>
+<section id="join-nodes-and-leave">
+<h3>6.1 join(nodes) および leave()<a class="headerlink" href="#join-nodes-and-leave" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>配列がクラスタービットマップで起動されるとき、または停止されるときに呼び出されます。join()はクラスタが利用可能になるようにし、各種リソースを初期化します。クラスタ内の最初の‘nodes’ノードのみが配列を使用できます。</p>
+</div></blockquote>
+</section>
+<section id="slot-number">
+<h3>6.2 slot_number()<a class="headerlink" href="#slot-number" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>クラスタインフラストラクチャが推奨するスロット番号を報告します。範囲は0からnodes-1です。</p>
+</div></blockquote>
+</section>
+<section id="resync-info-update">
+<h3>6.3 resync_info_update()<a class="headerlink" href="#resync-info-update" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>これはビットマップロックに保存されている再同期範囲を更新します。再同期が進むにつれて開始位置が更新され、終了位置は常に配列の終わりです。これにより、 <em>ではありません</em> RESYNCINGメッセージを送信します。</p>
+</div></blockquote>
+</section>
+<section id="resync-start-resync-finish">
+<h3>6.4 resync_start(), resync_finish()<a class="headerlink" href="#resync-start-resync-finish" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>再同期/回復/再構成が開始または停止するときに呼び出されます。これらはビットマップロック内の再同期範囲を更新し、RESYNCINGメッセージも送信します。resync_startは配列全体を再同期中と報告し、resync_finishはすべてを報告しません。</p>
+<p>resync_finish()はさらにBITMAP_NEEDS_SYNCメッセージを送信し、他のノードが制御を引き継ぐことを可能にします。</p>
+</div></blockquote>
+</section>
+<section id="metadata-update-start-metadata-update-finish-metadata-update-cancel">
+<h3>6.5 metadata_update_start(), metadata_update_finish(), metadata_update_cancel()<a class="headerlink" href="#metadata-update-start-metadata-update-finish-metadata-update-cancel" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>metadata_update_startはメタデータへの排他アクセスを取得するために使用されます。そのアクセスを得た後でも変更が必要な場合は、metadata_update_finish()が他のノードにMETADATA_UPDATEメッセージを送信します。そうでない場合は、metadata_update_cancel()を使用してロックを解放できます。</p>
+</div></blockquote>
+</section>
+<section id="area-resyncing">
+<h3>6.6 area_resyncing()<a class="headerlink" href="#area-resyncing" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>これは2つの機能要素を統合しています。</p>
+<p>まず、指定されたセクタ範囲内でどのノードが現在再同期しているかを確認します。再同期が見つかった場合、呼び出し元はその範囲での書き込みや読み込みバランスを避けることになります。</p>
+<p>次に、ノード回復が進行中である場合、READリクエストに対してすべての領域が再同期中であると報告します。これにより、クラスタファイルシステムとクラスタRAIDがノード障害を処理する際の競合を回避します。</p>
+</div></blockquote>
+</section>
+<section id="add-new-disk-start-add-new-disk-finish-new-disk-ack">
+<h3>6.7 add_new_disk_start(), add_new_disk_finish(), new_disk_ack()<a class="headerlink" href="#add-new-disk-start-add-new-disk-finish-new-disk-ack" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>これは上記の新しいディスクプロトコルを管理するために使用されます。新しいデバイスが追加された場合、add_new_disk_start()がデバイスが配列にバインドされる前に呼び出され、成功した場合、デバイスが完全に追加された後にadd_new_disk_finish()が呼び出されます。</p>
+<p>デバイスが以前のリクエストへの応答として追加された場合、またはデバイスが「利用不可」と宣言された場合、new_disk_ack()が呼び出されます。</p>
+</div></blockquote>
+</section>
+<section id="remove-disk">
+<h3>6.8 remove_disk()<a class="headerlink" href="#remove-disk" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>スパレや障害が発生したデバイスが配列から削除されるときに呼び出されます。これにより、他のノードにREMOVEメッセージが送信されます。</p>
+</div></blockquote>
+</section>
+<section id="gather-bitmaps">
+<h3>6.9 gather_bitmaps()<a class="headerlink" href="#gather-bitmaps" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>すべての他のノードにRE_ADDメッセージを送信し、その後すべてのビットマップからビットマップ情報を収集します。この結合されたビットマップは、再追加されたデバイスの復元に使用されます。</p>
+</div></blockquote>
+</section>
+<section id="lock-all-bitmaps-and-unlock-all-bitmaps">
+<h3>6.10 lock_all_bitmaps() および unlock_all_bitmaps()<a class="headerlink" href="#lock-all-bitmaps-and-unlock-all-bitmaps" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>ビットマップをnoneに変更する場合に呼び出されます。クラスタRAIDのビットマップをクリアするノードは、クラスタ内のすべてのビットマップロックをロックすることで他のノードがRAIDを使用していないことを確認する必要があります。その後、これらのロックは適切にアンロックされます。</p>
+</div></blockquote>
+</section>
+</section>
+<section id="unsupported-features">
+<h2>7. 対応していない機能<a class="headerlink" href="#unsupported-features" title="この見出しへのパーマリンク">¶</a></h2>
+<p>クラスタMDではまだサポートされていない機能があります。</p>
+<ul class="simple">
+<li><p>array_sectorsを変更する。</p></li>
+</ul>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../driver-model/index.html">ドライバモデル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../basics.html">ドライバの基礎</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infrastructure.html">デバイスドライバのインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ioctl.html">ioctlベースのインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../early-userspace/index.html">初期ユーザースペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pm/index.html">CPUおよびデバイスの電源管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../clk.html">共通のCLKフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device-io.html">バスを問わないデバイスアクセス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dma-buf.html">バッファ共有と同期</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device_link.html">デバイスリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../component.html">複合ドライバ用コンポーネントヘルパ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../message-based.html">メッセージベースのデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infiniband.html">InfiniBandおよびリモートDMA（RDMA）インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../frame-buffer.html">フレームバッファライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../regulator.html">電圧および電流レギュレータAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../input.html">入力サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../usb/index.html">Linux USB API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firewire.html">Firewire（IEEE 1394）ドライバインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pci/index.html">Linux PCIドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../spi.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i2c.html">I<sup>2</sup>CおよびSMBusサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmb.html">衛星MC用IPMBドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmi.html">Linux IPMIドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i3c/index.html">I3Cサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../interconnect.html">汎用システムインターコネクトサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../devfreq.html">デバイス周波数スケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hsi.html">高速同期シリアルインターフェース (HSI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../edac.html">エラー検出と訂正 (EDAC) デバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../scsi.html">SCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../libata.html">libATA開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../target.html">ターゲットおよびiSCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mailbox.html">共通メールボックスフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mtdnand.html">MTD NANDドライバプログラミングインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html">パラレルポートデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#x50-uart-driver">16x50 UARTドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#pulse-width-modulation-pwm">パルス幅変調 (PWM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mei/index.html">インテル(R) マネジメントエンジニアリングインターフェース (インテル(R) MEI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mtd/index.html">メモリ技術デバイス (MTD)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mmc/index.html">MMC/SD/SDIOカードサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nvdimm/index.html">非揮発性メモリデバイス (NVDIMM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../w1.html">W1: ダラスの1ワイヤーバス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rapidio/index.html">Linux RapidIO サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../s390-drivers.html">s390チャネルデバイスドライバの作成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vme.html">VMEデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../80211/index.html">Linux 802.11ドライバ開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../uio-howto.html">ユーザースペースI/O HOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firmware/index.html">LinuxファームウェアAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pinctl.html">PINCTRL (PIN CONTROL)サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../gpio/index.html">汎用入出力 (GPIO)</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">RAID</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../media/index.html">メディアサブシステム カーネル内部API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../misc_devices.html">その他のデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nfc/index.html">近距離通信 (NFC)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dmaengine/index.html">DMAエンジンドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../slimbus.html">LinuxカーネルSLIMbusサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../soundwire/index.html">SoundWireドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../thermal/index.html">熱管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../fpga/index.html">FPGAサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../acpi/index.html">ACPI サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../backlight/lp855x-driver.html">カーネルドライバlp855x</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../connector.html">カーネルコンネクタ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../console.html">コンソールドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dcdbas.html">Dellシステム管理ベースドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../eisa.html">EISAバスサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isa.html">ISAドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isapnp.html">ISA Plug &amp; Playサポート (Jaroslav Kysela &lt;perex@suse.cz&gt;)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io-mapping.html">io_mapping関数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io_ordering.html">メモリマップアドレスへのI/O書き込みの順序付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../generic-counter.html">汎用カウンタインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lightnvm-pblk.html">pblk: 物理ブロックデバイスターゲット</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../memory-devices/index.html">メモリコントローラー ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../men-chameleon-bus.html">MEN Chameleon Bus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ntb.html">NTB ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nvmem.html">NVMEM サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../parport-lowlevel.html">PARPORT インターフェース ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pps.html">PPS - パルス毎秒 (Pulse Per Second)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ptp.html">Linux用PTP ハードウェアクロック インフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../phy/index.html">ジェネリック PHY フレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pti_intel_mid.html">インテル MID PTI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pwm.html">パルス幅変調 (PWM) インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html">PLDM ファームウェア フラッシュアップデート ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html#overview-of-the-pldmfw-library">概要: <code class="docutils literal notranslate"><span class="pre">pldmfw</span></code> ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rfkill.html">rfkill - RFキルスイッチサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../serial/index.html">シリアルデバイスのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sm501.html">SM501 ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../switchtec.html">Linux Switchtec サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sync_file.html">シンクファイル API ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio-mediated-device.html">VFIO メディエイテッドデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio.html">VFIO - 「仮想ファンクション I/O」 </a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xilinx/index.html">Xilinx FPGA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xillybus.html">ジェネリックFPGAインターフェース用Xillybusドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../zorro.html">Zorroデバイス用のデバイスドライバの作成</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul>
+<li><a href="index.html">RAID</a><ul>
+<li>前へ: <a href="index.html" title="前章">RAID</a></li>
+<li>次へ: <a href="raid5-cache.html" title="次章">RAID 4/5/6キャッシュ</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/driver-api/md/md-cluster.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

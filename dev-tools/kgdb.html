@@ -1,0 +1,1091 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>kgdb、kdbおよびカーネルデバッガーの内部構造 — Linux Kernelドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="kselftest.html" rel="next" title="Linux Kernel Selftests"/>
+<link href="gdb-kernel-debugging.html" rel="prev" title="Debugging kernel and modules via gdb"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="using-kgdb-kdb-and-the-kernel-debugger-internals">
+<h1>Using kgdb, kdb and the kernel debugger internals<a class="headerlink" href="#using-kgdb-kdb-and-the-kernel-debugger-internals" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Jason Wessel</p>
+</dd>
+</dl>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>カーネルには、kdbとkgdbという2つの異なるデバッガーのフロントエンドがあり、これらはデバッグコアとインターフェースします。カーネルを適切にコンパイルおよび実行時設定することで、どちらかのデバッガーを用いたり、動的に切り替えることができます。</p>
+<p>kdbはキーボードまたはシリアルコンソールで使用できるシンプルなシェルスタイルのインターフェースです。メモリやレジスタ、プロセスリスト、dmesg、さらには特定の場所で停止するためのブレイクポイントの設定が可能です。kdbはソースレベルデバッガーではありませんが、ブレイクポイントの設定や基本的なカーネル実行制御が可能です。kdbは主に開発支援やカーネル問題の診断に使用されるツールです。カーネルビルトインやカーネルモジュールでコードがビルドされた場合、一部のシンボルを名前で参照することが可能です。
+<code class="docutils literal notranslate"><span class="pre">CONFIG_KALLSYMS</span></code>.</p>
+<p>kgdbはLinuxカーネルのソースレベルデバッガーとして設計されています。kgdbはgdbと併用してカーネルのデバッグに使用されます。gdbを用いてカーネルに「ブレイクイン」し、メモリや変数を確認し、呼び出しスタック情報をアプリケーション開発者がアプリケーションをデバッグするようにするのと同様に確認できることが期待されます。カーネルコードにブレイクポイントを設定し、一部の制限付きの実行ステップを実行することが可能です。</p>
+<p>kgdbを使用するには2台のマシンが必要です。そのうち1台は開発マシン、もう1台はターゲットマシンです。デバッグされるカーネルはターゲットマシン上で動作します。開発マシンではvmlinuxファイル（シンボルを含むファイル、bzImageやzImage、uImageなどのブートイメージではなく）に対してgdbのインスタンスを実行します。gdbでは開発者が接続パラメータを指定し、kgdbに接続します。開発者がgdbで使用する接続タイプは、kgdb I/Oモジュールがテストマシンのカーネルでコンパイルされたビルトインかロード可能なモジュールとして利用可能かどうかに依存します。</p>
+</section>
+<section id="compiling-a-kernel">
+<h2>カーネルのコンパイル<a class="headerlink" href="#compiling-a-kernel" title="この見出しへのパーマリンク">¶</a></h2>
+<ul class="simple">
+<li><p>kdbのコンパイルを有効にするには、まずkgdbを有効にする必要があります。</p></li>
+<li><p>kgdbのテストコンパイルオプションについては、kgdbテストスイート章で説明しています。</p></li>
+</ul>
+<section id="kernel-config-options-for-kgdb">
+<h3>kgdbのカーネル構成オプション<a class="headerlink" href="#kernel-config-options-for-kgdb" title="この見出しへのパーマリンク">¶</a></h3>
+<p>有効にするには <code class="docutils literal notranslate"><span class="pre">CONFIG_KGDB</span></code> 以下の項目を確認してください
+<span class="menuselection">カーネルハッキング ‣ カーネルデバッグ</span> を選択してください
+<span class="menuselection">KGDB: カーネルデバッガー</span>.</p>
+<p>vmlinuxファイルにシンボルが含まれていることは必須ではありませんが、シンボルデータがないとgdbは非常に使いづらいので、シンボルデータを有効にする必要があります。 <code class="docutils literal notranslate"><span class="pre">CONFIG_DEBUG_INFO</span></code> これは
+<span class="menuselection">カーネルをデバッグ情報付きでコンパイルする</span> というオプションで、構成メニューに表示されます。</p>
+<p>推奨ですが必須ではありませんので、
+<code class="docutils literal notranslate"><span class="pre">CONFIG_FRAME_POINTER</span></code> 呼び出されるカーネルオプション <span class="menuselection">フレームポインタを用いてカーネルをコンパイルする</span> コンパイル時の設定メニューでこのオプションを選択すると、コンパイルされた実行ファイルにコードが挿入され、レジスタまたはスタックにフレーム情報を保存するタイミングが設定されます。これにより、gdbなどのデバッガーがカーネルのデバッグ中により正確なスタックバックトレースを構築できるようになります。</p>
+<p>使用しているアーキテクチャがカーネルオプションをサポートする場合
+<code class="docutils literal notranslate"><span class="pre">CONFIG_STRICT_KERNEL_RWX</span></code>、このオプションをオフにすることを検討すべきです。このオプションは、カーネルのメモリ領域の特定の領域を読み取り専用としてマークするため、ソフトウェアブレイクポイントの使用を防ぎます。kgdbがアーキテクチャをサポートする場合、ハードウェアブレイクポイントを使用してこのオプションをオンにして実行することも可能です。そうでない場合は、このオプションをオフにする必要があります。 <code class="docutils literal notranslate"><span class="pre">CONFIG_STRICT_KERNEL_RWX</span></code>
+次に、デバッグホストとデバッグ対象機器を接続するための1つ以上のI/Oドライバを選択する必要があります。早期ブートデバッグには、早期デバッグをサポートするKGDB I/Oドライバが必要であり、ドライバはカーネルに直接組み込まれる必要があります。KGDB I/Oドライバの設定は、カーネルまたはモジュールパラメータを通じて行われ、kgdbocパラメータに関するセクションで詳しく説明しています。</p>
+<p>以下はkgdb用のシンボルの例です。</p>
+<p>kdb用のカーネル構成オプション <code class="docutils literal notranslate"><span class="pre">.config</span></code> kdbは、カーネルのデバッグコア上に設置された単純なgdbstubよりもはるかに複雑です。kdbはシェルを実装し、カーネルの他の部分で補助関数を追加して、例えば、コマンドを実行した際に表示されるような興味深いデータを出力する責任があります。kdbをカーネルに組み込むには、kgdbと同じ手順を実行します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># CONFIG_STRICT_KERNEL_RWX is not set
+CONFIG_FRAME_POINTER=y
+CONFIG_KGDB=y
+CONFIG_KGDB_SERIAL_CONSOLE=y
+</pre></div>
+</div>
+</section>
+<section id="kernel-config-options-for-kdb">
+<h3>kgdbocパラメータに関するセクションで詳しく説明しています。<a class="headerlink" href="#kernel-config-options-for-kdb" title="この見出しへのパーマリンク">¶</a></h3>
+<p>. そのために、kdbをカーネルに組み込むには、kgdbと同じ手順を実行します。
+<code class="docutils literal notranslate"><span class="pre">lsmod</span></code>（sleepable RCU）が導入されました。 <code class="docutils literal notranslate"><span class="pre">ps</span></code>kgdbocパラメータに関するセクションで詳しく説明しています。</p>
+<p>kdbの主な設定オプションは <code class="docutils literal notranslate"><span class="pre">CONFIG_KGDB_KDB</span></code> これは
+<span class="menuselection">KGDB_KDB: kgdbのフロントエンドを含める</span> 設定メニュー内で。理論上、シリアルポートでkdbを使用する予定であれば、すでにI/Oドライバ（例として）を選択しているはずである
+<code class="docutils literal notranslate"><span class="pre">CONFIG_KGDB_SERIAL_CONSOLE</span></code> インターフェースを選択したはずである。これはkgdbを設定しているときの話である</p>
+<p>kdbでPS/2スタイルのキーボードを使用したい場合は、選択する
+<code class="docutils literal notranslate"><span class="pre">CONFIG_KDB_KEYBOARD</span></code> これは <span class="menuselection">KGDB_KDB: キーボードを入力デバイスとして</span> オプションは <code class="docutils literal notranslate"><span class="pre">CONFIG_KDB_KEYBOARD</span></code> gdbインターフェースでkgdbを使用する際には、このオプションは使用されない。このオプションは <code class="docutils literal notranslate"><span class="pre">CONFIG_KDB_KEYBOARD</span></code>
+kdbとの併用にのみ有効である</p>
+<p>kdb用のカーネル構成オプション <code class="docutils literal notranslate"><span class="pre">.config</span></code> kdbを有効/無効にするシンボル:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># CONFIG_STRICT_KERNEL_RWX is not set
+CONFIG_FRAME_POINTER=y
+CONFIG_KGDB=y
+CONFIG_KGDB_SERIAL_CONSOLE=y
+CONFIG_KGDB_KDB=y
+CONFIG_KDB_KEYBOARD=y
+</pre></div>
+</div>
+</section>
+</section>
+<section id="kernel-debugger-boot-arguments">
+<h2>カーネルデバッガーのブート引数<a class="headerlink" href="#kernel-debugger-boot-arguments" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このセクションでは、カーネルデバッガーの構成に影響を与えるさまざまなランタイムカーネルパラメータについて説明します。次の章では、kdbとkgdbの使用方法と、構成パラメータの例をいくつか紹介します。</p>
+<section id="kernel-parameter-kgdboc">
+<h3>カーネルパラメータ: kgdboc<a class="headerlink" href="#kernel-parameter-kgdboc" title="この見出しへのパーマリンク">¶</a></h3>
+<p>kgdbocドライバはもともと「kgdb over console（コンソールを介したkgdb）」という略称でしたが、現在ではgdbとkgdbの通信方法を設定する主要なメカニズムであり、kdbシェルとやり取りするためのデバイスを指定する方法でもあります。</p>
+<p>kgdb/gdbではkgdbocは単一のシリアルポートで動作設計されています。シリアルコンソールを主なコンソールとして使用し、かつカーネルデバッグにも利用する場合に使用することを意図しています。また、システムコンソールとして指定されていないシリアルポートでもkgdbを用いることが可能です。kgdbocはカーネルのビルトインまたはロード可能なモジュールとして構成可能です。kgdbocを有効にするには
+<code class="docutils literal notranslate"><span class="pre">kgdbwait</span></code> kgdbocをカーネルのビルトインとして構築する必要があります。</p>
+<p>オプションでKMS（Kernel Mode Setting）統合を有効化できます。KMSとkgdbocを併用し、アトミックモード設定フックを持つビデオドライバを使用している場合、グラフィックコンソール上でデバッガーに移行することが可能です。カーネルの実行が再開されると、以前のグラフィックモードが復元されます。この統合は、kdbを使用してクラッシュの診断やメモリの分析を行う際に、フルグラフィックコンソールアプリケーションを実行できる有用なツールとして機能します。</p>
+<section id="kgdboc-arguments">
+<h4>kgdboc引数<a class="headerlink" href="#kgdboc-arguments" title="この見出しへのパーマリンク">¶</a></h4>
+<p>使用方法:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kgdboc=[kms][[,]kbd][[,]serial_device][,baud]
+</pre></div>
+</div>
+<p>オプションの構成を併用する場合、上記の順序を厳守する必要があります。</p>
+<p>略称:</p>
+<ul class="simple">
+<li><p>kms = Kernel Mode Setting</p></li>
+<li><p>kbd = Keyboard</p></li>
+</ul>
+<p>kdbおよび/またはkgdbを使用する場合、以下のシナリオのいずれかでkgdbocをキーボードおよび/またはシリアルデバイスを使用して構成できます。オプションの構成を併用する場合、上記の順序を厳守する必要があります。KMS＋のみgdbを使用する組み合わせは一般的に有用ではありません。</p>
+<section id="using-loadable-module-or-built-in">
+<h5>ロード可能なモジュールまたはビルトインを使用する<a class="headerlink" href="#using-loadable-module-or-built-in" title="この見出しへのパーマリンク">¶</a></h5>
+<ol class="arabic">
+<li><p>カーネルのビルトインとして:</p>
+<p>カーネル起動引数を使用:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kgdboc=&lt;tty-device&gt;,[baud]
+</pre></div>
+</div>
+</li>
+<li><p>カーネルロード可能なモジュールとして:</p>
+<p>コマンドを使用:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>modprobe kgdboc kgdboc=&lt;tty-device&gt;,[baud]
+</pre></div>
+</div>
+<p>kgdboc文字列のフォーマット例を以下に示します。1つ目はx86ターゲットで最初のシリアルポートを使用する例、2つ目はARM Versatile ABで2番目のシリアルポートを使用する例です。</p>
+<ol class="arabic simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">kgdboc=ttyS0,115200</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">kgdboc=ttyAMA1,115200</span></code></p></li>
+</ol>
+</li>
+</ol>
+</section>
+<section id="configure-kgdboc-at-runtime-with-sysfs">
+<h5>sysfs経由でkgdbocをランタイムで構成する<a class="headerlink" href="#configure-kgdboc-at-runtime-with-sysfs" title="この見出しへのパーマリンク">¶</a></h5>
+<p>ランタイムでkgdbocを有効化または無効化するには、sysfsにパラメータをエコーバックします。以下に例を示します:</p>
+<ol class="arabic">
+<li><p>ttyS0でkgdbocを有効化:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo ttyS0 &gt; /sys/module/kgdboc/parameters/kgdboc
+</pre></div>
+</div>
+</li>
+<li><p>kgdbocを無効化:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo "" &gt; /sys/module/kgdboc/parameters/kgdboc
+</pre></div>
+</div>
+</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>ttyがすでに構成またはオープンされている場合、ボーレートを指定する必要はありません。</p>
+</div>
+</section>
+<section id="more-examples">
+<h5>さらに多くの例<a class="headerlink" href="#more-examples" title="この見出しへのパーマリンク">¶</a></h5>
+<p>kdbおよび/またはkgdbを使用する場合、以下のシナリオのいずれかでkgdbocをキーボードおよび/またはシリアルデバイスを使用して構成できます。</p>
+<ol class="arabic">
+<li><p>シリアルポートのみを介してkdbとkgdb:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kgdboc=&lt;serial_device&gt;[,baud]
+</pre></div>
+</div>
+<p>例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kgdboc=ttyS0,115200
+</pre></div>
+</div>
+</li>
+<li><p>キーボードとシリアルポートを介してkdbとkgdb:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kgdboc=kbd,&lt;serial_device&gt;[,baud]
+</pre></div>
+</div>
+<p>例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kgdboc=kbd,ttyS0,115200
+</pre></div>
+</div>
+</li>
+<li><p>キーボードを介してkdbを用いる場合:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kgdboc=kbd
+</pre></div>
+</div>
+</li>
+<li><p>カーネルモード設定を用いる場合:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kgdboc=kms,kbd
+</pre></div>
+</div>
+</li>
+<li><p>カーネルモード設定を用い、シリアルポートを介してkgdbを用いる場合:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kgdboc=kms,kbd,ttyS0,115200
+</pre></div>
+</div>
+</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>kgdbocはgdb remoteプロトコルを介したターゲットの中断をサポートしていません。手動で送信する必要があります <kbd class="kbd compound docutils literal notranslate"><kbd class="kbd docutils literal notranslate">SysRq</kbd>-<kbd class="kbd docutils literal notranslate">G</kbd></kbd> コンソールプロキシがなければなりません。コンソールプロキシはデバッガー用の別個のTCPポートと"人間"コンソール用の別個のTCPポートを持ち、プロキシがコンソール出力をターミナルプログラムに送信するのを担当します。 <kbd class="kbd compound docutils literal notranslate"><kbd class="kbd docutils literal notranslate">SysRq</kbd>-<kbd class="kbd docutils literal notranslate">G</kbd></kbd>
+あなたの代わりに送信します。</p>
+</div>
+<p>kgdbocをプロキシなしで使用する場合、デバッガーが2つのエントリポイントのいずれかに接続されることがあります。kgdbocをロードした後で例外が発生した場合、コンソールにデバッガーを待機しているというメッセージが表示されます。この場合、ターミナルプログラムを切断し、デバッガーを接続します。ターゲットシステムを中断して強制的にデバッグセッションに入る場合は、シーケンスを発行し、その後文字 <kbd class="kbd docutils literal notranslate">Sysrq</kbd> をタイプします。 <kbd class="kbd docutils literal notranslate">g</kbd>その後、ターミナルセッションを切断し、gdbを接続します。この方法が気に入らない場合は、gdbをハックして、シーケンスを自動的に送信するように設定するか、または未変更のgdbでデバッグが可能なデバッガープロキシを使用します。 <kbd class="kbd compound docutils literal notranslate"><kbd class="kbd docutils literal notranslate">SysRq</kbd>-<kbd class="kbd docutils literal notranslate">G</kbd></kbd> を自動的に送信するように設定します。また、初期接続時にも送信します。</p>
+</section>
+</section>
+</section>
+<section id="kernel-parameter-kgdboc-earlycon">
+<h3>カーネルパラメータ: <code class="docutils literal notranslate"><span class="pre">kgdboc_earlycon</span></code><a class="headerlink" href="#kernel-parameter-kgdboc-earlycon" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルパラメータ <code class="docutils literal notranslate"><span class="pre">kgdboc_earlycon</span></code> を指定し、シリアルドライバーがポーリングをサポートするブートコンソールを登録している場合（割り込みを必要とせず、非ブロッキングread()関数を実装している）、kgdbはブートコンソールを使用して動作を試みます。その後、通常のttyドライバーに移行します。 <code class="docutils literal notranslate"><span class="pre">kgdboc</span></code> パラメータで指定されたものに。</p>
+<p>通常はブートコンソールは1つだけ（read()関数を実装している）ので、単に <code class="docutils literal notranslate"><span class="pre">kgdboc_earlycon</span></code> を追加するだけで動作します。ブートコンソールが複数ある場合は、ブートコンソールの名前を追加して区別します。注意点として、ブートコンソールレイヤーとttyレイヤーで登録される名前は同じポートでも異なります。</p>
+<p>例えば、あるボードでは明示的に以下のようにします:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kgdboc_earlycon=qcom_geni kgdboc=ttyMSM0
+</pre></div>
+</div>
+<p>デバイスのブートコンソールが唯一「qcom_geni」だった場合、以下のように簡略化できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kgdboc_earlycon kgdboc=ttyMSM0
+</pre></div>
+</div>
+</section>
+<section id="kernel-parameter-kgdbwait">
+<h3>カーネルパラメータ: <code class="docutils literal notranslate"><span class="pre">kgdbwait</span></code><a class="headerlink" href="#kernel-parameter-kgdbwait" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルコマンドラインオプション <code class="docutils literal notranslate"><span class="pre">kgdbwait</span></code> は、カーネルの起動中にkgdbがデバッガー接続を待機するようにします。このオプションは、kgdb I/Oドライバをカーネルに組み込んでおり、I/Oドライバの構成をカーネルコマンドラインオプションで指定した場合にのみ使用可能です。kgdbwaitパラメータは、カーネルコマンドラインにおいてkgdb I/Oドライバの構成パラメータの直後に常に追加する必要があります。そうでなければ、I/Oドライバが構成される前にカーネルに使用を依頼してしまうため、動作しません。</p>
+<p>このオプションを使用すると、カーネルはI/Oドライバおよびアーキテクチャが許可する限り、できるだけ早く停止して待機します。kgdb I/Oドライバをロード可能なカーネルモジュールとしてビルドした場合、kgdbwaitは何も実行しません。</p>
+</section>
+<section id="kernel-parameter-kgdbcon">
+<h3>カーネルパラメータ: <code class="docutils literal notranslate"><span class="pre">kgdbcon</span></code><a class="headerlink" href="#kernel-parameter-kgdbcon" title="この見出しへのパーマリンク">¶</a></h3>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">kgdbcon</span></code> 機能により、 <a class="reference internal" href="../core-api/printk-basics.html#c.printk" title="printk"><code class="xref c c-func docutils literal notranslate"><span class="pre">printk()</span></code></a> gdbがカーネルに接続されているときにgdb内でのメッセージを確認できます。Kdbはkgdbcon機能を使用しません。</p>
+<p>kgdbは、デバッガーが接続・実行しているときに、gdbシリアルプロトコルを使用してコンソールメッセージをデバッガーに送信する機能をサポートしています。この機能を有効にする方法は2通りあります。</p>
+<ol class="arabic">
+<li><p>カーネルコマンドラインオプションで有効化:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kgdbcon
+</pre></div>
+</div>
+</li>
+<li><p>I/Oドライバを構成する前にsysfsを使用:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo 1 &gt; /sys/module/kgdb/parameters/kgdb_use_con
+</pre></div>
+</div>
+</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>kgdb I/Oドライバを構成した後でこの操作を行った場合、設定は次のI/O再構成のタイミングまで有効になりません。</p>
+</div>
+<div class="admonition important">
+<p class="admonition-title">重要です。</p>
+<p>kgdboc + kgdbconは、アクティブなシステムコンソールのttyでは使用できません。誤った使用例は:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>console=ttyS0,115200 kgdboc=ttyS0 kgdbcon
+</pre></div>
+</div>
+</div>
+<p>システムコンソールでないttyでこのオプションとkgdbocを使用することは可能です。</p>
+</section>
+<section id="run-time-parameter-kgdbreboot">
+<h3>ランタイムパラメータ: <code class="docutils literal notranslate"><span class="pre">kgdbreboot</span></code><a class="headerlink" href="#run-time-parameter-kgdbreboot" title="この見出しへのパーマリンク">¶</a></h3>
+<p>kgdbreboot機能により、デバッガーが再起動通知をどのように処理するかを変更できます。動作の選択肢は3つあり、デフォルトでは常に0が設定されています。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 5%"/>
+<col style="width: 53%"/>
+<col style="width: 42%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>1</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">echo</span> <span class="pre">-1</span> <span class="pre">&gt;</span> <span class="pre">/sys/module/debug_core/parameters/kgdbreboot</span></code></p></td>
+<td><p>再起動通知を完全に無視する。</p></td>
+</tr>
+<tr class="row-even"><td><p>2</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">echo</span> <span class="pre">0</span> <span class="pre">&gt;</span> <span class="pre">/sys/module/debug_core/parameters/kgdbreboot</span></code></p></td>
+<td><p>すべての接続されたデバッガークライアントに切断メッセージを送信する。</p></td>
+</tr>
+<tr class="row-odd"><td><p>3</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">echo</span> <span class="pre">1</span> <span class="pre">&gt;</span> <span class="pre">/sys/module/debug_core/parameters/kgdbreboot</span></code></p></td>
+<td><p>再起動通知時にデバッガーに移行する。</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="kernel-parameter-nokaslr">
+<h3>カーネルパラメータ: <code class="docutils literal notranslate"><span class="pre">nokaslr</span></code><a class="headerlink" href="#kernel-parameter-nokaslr" title="この見出しへのパーマリンク">¶</a></h3>
+<p>使用しているアーキテクチャでKASLRがデフォルトで有効になっている場合、無効にすることを検討してください。KASLRはカーネルイメージの仮想アドレスをランダム化し、gdbがvmlinuxのシンボルテーブルからカーネルシンボルのアドレスを解決するのを混乱させます。</p>
+</section>
+</section>
+<section id="using-kdb">
+<h2>kdb の使用<a class="headerlink" href="#using-kdb" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="quick-start-for-kdb-on-a-serial-port">
+<h3>シリアルポートでのkdbのクイックスタート<a class="headerlink" href="#quick-start-for-kdb-on-a-serial-port" title="この見出しへのパーマリンク">¶</a></h3>
+<p>kdbの使用方法の簡単な例です。</p>
+<ol class="arabic">
+<li><p>カーネルパラメータを使用して起動時にkgdbocを構成:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>console=ttyS0,115200 kgdboc=ttyS0,115200 nokaslr
+</pre></div>
+</div>
+<p>または</p>
+<p>カーネルが起動した後でkgdbocを構成する（シリアルポートコンソールを使用している場合）:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo ttyS0 &gt; /sys/module/kgdboc/parameters/kgdboc
+</pre></div>
+</div>
+</li>
+<li><p>手動でカーネルデバッガーに移行するか、オプスやフォールトを待機して移行します。手動でカーネルデバッガーに移行する方法はいくつかありますが、すべてが <kbd class="kbd compound docutils literal notranslate"><kbd class="kbd docutils literal notranslate">SysRq</kbd>-<kbd class="kbd docutils literal notranslate">G</kbd></kbd>を使用することを意味します。これは、あなたのカーネル構成で <code class="docutils literal notranslate"><span class="pre">CONFIG_MAGIC_SysRq=y</span></code> を有効にしておく必要があります。</p>
+<ul>
+<li><p>rootとしてログインしているか、スーパーユーザーセッションでログインしている場合、次を実行できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo g &gt; /proc/sysrq-trigger
+</pre></div>
+</div>
+</li>
+<li><p>minicom 2.2を使用した例</p>
+<p>押してください: <kbd class="kbd compound docutils literal notranslate"><kbd class="kbd docutils literal notranslate">CTRL</kbd>-<kbd class="kbd docutils literal notranslate">A</kbd></kbd> <kbd class="kbd docutils literal notranslate">f</kbd> <kbd class="kbd docutils literal notranslate">g</kbd></p>
+</li>
+<li><p>telnetでターミナルサーバーに接続し、リモートブレイクを送信可能な場合、</p>
+<p>押してください: <kbd class="kbd compound docutils literal notranslate"><kbd class="kbd docutils literal notranslate">CTRL</kbd>-<kbd class="kbd docutils literal notranslate">]</kbd></kbd></p>
+<p>入力してください: <code class="docutils literal notranslate"><span class="pre">send</span> <span class="pre">break</span></code></p>
+<p>押してください: <kbd class="kbd docutils literal notranslate">Enter</kbd> <kbd class="kbd docutils literal notranslate">g</kbd></p>
+</li>
+</ul>
+</li>
+<li><p>kdbプロンプトから、 <code class="docutils literal notranslate"><span class="pre">help</span></code> コマンドを実行して、利用可能なコマンドの一覧を確認できます。</p>
+<p>kdbで役立つコマンドには以下があります:</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 14%"/>
+<col style="width: 86%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lsmod</span></code></p></td>
+<td><p>カーネルモジュールがロードされている場所を表示します</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ps</span></code></p></td>
+<td><p>アクティブなプロセスのみを表示します</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ps</span> <span class="pre">A</span></code></p></td>
+<td><p>すべてのプロセスを表示します</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">summary</span></code></p></td>
+<td><p>カーネルバージョン情報とメモリ使用量を表示します</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">bt</span></code></p></td>
+<td><p>dump_stack()を使用して現在のプロセスのバックトレースを取得します</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dmesg</span></code></p></td>
+<td><p>カーネルsyslogバッファを表示します</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">go</span></code></p></td>
+<td><p>システムの実行を継続します</p></td>
+</tr>
+</tbody>
+</table>
+</li>
+<li><p>kdbを使用終了した後は、システムの再起動を行うか、以下のコマンドを使用してカーネルの実行を再開する必要があります。 <code class="docutils literal notranslate"><span class="pre">go</span></code> 長時間カーネルを停止した場合、ネットワーク通信に依存するアプリケーションや、リアルタイムの壁時計時間に関連する処理が影響を受ける可能性があります。そのため、カーネルデバッガーを使用する際は、この点を考慮してください。</p></li>
+</ol>
+</section>
+<section id="quick-start-for-kdb-using-a-keyboard-connected-console">
+<h3>キーボード接続コンソールを使用したkdbのクイックスタート<a class="headerlink" href="#quick-start-for-kdb-using-a-keyboard-connected-console" title="この見出しへのパーマリンク">¶</a></h3>
+<p>これはキーボードを使用してkdbを使用する方法の簡単な例です。</p>
+<ol class="arabic">
+<li><p>カーネルパラメータを使用して起動時にkgdbocを構成:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kgdboc=kbd
+</pre></div>
+</div>
+<p>または</p>
+<p>カーネルが起動した後でkgdbocを設定してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo kbd &gt; /sys/module/kgdboc/parameters/kgdboc
+</pre></div>
+</div>
+</li>
+<li><p>手動でカーネルデバッガーに移行するか、オプスやフォールトを待機して移行します。手動でカーネルデバッガーに移行する方法はいくつかありますが、すべてが <kbd class="kbd compound docutils literal notranslate"><kbd class="kbd docutils literal notranslate">SysRq</kbd>-<kbd class="kbd docutils literal notranslate">G</kbd></kbd>を使用することを意味します。これは、あなたのカーネル構成で <code class="docutils literal notranslate"><span class="pre">CONFIG_MAGIC_SysRq=y</span></code> を有効にしておく必要があります。</p>
+<ul>
+<li><p>rootとしてログインしているか、スーパーユーザーセッションでログインしている場合、次を実行できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo g &gt; /proc/sysrq-trigger
+</pre></div>
+</div>
+</li>
+<li><p>ラップトップキーボードを使用する例：</p>
+<p>押しっぱなしで保持してください： <kbd class="kbd docutils literal notranslate">Alt</kbd></p>
+<p>押しっぱなしで保持してください： <kbd class="kbd docutils literal notranslate">Fn</kbd></p>
+<p>ラベルが表示されているキーを押してから離してください： <kbd class="kbd docutils literal notranslate">SysRq</kbd></p>
+<p>離してください： <kbd class="kbd docutils literal notranslate">Fn</kbd></p>
+<p>押してから離してください： <kbd class="kbd docutils literal notranslate">g</kbd></p>
+<p>離してください： <kbd class="kbd docutils literal notranslate">Alt</kbd></p>
+</li>
+<li><p>PS/2 101キーキーボードを使用する例</p>
+<p>押しっぱなしで保持してください： <kbd class="kbd docutils literal notranslate">Alt</kbd></p>
+<p>ラベルが表示されているキーを押してから離してください： <kbd class="kbd docutils literal notranslate">SysRq</kbd></p>
+<p>押してから離してください： <kbd class="kbd docutils literal notranslate">g</kbd></p>
+<p>離してください： <kbd class="kbd docutils literal notranslate">Alt</kbd></p>
+</li>
+</ul>
+</li>
+<li><p>ここでkdbコマンドを入力してください、例えば <code class="docutils literal notranslate"><span class="pre">help</span></code>, <code class="docutils literal notranslate"><span class="pre">dmesg</span></code>, <code class="docutils literal notranslate"><span class="pre">bt</span></code> または <code class="docutils literal notranslate"><span class="pre">go</span></code> カーネルの実行を再開します。</p></li>
+</ol>
+</section>
+</section>
+<section id="using-kgdb-gdb">
+<h2>kgdb / gdb の使用<a class="headerlink" href="#using-kgdb-gdb" title="この見出しへのパーマリンク">¶</a></h2>
+<p>kgdbを使用するには、kgdb I/Oドライバの1つに構成情報を渡して有効化する必要があります。構成情報を渡さない場合、kgdbはまったく動作しません。kgdb I/Oドライバがロードされ構成されている場合に限り、kgdbがカーネルのトラップハンドラにアクティブに接続します。kgdb I/Oドライバを無効化すると、kgdbがすべてのカーネルハンドルポイントを登録解除します。</p>
+<p>すべてのkgdb I/Oドライバは、以下の条件を満たす場合、実行時にも再構成できます
+<code class="docutils literal notranslate"><span class="pre">CONFIG_SYSFS</span></code> および <code class="docutils literal notranslate"><span class="pre">CONFIG_MODULES</span></code> が有効化されている場合、新しい設定文字列を <code class="docutils literal notranslate"><span class="pre">/sys/module/&lt;driver&gt;/parameter/&lt;option&gt;</span></code>にエコーします。ドライバを無効化するには、空文字列を渡してください。デバッグが接続されている間は設定を変更できません。デバッグを解除するには、 <code class="docutils literal notranslate"><span class="pre">detach</span></code> コマンドでデバッガーを分離してください。</p>
+<section id="connecting-with-gdb-to-a-serial-port">
+<h3>シリアルポート経由でgdbに接続する<a class="headerlink" href="#connecting-with-gdb-to-a-serial-port" title="この見出しへのパーマリンク">¶</a></h3>
+<ol class="arabic">
+<li><p>kgdbocを設定</p>
+<p>カーネルパラメータを使用して起動時にkgdbocを構成:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kgdboc=ttyS0,115200
+</pre></div>
+</div>
+<p>または</p>
+<p>カーネルが起動した後でkgdbocを設定してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo ttyS0 &gt; /sys/module/kgdboc/parameters/kgdboc
+</pre></div>
+</div>
+</li>
+<li><p>カーネルの実行を停止（デバッグにブレイクイン）</p>
+<p>kgdboc経由でgdbに接続するには、まずカーネルを停止する必要があります。カーネルを停止する方法には、ブート引数としてkgdbwaitを使用する方法、または <kbd class="kbd compound docutils literal notranslate"><kbd class="kbd docutils literal notranslate">SysRq</kbd>-<kbd class="kbd docutils literal notranslate">G</kbd></kbd>、カーネルが例外を発生させ、デバッグを接続するのを待機するまで実行を続ける方法があります。</p>
+<ul>
+<li><p>rootとしてログインしているか、スーパーユーザーセッションでログインしている場合、次を実行できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo g &gt; /proc/sysrq-trigger
+</pre></div>
+</div>
+</li>
+<li><p>minicom 2.2を使用した例</p>
+<p>押してください: <kbd class="kbd compound docutils literal notranslate"><kbd class="kbd docutils literal notranslate">CTRL</kbd>-<kbd class="kbd docutils literal notranslate">A</kbd></kbd> <kbd class="kbd docutils literal notranslate">f</kbd> <kbd class="kbd docutils literal notranslate">g</kbd></p>
+</li>
+<li><p>telnetでターミナルサーバーに接続し、リモートブレイクを送信可能な場合、</p>
+<p>押してください: <kbd class="kbd compound docutils literal notranslate"><kbd class="kbd docutils literal notranslate">CTRL</kbd>-<kbd class="kbd docutils literal notranslate">]</kbd></kbd></p>
+<p>入力してください: <code class="docutils literal notranslate"><span class="pre">send</span> <span class="pre">break</span></code></p>
+<p>押してください: <kbd class="kbd docutils literal notranslate">Enter</kbd> <kbd class="kbd docutils literal notranslate">g</kbd></p>
+</li>
+</ul>
+</li>
+<li><p>gdbから接続</p>
+<p>直接接続されたポートを使用する例：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>% gdb ./vmlinux
+(gdb) set remotebaud 115200
+(gdb) target remote /dev/ttyS0
+</pre></div>
+</div>
+<p>例（TCPポート2012のテルミナルサーバーにkgdbを接続）：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>% gdb ./vmlinux
+(gdb) target remote 192.168.2.2:2012
+</pre></div>
+</div>
+<p>接続後、アプリケーションプログラムをデバッグするようにカーネルをデバッグできます。</p>
+<p>接続に問題があるか、デバッグ中に重大な問題が発生している場合、gdbがターゲット通信について詳細に情報を出力するように有効化することが最も一般的です。これを実行する前に、 <code class="docutils literal notranslate"><span class="pre">target</span> <span class="pre">remote</span></code> コマンドを入力してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>set debug remote 1
+</pre></div>
+</div>
+</li>
+</ol>
+<p>gdbで継続して実行している場合、再度「ブレイクイン」する必要がある場合は、別の <kbd class="kbd compound docutils literal notranslate"><kbd class="kbd docutils literal notranslate">SysRq</kbd>-<kbd class="kbd docutils literal notranslate">G</kbd></kbd>を実行してください。ブレイクポイントを設定することで、簡単なエントリポイントを作成できます <code class="docutils literal notranslate"><span class="pre">sys_sync</span></code> に設定し、その後実行を開始してください。 <code class="docutils literal notranslate"><span class="pre">sync</span></code> シェルまたはスクリプトからデバッグモードに入るための方法です。</p>
+</section>
+</section>
+<section id="kgdb-and-kdb-interoperability">
+<h2>kgdb と kdb の相互運用性<a class="headerlink" href="#kgdb-and-kdb-interoperability" title="この見出しへのパーマリンク">¶</a></h2>
+<p>kdbとkgdbの間で動的に切り替えることができます。デバッグコアは最後に使用したモードを記憶し、自動的に同じモードで起動します。</p>
+<section id="switching-between-kdb-and-kgdb">
+<h3>kdbとkgdbの切り替え<a class="headerlink" href="#switching-between-kdb-and-kgdb" title="この見出しへのパーマリンク">¶</a></h3>
+<section id="switching-from-kgdb-to-kdb">
+<h4>kgdbからkdbへの切り替え<a class="headerlink" href="#switching-from-kgdb-to-kdb" title="この見出しへのパーマリンク">¶</a></h4>
+<p>kgdbからkdbへの切り替えには2つの方法があります。gdbを使用してメンテナンスパケットを送信するか、盲打でコマンドを入力するかです。 <code class="docutils literal notranslate"><span class="pre">$3#33</span></code>kgdbモードでカーネルデバッガーが停止すると、メッセージが表示されます。 <code class="docutils literal notranslate"><span class="pre">KGDB</span> <span class="pre">or</span> <span class="pre">$3#33</span> <span class="pre">for</span> <span class="pre">KDB</span></code>重要ですが、正しい順序で一度に入力する必要があります。バックスペースや削除キーを入力することはできません。kgdbはそれらをデバッグストリームの一部として解釈します。</p>
+<ol class="arabic">
+<li><p>盲打で入力してkgdbからkdbに切り替えます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$3#33
+</pre></div>
+</div>
+</li>
+<li><p>gdbを使用してkgdbからkdbに切り替えます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>maintenance packet 3
+</pre></div>
+</div>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>今すぐgdbを終了する必要があります。通常は <kbd class="kbd compound docutils literal notranslate"><kbd class="kbd docutils literal notranslate">CTRL</kbd>-<kbd class="kbd docutils literal notranslate">Z</kbd></kbd> を押して、コマンドを実行します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kill -9 %
+</pre></div>
+</div>
+</div>
+</li>
+</ol>
+</section>
+<section id="change-from-kdb-to-kgdb">
+<h4>kdbからkgdbへの切り替え<a class="headerlink" href="#change-from-kdb-to-kgdb" title="この見出しへのパーマリンク">¶</a></h4>
+<p>kdbからkgdbへの切り替えには2つの方法があります。kdbシェルプロンプトからkgdbコマンドを実行して手動でkgdbモードに移行するか、kdbシェルプロンプトがアクティブなときにgdbを接続するかです。kdbシェルはgdbリモートプロトコルで通常最初に実行されるコマンドを検出し、そのコマンドを確認すると自動的にkgdbモードに切り替わります。</p>
+<ol class="arabic">
+<li><p>kdbプロンプトからコマンドを実行します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kgdb
+</pre></div>
+</div>
+<p>今すぐターミナルプログラムを切断し、gdbに接続します</p>
+</li>
+<li><p>kdbプロンプトでターミナルプログラムを切断し、gdbに接続します。</p></li>
+</ol>
+</section>
+</section>
+<section id="running-kdb-commands-from-gdb">
+<h3>gdbからkdbコマンドを実行する<a class="headerlink" href="#running-kdb-commands-from-gdb" title="この見出しへのパーマリンク">¶</a></h3>
+<p>gdbモニタコマンドを使用して、限定されたkdbコマンドを実行できます。ランタイム制御やブレイクポイント操作は実行しないでください。それらはカーネルデバッガーの状態を妨げる可能性があります。gdbが接続されている場合は、ブレイクポイントやランタイム制御操作にはgdbを使用してください。より役に立つコマンドはlsmod、dmesg、ps、またはメモリ情報コマンドの一部かもしれません。すべての実行可能なkdbコマンドを確認するには
+<code class="docutils literal notranslate"><span class="pre">monitor</span> <span class="pre">help</span></code>.</p>
+<p>例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(gdb) monitor ps
+1 idle process (state I) and
+27 sleeping system daemon (state M) processes suppressed,
+use 'ps A' to see all.
+Task Addr       Pid   Parent [*] cpu State Thread     Command
+
+0xc78291d0        1        0  0    0   S  0xc7829404  init
+0xc7954150      942        1  0    0   S  0xc7954384  dropbear
+0xc78789c0      944        1  0    0   S  0xc7878bf4  sh
+(gdb)
+</pre></div>
+</div>
+</section>
+</section>
+<section id="kgdb-test-suite">
+<h2>kgdb テストスイート<a class="headerlink" href="#kgdb-test-suite" title="この見出しへのパーマリンク">¶</a></h2>
+<p>カーネルコンフィギュレーションでkgdbが有効になっている場合、コンフィギュレーションパラメータを有効化することもできます <code class="docutils literal notranslate"><span class="pre">KGDB_TESTS</span></code>。この設定を有効にすると、kgdb内部関数をテストするための特別なkgdb I/Oモジュールが有効になります。</p>
+<p>kgdbテストは主に開発者向けに設計されており、kgdb内部のテストや、新しいkgdbアーキテクチャ固有の実装を開発するためのツールとしても使用されます。これらはLinuxカーネルの一般ユーザーにはあまり適していません。主なドキュメンテーションは以下の場所を確認してください <code class="docutils literal notranslate"><span class="pre">drivers/misc/kgdbts.c</span></code> ファイル。</p>
+<p>kgdbテストスイートは、コンパイル時にカーネルコンフィギュレーションパラメータを設定して、コアセットのテストを実行するように構成することもできます
+<code class="docutils literal notranslate"><span class="pre">KGDB_TESTS_ON_BOOT</span></code>. このオプションは自動化されたリグレッションテストを目的としており、カーネルのブート構成引数を変更する必要はありません。このオプションが有効になると、kgdbテストスイートは指定することで無効化できます <code class="docutils literal notranslate"><span class="pre">kgdbts=</span></code> カーネルのブート引数として。</p>
+</section>
+<section id="kernel-debugger-internals">
+<h2>カーネルデバッガーの内部構造<a class="headerlink" href="#kernel-debugger-internals" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="architecture-specifics">
+<h3>アーキテクチャ固有の仕様<a class="headerlink" href="#architecture-specifics" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルデバッガーはいくつかのコンポーネントに分かれています:</p>
+<ol class="arabic">
+<li><p>デバッグコア</p>
+<p>デバッグコアは <code class="docutils literal notranslate"><span class="pre">kernel/debugger/debug_core.c</span></code>. これは以下の要素を含みます:</p>
+<ul>
+<li><p>汎用的なOS例外ハンドラで、マルチCPUシステムにおいてプロセッサを停止状態に同期する機能を含みます。</p></li>
+<li><p>kgdb I/Oドライバと通信するためのAPI</p></li>
+<li><p>アーキテクチャ固有のkgdb実装に呼び出しを行うためのAPI</p></li>
+<li><p>デバッガーを使用しながらメモリに安全な読み書きを行うロジック</p></li>
+<li><p>アーキテクチャによって上書きされない限り、ソフトウェアブレイクポイントの完全な実装</p></li>
+<li><p>kdbまたはkgdbフロントエンドをデバッグコアに呼び出すためのAPI</p></li>
+<li><p>アトミックなカーネルモード設定用の構造体とコールバックAPI</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>kgdbocはKMSコールバックが呼び出される場所です。</p>
+</div>
+</li>
+</ul>
+</li>
+<li><p>kgdbのアーキテクチャ固有の実装</p>
+<p>この実装は通常 <code class="docutils literal notranslate"><span class="pre">arch/*/kernel/kgdb.c</span></code>. 例として、 <code class="docutils literal notranslate"><span class="pre">arch/x86/kernel/kgdb.c</span></code> は、このアーキテクチャにおけるHWブレイクポイントの実装 specifics およびトラップハンドラの動的登録・解除の初期化を含みます。アーキテクチャ固有の部分は以下の機能を実装します:</p>
+<ul class="simple">
+<li><p>は、アーキテクチャ固有のトラップキャッチャーを含み、kgdb_handle_exception()を呼び出してkgdbの作業を開始します</p></li>
+<li><p>gdb固有のパケット形式とstruct pt_regsの間の翻訳</p></li>
+<li><p>アーキテクチャ固有のトラップハンドルの登録と解除</p></li>
+<li><p>特別な例外処理とクリーンアップ</p></li>
+<li><p>NMI例外処理とクリーンアップ</p></li>
+<li><p>(オプション) HWブレイクポイント</p></li>
+</ul>
+</li>
+<li><p>gdbstubフロントエンド (別名kgdb)</p>
+<p>gdbstubは <code class="docutils literal notranslate"><span class="pre">kernel/debug/gdbstub.c</span></code>. これは以下の要素を含みます:</p>
+<ul class="simple">
+<li><p>gdbシリアルプロトコルを実装するためのすべてのロジック</p></li>
+</ul>
+</li>
+<li><p>kdbフロントエンド</p>
+<p>kdbデバッガーシェルはいくつかのコンポーネントに分かれています。kdbコアはkernel/debug/kdbに位置しています。他のカーネルコンポーネントには、ロックを取得することなくカーネルの情報を検査・報告できるようにするヘルパーファンクションが含まれています。kdbコアは以下の機能を実装しています。</p>
+<ul class="simple">
+<li><p>シンプルなシェル</p></li>
+<li><p>kdbコアコマンドセット</p></li>
+<li><p>追加のkdbシェルコマンドを登録するための登録API</p>
+<ul>
+<li><p>self-containedなkdbモジュールの良い例は <code class="docutils literal notranslate"><span class="pre">ftdump</span></code>
+ftraceバッファのダンプコマンドです。参照:
+<code class="docutils literal notranslate"><span class="pre">kernel/trace/trace_kdb.c</span></code></p></li>
+<li><p>動的登録を行う新しいkdbコマンドの例として、kdb_hello.koカーネルモジュールを構築できます
+<code class="docutils literal notranslate"><span class="pre">samples/kdb/kdb_hello.c</span></code>. この例を構築するには、
+<code class="docutils literal notranslate"><span class="pre">CONFIG_SAMPLES=y</span></code> および <code class="docutils literal notranslate"><span class="pre">CONFIG_SAMPLE_KDB=m</span></code> カーネル構成に設定してください。後で実行してください <code class="docutils literal notranslate"><span class="pre">modprobe</span> <span class="pre">kdb_hello</span></code> kdbシェルに入ると、次のコマンドを実行できます <code class="docutils literal notranslate"><span class="pre">hello</span></code> Sometimes</p></li>
+</ul>
+</li>
+<li><p>kdb_printf()の実装は、メッセージを直接I/Oドライバに送信し、カーネルログを迂回します。</p></li>
+<li><p>kdbシェルにおけるSW/ハードウェアブレイクポイント管理</p></li>
+</ul>
+</li>
+<li><p>kgdb I/Oドライバ</p>
+<p>各kgdb I/Oドライバは、以下の実装を提供しなければなりません。</p>
+<ul class="simple">
+<li><p>組み込みまたはモジュールによる設定</p></li>
+<li><p>動的設定およびkgdbハックの登録呼び出し</p></li>
+<li><p>読み込みおよび書き込みキャラクタインターフェース</p></li>
+<li><p>kgdbコアから解除する際のクリーンアップハンドラ</p></li>
+<li><p>(オプション) 早期デバッグメソッド</p></li>
+</ul>
+<p>kgdb I/Oドライバはハードウェアと非常に密接に協働する必要があります。システムコンテキストを完全に復元せずに割込みを有効化したり、他のシステムコンテキストを変更したりしてはなりません。kgdbコアは入力が必要なときにkgdb I/Oドライバを繰り返し「ポーリング」します。データが利用できない場合、I/Oドライバはすぐに返す必要があります。これにより、今後、ウォッチドッグハードウェアを操作してターゲットシステムがリセットされない状態で実行できる可能性があります。</p>
+</li>
+</ol>
+<p>新しいアーキテクチャにkgdbアーキテクチャ固有のサポートを追加する場合、アーキテクチャは <code class="docutils literal notranslate"><span class="pre">HAVE_ARCH_KGDB</span></code> アーキテクチャ固有のKconfigファイルで定義する必要があります。これにより、アーキテクチャにkgdbが有効になり、その時点でアーキテクチャ固有のkgdb実装を作成しなければなりません。</p>
+<p>すべてのアーキテクチャで設定する必要があるフラグがあります。これらは、
+<code class="docutils literal notranslate"><span class="pre">asm/kgdb.h</span></code> ファイル。</p>
+<ul class="simple">
+<li><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">NUMREGBYTES</span></code>:</dt><dd><p>すべてのレジスタのバイト数を設定し、これらがすべてパケットに収まるようにする必要があります。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">BUFMAX</span></code>:</dt><dd><p>GDBが読み込むバッファのバイト数。これはNUMREGBYTESよりも大きくなければなりません。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">CACHE_FLUSH_IS_SAFE</span></code>:</dt><dd><p>flush_cache_rangeまたはflush_icache_rangeを呼び出すことが常に安全である場合、1に設定します。一部のアーキテクチャでは、SMPでこれらの関数を呼び出すことが安全でない場合があります。</p>
+</dd>
+</dl>
+</li>
+</ul>
+<p>共有バックエンドに必要な以下の関数があります。これらは、
+<code class="docutils literal notranslate"><span class="pre">kernel/kgdb.c</span></code>で定義されており、アーキテクチャ固有のバックエンドで提供する必要があります。ただし、(オプション)としてマークされている場合は、アーキテクチャが特定の実装を提供しなくてもデフォルト関数を使用できます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.kgdb_skipexception">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kgdb_skipexception</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">例外</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pt_regs</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">regs</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.kgdb_skipexception" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>(オプション) kgdb_handle_exceptionを早期に終了</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">exception</span></code></dt><dd><p>例外ベクタ番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pt_regs</span> <span class="pre">*regs</span></code></dt><dd><p>現在の <code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pt_regs</span></code>.</p>
+<p>一部のアーキテクチャでは、ブレイクポイントが削除された後にブレイクポイント例外が発生した場合、その例外をスキップする必要があります。これはkgdbのアーキテクチャ固有の部分で実装できます。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.kgdb_breakpoint">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kgdb_breakpoint</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.kgdb_breakpoint" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>コンパイルインブレイクポイント</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<blockquote>
+<div><p>これはアーキテクチャごとに静的インラインで実装されます。この関数はkgdbコアがアーキテクチャ固有のトラップを実行してkgdbが例外処理に入るのを引き起こすために呼び出されます。</p>
+</div></blockquote>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.kgdb_arch_init">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kgdb_arch_init</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.kgdb_arch_init" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>アーキテクチャ固有の初期化を行います。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<blockquote>
+<div><p>この関数はアーキテクチャ固有のコールバックの初期化を処理します。</p>
+</div></blockquote>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.kgdb_arch_exit">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kgdb_arch_exit</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.kgdb_arch_exit" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>アーキテクチャ固有の初期化の解除を行います。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<blockquote>
+<div><p>この関数は動的登録・解除用のアーキテクチャ固有のコールバックの解除処理を行います。</p>
+</div></blockquote>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.pt_regs_to_gdb_regs">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">pt_regs_to_gdb_regs</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">gdb_regs</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pt_regs</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">regs</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.pt_regs_to_gdb_regs" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ptraceレジスタをGDBレジスタに変換します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">*gdb_regs</span></code></dt><dd><p>GDBが望む順序でレジスタを保持するポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pt_regs</span> <span class="pre">*regs</span></code></dt><dd><p>以下の <code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pt_regs</span></code> 現在のプロセスの</p>
+<p>pt_regsを <strong>regs</strong> GDBが期待する形式のレジスタに変換し、 <strong>gdb_regs</strong>.</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.sleeping_thread_to_gdb_regs">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">sleeping_thread_to_gdb_regs</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">gdb_regs</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">task_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">p</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.sleeping_thread_to_gdb_regs" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ptraceレジスタをGDBレジスタに変換します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">*gdb_regs</span></code></dt><dd><p>GDBが望む順序でレジスタを保持するポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">task_struct</span> <span class="pre">*p</span></code></dt><dd><p>以下の <code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">task_struct</span></code> 望まれるプロセスの</p>
+<p>スリープ中のプロセスのレジスタ値を <strong>p</strong> GDBが期待する形式に変換します。この関数はkgdbがプロセスにアクセスできない場合に呼び出され、
+<code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pt_regs</span></code> アクセスできないため、
+<strong>gdb_regs</strong> switch_toの際のthreadフィールドで保存された値でgdbレジスタを <code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">thread_struct</span></code>
+埋めます。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.gdb_regs_to_pt_regs">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">gdb_regs_to_pt_regs</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">gdb_regs</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pt_regs</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">regs</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.gdb_regs_to_pt_regs" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>GDBレジスタをptraceレジスタに変換します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">*gdb_regs</span></code></dt><dd><p>GDBから受け取ったレジスタを保持するポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pt_regs</span> <span class="pre">*regs</span></code></dt><dd><p>ポインタを <code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pt_regs</span></code> これらの値を保持するための</p>
+<p>GDBレジスタを <strong>gdb_regs</strong> pt_regsに変換し、 <strong>regs</strong>.</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.kgdb_arch_handle_exception">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kgdb_arch_handle_exception</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">vector</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">signo</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">err_code</span></span>, <span class="kt"><span class="pre">char</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">remcom_in_buffer</span></span>, <span class="kt"><span class="pre">char</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">remcom_out_buffer</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pt_regs</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">regs</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.kgdb_arch_handle_exception" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>アーキテクチャ固有のGDBパケットの処理を行います。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">vector</span></code></dt><dd><p>発生した例外のエラーベクター</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">signo</span></code></dt><dd><p>発生した例外のシグナル番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">err_code</span></code></dt><dd><p>発生した例外のエラーコード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">char</span> <span class="pre">*remcom_in_buffer</span></code></dt><dd><p>読み取ったパケットのバッファ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">char</span> <span class="pre">*remcom_out_buffer</span></code></dt><dd><p>バッファの <code class="docutils literal notranslate"><span class="pre">BUFMAX</span></code> パケットを書き込むためのバイト数。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pt_regs</span> <span class="pre">*regs</span></code></dt><dd><p>以下の <code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pt_regs</span></code> 現在のプロセスの</p>
+<p>この関数は、'c' および 's' コマンドパケット、ハードウェアブレイクポイントを設定/削除するパケットを処理しなければなりません（使用する場合）。ハードウェアが処理する必要がある追加のパケットがある場合、ここで処理されます。この関数は、さらにパケットを処理したい場合は -1 を返し、kgdb コールバックから終了する場合は <code class="docutils literal notranslate"><span class="pre">0</span></code> または <code class="docutils literal notranslate"><span class="pre">1</span></code> を返す必要があります。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.kgdb_arch_handle_qxfer_pkt">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kgdb_arch_handle_qxfer_pkt</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">char</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">remcom_in_buffer</span></span>, <span class="kt"><span class="pre">char</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">remcom_out_buffer</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.kgdb_arch_handle_qxfer_pkt" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>アーキテクチャ固有の GDB XML パケットを処理します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">char</span> <span class="pre">*remcom_in_buffer</span></code></dt><dd><p>読み取ったパケットのバッファ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">char</span> <span class="pre">*remcom_out_buffer</span></code></dt><dd><p>バッファの <code class="docutils literal notranslate"><span class="pre">BUFMAX</span></code> パケットを書き込むためのバイト数。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.kgdb_call_nmi_hook">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kgdb_call_nmi_hook</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">無視される</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.kgdb_call_nmi_hook" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>現在のCPUで kgdb_nmicallback() を呼び出します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*ignored</span></code></dt><dd><p>このパラメータはプロトタイプに合わせるためだけに存在します。</p>
+<p>デフォルト実装を使用している場合、 <a class="reference internal" href="#c.kgdb_roundup_cpus" title="kgdb_roundup_cpus"><code class="xref c c-func docutils literal notranslate"><span class="pre">kgdb_roundup_cpus()</span></code></a>
+この関数は各CPUごとに呼び出されます。デフォルト実装を実装していない場合、
+<a class="reference internal" href="#c.kgdb_call_nmi_hook" title="kgdb_call_nmi_hook"><code class="xref c c-func docutils literal notranslate"><span class="pre">kgdb_call_nmi_hook()</span></code></a> デフォルトが使用されます。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.kgdb_roundup_cpus">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kgdb_roundup_cpus</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.kgdb_roundup_cpus" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>他のCPUを待機状態にします</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<blockquote>
+<div><p>SMPシステムでは、他のCPUの注意を引く必要があり、それらを既知の状態にします。この関数は、他のCPUが kgdb_wait() を呼び出すようにする必要があります。注意：一部のアーキテクチャでは、NMIアプローチがすべてのCPUを待機するための方法として使用されません。通常、これらのアーキテクチャはこの関数を実装しないでデフォルトを使用できます。</p>
+<p>非SMPシステムでは、この関数は呼び出されません。</p>
+</div></blockquote>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.kgdb_arch_set_pc">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kgdb_arch_set_pc</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pt_regs</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">regs</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">pc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.kgdb_arch_set_pc" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>プログラムカウンタへのジェネリックなコールバック</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pt_regs</span> <span class="pre">*regs</span></code></dt><dd><p>現在の <code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pt_regs</span></code>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">pc</span></code></dt><dd><p>プログラムカウンタの新しい値</p>
+<p>この関数はプログラムカウンタを更新し、アーキテクチャ固有の実装が必要です。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.kgdb_arch_late">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kgdb_arch_late</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.kgdb_arch_late" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>アーキテクチャ固有の初期化を行います。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<blockquote>
+<div><p>この関数は、アーキテクチャ固有のコールバックの遅延初期化を処理します。ハードウェアブレイクポイントの遅延初期化などに使用するオプション関数です。デフォルト実装は何もしません。</p>
+</div></blockquote>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.kgdb_arch">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kgdb_arch</span></span></span><a class="headerlink" href="#c.kgdb_arch" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>アーキテクチャ固有の値を説明します。</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct kgdb_arch {
+  unsigned char           gdb_bpt_instr[BREAK_INSTR_SIZE];
+  unsigned long           flags;
+  int (*set_breakpoint)(unsigned long, char *);
+  int (*remove_breakpoint)(unsigned long, char *);
+  int (*set_hw_breakpoint)(unsigned long, int, enum kgdb_bptype);
+  int (*remove_hw_breakpoint)(unsigned long, int, enum kgdb_bptype);
+  void (*disable_hw_break)(struct pt_regs *regs);
+  void (*remove_all_hw_break)(void);
+  void (*correct_hw_break)(void);
+  void (*enable_nmi)(bool on);
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">gdb_bpt_instr</span></code></dt><dd><p>ブレイクポイントをトリガーするインストラクション</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">flags</span></code></dt><dd><p>フラグは現在、ただの <code class="docutils literal notranslate"><span class="pre">KGDB_HW_BREAKPOINT</span></code>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">set_breakpoint</span></code></dt><dd><p>アーキテクチャがソフトウェアブレイクポイントを設定する方法を指定できるようにします。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">remove_breakpoint</span></code></dt><dd><p>アーキテクチャがソフトウェアブレイクポイントを削除する方法を指定できるようにします。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">set_hw_breakpoint</span></code></dt><dd><p>アーキテクチャがハードウェアブレイクポイントを設定する方法を指定できるようにします。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">remove_hw_breakpoint</span></code></dt><dd><p>アーキテクチャがハードウェアブレイクポイントを削除する方法を指定できるようにします。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">disable_hw_break</span></code></dt><dd><p>アーキテクチャが単一のCPUに対してハードウェアブレイクポイントを無効にする方法を指定できるようにします。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">remove_all_hw_break</span></code></dt><dd><p>アーキテクチャがすべてのハードウェアブレイクポイントを削除する方法を指定できるようにします。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">correct_hw_break</span></code></dt><dd><p>ハードウェアデバッグレジスタを修正する方法をアーキテクチャが指定できるようにします。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">enable_nmi</span></code></dt><dd><p>NMIでトリガーされるKGDBへのエントリを管理します</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.kgdb_io">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kgdb_io</span></span></span><a class="headerlink" href="#c.kgdb_io" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>I/OドライバがKGDBと通信するためのインターフェースを説明します。</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct kgdb_io {
+  const char              *name;
+  int (*read_char) (void);
+  void (*write_char) (u8);
+  void (*flush) (void);
+  int (*init) (void);
+  void (*deinit) (void);
+  void (*pre_exception) (void);
+  void (*post_exception) (void);
+  struct console          *cons;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">name</span></code></dt><dd><p>I/Oドライバの名前</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">read_char</span></code></dt><dd><p>1文字を返す関数へのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">write_char</span></code></dt><dd><p>1文字を書く関数へのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">flush</span></code></dt><dd><p>未処理の書き込みをフラッシュする関数ポインタ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">init</span></code></dt><dd><p>デバイスを初期化する関数ポインタ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">deinit</span></code></dt><dd><p>デバイスをデイニットする関数ポインタ。このI/Oドライバが一時的であり、置き換えを期待していることを示す。I/Oドライバが置き換えられたり明示的に登録解除されたりするときに呼ばれる。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">pre_exception</span></code></dt><dd><p>I/Oドライバの準備作業を行う関数ポインタ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">post_exception</span></code></dt><dd><p>I/Oドライバのクリーンアップ作業を行う関数ポインタ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cons</span></code></dt><dd><p>I/Oデバイスがコンソールである場合に有効。それ以外はNULL。</p>
+</dd>
+</dl>
+</section>
+<section id="kgdboc-internals">
+<h3>kgdbocの内部構造<a class="headerlink" href="#kgdboc-internals" title="この見出しへのパーマリンク">¶</a></h3>
+<section id="kgdboc-and-uarts">
+<h4>kgdbocとUART<a class="headerlink" href="#kgdboc-and-uarts" title="この見出しへのパーマリンク">¶</a></h4>
+<p>kgdbocドライバは実際には非常に薄いドライバであり、ハードウェアドライバの下層にある「ポーリングハンドル」にttyドライバが接続されていることを前提としている。kgdbocの初期実装では、シリアルコアがポーリングモードでの1文字の読み書きを行うための低レベルUARTハンドルを公開するように変更され、kgdbがデバッグ機器にI/Oリクエストを送信する際、kgdbocはシリアルコア内のコールバックを呼び出し、そのコールバックはUARTドライバ内のコールバックを使用する。</p>
+<p>kgdbocをUARTで使用する場合、UARTドライバはstruct uart_ops内の2つのコールバックを実装しなければならない。例は <code class="docutils literal notranslate"><span class="pre">drivers/8250.c</span></code>:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#ifdef CONFIG_CONSOLE_POLL
+    .poll_get_char = serial8250_get_poll_char,
+    .poll_put_char = serial8250_put_poll_char,
+#endif
+</pre></div>
+</div>
+<p>ポーリングドライバの作成に関する実装詳細は、
+<code class="docutils literal notranslate"><span class="pre">#ifdef</span> <span class="pre">CONFIG_CONSOLE_POLL</span></code>、上記のように示されている。ポーリングハンドルはアトミックコンテキストから呼び出される必要があり、返却時にUARTチップの状態を復元する必要があるため、システムがデバッグ機器から接続を解除したときに正常に戻るよう確保しなければならない。ロックに関する考慮は非常に慎重に行う必要があり、ここでの失敗はリセットボタンを押す可能性が高い。</p>
+</section>
+<section id="kgdboc-and-keyboards">
+<h4>kgdbocとキーボード<a class="headerlink" href="#kgdboc-and-keyboards" title="この見出しへのパーマリンク">¶</a></h4>
+<p>kgdbocドライバは、接続されたキーボードとの通信設定を行うロジックを含んでいる。キーボードインフラストラクチャは、 <code class="docutils literal notranslate"><span class="pre">CONFIG_KDB_KEYBOARD=y</span></code> がカーネル構成に設定されているときにのみカーネルにコンパイルされる。</p>
+<p>PS/2タイプのキーボード用のポーリング中心のキーボードドライバは、
+<code class="docutils literal notranslate"><span class="pre">drivers/char/kdb_keyboard.c</span></code>に存在する。このドライバはkgdbocが配列内のコールバックを埋め込むときにデバッグコアに接続される。
+<span class="c-expr sig sig-inline c"><span class="n">kdb_poll_funcs</span><span class="p">[</span><span class="p">]</span></span>。kdb_get_kbd_char()は、ハードウェアから単一の文字入力をポーリングするトップレベルの関数です。</p>
+</section>
+<section id="kgdboc-and-kms">
+<h4>kgdbocとKMS<a class="headerlink" href="#kgdboc-and-kms" title="この見出しへのパーマリンク">¶</a></h4>
+<p>kgdbocドライバは、使用時にグラフィックディスプレイがテキストコンテキストに切り替わるようリクエストするロジックを含んでいる。ただし、これはビデオドライバがフレームバッファコンソールとアトミックカーネルモード設定をサポートしている場合に限る。 <code class="docutils literal notranslate"><span class="pre">kgdboc=kms,kbd</span></code>を提供する</p>
+<p>カーネルデバッガーが入力されるたびに、kgdboc_pre_exp_handler()が呼び出され、これは仮想コンソールレイヤー内のcon_debug_enter()を呼び出します。カーネルの実行を再開する際には、カーネルデバッガーがkgdb、post_exp_handler()を呼び出し、これはcon_debug_leave()を呼び出します。</p>
+<p>カーネルデバッガーおよびアトミックKMSコールバックと互換性があるビデオドライバーは、 <code class="docutils literal notranslate"><span class="pre">mode_set_base_atomic</span></code>,
+<code class="docutils literal notranslate"><span class="pre">fb_debug_enter</span></code> および <code class="docutils literal notranslate"><span class="pre">fb_debug_leave</span> <span class="pre">operations</span></code>を実装しなければなりません。For the
+<code class="docutils literal notranslate"><span class="pre">fb_debug_enter</span></code> および <code class="docutils literal notranslate"><span class="pre">fb_debug_leave</span></code> ハードウェア用にカスタムの実装を行うか、ジェネリックなDRM fbヘルパ関数を使用するという選択肢があります。以下の例は、drivers/gpu/drm/i915/intel_display.c における .mode_set_base_atomic 操作の初期化を示しています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static const struct drm_crtc_helper_funcs intel_helper_funcs = {
+[...]
+        .mode_set_base_atomic = intel_pipe_set_base_atomic,
+[...]
+};
+</pre></div>
+</div>
+<p>i915ドライバーがジェネリックなDRMヘルパ関数を使用して fb_debug_enter および fb_debug_leave 関数を初期化する方法の例です。 <code class="docutils literal notranslate"><span class="pre">drivers/gpu/drm/i915/intel_fb.c</span></code>:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static struct fb_ops intelfb_ops = {
+[...]
+       .fb_debug_enter = drm_fb_helper_debug_enter,
+       .fb_debug_leave = drm_fb_helper_debug_leave,
+[...]
+};
+</pre></div>
+</div>
+</section>
+</section>
+</section>
+<section id="credits">
+<h2>貢献者<a class="headerlink" href="#credits" title="この見出しへのパーマリンク">¶</a></h2>
+<p>以下の人物がこのドキュメントの作成に直接または間接的に貢献しています：</p>
+<ol class="arabic simple">
+<li><p>Amit Kale &lt;<a class="reference external" href="mailto:amitkale%40linsyssoft.com">amitkale<span>@</span>linsyssoft<span>.</span>com</a>&gt;</p></li>
+<li><p>Tom Rini &lt;<a class="reference external" href="mailto:trini%40kernel.crashing.org">trini<span>@</span>kernel<span>.</span>crashing<span>.</span>org</a>&gt;</p></li>
+</ol>
+<p>2008年3月にこのドキュメントは完全に再作成されました：</p>
+<ul class="simple">
+<li><p>Jason Wessel &lt;<a class="reference external" href="mailto:jason.wessel%40windriver.com">jason<span>.</span>wessel<span>@</span>windriver<span>.</span>com</a>&gt;</p></li>
+</ul>
+<p>2010年1月にこのドキュメントはkdbを含むように更新されました。</p>
+<ul class="simple">
+<li><p>Jason Wessel &lt;<a class="reference external" href="mailto:jason.wessel%40windriver.com">jason<span>.</span>wessel<span>@</span>windriver<span>.</span>com</a>&gt;</p></li>
+</ul>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">カーネル用の開発ツール</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="coccinelle.html">Coccinelle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sparse.html">Sparse</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kcov.html">kcov: code coverage for fuzzing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gcov.html">Using gcov with the Linux kernel</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kasan.html">The Kernel Address Sanitizer (KASAN)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ubsan.html">The Undefined Behavior Sanitizer - UBSAN</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kmemleak.html">Kernel Memory Leak Detector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kcsan.html">The Kernel Concurrency Sanitizer (KCSAN)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kfence.html">Kernel Electric-Fence (KFENCE)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gdb-kernel-debugging.html">Debugging kernel and modules via gdb</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Using kgdb, kdb and the kernel debugger internals</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kselftest.html">Linux Kernel Selftests</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kunit/index.html">KUnit - Unit Testing for the Linux Kernel</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">カーネル用の開発ツール</a><ul>
+<li>前へ: <a href="gdb-kernel-debugging.html" title="前章">Debugging kernel and modules via gdb</a></li>
+<li>次へ: <a href="kselftest.html" title="次章">Linux Kernel Selftests</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/dev-tools/kgdb.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

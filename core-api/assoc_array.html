@@ -1,0 +1,537 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>汎用連想配列の実装 — The Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="xarray.html" rel="next" title="XArray"/>
+<link href="kref.html" rel="prev" title="カーネルオブジェクトに参照カウンタ（krefs）を追加する"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="generic-associative-array-implementation">
+<h1>汎用連想配列の実装<a class="headerlink" href="#generic-associative-array-implementation" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="overview">
+<h2>概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>この連想配列の実装は、以下の特性を持つオブジェクトコンテナです：</p>
+<ol class="arabic">
+<li><p>オブジェクトは不透明ポインタです。実装はそれらがどこを指しているか（どこを指しているか）や、指しているオブジェクトの内容（存在するかどうか）には関心を持ちません。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>オブジェクトへのポインタは、最下位ビットがゼロでなければなりません。</p>
+</div>
+</li>
+<li><p>オブジェクトは、配列による使用のためにリンクブロックを含む必要はありません。これにより、オブジェクトが複数の配列に同時に存在できるようになります。代わりに、配列はメタデータブロックから構成され、これらのブロックがオブジェクトを指します。</p></li>
+<li><p>オブジェクトは、配列内でそれらを特定するインデックスキーが必要です。</p></li>
+<li><p>インデックスキーは一意でなければなりません。同じキーを持つオブジェクトを配列に挿入すると、古いオブジェクトが置き換えられます。</p></li>
+<li><p>インデックスキーは任意の長さで、異なる長さのキーも可能です。</p></li>
+<li><p>インデックスキーは、長さの変化が見られる前に、長さを早期にエンコードする必要があります。</p></li>
+<li><p>インデックスキーにはハッシュを含めることで、配列内でオブジェクトを分散させることができます。</p></li>
+<li><p>この配列は反復可能であり、オブジェクトはキー順で必ずしも出力されるとは限りません。</p></li>
+<li><p>配列が変更されている間でも反復可能です。ただし、イテレータがRCU readlockを保持している必要があります。注意点として、このような状況では一部のオブジェクトが複数回表示される可能性があります。これが問題となる場合は、イテレータが変更を防ぐロックを取得する必要があります。ただし、削除されていない限りオブジェクトは見逃されることはありません。</p></li>
+<li><p>配列内のオブジェクトはインデックスキーにより検索可能です。</p></li>
+<li><p>配列が変更されている間でも、RCU readlockを保持しているスレッドが検索を行う限り、オブジェクトを検索可能です。</p></li>
+</ol>
+<p>この実装は、radix treeと同様の方法でインデックスキーのニブルを各レベルでインデックスする16ポインタノードの木を使用しています。メモリ効率を向上させるため、単一占有ノードの連続をスキップするショートカットを設置できます。さらに、ノードは、ノード内の空きスペースに葉オブジェクトポインタを詰め込むことで、追加する必要があるまで新たな枝を作成するのではなく、効率的に管理します。</p>
+</section>
+<section id="the-public-api">
+<h2>パブリックAPI<a class="headerlink" href="#the-public-api" title="この見出しへのパーマリンク">¶</a></h2>
+<p>パブリックAPIは <code class="docutils literal notranslate"><span class="pre">&lt;linux/assoc_array.h&gt;</span></code>にあります。連想配列は次の構造に根ざしています：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct assoc_array {
+        ...
+};
+</pre></div>
+</div>
+<p>コードは、 <code class="docutils literal notranslate"><span class="pre">CONFIG_ASSOCIATIVE_ARRAY</span></code> 以下のように変更してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>./script/config -e ASSOCIATIVE_ARRAY
+</pre></div>
+</div>
+<section id="edit-script">
+<h3>編集スクリプト<a class="headerlink" href="#edit-script" title="この見出しへのパーマリンク">¶</a></h3>
+<p>挿入および削除関数は、後に変更を実行する際にリスクを回避できます <code class="docutils literal notranslate"><span class="pre">ENOMEM</span></code>これは、内部ツリーにインストールされる事前に割り当てられたメタデータブロックを保持し、スクリプトが適用される際にツリーから削除されるメタデータブロックを追跡します。</p>
+<p>スクリプトが適用された後も、死んだブロックや死んだオブジェクトを追跡し、後で解放できるようにします。解放はRCU grace periodが終了した後に行われ、これによりRCU read lockの下でアクセス関数が実行されることが可能になります。</p>
+<p>このスクリプトは、APIの外側で次の型のポインタとして表示されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct assoc_array_edit;
+</pre></div>
+</div>
+<p>スクリプトを処理するための関数は2つあります:</p>
+<ol class="arabic">
+<li><p>編集スクリプトを適用する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void assoc_array_apply_edit(struct assoc_array_edit *edit);
+</pre></div>
+</div>
+</li>
+</ol>
+<p>これは編集機能を実行し、さまざまなライトバリアを挿入してRCU read lockの下でアクセスが継続可能にするため、編集スクリプトは <code class="docutils literal notranslate"><span class="pre">call_rcu()</span></code> に渡され、それによってスクリプトおよびスクリプトが指す死んだデータを解放します。</p>
+<ol class="arabic" start="2">
+<li><p>編集スクリプトをキャンセルする:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void assoc_array_cancel_edit(struct assoc_array_edit *edit);
+</pre></div>
+</div>
+</li>
+</ol>
+<p>これは編集スクリプトおよびすべての事前に割り当てられたメモリを即座に解放します。これは挿入に関連している場合でも、新しいオブジェクトはこの関数によって解放されず、呼び出し元が明示的に解放する必要があります。</p>
+<p>これらの関数は失敗することが保証されています。</p>
+</section>
+<section id="operations-table">
+<h3>操作テーブル<a class="headerlink" href="#operations-table" title="この見出しへのパーマリンク">¶</a></h3>
+<p>複数の関数は操作テーブルを引数として受け取ります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct assoc_array_ops {
+        ...
+};
+</pre></div>
+</div>
+<p>これは、すべてのメソッドを提供する必要があります:</p>
+<ol class="arabic">
+<li><p>呼び出し元データからインデックスキーのチャンクを取得する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>unsigned long (*get_key_chunk)(const void *index_key, int level);
+</pre></div>
+</div>
+</li>
+</ol>
+<p>これは、レベル引数で指定された位置から、呼び出し元が提供したインデックスキーのチャンクを返す必要があります。レベル引数は
+<em>ビット</em> の倍数であり、関数は <code class="docutils literal notranslate"><span class="pre">ASSOC_ARRAY_KEY_CHUNK_SIZE</span></code> を返す必要があります。エラーは発生しません。
+<code class="docutils literal notranslate"><span class="pre">ASSOC_ARRAY_KEY_CHUNK_SIZE</span> <span class="pre">bits</span></code>.</p>
+<ol class="arabic" start="2">
+<li><p>オブジェクトのインデックスキーのチャンクを取得する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>unsigned long (*get_object_key_chunk)(const void *object, int level);
+</pre></div>
+</div>
+</li>
+</ol>
+<p>前の関数と同様ですが、データは配列内のオブジェクトから取得します。</p>
+<ol class="arabic" start="3">
+<li><p>これは私たちが探しているオブジェクトかどうかを確認する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>bool (*compare_object)(const void *object, const void *index_key);
+</pre></div>
+</div>
+</li>
+</ol>
+<p>オブジェクトをインデックスキーと比較し、 <code class="docutils literal notranslate"><span class="pre">true</span></code> に一致した場合、
+<code class="docutils literal notranslate"><span class="pre">false</span></code> に一致しない場合に返します。</p>
+<ol class="arabic" start="4">
+<li><p>2つのオブジェクトのインデックスキーを比較する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int (*diff_objects)(const void *object, const void *index_key);
+</pre></div>
+</div>
+</li>
+</ol>
+<p>指定されたオブジェクトのインデックスキーが与えられたインデックスキーと異なるビット位置を返します。同じ場合は-1を返します。</p>
+<ol class="arabic" start="5">
+<li><p>オブジェクトを解放する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void (*free_object)(void *object);
+</pre></div>
+</div>
+</li>
+</ol>
+<p>指定されたオブジェクトを解放します。注意: この関数は、 <code class="docutils literal notranslate"><span class="pre">assoc_array_apply_edit()</span></code> が呼び出された後にRCU grace periodが終了した後に呼び出される可能性があるため、 <code class="docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code> はモジュールアンロード時に必要となる場合があります。</p>
+</section>
+<section id="manipulation-functions">
+<h3>操作関数<a class="headerlink" href="#manipulation-functions" title="この見出しへのパーマリンク">¶</a></h3>
+<p>連想配列を操作するための関数はいくつかあります:</p>
+<ol class="arabic">
+<li><p>連想配列を初期化する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void assoc_array_init(struct assoc_array *array);
+</pre></div>
+</div>
+</li>
+</ol>
+<p>これは連想配列のベース構造を初期化します。失敗することはありません。</p>
+<ol class="arabic" start="2">
+<li><p>連想配列内のオブジェクトを挿入/置き換える:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct assoc_array_edit *
+assoc_array_insert(struct assoc_array *array,
+                   const struct assoc_array_ops *ops,
+                   const void *index_key,
+                   void *object);
+</pre></div>
+</div>
+</li>
+</ol>
+<p>この関数は指定されたオブジェクトを配列に挿入します。注意: ポインタの最下位ビットはゼロでなければなりません。これは内部的にポインタの型をマークするためです。</p>
+<p>そのキーに対応するオブジェクトがすでに存在する場合、新しいオブジェクトで置き換えられ、古いオブジェクトは自動的に解放されます。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">index_key</span></code> 引数はインデックスキー情報を保持し、メソッドが呼び出される際にopsテーブルに渡されます。</p>
+<p>この関数は配列自体を変更しませんが、編集スクリプトを返します。  <code class="docutils literal notranslate"><span class="pre">-ENOMEM</span></code> メモリ不足エラーの場合は、このエラーが返されます。</p>
+<p>呼び出し元は、配列の他の変更処理に対して排他的にロックする必要があります。</p>
+<ol class="arabic" start="3">
+<li><p>連想配列からオブジェクトを削除するには、</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct assoc_array_edit *
+assoc_array_delete(struct assoc_array *array,
+                   const struct assoc_array_ops *ops,
+                   const void *index_key);
+</pre></div>
+</div>
+</li>
+</ol>
+<p>指定されたデータに一致するオブジェクトを配列から削除します。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">index_key</span></code> 引数はインデックスキー情報を保持し、メソッドが呼び出される際にopsテーブルに渡されます。</p>
+<p>この関数は配列自体を変更しませんが、編集スクリプトを返します。  <code class="docutils literal notranslate"><span class="pre">-ENOMEM</span></code> メモリ不足エラーの場合は、このエラーが返されます。  <code class="docutils literal notranslate"><span class="pre">NULL</span></code> 指定されたオブジェクトが配列内に存在しない場合、この値が返されます。</p>
+<p>呼び出し元は、配列の他の変更処理に対して排他的にロックする必要があります。</p>
+<ol class="arabic" start="4">
+<li><p>連想配列からすべてのオブジェクトを削除するには、</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct assoc_array_edit *
+assoc_array_clear(struct assoc_array *array,
+                  const struct assoc_array_ops *ops);
+</pre></div>
+</div>
+</li>
+</ol>
+<p>連想配列からすべてのオブジェクトを削除し、完全に空にします。</p>
+<p>この関数は配列自体を変更しませんが、編集スクリプトを返します。  <code class="docutils literal notranslate"><span class="pre">-ENOMEM</span></code> メモリ不足エラーの場合は、このエラーが返されます。</p>
+<p>呼び出し元は、配列の他の変更処理に対して排他的にロックする必要があります。</p>
+<ol class="arabic" start="5">
+<li><p>連想配列を破壊し、すべてのオブジェクトを削除するには、</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void assoc_array_destroy(struct assoc_array *array,
+                         const struct assoc_array_ops *ops);
+</pre></div>
+</div>
+</li>
+</ol>
+<p>連想配列の内容を破壊し、完全に空にします。この関数が実行中、別のスレッドがRCU読み取りロックの下で配列をトラバースしてはいけません。メモリ解放時にRCUの遅延処理を行わないため、この関数が実行中、別のスレッドがRCU読み取りロックの下で配列をトラバースしてはいけません。</p>
+<p>呼び出し元は、配列の他の変更処理およびアクセッサに対して排他的にロックする必要があります。</p>
+<ol class="arabic" start="6">
+<li><p>連想配列をガベージコレクトするには、</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int assoc_array_gc(struct assoc_array *array,
+                   const struct assoc_array_ops *ops,
+                   bool (*iterator)(void *object, void *iterator_data),
+                   void *iterator_data);
+</pre></div>
+</div>
+</li>
+</ol>
+<p>連想配列のオブジェクトをイテレートし、各オブジェクトを
+<code class="docutils literal notranslate"><span class="pre">iterator()</span></code>. <code class="docutils literal notranslate"><span class="pre">iterator()</span></code> が返します <code class="docutils literal notranslate"><span class="pre">true</span></code>返す場合、オブジェクトは解放されます。 <code class="docutils literal notranslate"><span class="pre">false</span></code>返す場合、オブジェクトは解放されます。 <code class="docutils literal notranslate"><span class="pre">iterator()</span></code> 関数が返す場合、 <code class="docutils literal notranslate"><span class="pre">true</span></code>オブジェクトの参照カウントを適切にインクリメントする必要があります。</p>
+<p>内部の木構造は可能であれば圧縮され、ノード数を減らします。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">iterator_data</span></code> は直接に <code class="docutils literal notranslate"><span class="pre">iterator()</span></code> に渡され、関数では無視されます。</p>
+<p>関数は成功した場合、 <code class="docutils literal notranslate"><span class="pre">0</span></code> 成功した場合、 <code class="docutils literal notranslate"><span class="pre">-ENOMEM</span></code> メモリが不足した場合、</p>
+<p>他のスレッドがRCU読み取りロックの下で配列をイテレートしたり検索したりすることが可能です。呼び出し元は、配列の他の変更処理に対して排他的にロックする必要があります。</p>
+</section>
+<section id="access-functions">
+<h3>アクセス関数<a class="headerlink" href="#access-functions" title="この見出しへのパーマリンク">¶</a></h3>
+<p>連想配列にアクセスするための関数は2つあります：</p>
+<ol class="arabic">
+<li><p>連想配列内のすべてのオブジェクトをイテレートするには、</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int assoc_array_iterate(const struct assoc_array *array,
+                        int (*iterator)(const void *object,
+                                        void *iterator_data),
+                        void *iterator_data);
+</pre></div>
+</div>
+</li>
+</ol>
+<p>配列内の各オブジェクトをイテレータコールバック関数に渡します。
+<code class="docutils literal notranslate"><span class="pre">iterator_data</span></code> はその関数のプライベートデータです。</p>
+<p>配列が変更されている間でも、RCU read lockを保持している限り、配列を使用できます。このような状況では、イテレーション関数がオブジェクトを2回確認する可能性があります。これが問題である場合は、変更をロックする必要があります。ただし、イテレーションアルゴリズムはどのオブジェクトも見逃してはなりません。</p>
+<p>関数は成功した場合、 <code class="docutils literal notranslate"><span class="pre">0</span></code> 配列にオブジェクトが存在しなかった場合、または最後に呼び出されたイテレーション関数の結果を返します。イテレーション関数のどの呼び出しがゼロ以外の戻り値を返す場合でも、即座にイテレーションは停止します。</p>
+<ol class="arabic" start="2">
+<li><p>連想配列内からオブジェクトを検索するには:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void *assoc_array_find(const struct assoc_array *array,
+                       const struct assoc_array_ops *ops,
+                       const void *index_key);
+</pre></div>
+</div>
+</li>
+</ol>
+<p>この処理は、インデックスキーで指定されたオブジェクトに直接、配列の内部ツリーをたどります。</p>
+<p>配列が変更されている間でも、RCU read lockを保持している限り、配列を使用できます。</p>
+<p>オブジェクトが見つかった場合、関数はそのオブジェクトを返します（オブジェクトの型を設定します） <code class="docutils literal notranslate"><span class="pre">*_type</span></code> または <code class="docutils literal notranslate"><span class="pre">NULL</span></code> オブジェクトが見つからない場合、関数は</p>
+</section>
+<section id="index-key-form">
+<h3>インデックスキーの形式<a class="headerlink" href="#index-key-form" title="この見出しへのパーマリンク">¶</a></h3>
+<p>インデックスキーは任意の形式で構いませんが、アルゴリズムにキーの長さが分からないため、キーの長さを早期に含めることが強く推奨されます。これにより、長さによる比較の影響が最小限に抑えられます。</p>
+<p>これにより、長さの異なるキーを持つ葉は離れ離れになり、長さの同じキーを持つ葉は集まっていきます。</p>
+<p>インデックスキーは、キーの残り部分のハッシュで始めることが推奨され、キースペース全体にわたって散らばりを最大化します。</p>
+<p>散らばりが良いほど、内部の木は広く低くなります。</p>
+<p>散らばりが悪い場合でも、ショートカットやノードが葉とメタデータポインタを混在させることで、あまり大きな問題にはなりません。</p>
+<p>インデックスキーはマシンワード単位で読み込まれ、各チャンクはレベルごとに1つのニブル（4ビット）に分割されます。32ビットCPUでは8レベル、64ビットCPUでは16レベルが可能で、散らばりが十分であれば、どのインデックスキーでも1つのワードしか使用しない可能性が低いです。</p>
+</section>
+</section>
+<section id="internal-workings">
+<h2>内部の仕組み<a class="headerlink" href="#internal-workings" title="この見出しへのパーマリンク">¶</a></h2>
+<p>連想配列のデータ構造には内部の木があります。この木はノードとショートカットの2種類のメタデータブロックで構成されています。</p>
+<p>ノードはスロットの配列であり、各スロットは以下の4つの可能性のいずれかを含みます:</p>
+<ul class="simple">
+<li><p>NULLポインタ、スロットが空であることを示します。</p></li>
+<li><p>オブジェクトへのポインタ（葉）</p></li>
+<li><p>次のレベルのノードへのポインタ</p></li>
+<li><p>ショートカットへのポインタ</p></li>
+</ul>
+<section id="basic-internal-tree-layout">
+<h3>基本的な内部ツリーのレイアウト<a class="headerlink" href="#basic-internal-tree-layout" title="この見出しへのパーマリンク">¶</a></h3>
+<p>一時的にショートカットを無視すると、ノードはマルチレベルツリーを形成します。インデックスキー空間はツリー内のノードによって厳密に分割され、ノードは固定されたレベルに配置されます。例えば：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Level: 0               1               2               3
+       =============== =============== =============== ===============
+                                                       NODE D
+                       NODE B          NODE C  +------&gt;+---+
+               +------&gt;+---+   +------&gt;+---+   |       | 0 |
+       NODE A  |       | 0 |   |       | 0 |   |       +---+
+       +---+   |       +---+   |       +---+   |       :   :
+       | 0 |   |       :   :   |       :   :   |       +---+
+       +---+   |       +---+   |       +---+   |       | f |
+       | 1 |---+       | 3 |---+       | 7 |---+       +---+
+       +---+           +---+           +---+
+       :   :           :   :           | 8 |---+
+       +---+           +---+           +---+   |       NODE E
+       | e |---+       | f |           :   :   +------&gt;+---+
+       +---+   |       +---+           +---+           | 0 |
+       | f |   |                       | f |           +---+
+       +---+   |                       +---+           :   :
+               |       NODE F                          +---+
+               +------&gt;+---+                           | f |
+                       | 0 |           NODE G          +---+
+                       +---+   +------&gt;+---+
+                       :   :   |       | 0 |
+                       +---+   |       +---+
+                       | 6 |---+       :   :
+                       +---+           +---+
+                       :   :           | f |
+                       +---+           +---+
+                       | f |
+                       +---+
+</pre></div>
+</div>
+<p>上記の例では、7つのノード（A-G）があり、それぞれ16つのスロット（0-f）を持っています。ツリー内に他のメタデータノードが存在しないと仮定すると、キー空間は以下のように分割されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>KEY PREFIX      NODE
+==========      ====
+137*            D
+138*            E
+13[0-69-f]*     C
+1[0-24-f]*      B
+e6*             G
+e[0-57-f]*      F
+[02-df]*        A
+</pre></div>
+</div>
+<p>したがって、以下の例のようなインデックスキーを持つキーは、適切なノードに見つかるでしょう：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>INDEX KEY       PREFIX  NODE
+=============== ======= ====
+13694892892489  13      C
+13795289025897  137     D
+13889dde88793   138     E
+138bbb89003093  138     E
+1394879524789   12      C
+1458952489      1       B
+9431809de993ba  -       A
+b4542910809cd   -       A
+e5284310def98   e       F
+e68428974237    e6      G
+e7fffcbd443     e       F
+f3842239082     -       A
+</pre></div>
+</div>
+<p>メモリを節約するため、ノードがそのキー空間の一部に含まれるすべてのリーフを保持できる場合、そのノードはすべてのリーフを保持し、メタデータポインタを保持しません。たとえ一部のリーフが同じスロットに配置されたいとしてもです。</p>
+<p>ノードはリーフとメタデータポインタの異質な混合を含むことができます。メタデータポインタは、キー空間の分割に応じたスロットに配置しなければなりません。リーフはメタデータポインタが占有していないスロットに配置できます。ノード内のどのリーフも、メタデータポインタが占有するスロットと一致しないことが保証されています。メタデータポインタが存在する場合、そのメタデータキーのプレフィックスと一致するキーを持つリーフは、メタデータポインタが指すサブツリーに配置される必要があります。</p>
+<p>上記のインデックスキーの一覧において、ノードAには以下のリーフが含まれます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>SLOT    CONTENT         INDEX KEY (PREFIX)
+====    =============== ==================
+1       PTR TO NODE B   1*
+any     LEAF            9431809de993ba
+any     LEAF            b4542910809cd
+e       PTR TO NODE F   e*
+any     LEAF            f3842239082
+</pre></div>
+</div>
+<p>そしてノードBには：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>3   PTR TO NODE C   13*
+any LEAF            1458952489
+</pre></div>
+</div>
+</section>
+<section id="shortcuts">
+<h3>ショートカット<a class="headerlink" href="#shortcuts" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ショートカットは、キー空間の一部をジャンプするメタデータレコードです。ショートカットは、レベルを上る単一占有ノードの連続を代替するものであり、メモリの節約とトラバーサルの高速化のために存在します。</p>
+<p>ツリーのルートがショートカットである可能性があります。たとえば、ツリーに少なくとも17つのノードがあり、すべてのノードが同じキープレフィックス <code class="docutils literal notranslate"><span class="pre">1111</span></code>を持つ場合、挿入アルゴリズムは、一度のバウンドで <code class="docutils literal notranslate"><span class="pre">1111</span></code> キー空間をスキップし、これらのキーが実際に異なるレベル4に到達するようにします。</p>
+</section>
+<section id="splitting-and-collapsing-nodes">
+<h3>ノードの分割と収束<a class="headerlink" href="#splitting-and-collapsing-nodes" title="この見出しへのパーマリンク">¶</a></h3>
+<p>各ノードは最大16つのリーフとメタデータポインタを保持できます。挿入アルゴリズムがノードに17番目のオブジェクトを挿入しようとする場合、そのノードは分割され、少なくともそのレベルで共通のキーセグメントを持つリーフが別のノードに配置され、その共通キーセグメントに基づいてルートされるようになります。</p>
+<p>フルノード内のリーフと挿入されるリーフが十分に似ている場合、ツリーにショートカットが挿入されます。</p>
+<p>ノードのサブツリー内のオブジェクト数が16個以下になる場合、そのサブツリーは単一のノードに収束され、可能であればルートに伝播します。</p>
+</section>
+<section id="non-recursive-iteration">
+<h3>非再帰的反復<a class="headerlink" href="#non-recursive-iteration" title="この見出しへのパーマリンク">¶</a></h3>
+<p>各ノードおよびショートカットは、親ノードへのバックポインタと、その親ノードがそのノードを指すスロット番号を含みます。非再帰的な反復処理では、これらのバックポインタを使用して木をルートに向かって進み、親ノードに移動し、スロットN＋1に進むことで、スタックを使用することなく進捗を確保します。</p>
+<p>バックポインタは、同時に変更と反復処理を行うことを困難にします。</p>
+</section>
+<section id="simultaneous-alteration-and-iteration">
+<h3>同時変更と反復<a class="headerlink" href="#simultaneous-alteration-and-iteration" title="この見出しへのパーマリンク">¶</a></h3>
+<p>考慮すべきケースはいくつかあります：</p>
+<ol class="arabic">
+<li><p>シンプルな挿入/置換。これは、バリアの後で新しい葉へのポインタにNULLまたは古い一致する葉ポインタを置き換えるだけの操作です。メタデータブロックはそれ以外に変更されません。古い葉はRCUのグレース期間が終了するまで解放されません。</p></li>
+<li><p>シンプルな削除。これは、古い一致する葉ポインタをクリアするだけの操作です。メタデータブロックはそれ以外に変更されません。古い葉はRCUのグレース期間が終了するまで解放されません。</p></li>
+<li><p>未処理のサブツリーの一部を置き換える挿入。これは、サブツリーの一部を置き換える可能性がありますが、そのポインタに到達するまでは反復処理に影響を与えません。また、先祖ブロックは置き換えられず（レイアウトは変更されません）、そのため反復処理に影響を与えません。</p></li>
+<li><p>アクティブに処理中のノードを置き換える挿入。これは問題ではありません。なぜなら、アンカーポインタをすでに通過しており、バックポインタをたどるまで新しいレイアウトに切り替わらないからです。その時点で、置き換えられたノード内の葉はすでに検査済みであり（ノード内のすべての葉をメタデータポインタをたどる前に反復処理します）、そのため影響を受けません。</p>
+<p>ただし、私たちがいるスロットよりも後ろのスロットにある新しい枝に分離された一部の葉を再び見ることになる可能性があります。</p>
+</li>
+<li><p>依存する枝を処理中のノードを置き換える挿入。これは、バックポインタをたどるまで私たちに影響を与えません。これは（4）と同様です。</p></li>
+<li><p>私たちの下にある枝を削除して縮小する場合。これは私たちに影響を与えません。なぜなら、バックポインタにより、新しいノードの親ノードに戻る前に新しいノードを見ることはできないからです。縮小されたサブツリー全体は変更せずに破棄され、同じスロットにルートが残るため、再度処理する必要がありません。私たちがスロット＋1に進むため、再度処理しないようにします。</p></li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>特定の状況では、ノードの親ポインタと親スロットポインタを同時に変更する必要があります（たとえば、別のノードを挿入してそのノードを上位レベルに移動した場合）。読み取りロックを回避せずにこれを行うことはできませんので、そのノードを置き換える必要があります。</p>
+<p>ただし、ショートカットをノードに変換する際には問題になりません。ショートカットは1つのスロットしか持たないため、逆方向に移動する際には親のスロット番号は使用されません。これにより、バリアーを使用して親のスロット番号がバックポインタの後で読み込まれるように確保すれば、スロット番号を最初に変更しても問題ありません。</p>
+</div>
+<p>非活性ブロックやリーフはRCUグレースペリオドが過ぎた後で解放されるため、ウォーキングやイテレーションを行っている者がRCU読み込みロックを保持している限り、古いスーパーストラクチャが消えてしまうことはありません。</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">コアAPIドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#core-utilities">Core utilities</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#data-structures-and-low-level-utilities">Data structures and low-level utilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#concurrency-primitives">Concurrency primitives</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#low-level-hardware-management">Low-level hardware management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#memory-management">Memory management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#interfaces-for-kernel-debugging">Interfaces for kernel debugging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#everything-else">Everything else</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">コアAPIドキュメント</a><ul>
+<li>前へ: <a href="kref.html" title="前章">カーネルオブジェクトに参照カウンタ（krefs）を追加する</a></li>
+<li>次へ: <a href="xarray.html" title="次章">XArray</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/core-api/assoc_array.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>
