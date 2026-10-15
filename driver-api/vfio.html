@@ -1,0 +1,588 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>VFIO - 「Virtual Function I/O」— Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="xilinx/index.html" rel="next" title="Xilinx FPGA"/>
+<link href="vfio-mediated-device.html" rel="prev" title="VFIO メディエイテッドデバイス"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="vfio-virtual-function-i-o-1">
+<h1>VFIO - 「仮想ファンクション I/O」 <a class="footnote-reference brackets" href="#id5" id="id1">1</a><a class="headerlink" href="#vfio-virtual-function-i-o-1" title="この見出しへのパーマリンク">¶</a></h1>
+<p>多くの現代のシステムは、I/Oデバイスが割り当てられた境界内で動作することを保証するため、DMAおよび割込みリマッピング機能を提供しています。これはAMD-ViとIntel VT-dを搭載したx86ハードウェア、Partitionable Endpoints（PEs）を持つPOWERシステム、およびFreescale PAMUを含む埋め込まれたPowerPCシステムなどに該当します。VFIOドライバーは、セキュアなIOMMU保護環境においてユーザー空間に直接デバイスアクセスを提供する、IOMMU/デバイスに依存しないフレームワークです。言い換えれば、これは安全 <a class="footnote-reference brackets" href="#id6" id="id2">2</a>な非特権ユーザー空間ドライバーを可能にします。</p>
+<p>なぜこのようなことが望まれるのでしょうか？仮想マシンは、最高のI/Oパフォーマンスを実現するため、デバイス割当（「デバイス割当」）を活用します。デバイスおよびホストの観点からすれば、これは仮想マシンをユーザー空間ドライバーに変換し、大幅なレイテンシー削減、高い帯域幅、および裸メタリックデバイスドライバーの直接利用といった利点をもたらします <a class="footnote-reference brackets" href="#id7" id="id3">3</a>.</p>
+<p>一部のアプリケーション、特に高性能コンピューティング分野では、ユーザー空間からの低オーバーヘッドで直接デバイスへのアクセスが恩恵を受けています。ネットワークアダプター（TCP/IPベースでない場合も含む）やコンピュートアクセラレータなどが該当します。VFIO導入以前には、これらのドライバーは、正しいアップストリームドライバーになるためにフルな開発サイクルを経る必要があったり、ツリー外でメンテナンスする必要があったり、UIOフレームワークを使用する必要があり、これはIOMMU保護の概念を持たず、制限された割込みサポートがあり、PCI構成空間などのアクセスにはroot特権が必要でした。</p>
+<p>VFIOドライバーフレームワークはこれらを統合し、KVM PCI固有のデバイス割当コードを置き換え、UIOよりもセキュアで機能性の高いユーザー空間ドライバー環境を提供することを目的としています。</p>
+<section id="groups-devices-and-iommus">
+<h2>グループ、デバイス、およびIOMMUs<a class="headerlink" href="#groups-devices-and-iommus" title="この見出しへのパーマリンク">¶</a></h2>
+<p>デバイスはどのI/Oドライバーの主な対象です。デバイスは、I/Oアクセス、割込み、DMAからなるプログラミングインターフェースを通常作成します。それぞれの詳細には立ち入らないとしても、DMAはセキュアな環境を維持する上で最も重要な要素です。なぜなら、デバイスがシステムメモリへの読み書きアクセスを許可することで、全体的なシステムの信頼性に最も大きなリスクを及ぼすからです。</p>
+<p>このリスクを軽減するため、多くの現代のIOMMUは、以前はアドレス解決の問題を解決するためのインターフェースであったものが、今では隔離特性を組み込むようになりました。これにより、デバイス同士や任意のメモリアクセスから隔離されるようになり、仮想マシンへのセキュアな直接デバイス割当が可能になります。</p>
+<p>この隔離は常に単一のデバイスレベルの粒度で行われるとは限りません。IOMMUがこの機能を備えている場合でも、デバイスの特性やインターコネクト、IOMMUのトポロジーなどの要素がこの隔離を低下させることがあります。たとえば、個々のデバイスがより大きなマルチファンクションエンクロージャーの一部である場合があります。IOMMUがエンクロージャー内のデバイスを区別できる場合でも、エンクロージャーはデバイス間のトランザクションがIOMMUに到達する必要がない場合があります。このような例としては、ファンクション間のバックドアを持つマルチファンクションPCIデバイスから、PCI-ACS（アクセス制御サービス）をサポートしていないブリッジがIOMMUを経由せずにリダイレクトを許可するものまで幅広いです。また、デバイスの隠蔽においてもトポロジーが影響を与えることがあります。PCIe-to-PCIブリッジはブリッジの後ろにあるデバイスをマスクし、トランザクションがブリッジ自体から発生しているように見えます。明らかにIOMMUの設計はこの分野において重要な要素です。</p>
+<p>したがって、IOMMUは基本的にデバイスレベルの粒度で機能しますが、どのシステムも粒度が低下する可能性があります。このため、IOMMU APIはIOMMUグループという概念をサポートしています。グループとは、システム内の他のすべてのデバイスから隔離可能なデバイスの集合です。グループはしたがってVFIOが使用する所有権の単位です。</p>
+<p>グループはセキュアなユーザーへのアクセスを確保するために使用する最小の粒度です。ただし、必ずしも最適な粒度ではありません。ページテーブルを使用するIOMMUでは、複数のグループで同じページテーブルを共有できる可能性があり、これによりプラットフォーム（TLBスラッシングの減少、複数のページテーブルの削減）およびユーザー（単一の翻訳セットのプログラミングのみ）へのオーバーヘッドを削減できます。このため、VFIOはコンテナクラスを活用しており、1つまたは複数のグループを保持できます。コンテナは単に/dev/vfio/vfioというキャラクタデバイスを開くことで作成されます。</p>
+<p>単独ではコンテナは機能が限定されており、ほぼすべてのバージョンや拡張機能のクエリインターフェースはロックされています。ユーザーは次のレベルの機能を有効にするためにコンテナにグループを追加する必要があります。これを実行するには、まず対象のデバイスに関連するグループを特定する必要があります。これは下記の例に記載されているsysfsリンクを使用して行うことができます。デバイスをホストドライバーからアンバインドし、VFIOドライバーにバインドすることで、グループは/dev/vfio/$GROUP（$GROUPはデバイスが所属するIOMMUグループ番号）として新たにVFIOグループが出現します。IOMMUグループに複数のデバイスが含まれる場合、それぞれをVFIOドライバーにバインドする必要があります（VFIOドライバーが利用できない場合でも、ホストドライバーからデバイスをアンバインドするだけでグループは利用可能になりますが、特定のデバイスは利用できません）。TBD - ドライバーのプローブを無効化するインターフェース／デバイスのロック機能。</p>
+<p>グループが準備完了したら、VFIOグループキャラクターデバイス（/dev/vfio/$GROUP）を開き、VFIO_GROUP_SET_CONTAINER ioctlを使用して以前に開いたコンテナファイルのファイル記述子を渡すことでコンテナに追加できます。必要があれば、IOMMUドライバーがグループ間でIOMMUコンテキストを共有可能である場合、複数のグループを同じコンテナに設定できます。グループが既存のグループを持つコンテナに設定できない場合、代わりに新しい空のコンテナを使用する必要があります。</p>
+<p>グループ（または複数のグループ）がコンテナに接続されると、残りのioctlが利用可能になり、VFIO IOMMUインターフェースへのアクセスが可能になります。さらに、VFIOグループファイル記述子上でioctlを実行することで、グループ内の各デバイスのファイル記述子を取得できるようになります。</p>
+<p>VFIOデバイスAPIには、デバイスの説明、デバイス記述子上のI/O領域およびその読み込み／書き込み／mmapオフセット、また中断通知の説明と登録メカニズムに関するioctlが含まれます。</p>
+</section>
+<section id="vfio-usage-example">
+<h2>VFIOの使用例<a class="headerlink" href="#vfio-usage-example" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ユーザーがアクセスしたいPCIデバイスは0000:06:0d.0です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ readlink /sys/bus/pci/devices/0000:06:0d.0/iommu_group
+../../../../kernel/iommu_groups/26
+</pre></div>
+</div>
+<p>このデバイスはIOMMUグループ26に属しています。このデバイスはPCIバス上にあるため、ユーザーはvfio-pciを使用してグループを管理します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># modprobe vfio-pci
+</pre></div>
+</div>
+<p>このデバイスをvfio-pciドライバーにバインドすると、このグループ用のVFIOグループキャラクターデバイスが作成されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ lspci -n -s 0000:06:0d.0
+06:0d.0 0401: 1102:0002 (rev 08)
+# echo 0000:06:0d.0 &gt; /sys/bus/pci/devices/0000:06:0d.0/driver/unbind
+# echo 1102 0002 &gt; /sys/bus/pci/drivers/vfio-pci/new_id
+</pre></div>
+</div>
+<p>次に、VFIO使用のためにグループ内の他のデバイスを確認する必要があります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ls -l /sys/bus/pci/devices/0000:06:0d.0/iommu_group/devices
+total 0
+lrwxrwxrwx. 1 root root 0 Apr 23 16:13 0000:00:1e.0 -&gt;
+        ../../../../devices/pci0000:00/0000:00:1e.0
+lrwxrwxrwx. 1 root root 0 Apr 23 16:13 0000:06:0d.0 -&gt;
+        ../../../../devices/pci0000:00/0000:00:1e.0/0000:06:0d.0
+lrwxrwxrwx. 1 root root 0 Apr 23 16:13 0000:06:0d.1 -&gt;
+        ../../../../devices/pci0000:00/0000:00:1e.0/0000:06:0d.1
+</pre></div>
+</div>
+<p>このデバイスはPCIe-to-PCIブリッジの後ろにあります <a class="footnote-reference brackets" href="#id8" id="id4">4</a>したがって、同様の手順に従って、デバイス 0000:06:0d.1 もグループに追加する必要があります。デバイス 0000:00:1e.0 は、現在ホストドライバーを持っていないブリッジです。そのため、このデバイスを vfio-pci ドライバにバインドする必要はありません（vfio-pci は現在、PCI ブリッジをサポートしていません）。</p>
+<p>非特権操作を希望する場合は、ユーザーにグループへのアクセス権を提供する必要があります（注意：/dev/vfio/vfio は単独では機能を持たず、システムがモード 0666 に設定されていることが期待されます）：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># chown user:user /dev/vfio/26
+</pre></div>
+</div>
+<p>ユーザーは、このグループのすべてのデバイスおよび IOMMU に完全なアクセス権を持ち、以下のようにアクセスできます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int container, group, device, i;
+struct vfio_group_status group_status =
+                                { .argsz = sizeof(group_status) };
+struct vfio_iommu_type1_info iommu_info = { .argsz = sizeof(iommu_info) };
+struct vfio_iommu_type1_dma_map dma_map = { .argsz = sizeof(dma_map) };
+struct vfio_device_info device_info = { .argsz = sizeof(device_info) };
+
+/* Create a new container */
+container = open("/dev/vfio/vfio", O_RDWR);
+
+if (ioctl(container, VFIO_GET_API_VERSION) != VFIO_API_VERSION)
+        /* Unknown API version */
+
+if (!ioctl(container, VFIO_CHECK_EXTENSION, VFIO_TYPE1_IOMMU))
+        /* Doesn't support the IOMMU driver we want. */
+
+/* Open the group */
+group = open("/dev/vfio/26", O_RDWR);
+
+/* Test the group is viable and available */
+ioctl(group, VFIO_GROUP_GET_STATUS, &amp;group_status);
+
+if (!(group_status.flags &amp; VFIO_GROUP_FLAGS_VIABLE))
+        /* Group is not viable (ie, not all devices bound for vfio) */
+
+/* Add the group to the container */
+ioctl(group, VFIO_GROUP_SET_CONTAINER, &amp;container);
+
+/* Enable the IOMMU model we want */
+ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU);
+
+/* Get addition IOMMU info */
+ioctl(container, VFIO_IOMMU_GET_INFO, &amp;iommu_info);
+
+/* Allocate some space and setup a DMA mapping */
+dma_map.vaddr = mmap(0, 1024 * 1024, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+dma_map.size = 1024 * 1024;
+dma_map.iova = 0; /* 1MB starting at 0x0 from device view */
+dma_map.flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE;
+
+ioctl(container, VFIO_IOMMU_MAP_DMA, &amp;dma_map);
+
+/* Get a file descriptor for the device */
+device = ioctl(group, VFIO_GROUP_GET_DEVICE_FD, "0000:06:0d.0");
+
+/* Test and setup the device */
+ioctl(device, VFIO_DEVICE_GET_INFO, &amp;device_info);
+
+for (i = 0; i &lt; device_info.num_regions; i++) {
+        struct vfio_region_info reg = { .argsz = sizeof(reg) };
+
+        reg.index = i;
+
+        ioctl(device, VFIO_DEVICE_GET_REGION_INFO, &amp;reg);
+
+        /* Setup mappings... read/write offsets, mmaps
+         * For PCI devices, config space is a region */
+}
+
+for (i = 0; i &lt; device_info.num_irqs; i++) {
+        struct vfio_irq_info irq = { .argsz = sizeof(irq) };
+
+        irq.index = i;
+
+        ioctl(device, VFIO_DEVICE_GET_IRQ_INFO, &amp;irq);
+
+        /* Setup IRQs... eventfds, VFIO_DEVICE_SET_IRQS */
+}
+
+/* Gratuitous device reset and go... */
+ioctl(device, VFIO_DEVICE_RESET);
+</pre></div>
+</div>
+</section>
+<section id="vfio-user-api">
+<h2>VFIOユーザーアPI<a class="headerlink" href="#vfio-user-api" title="この見出しへのパーマリンク">¶</a></h2>
+<p>VFIO API の完全なドキュメンテーションについては、include/linux/vfio.h を参照してください。</p>
+</section>
+<section id="vfio-bus-driver-api">
+<h2>VFIOバスドライバAPI<a class="headerlink" href="#vfio-bus-driver-api" title="この見出しへのパーマリンク">¶</a></h2>
+<p>VFIO バスドライバ（例: vfio-pci）は、VFIO コアにのみ少数のインターフェースを使用します。デバイスがドライバにバインドされたり解除されたりする際、ドライバは vfio_add_group_dev() と vfio_del_group_dev() をそれぞれ呼び出します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>extern int vfio_add_group_dev(struct device *dev,
+                              const struct vfio_device_ops *ops,
+                              void *device_data);
+
+extern void *vfio_del_group_dev(struct device *dev);
+</pre></div>
+</div>
+<p>vfio_add_group_dev() は、指定された dev の iommu_group を追跡を開始し、VFIO バスドライバが所有していると登録するようにコアに指示します。ドライバは、ファイル操作構造体に似たコールバック用の ops 構造体を提供します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct vfio_device_ops {
+        int     (*open)(void *device_data);
+        void    (*release)(void *device_data);
+        ssize_t (*read)(void *device_data, char __user *buf,
+                        size_t count, loff_t *ppos);
+        ssize_t (*write)(void *device_data, const char __user *buf,
+                         size_t size, loff_t *ppos);
+        long    (*ioctl)(void *device_data, unsigned int cmd,
+                         unsigned long arg);
+        int     (*mmap)(void *device_data, struct vm_area_struct *vma);
+};
+</pre></div>
+</div>
+<p>各関数には、上記 vfio_add_group_dev() 呼び出しで登録された device_data が渡されます。これにより、バスドライバがオパケなプライベートデータを簡単に保存できる場所が提供されます。open/release コールバックは、VFIO_GROUP_GET_DEVICE_FD を通じてデバイス用に新しいファイルディスクリプタが作成されるときに発生します。ioctl インターフェースは VFIO_DEVICE_* ioctl を直接透過的に処理します。read/write/mmap インターフェースは、デバイスごとの VFIO_DEVICE_GET_REGION_INFO ioctl で定義されたデバイス領域へのアクセスを実装します。</p>
+</section>
+<section id="ppc64-spapr-implementation-note">
+<h2>PPC64 sPAPR実装ノート<a class="headerlink" href="#ppc64-spapr-implementation-note" title="この見出しへのパーマリンク">¶</a></h2>
+<p>この実装にはいくつかの特異点があります：</p>
+<ol class="arabic">
+<li><p>古いシステム（POWER7 と P5IOC2/IODA1 を搭載）では、コンテナごとに1つの IOMMU グループのみがサポートされます。IOMMU テーブルは起動時に割り当てられ、各 IOMMU グループ（PE と呼ばれる）ごとに1つのテーブルが存在します（PE は通常 PCI ドメインですが、必ずしもそうではありません）。</p>
+<p>新しいシステム（POWER8 と IODA2 を搭載）では、ハードウェア設計が改善されており、複数の IOMMU グループを VFIO コンテナごとに持つことが可能になりました。</p>
+</li>
+<li><p>ハードウェアは、いわゆる DMA ウィンドウをサポートしています。これは、DMA 送信が許可される PCI アドレス範囲であり、ウィンドウ外のアドレス空間へのアクセス試行は、全体の PE の隔離を引き起こします。</p></li>
+<li><p>PPC64ゲストはパラバーティザライズされていますが、完全なエミュレーションではありません。DMA用のページのマッピング/アンマッピングを行うAPIがあり、通常は1〜32ページを1回の呼び出しでマッピングします。現在、呼び出し回数を減らす方法はありません。処理を高速化するために、リアルモードでマッピング/アンマッピングの処理が実装されており、性能が非常に高いですが、リアルタイムでのロックページのアカウント処理ができないなどの制限があります。</p></li>
+<li><p>sPAPR仕様によると、パーティション可能エンドポイント（PE）は、パーティションおよびエラー回復の目的で扱う単位となるI/Oサブツリーです。PEは単一またはマルチファンクションIOA（IOアダプター）、マルチファンクションIOAのファンクション、複数のIOA（スイッチやブリッジ構造を含む可能性がある）を含むことができます。PPC64ゲストはEEH RTASサービスを用いてPCIエラーを検出・回復します。</p>
+<p>そのため、4つの追加のioctlが追加されました：</p>
+<blockquote>
+<div><dl class="simple">
+<dt>VFIO_IOMMU_SPAPR_TCE_GET_INFO</dt><dd><p>PCIバス上のDMAウィンドウのサイズと開始位置を返します。</p>
+</dd>
+<dt>VFIO_IOMMU_ENABLE</dt><dd><p>コンテナを有効化します。この時点でロックページのアカウント処理が行われます。これにより、ユーザーはDMAウィンドウを確認し、rlimitを調整した後で実際の作業を行えるようになります。</p>
+</dd>
+<dt>VFIO_IOMMU_DISABLE</dt><dd><p>コンテナを無効化します。</p>
+</dd>
+<dt>VFIO_EEH_PE_OP</dt><dd><p>EEHの設定、エラー検出、回復のためのAPIを提供します。</p>
+</dd>
+</dl>
+</div></blockquote>
+<p>上記の例からのコードフローはやや変更されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct vfio_eeh_pe_op pe_op = { .argsz = sizeof(pe_op), .flags = 0 };
+
+.....
+/* Add the group to the container */
+ioctl(group, VFIO_GROUP_SET_CONTAINER, &amp;container);
+
+/* Enable the IOMMU model we want */
+ioctl(container, VFIO_SET_IOMMU, VFIO_SPAPR_TCE_IOMMU)
+
+/* Get addition sPAPR IOMMU info */
+vfio_iommu_spapr_tce_info spapr_iommu_info;
+ioctl(container, VFIO_IOMMU_SPAPR_TCE_GET_INFO, &amp;spapr_iommu_info);
+
+if (ioctl(container, VFIO_IOMMU_ENABLE))
+        /* Cannot enable container, may be low rlimit */
+
+/* Allocate some space and setup a DMA mapping */
+dma_map.vaddr = mmap(0, 1024 * 1024, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+
+dma_map.size = 1024 * 1024;
+dma_map.iova = 0; /* 1MB starting at 0x0 from device view */
+dma_map.flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE;
+
+/* Check here is .iova/.size are within DMA window from spapr_iommu_info */
+ioctl(container, VFIO_IOMMU_MAP_DMA, &amp;dma_map);
+
+/* Get a file descriptor for the device */
+device = ioctl(group, VFIO_GROUP_GET_DEVICE_FD, "0000:06:0d.0");
+
+....
+
+/* Gratuitous device reset and go... */
+ioctl(device, VFIO_DEVICE_RESET);
+
+/* Make sure EEH is supported */
+ioctl(container, VFIO_CHECK_EXTENSION, VFIO_EEH);
+
+/* Enable the EEH functionality on the device */
+pe_op.op = VFIO_EEH_PE_ENABLE;
+ioctl(container, VFIO_EEH_PE_OP, &amp;pe_op);
+
+/* You're suggested to create additional data struct to represent
+ * PE, and put child devices belonging to same IOMMU group to the
+ * PE instance for later reference.
+ */
+
+/* Check the PE's state and make sure it's in functional state */
+pe_op.op = VFIO_EEH_PE_GET_STATE;
+ioctl(container, VFIO_EEH_PE_OP, &amp;pe_op);
+
+/* Save device state using pci_save_state().
+ * EEH should be enabled on the specified device.
+ */
+
+....
+
+/* Inject EEH error, which is expected to be caused by 32-bits
+ * config load.
+ */
+pe_op.op = VFIO_EEH_PE_INJECT_ERR;
+pe_op.err.type = EEH_ERR_TYPE_32;
+pe_op.err.func = EEH_ERR_FUNC_LD_CFG_ADDR;
+pe_op.err.addr = 0ul;
+pe_op.err.mask = 0ul;
+ioctl(container, VFIO_EEH_PE_OP, &amp;pe_op);
+
+....
+
+/* When 0xFF's returned from reading PCI config space or IO BARs
+ * of the PCI device. Check the PE's state to see if that has been
+ * frozen.
+ */
+ioctl(container, VFIO_EEH_PE_OP, &amp;pe_op);
+
+/* Waiting for pending PCI transactions to be completed and don't
+ * produce any more PCI traffic from/to the affected PE until
+ * recovery is finished.
+ */
+
+/* Enable IO for the affected PE and collect logs. Usually, the
+ * standard part of PCI config space, AER registers are dumped
+ * as logs for further analysis.
+ */
+pe_op.op = VFIO_EEH_PE_UNFREEZE_IO;
+ioctl(container, VFIO_EEH_PE_OP, &amp;pe_op);
+
+/*
+ * Issue PE reset: hot or fundamental reset. Usually, hot reset
+ * is enough. However, the firmware of some PCI adapters would
+ * require fundamental reset.
+ */
+pe_op.op = VFIO_EEH_PE_RESET_HOT;
+ioctl(container, VFIO_EEH_PE_OP, &amp;pe_op);
+pe_op.op = VFIO_EEH_PE_RESET_DEACTIVATE;
+ioctl(container, VFIO_EEH_PE_OP, &amp;pe_op);
+
+/* Configure the PCI bridges for the affected PE */
+pe_op.op = VFIO_EEH_PE_CONFIGURE;
+ioctl(container, VFIO_EEH_PE_OP, &amp;pe_op);
+
+/* Restored state we saved at initialization time. pci_restore_state()
+ * is good enough as an example.
+ */
+
+/* Hopefully, error is recovered successfully. Now, you can resume to
+ * start PCI traffic to/from the affected PE.
+ */
+
+....
+</pre></div>
+</div>
+</li>
+<li><p>SPAPR TCE IOMMUのv2があります。これはVFIO_IOMMU_ENABLE/VFIO_IOMMU_DISABLEを非推奨にし、2つの新しいioctl（VFIO_IOMMU_SPAPR_REGISTER_MEMORYおよびVFIO_IOMMU_SPAPR_UNREGISTER_MEMORY）を実装します（これらはv1 IOMMUでは非対応です）。</p>
+<p>PPC64パラバーティザライズゲストは多くのマッピング/アンマッピングリクエストを生成し、その処理にはページのピンニング/アンピンニングとmm::locked_vmカウンターの更新が含まれます。v2 IOMMUはアカウント処理とピンニングを別個の操作に分離しています：</p>
+<ul class="simple">
+<li><p>VFIO_IOMMU_SPAPR_REGISTER_MEMORY/VFIO_IOMMU_SPAPR_UNREGISTER_MEMORY ioctlはユーザー空間のアドレスとピンするブロックのサイズを受け取ります。バイセクティングはサポートされておらず、VFIO_IOMMU_UNREGISTER_MEMORYは登録したメモリブロックに使用した正確なアドレスとサイズで呼び出される必要があります。ユーザー空間ではこれらのioctlを頻繁に呼び出すことは期待されていません。範囲はVFIOコンテナ内のリンクリストに保存されます。</p></li>
+<li><p>VFIO_IOMMU_MAP_DMA/VFIO_IOMMU_UNMAP_DMA ioctlは実際のIOMMUテーブルを更新するだけで、ピンニングは行いません。代わりに、ユーザー空間のアドレスが事前に登録された範囲から取得されているかを確認します。</p></li>
+</ul>
+<p>この分離により、ゲスト向けのDMAの最適化が可能になります。</p>
+</li>
+<li><p>sPAPR仕様では、ゲストがPCIバス上で変更可能なページサイズを持つ追加DMAウィンドウを取得できるようになります。この機能をサポートするため、VFIO_IOMMU_SPAPR_TCE_CREATEおよびVFIO_IOMMU_SPAPR_TCE_REMOVEという2つのioctlが追加されました。プラットフォームがこの機能をサポートしない場合、ユーザースペースにエラーが返されます。既存のハードウェアは最大2つのDMAウィンドウをサポートしており、1つは2GBの長さで4Kページを使用する「デフォルト32bitウィンドウ」、もう1つは全体のRAMサイズまで拡張可能で、異なるページサイズを使用します。この後者はオプションであり、ゲストドライバが64bit DMAをサポートする場合、実行時にゲストが作成します。</p>
+<p>VFIO_IOMMU_SPAPR_TCE_CREATEは、ページシフト、DMAウィンドウサイズ、およびTCEテーブルレベル数（TCEテーブルが十分に大きく、カーネルが物理的に連続したメモリを確保できない場合）を受け取り、利用可能なスロットに新しいウィンドウを作成し、新しいウィンドウの開始バスアドレスを返します。ハードウェアの制限により、ユーザースペースはDMAウィンドウの位置を指定できません。</p>
+<p>VFIO_IOMMU_SPAPR_TCE_REMOVEは、DMAウィンドウのバス開始アドレスを受け取り、それを削除します。</p>
+</li>
+</ol>
+<hr class="docutils"/>
+<dl class="footnote brackets">
+<dt class="label" id="id5"><span class="brackets"><a class="fn-backref" href="#id1">1</a></span></dt>
+<dd><p>VFIOは当初、トム・ライオン氏がシスコで実装した際には「Virtual Function I/O（仮想ファンクションI/O）」というイニシャルでしたが、その後はイニシャルを越えて使い続けています。</p>
+</dd>
+<dt class="label" id="id6"><span class="brackets"><a class="fn-backref" href="#id2">2</a></span></dt>
+<dd><p>「安全（safe）」の概念もまた、デバイスが「適切な動作（well behaved）」をしているかどうかに依存します。複数ファンクションを持つデバイスがファンクション間でバックドアを持つ可能性があり、単一ファンクションのデバイスでもMMIOレジスタを通じてPCIコンフィグスペースへの代替アクセスを持つ可能性があります。前者については、IOMMUドライバに追加の注意点を加えることで、複数ファンクションPCIデバイスをグループ化（iommu=group_mf）して対策できます。後者は防げませんが、IOMMUは依然として隔離を提供すべきです。PCIではSR-IOV仮想ファンクションが「適切な動作」の最も信頼できる指標です。</p>
+</dd>
+<dt class="label" id="id7"><span class="brackets"><a class="fn-backref" href="#id3">3</a></span></dt>
+<dd><p>常に、仮想マシンデバイス割当にはVFIOの範囲を超えたトレードオフがあります。今後、IOMMU技術が進化することでこれらのトレードオフは一部は解消されるかもしれませんが、すべてを解消するには至りません。</p>
+</dd>
+<dt class="label" id="id8"><span class="brackets"><a class="fn-backref" href="#id4">4</a></span></dt>
+<dd><p>この場合、デバイスはPCIブリッジの下にあるため、デバイスの両ファンクションからのトランザクションはIOMMUにとって区別がつきません：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>-[0000:00]-+-1e.0-[06]--+-0d.0
+                        \-0d.1
+
+00:1e.0 PCI bridge: Intel Corporation 82801 PCI Bridge (rev 90)
+</pre></div>
+</div>
+</dd>
+</dl>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxドライバ実装者向けAPIガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="driver-model/index.html">ドライバモデル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="basics.html">ドライバの基礎</a></li>
+<li class="toctree-l2"><a class="reference internal" href="infrastructure.html">デバイスドライバのインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ioctl.html">ioctlベースのインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="early-userspace/index.html">初期ユーザースペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pm/index.html">CPUおよびデバイスの電源管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="clk.html">共通のCLKフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="device-io.html">バスを問わないデバイスアクセス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dma-buf.html">バッファ共有と同期</a></li>
+<li class="toctree-l2"><a class="reference internal" href="device_link.html">デバイスリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="component.html">複合ドライバ用コンポーネントヘルパ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="message-based.html">メッセージベースのデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="infiniband.html">InfiniBandおよびリモートDMA（RDMA）インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="frame-buffer.html">フレームバッファライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="regulator.html">電圧および電流レギュレータAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="iio/index.html">産業用I/O</a></li>
+<li class="toctree-l2"><a class="reference internal" href="input.html">入力サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="usb/index.html">Linux USB API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="firewire.html">Firewire（IEEE 1394）ドライバインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pci/index.html">Linux PCIドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="spi.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="i2c.html">I<sup>2</sup>CおよびSMBusサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipmb.html">衛星MC用IPMBドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipmi.html">Linux IPMIドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="i3c/index.html">I3Cサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="interconnect.html">汎用システムインターコネクトサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="devfreq.html">デバイス周波数スケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hsi.html">高速同期シリアルインターフェース (HSI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="edac.html">エラー検出と訂正 (EDAC) デバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="scsi.html">SCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="libata.html">libATA開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="target.html">ターゲットおよびiSCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mailbox.html">共通メールボックスフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mtdnand.html">MTD NANDドライバプログラミングインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="miscellaneous.html">パラレルポートデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="miscellaneous.html#x50-uart-driver">16x50 UARTドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="miscellaneous.html#pulse-width-modulation-pwm">パルス幅変調 (PWM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mei/index.html">インテル(R) マネジメントエンジニアリングインターフェース (インテル(R) MEI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mtd/index.html">メモリ技術デバイス (MTD)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mmc/index.html">MMC/SD/SDIOカードサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nvdimm/index.html">非揮発性メモリデバイス (NVDIMM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="w1.html">W1: ダラスの1ワイヤーバス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rapidio/index.html">Linux RapidIO サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="s390-drivers.html">s390チャネルデバイスドライバの作成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vme.html">VMEデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="80211/index.html">Linux 802.11ドライバ開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="uio-howto.html">ユーザースペースI/O HOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="firmware/index.html">LinuxファームウェアAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pinctl.html">PINCTRL (PIN CONTROL)サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gpio/index.html">汎用入出力 (GPIO)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="md/index.html">RAID</a></li>
+<li class="toctree-l2"><a class="reference internal" href="media/index.html">メディアサブシステム カーネル内部API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="misc_devices.html">その他のデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nfc/index.html">近距離通信 (NFC)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dmaengine/index.html">DMAエンジンドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="slimbus.html">LinuxカーネルSLIMbusサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="soundwire/index.html">SoundWireドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="thermal/index.html">熱管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="fpga/index.html">FPGAサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="acpi/index.html">ACPI サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="backlight/lp855x-driver.html">カーネルドライバlp855x</a></li>
+<li class="toctree-l2"><a class="reference internal" href="connector.html">カーネルコンネクタ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="console.html">コンソールドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dcdbas.html">Dellシステム管理ベースドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="eisa.html">EISAバスサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="isa.html">ISAドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="isapnp.html">ISA Plug &amp; Playサポート (Jaroslav Kysela &lt;perex@suse.cz&gt;)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="io-mapping.html">io_mapping関数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="io_ordering.html">メモリマップアドレスへのI/O書き込みの順序付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic-counter.html">汎用カウンタインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lightnvm-pblk.html">pblk: 物理ブロックデバイスターゲット</a></li>
+<li class="toctree-l2"><a class="reference internal" href="memory-devices/index.html">メモリコントローラー ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="men-chameleon-bus.html">MEN Chameleon Bus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ntb.html">NTB ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nvmem.html">NVMEM サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="parport-lowlevel.html">PARPORT インターフェース ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pps.html">PPS - パルス毎秒 (Pulse Per Second)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ptp.html">Linux用PTP ハードウェアクロック インフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phy/index.html">ジェネリック PHY フレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pti_intel_mid.html">インテル MID PTI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pwm.html">パルス幅変調 (PWM) インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pldmfw/index.html">PLDM ファームウェア フラッシュアップデート ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pldmfw/index.html#overview-of-the-pldmfw-library">概要: <code class="docutils literal notranslate"><span class="pre">pldmfw</span></code> ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rfkill.html">rfkill - RFキルスイッチサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="serial/index.html">シリアルデバイスのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sm501.html">SM501 ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="switchtec.html">Linux Switchtec サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sync_file.html">シンクファイル API ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vfio-mediated-device.html">VFIO メディエイテッドデバイス</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">VFIO - 「仮想ファンクション I/O」 </a></li>
+<li class="toctree-l2"><a class="reference internal" href="xilinx/index.html">Xilinx FPGA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xillybus.html">ジェネリックFPGAインターフェース用Xillybusドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="zorro.html">Zorroデバイス用のデバイスドライバの作成</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxドライバ実装者向けAPIガイド</a><ul>
+<li>前へ: <a href="vfio-mediated-device.html" title="前章">VFIO メディエイテッドデバイス</a></li>
+<li>次へ: <a href="xilinx/index.html" title="次章">Xilinx FPGA</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/driver-api/vfio.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

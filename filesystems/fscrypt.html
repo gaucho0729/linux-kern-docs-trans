@@ -1,0 +1,745 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>ファイルシステムレベルでの暗号化 (fscrypt) — Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="fsverity.html" rel="next" title="fs-verity: 読み取り専用のファイルベースの正当性保護"/>
+<link href="journalling.html" rel="prev" title="Linux Journalling API"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="filesystem-level-encryption-fscrypt">
+<h1>ファイルシステムレベルでの暗号化 (fscrypt)<a class="headerlink" href="#filesystem-level-encryption-fscrypt" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>fscrypt は、ファイルシステムが透明なファイルおよびディレクトリの暗号化をサポートするために接続可能なライブラリです。</p>
+<p>注意: このドキュメントにおける「fscrypt」は、カーネルレベルの部分を指し、実装されています <code class="docutils literal notranslate"><span class="pre">fs/crypto/</span></code>, 対してユーザースペースツール
+<a class="reference external" href="https://github.com/google/fscrypt">fscrypt</a>. このドキュメントはカーネルレベルの部分のみをカバーしています。コマンドラインでの暗号化の使用例については、ユーザースペースツールのドキュメンテーションを参照してください <a class="reference external" href="https://github.com/google/fscrypt">fscrypt</a>. また、カーネルの API を直接使用する代わりに、fscrypt ユーザースペースツールや、fscryptctl、Android のキーマネジメントシステムなどの既存のツールを使用することを推奨します。
+<a class="reference external" href="https://github.com/google/fscryptctl">fscryptctl</a> または <a class="reference external" href="https://source.android.com/security/encryption/file-based">Android のキーマネジメントシステム</a>, カーネルの API を直接使用するよりも推奨されます。既存のツールを使用することで、自らのセキュリティバグを導入する可能性を減らすことができます。(ただし、完全性を保つため、このドキュメンテーションではカーネルの API についてもカバーしています。)</p>
+<p>dm-crypt とは異なり、fscrypt はブロックデバイスレベルではなくファイルシステムレベルで動作します。これにより、異なるファイルに異なる鍵で暗号化し、同じファイルシステム内に未暗号化のファイルを保持できるようになります。これは、各ユーザーの静的データが他者から暗号的に隔離される必要がある複数ユーザーのシステムにおいて有用です。ただし、ファイル名を除き、fscrypt はファイルシステムのメタデータを暗号化しません。</p>
+<p>eCryptfs とは異なり、eCryptfs はスタックファイルシステムですが、fscrypt は現在 ext4、F2FS、UBIFS などのサポートされているファイルシステムに直接統合されています。これにより、暗号化されたファイルをページキャッシュに復号化されたページと暗号化されたページの両方をキャッシュする必要がなく、メモリ使用量をほぼ半分に抑え、未暗号化ファイルと同様の性能を実現します。同様に、dentries と inodes の必要数も半分になります。eCryptfs は暗号化されたファイル名を 143 バイトに制限し、アプリケーション互換性の問題を引き起こしますが、fscrypt は最大 255 バイト (NAME_MAX) を許可します。最後に、eCryptfs とは異なり、fscrypt API はマウントする必要なく権限のないユーザーでも使用可能です。</p>
+<p>fscrypt はファイルを場所を変えて暗号化することをサポートしていません。代わりに、空のディレクトリを暗号化済みとしてマークすることをサポートしています。その後、ユーザースペースがキーを提供した後、そのディレクトリツリー内に作成されるすべての通常ファイル、ディレクトリ、およびシンボリックリンクが透明に暗号化されます。</p>
+</section>
+<section id="threat-model">
+<h2>脅威モデル<a class="headerlink" href="#threat-model" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="offline-attacks">
+<h3>オフライン攻撃<a class="headerlink" href="#offline-attacks" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ユーザー空間が強力な暗号化キーを選択した場合、fscryptはブロックデバイスの内容が特定の時点における永続的なオフライン侵害を受けた際、ファイルの内容およびファイル名の機密性を保護します。ただし、fscryptはファイルサイズ、ファイルパーミッション、ファイルタイムスタンプ、拡張属性などのファイル名以外のメタデータの機密性を保護しません。また、ファイル内の空き領域（論理的にゼロを含む未割当ブロック）の存在や位置も保護されません。</p>
+<p>攻撃者が認可されたユーザーがファイルシステムにアクセスする前にオフラインでファイルシステムを操作できる場合、fscryptは機密性や正当性を保護するものではありません。</p>
+</section>
+<section id="online-attacks">
+<h3>オンライン攻撃<a class="headerlink" href="#online-attacks" title="この見出しへのパーマリンク">¶</a></h3>
+<p>fscrypt（および一般的なストレージ暗号化）は、オンライン攻撃に対して制限された保護を提供する可能性があります。詳細は以下の通りです。</p>
+<section id="side-channel-attacks">
+<h4>サイドチャネル攻撃<a class="headerlink" href="#side-channel-attacks" title="この見出しへのパーマリンク">¶</a></h4>
+<p>fscryptは、Linux Cryptographic APIアルゴリズムの安全性に依存してサイドチャネル攻撃（例：タイミングや電磁的な攻撃）に対して抵抗性を持ちます。テーブルベースのAESなどの脆弱なアルゴリズムが使用されている場合、攻撃者がオンラインシステムに対してサイドチャネル攻撃を実行する可能性があります。サイドチャネル攻撃は、復号データを消費するアプリケーションにも適用されることがあります。</p>
+</section>
+<section id="unauthorized-file-access">
+<h4>未承認のファイルアクセス<a class="headerlink" href="#unauthorized-file-access" title="この見出しへのパーマリンク">¶</a></h4>
+<p>暗号化キーが追加された後、fscryptは同じシステム上の他のユーザーからプレーンテキストのファイル内容やファイル名を隠すことはできません。代わりに、ファイルモードビット、POSIX ACL、LSM、ネームスペースなどの既存のアクセス制御メカニズムを使用する必要があります。</p>
+<p>(この理由について理解するには、暗号化キーが追加された時点で、システム自体の観点からデータの機密性は、 <em>ではありません</em> 暗号化の数学的性質によって保護されるのではなく、カーネルの正しさによってのみ保護されるため、 <em>コード</em> そのため、暗号化に特化したアクセス制御チェックは、カーネルによってのみ強制されるため、既存のアクセス制御メカニズムの幅広さと大きく重複する可能性があります。)</p>
+</section>
+<section id="kernel-memory-compromise">
+<h4>カーネルメモリの侵害<a class="headerlink" href="#kernel-memory-compromise" title="この見出しへのパーマリンク">¶</a></h4>
+<p>物理的な攻撃やカーネルのセキュリティ脆弱性を悪用して任意のメモリから読み取れるほどシステムを侵害した攻撃者は、現在使用中のすべての暗号化キーを侵害できます。</p>
+<p>ただし、fscryptはカーネルから暗号化キーを削除できるため、それらが後続の侵害から保護される可能性があります。</p>
+<p>詳しく説明すると、FS_IOC_REMOVE_ENCRYPTION_KEY ioctl（またはFS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERS ioctl）は、カーネルメモリからマスターエンクリプションキーを削除（「ワイプ」）することができ、その場合、このキーで「アンロック」されていたインODEのキャッシュをすべて強制的に削除しようとします。これにより、各ファイルのキーも削除され、再度「ロック」状態に戻り、暗号化された形式（暗号文）として表示されるようになります。</p>
+<p>しかし、これらのioctlにはいくつかの制限があります：</p>
+<ul class="simple">
+<li><p>使用中のファイルのファイルごとのキーは <em>ではありません</em> 削除またはワイプされます。したがって、最大の効果を得るためには、ユーザー空間では関連する暗号化ファイルやディレクトリを閉じ、影響を受ける暗号化ディレクトリに作業ディレクトリを持つプロセスをすべて終了させる必要があります。</p></li>
+<li><p>カーネルは、ユーザー空間が保持しているマスターキーのコピーを魔法のようにワイプすることはできません。そのため、ユーザー空間でもマスターキーのコピーをすべてワイプする必要があります。通常はFS_IOC_ADD_ENCRYPTION_KEYを実行した直後にこれを実行すべきで、FS_IOC_REMOVE_ENCRYPTION_KEYを待つことなく。もちろん、キーヒエラルキーの上位レベルにも同様の適用が求められます。また、キーを含むメモリをmlock()でロックして、スワップから保護するなどの他のセキュリティ対策も実施すべきです。</p></li>
+<li><p>一般的に、カーネルVFSキャッシュ内の復号化されたコンテンツやファイル名は解放されるが、ワイプされません。そのため、対応するキーがワイプされた後でも、解放されたメモリから一部のデータが復元される可能性があります。この問題を部分的に解決するには、カーネル構成にCONFIG_PAGE_POISONING=yを設定し、カーネルコマンドラインにpage_poison=1を追加することで、ページポイズニングを有効にできます。ただし、これはパフォーマンスにコストがかかるため注意が必要です。</p></li>
+<li><p>CPUレジスタや暗号アクセラレータハードウェア（暗号APIがアルゴリズムを実装するために使用されている場合）、またはここでは考慮されていない他の場所に秘密鍵が依然として存在している可能性があります。</p></li>
+</ul>
+</section>
+<section id="limitations-of-v1-policies">
+<h4>v1ポリシーの制限<a class="headerlink" href="#limitations-of-v1-policies" title="この見出しへのパーマリンク">¶</a></h4>
+<p>v1暗号化ポリシーはオンライン攻撃に対していくつかの弱点があります：</p>
+<ul class="simple">
+<li><p>提供されたマスターキーが正しいかどうかの検証が行われていません。そのため、悪意のあるユーザーは、読み取り専用アクセスを持つ他のユーザーの暗号化ファイルに間違ったキーを一時的に関連付けることができます。ファイルシステムキャッシュのため、他のユーザーのアクセスがこれらのファイルに対して間違ったキーを使用することになり、他のユーザーが自身のキーリングに正しいキーを保持している場合でも、読み取り専用アクセスの意味を侵害します。</p></li>
+<li><p>ファイルごとのキーが侵害されると、そのキーを生成したマスターキーも侵害されます。</p></li>
+<li><p>非rootユーザーは暗号化キーを安全に削除できません。</p></li>
+</ul>
+<p>上記のすべての問題はv2暗号化ポリシーで解決されています。この理由のほかにも、すべての新しい暗号化ディレクトリに対してv2暗号化ポリシーを使用することを推奨します。</p>
+</section>
+</section>
+</section>
+<section id="key-hierarchy">
+<h2>キーヒエラルキー<a class="headerlink" href="#key-hierarchy" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="master-keys">
+<h3>マスターキー<a class="headerlink" href="#master-keys" title="この見出しへのパーマリンク">¶</a></h3>
+<p>各暗号化ディレクトリツリーはマスターキーによって保護されています。 <em>マスターキー</em>マスターキーは最大で64バイトの長さにすることができます。コンテンツとファイル名の暗号モードのセキュリティ強度のうち大きい方以上である必要があります。たとえば、AES-256モードを使用する場合、マスターキーは少なくとも256ビット、つまり32バイトである必要があります。v1暗号化ポリシーで使用され、AES-256-XTSが使用される場合、より厳しい要件が適用されます。そのようなキーは64バイトにする必要があります。</p>
+<p>暗号化されたディレクトリツリーを「アンロック」するには、ユーザー空間が適切なマスターキーを提供する必要があります。マスターキーは任意の数存在でき、それぞれが任意の数のファイルシステム上のディレクトリツリーを保護できます。</p>
+<p>マスターキーは、実際の暗号化されたキーや、同じ長さのランダムなバイト列と区別がつかないものでなければなりません。これは、ユーザーが
+<strong>eisa_driver_registerから戻るときにEISAデバイスが検出されることを期待しないでください。なぜなら、バスがまだプローブされていない可能性が高いからです。実際には、ほとんどの場合（バスルートドライバーがブートプロセスの後半になってから動作するため）このことが起こります。残念ながら、ほとんどのドライバーは自らプローブを行い、プローブルーティンを終了するときに全体のマシンを探索していると期待しています。</strong> パスワードを直接マスターキーとして使用する、短いキーやをゼロパディングする、または短いキーやを繰り返すなどの方法を取る場合、セキュリティが保証されないことを意味します。ユーザー空間がこのようなエラーを犯す場合、暗号化証明や分析はもはや適用されなくなります。</p>
+<p>代わりに、ユーザーは暗号化されたランダム数生成器を使用するか、キーデリバーション関数（KDF）を使用してマスターキーを生成する必要があります。カーネルはキーストretchingを行いませんため、ユーザー空間がパスフレーズなどの低エントロピーの秘密情報をもとにキーやを導出する場合、scrypt、PBKDF2、Argon2などの目的に適したKDFを必ず使用する必要があります。</p>
+</section>
+<section id="key-derivation-function">
+<h3>キーデリバーション関数<a class="headerlink" href="#key-derivation-function" title="この見出しへのパーマリンク">¶</a></h3>
+<p>1つの例外を除き、fscryptはマスターキーやを直接暗号化に使用しません。代わりに、これらはキーデリバーション関数（KDF）への入力として使用され、実際のキーやを導出します。</p>
+<p>特定のマスターキーに使用されるKDFは、キーやがv1暗号化ポリシーかv2暗号化ポリシーかによって異なります。ユーザーが <strong>eisa_driver_registerから戻るときにEISAデバイスが検出されることを期待しないでください。なぜなら、バスがまだプローブされていない可能性が高いからです。実際には、ほとんどの場合（バスルートドライバーがブートプロセスの後半になってから動作するため）このことが起こります。残念ながら、ほとんどのドライバーは自らプローブを行い、プローブルーティンを終了するときに全体のマシンを探索していると期待しています。</strong> v1とv2の両方の暗号化ポリシーで同じキーやを使用する場合、（現実世界での攻撃は確認されていませんが）セキュリティが保証されない可能性があります。なぜなら、暗号化証明や分析はもはや適用されないからです。</p>
+<p>v1の暗号化ポリシーでは、KDFはファイルごとの暗号化キーを導出するのみをサポートしています。この仕組みは、マスターキーをAES-128-ECBで暗号化し、ファイルの16バイトのノンスをAESの鍵として使用することで動作します。生成された暗号文は導出キーとして使用され、暗号文が必要な長さより長くなる場合は、必要な長さにトリミングされます。</p>
+<p>v2の暗号化ポリシーでは、KDFはHKDF-SHA512を使用します。マスターキーは「input keying material」として渡され、ソルトは使用されません。各導出キーに対して、異なる「アプリケーション固有の情報文字列」が使用されます。たとえば、ファイルごとの暗号化キーを導出する場合、アプリケーション固有の情報文字列は「fscrypt\0」という文字列をファイルのノンスの前に接続し、コンテキストバイトを追加したものです。他の種類の導出キーには異なるコンテキストバイトが使用されます。</p>
+<p>HKDF-SHA512は元のAES-128-ECBベースのKDFよりも優れています。HKDFは柔軟性があり、逆再生不可能であり、マスターキーからのエントロピーを均等に分散します。また、HKDFは標準化されており、他のソフトウェアでも広く使用されています。一方、AES-128-ECBベースのKDFは一時的な実装です。</p>
+</section>
+<section id="per-file-encryption-keys">
+<h3>ファイルごとの暗号化キー<a class="headerlink" href="#per-file-encryption-keys" title="この見出しへのパーマリンク">¶</a></h3>
+<p>各マスターキーが多数のファイルを保護できるため、各ファイルの暗号化を「調整（tweak）」する必要があります。これにより、2つのファイルで同じ平文が同じ暗号文にマッピングしない、または逆に同じ暗号文が異なる平文にマッピングしないようにします。ほとんどの場合、fscryptはファイルごとのキーを導出することでこの調整を行います。新しい暗号化されたインノデ（通常ファイル、ディレクトリ、シンボリックリンク）が作成されるとき、fscryptはランダムに16バイトのノンスを生成し、インノデの暗号化xattrに保存します。その後、KDF（上記の説明に従って）を使用して処理を行います。 <a class="reference internal" href="#key-derivation-function">キーデリバーション関数</a>) マスターキーとノンスからファイルの鍵を導出するために使用されます。</p>
+<p>キーデリバティブがキーワラピングよりも選ばれた理由は、ワラップされたキーデータはより大きなxattrsを必要とし、ファイルシステムのinodeテーブル内にインラインで収まりにくかったためです。また、キーワラピングには顕著な利点が見られませんでした。特に、現在は複数の代替マスターキーでファイルをアンロックする必要も、マスターキーのローテーションをサポートする必要もありません。代わりに、マスターキーはユーザー空間でワラップされることが可能です。例えば、DIRECT_KEYポリシーで行われるように。
+<a class="reference external" href="https://github.com/google/fscrypt">fscrypt</a> ツールによって解決されます。</p>
+</section>
+<section id="direct-key-policies">
+<h3>DIRECT_KEYポリシー<a class="headerlink" href="#direct-key-policies" title="この見出しへのパーマリンク">¶</a></h3>
+<p>Adiantum暗号化モード（参照： <a class="reference internal" href="#encryption-modes-and-usage">暗号化モードと使用方法</a>) はコンテンツおよびファイル名の暗号化に適しており、長めのIVを受容します。長さは8バイトの論理ブロック番号と16バイトのファイルごとのノンスを同時に保持できるほど十分です。また、AdiantのキーのオーバーヘッドはAES-256-XTSキーに比べて大きいです。</p>
+<p>したがって、パフォーマンスの向上とメモリの節約のために、Adiantumでは「direct key（直接キー）」の設定がサポートされています。ユーザーがfscryptポリシーでFSCRYPT_POLICY_FLAG_DIRECT_KEYを有効に設定した場合、ファイルごとの暗号化キーは使用されません。代わりに、データ（コンテンツまたはファイル名）が暗号化されるたびに、そのファイルの16バイトのnonceがIVに含まれます。さらに：</p>
+<ul class="simple">
+<li><p>v1暗号化ポリシーでは、暗号化はマスターキーを直接使用して行われます。このため、ユーザーは <strong>eisa_driver_registerから戻るときにEISAデバイスが検出されることを期待しないでください。なぜなら、バスがまだプローブされていない可能性が高いからです。実際には、ほとんどの場合（バスルートドライバーがブートプロセスの後半になってから動作するため）このことが起こります。残念ながら、ほとんどのドライバーは自らプローブを行い、プローブルーティンを終了するときに全体のマシンを探索していると期待しています。</strong> 他の用途でも、他のv1ポリシーでもマスターキーを同じく使用します。</p></li>
+<li><p>v2暗号化ポリシーでは、KDFを使用してモードごとのキーが導出されて暗号化が行われます。ユーザーは、他のv2暗号化ポリシーでも同じマスターキーを使用できます。</p></li>
+</ul>
+</section>
+<section id="iv-ino-lblk-64-policies">
+<h3>IV_INO_LBLK_64ポリシー<a class="headerlink" href="#iv-ino-lblk-64-policies" title="この見出しへのパーマリンク">¶</a></h3>
+<p>fscryptポリシーでFSCRYPT_POLICY_FLAG_IV_INO_LBLK_64が設定されている場合、暗号化キーはマスターキー、暗号化モード番号、ファイルシステムUUIDから導出されます。通常、この設定により、同じマスターキーで保護されるすべてのファイルはコンテンツ暗号化キーとファイル名暗号化キーを共通で使用します。ただし、異なるファイルのデータを異なる方法で暗号化する必要があるため、inode番号がIVに含まれます。その結果、ファイルシステムの縮小が許可されない場合があります。</p>
+<p>この形式は、UFS準拠のインライン暗号化ハードウェアに最適化されており、1回のI/Oリクエストあたりに64ビットのIVのみをサポートし、キースロットの数が極めて少ないハードウェアに使用されます。</p>
+</section>
+<section id="iv-ino-lblk-32-policies">
+<h3>IV_INO_LBLK_32ポリシー<a class="headerlink" href="#iv-ino-lblk-32-policies" title="この見出しへのパーマリンク">¶</a></h3>
+<p>IV_INO_LBLK_34ポリシーはIV_INO_LBLK_64と同様ですが、IV_INO_LBLK_32ではinode番号をSipHash-2-4（SipHashキーはマスターキーから導出）でハッシュ化し、ファイル論理ブロック番号を2^32で割った余りを加算して32ビットのIVを生成します。</p>
+<p>この形式は、eMMC v5.2準拠のインライン暗号化ハードウェアに最適化されており、1回のI/Oリクエストあたりに32ビットのIVのみをサポートし、キースロットの数が極めて少ないハードウェアに使用されます。この形式はハードウェアの制限によりIVの再利用が発生するため、必要に応じてのみ使用すべきです。</p>
+</section>
+<section id="key-identifiers">
+<h3>キーアイデンティファイア<a class="headerlink" href="#key-identifiers" title="この見出しへのパーマリンク">¶</a></h3>
+<p>v2暗号化ポリシーで使用されるマスターキーには、KDFを使用してユニークな16バイトの「キーアイデンティファイア」も導出されます。この値は明文で保存されるため、キーアイデンティファイア自体を信頼性を持って識別するために必要です。</p>
+</section>
+<section id="dirhash-keys">
+<h3>ディーライハッシュキー<a class="headerlink" href="#dirhash-keys" title="この見出しへのパーマリンク">¶</a></h3>
+<p>平文のファイル名に基づいて秘密鍵でハッシュ化されたディレクトリについては、KDF（Key Derivation Function）が使用され、各ディレクトリに対して128ビットのSipHash-2-4鍵を導出してファイル名をハッシュ化します。これはファイルごとの暗号化鍵を導出するのと同様の仕組みですが、異なるKDFコンテキストが使用されます。現在は、ケースフォールド（ケースインセンシティブ）で暗号化されたディレクトリのみがこのハッシュ方式を使用しています。</p>
+</section>
+</section>
+<section id="encryption-modes-and-usage">
+<h2>暗号化モードと使用方法<a class="headerlink" href="#encryption-modes-and-usage" title="この見出しへのパーマリンク">¶</a></h2>
+<p>fscryptは、ファイルコンテンツとファイル名それぞれに対して暗号化モードを指定できます。異なるディレクトリツリーは異なる暗号化モードを使用することが許可されています。現在、次の暗号化モードのペアがサポートされています：</p>
+<ul class="simple">
+<li><p>コンテンツにはAES-256-XTS、ファイル名にはAES-256-CTS-CBC</p></li>
+<li><p>コンテンツにはAES-128-CBC、ファイル名にはAES-128-CTS-CBC</p></li>
+<li><p>コンテンツとファイル名の両方にAdiantum</p></li>
+</ul>
+<p>不明な場合は、(AES-256-XTS, AES-256-CTS-CBC)のペアを使用してください。</p>
+<p>AES-128-CBCは、XTSをサポートしない暗号アクセラレータ（CAAMやCESAなど）を持つ低消費電力の埋め込みデバイスのために追加されました。AES-128-CBCを使用するには、CONFIG_CRYPTO_ESSIVとCONFIG_CRYPTO_SHA256（または他のSHA-256実装）が有効化されている必要があります。</p>
+<p>Adiantumは主にストリーム暗号ベースのモードで、専用の暗号指令を備わわないCPUでも高速に動作します。また、XTSとは異なり、真のワイドブロックモードです。これにより、ファイルごとの暗号化鍵の導出が必要なくなる場合もあります。ただし、2つの原始的暗号（XChaCha12とAES-256）のセキュリティに依存するため、1つの原始的暗号に比べて安全性が低下する可能性があります。詳しくは論文『Adiantum: length-preserving encryption for entry-level processors』（<a class="reference external" href="https://eprint.iacr.org/2018/720.pdf">https://eprint.iacr.org/2018/720.pdf</a>)を参照してください。Adiantumを使用するには、CONFIG_CRYPTO_ADIANTUMが有効化されている必要があります。また、ChaChaとNHPoly1305の高速実装も有効化する必要があります（例：ARM向けにはCONFIG_CRYPTO_CHACHA20_NEONとCONFIG_CRYPTO_NHPOLY1305_NEON）。</p>
+<p>新しい暗号化モードはファイルシステムごとの変更なしに相対的に簡単に追加できます。ただし、認証付き暗号（AE）モードは、暗号文拡張の処理が難しいため、現在はサポートされていません。</p>
+<section id="contents-encryption">
+<h3>コンテンツの暗号化<a class="headerlink" href="#contents-encryption" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ファイルコンテンツについては、各ファイルシステムブロックが独立して暗号化されます。Linuxカーネル5.5以降では、ブロックサイズがシステムのページサイズより小さいファイルシステムの暗号化がサポートされています。</p>
+<p>各ブロックのIV（初期化ベクトル）は、ファイル内の論理ブロック番号をリトルエンディアンとして設定します。ただし、</p>
+<ul class="simple">
+<li><p>CBCモード暗号化ではESSIVも使用されます。具体的には、各IVがAES-256で暗号化され、AES-256の鍵はファイルのデータ暗号化鍵のSHA-256ハッシュから生成されます。</p></li>
+<li><p>With <a class="reference internal" href="#direct-key-policies">DIRECT_KEYポリシー</a>、ファイルのnonceはIVに接続されます。現在はAdiantum暗号モードでのみ許可されています。</p></li>
+<li><p>With <a class="reference internal" href="#iv-ino-lblk-64-policies">IV_INO_LBLK_64ポリシー</a>、論理ブロック番号は32ビットに制限され、IVのビット0〜31に配置されます。inode番号（これも32ビットに制限されます）はビット32〜63に配置されます。</p></li>
+<li><p>With <a class="reference internal" href="#iv-ino-lblk-32-policies">IV_INO_LBLK_32ポリシー</a>、論理ブロック番号は32ビットに制限され、IVのビット0〜31に配置されます。inode番号はその後ハッシュ化され、2^32で割った余りとして追加されます。</p></li>
+</ul>
+<p>ファイルの論理ブロック番号がIVに含まれるため、ファイルシステムは暗号化されたファイル内でブロックが移動されることを防ぐ必要があります。たとえば、「collapse range」や「insert range」などの操作を介して。</p>
+</section>
+<section id="filenames-encryption">
+<h3>ファイル名の暗号化<a class="headerlink" href="#filenames-encryption" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ファイル名については、各フルファイル名を一度に暗号化します。ディレクトリ検索の効率を維持し、ファイル名の最大長が255バイトであるという要件のため、ディレクトリ内のすべてのファイル名には同じIVが使用されます。</p>
+<p>ただし、各暗号化ディレクトリは一意のキーを使用するか、またはファイルのnonce（ <a class="reference internal" href="#direct-key-policies">DIRECT_KEYポリシー</a>）やinode番号（ <a class="reference internal" href="#iv-ino-lblk-64-policies">IV_INO_LBLK_64ポリシー</a>）をIVに含めることが可能です。したがって、IVの再利用は単一のディレクトリ内で制限されます。</p>
+<p>CTS-CBCでは、IVの再利用により、平文ファイル名が暗号ブロックサイズ（AESでは16バイト）以上に共通のプレフィックスを持つ場合、対応する暗号化ファイル名も同じプレフィックスを持つことになります。これは望ましくありません。Adiantumはワイドブロック暗号モードであるため、このような脆弱性はありません。</p>
+<p>すべてのサポートされているファイル名暗号化モードは、平文長が16バイト以上であれば任意の長さを受け入れます。暗号ブロックのアライメントは必要ありません。ただし、16バイト未満のファイル名は暗号化前にNULLパディングで16バイトに拡充されます。さらに、ファイル名長の情報漏洩を防ぐため、すべてのファイル名は次の4、8、16、または32バイト境界（設定可能）にNULLパディングされます。32バイトは推奨されます。これは機密性を最大限に高める代償として、ディレクトリエントリがやや多くの空間を消費するためです。注意点として、NULL（<code class="docutils literal notranslate"><span class="pre">\0</span></code>）はファイル名として有効な文字ではないため、パディングは重複した平文を生成することはありません。</p>
+<p>シンボリックリンクのターゲットはファイル名の一種とみなされ、ディレクトリエントリ内のファイル名と同様に暗号化されます。ただし、各シンボリックリンクは独自のinodeを持ち、IVの再利用が問題にならないためです。</p>
+</section>
+</section>
+<section id="user-api">
+<h2>ユーザーAPI<a class="headerlink" href="#user-api" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="setting-an-encryption-policy">
+<h3>暗号化ポリシーの設定<a class="headerlink" href="#setting-an-encryption-policy" title="この見出しへのパーマリンク">¶</a></h3>
+<section id="fs-ioc-set-encryption-policy">
+<h4>FS_IOC_SET_ENCRYPTION_POLICY<a class="headerlink" href="#fs-ioc-set-encryption-policy" title="この見出しへのパーマリンク">¶</a></h4>
+<p>FS_IOC_SET_ENCRYPTION_POLICY ioctlは、空のディレクトリに暗号化ポリシーを設定するか、既に指定された暗号化ポリシーを持つディレクトリまたは通常ファイルを検証します。このioctlは、struct fscrypt_policy_v1またはstruct fscrypt_policy_v2へのポインタを引数として受け取ります。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#define FSCRYPT_POLICY_V1               0
+#define FSCRYPT_KEY_DESCRIPTOR_SIZE     8
+struct fscrypt_policy_v1 {
+        __u8 version;
+        __u8 contents_encryption_mode;
+        __u8 filenames_encryption_mode;
+        __u8 flags;
+        __u8 master_key_descriptor[FSCRYPT_KEY_DESCRIPTOR_SIZE];
+};
+#define fscrypt_policy  fscrypt_policy_v1
+
+#define FSCRYPT_POLICY_V2               2
+#define FSCRYPT_KEY_IDENTIFIER_SIZE     16
+struct fscrypt_policy_v2 {
+        __u8 version;
+        __u8 contents_encryption_mode;
+        __u8 filenames_encryption_mode;
+        __u8 flags;
+        __u8 __reserved[4];
+        __u8 master_key_identifier[FSCRYPT_KEY_IDENTIFIER_SIZE];
+};
+</pre></div>
+</div>
+<p>この構造体は以下の通り初期化する必要があります：</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">version</span></code> struct fscrypt_policy_v1が使用される場合はFSCRYPT_POLICY_V1 (0)、struct fscrypt_policy_v2が使用される場合はFSCRYPT_POLICY_V2 (2)を設定する必要があります。(注: 元のポリシーバージョンは「v1」と呼ばいますが、実際のバージョンコードは0です。) 新しい暗号化ディレクトリにはv2ポリシーを使用してください。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">contents_encryption_mode</span></code> および <code class="docutils literal notranslate"><span class="pre">filenames_encryption_mode</span></code> は、以下の定数から選ぶ必要があります： <code class="docutils literal notranslate"><span class="pre">&lt;linux/fscrypt.h&gt;</span></code> で指定する暗号化モードを識別します。不明な場合は、ファイル名の暗号化時に使用するNULLパディングの量を指定するFSCRYPT_POLICY_FLAGS_PAD_32 (0x3)を使用してください。 <code class="docutils literal notranslate"><span class="pre">contents_encryption_mode</span></code> で指定する暗号化モードを識別します。不明な場合は、FSCRYPT_MODE_AES_256_XTS (1)を使用してください。 <code class="docutils literal notranslate"><span class="pre">filenames_encryption_mode</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">flags</span></code> は、以下のフラグから選ぶことができます： <code class="docutils literal notranslate"><span class="pre">&lt;linux/fscrypt.h&gt;</span></code>:</p>
+<ul class="simple">
+<li><p>FSCRYPT_POLICY_FLAGS_PAD_*: ファイル名を暗号化する際のNULLパディングの量を指定します。不明な場合はFSCRYPT_POLICY_FLAGS_PAD_3,2 (0x3)を使用してください。</p></li>
+<li><p>FSCRYPT_POLICY_FLAG_DIRECT_KEY: 詳細は <a class="reference internal" href="#direct-key-policies">DIRECT_KEYポリシー</a>.</p></li>
+<li><p>FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64: 詳細は <a class="reference internal" href="#iv-ino-lblk-64-policies">IV_INO_LBLK_64ポリシー</a>.</p></li>
+<li><p>FSCRYPT_POLICY_FLAG_IV_INO_LBLK_32: 詳細は <a class="reference internal" href="#iv-ino-lblk-32-policies">IV_INO_LBLK_32ポリシー</a>.</p></li>
+</ul>
+<p>v1暗号化ポリシーはPAD_*およびDIRECT_KEYフラグのみをサポートします。他のフラグはv2暗号化ポリシーでのみサポートされます。</p>
+<p>DIRECT_KEY、IV_INO_LBLK_64、IV_INO_LBLK_32フラグは互いに排他的です。</p>
+</li>
+<li><p>v2暗号化ポリシーの場合、 <code class="docutils literal notranslate"><span class="pre">__reserved</span></code> をゼロに設定する必要があります。</p></li>
+<li><p>v1暗号化ポリシーの場合、 <code class="docutils literal notranslate"><span class="pre">master_key_descriptor</span></code> はキーリング内のマスターキーを検索する方法を指定します。詳細は <a class="reference internal" href="#adding-keys">Adding keys</a>を参照してください。ユーザー空間は各マスターキーに対して一意の <code class="docutils literal notranslate"><span class="pre">master_key_descriptor</span></code> を選択する必要があります。e4cryptおよびfscryptツールは、
+<code class="docutils literal notranslate"><span class="pre">SHA-512(SHA-512(master_key))</span></code>の最初の8バイトを使用しますが、この特定のスキームは必須ではありません。また、FS_IOC_SET_ENCRYPTION_POLICYの実行時にマスターキーがキーリングにすでに存在する必要はありません。ただし、暗号化ディレクトリにファイルを作成する前にマスターキーをキーリングに追加する必要があります。</p>
+<p>v2暗号化ポリシーの場合、 <code class="docutils literal notranslate"><span class="pre">master_key_descriptor</span></code> は <code class="docutils literal notranslate"><span class="pre">master_key_identifier</span></code>に置き換えられました。これはより長く、任意に選ぶことができません。代わりに、キーリングに追加する前に
+<a class="reference internal" href="#fs-ioc-add-encryption-key">FS_IOC_ADD_ENCRYPTION_KEY</a>を使用してキーリングに追加する必要があります。その後、 <code class="docutils literal notranslate"><span class="pre">key_spec.u.identifier</span></code>
+で、カーネルがstruct fscrypt_add_key_argで返した値を <code class="docutils literal notranslate"><span class="pre">master_key_identifier</span></code> としてstruct fscrypt_policy_v2に使用する必要があります。</p>
+</li>
+</ul>
+<p>ファイルがまだ暗号化されていない場合、FS_IOC_SET_ENCRYPTION_POLICYはそのファイルが空のディレクトリであることを確認します。そうであれば、指定された暗号化ポリシーをディレクトリに割り当て、暗号化ディレクトリに変換します。その後、 <a class="reference internal" href="#adding-keys">Adding keys</a>で説明したように対応するマスターキーを提供した後、ディレクトリ内に作成されるすべての通常ファイル、ディレクトリ（再帰的に）、およびシンボリックリンクは暗号化され、同じ暗号化ポリシーを継承します。ディレクトリのエントリ内のファイル名も暗号化されます。</p>
+<p>代替として、ファイルがすでに暗号化されている場合、FS_IOC_SET_ENCRYPTION_POLICYは指定された暗号化ポリシーが実際に適用されているものと完全に一致しているかを検証します。一致している場合、ioctlは0を返します。一致しない場合はEEXISTで失敗します。これは通常のファイルとディレクトリ、および空でないディレクトリにも適用されます。</p>
+<p>v2暗号化ポリシーがディレクトリに割り当てられた場合、指定されたキーが現在のユーザーによってすでに追加されているか、または呼び出し元が初期ユーザー名前空間でCAP_FOWNERの能力を持っている必要があります。(これはユーザーが他のユーザーのキーでデータを暗号化するのを防ぐためのものです。) キーはFS_IOC_SET_ENCRYPTION_POLICYの実行中に常に追加されている必要があります。ただし、新しい暗号化ディレクトリがすぐにアクセスされる必要がない場合、キーはすぐに削除してもよいです。</p>
+<p>注意点として、ext4ファイルシステムではルートディレクトリを暗号化することはできません。空であってもです。全体のファイルシステムを1つのキーで暗号化したいユーザーは、dm-cryptを使用することを検討してください。</p>
+<p>FS_IOC_SET_ENCRYPTION_POLICYは以下のエラーで失敗する場合があります：</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">EACCES</span></code>プロセスのUIDで所有されていないファイル、またはファイル所有者のUIDがマップされている名前空間でプロセスがCAP_FOWNERの能力を持っていない</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">EEXIST</span></code>ファイルが指定された暗号化ポリシーとは異なる暗号化ポリシーで既に暗号化されている</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">EINVAL</span></code>無効な暗号化ポリシーが指定された(無効なバージョン、モード、フラグ、または予約ビットが設定されている)、またはv1暗号化ポリシーが指定されたがディレクトリにケースフォールドフラグが有効になっている場合(ケースフォールドはv1ポリシーと互換性がありません)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">ENOKEY</span></code>v2暗号化ポリシーが指定されたが、指定された <code class="docutils literal notranslate"><span class="pre">master_key_identifier</span></code> キーがまだ追加されていない、または初期ユーザー名前空間でプロセスがCAP_FOWNERの能力を持っていない</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">ENOTDIR</span></code>ファイルが未暗号化で、通常のファイルであり、ディレクトリではない</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">ENOTEMPTY</span></code>ファイルが未暗号化で、空でないディレクトリである</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">ENOTTY</span></code>この種のファイルシステムは暗号化を実装していない</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">EOPNOTSUPP</span></code>カーネルがファイルシステムの暗号化をサポートしていない、またはファイルシステムのスーパーブロックに暗号化が有効になっていない。(たとえば、ext4ファイルシステムで暗号化を使用するには、カーネル構成にCONFIG_FS_ENCRYPTIONが有効になっていなければならず、スーパーブロックに「encrypt」機能フラグが有効になっている必要があります) <code class="docutils literal notranslate"><span class="pre">tune2fs</span> <span class="pre">-O</span> <span class="pre">encrypt</span></code> または <code class="docutils literal notranslate"><span class="pre">mkfs.ext4</span> <span class="pre">-O</span>
+<span class="pre">encrypt</span></code>.)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">EPERM</span></code>このディレクトリは暗号化できません。たとえば、ext4ファイルシステムのルートディレクトリである可能性があります</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">EROFS</span></code>ファイルシステムが読み取り専用です</p></li>
+</ul>
+</section>
+</section>
+<section id="getting-an-encryption-policy">
+<h3>暗号化ポリシーの取得<a class="headerlink" href="#getting-an-encryption-policy" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ファイルの暗号化ポリシーを取得するには次の2つのioctlが利用可能です：</p>
+<ul class="simple">
+<li><p><a class="reference internal" href="#fs-ioc-get-encryption-policy-ex">FS_IOC_GET_ENCRYPTION_POLICY_EX</a></p></li>
+<li><p><a class="reference internal" href="#fs-ioc-get-encryption-policy">FS_IOC_GET_ENCRYPTION_POLICY</a></p></li>
+</ul>
+<p>拡張版(_EX)のioctlコマンドはより一般的で、可能な限り使用することをお勧めします。ただし、古いカーネルでは元のioctlコマンドのみが利用可能です。アプリケーションではまず拡張版を試し、失敗した場合にENOTTYエラーが発生した場合は元のバージョンにフォールバックする必要があります。</p>
+<section id="fs-ioc-get-encryption-policy-ex">
+<h4>FS_IOC_GET_ENCRYPTION_POLICY_EX<a class="headerlink" href="#fs-ioc-get-encryption-policy-ex" title="この見出しへのパーマリンク">¶</a></h4>
+<p>FS_IOC_GET_ENCRYPTION_POLICY_EXは、ディレクトリまたは通常ファイルの暗号化ポリシー（存在する場合）を取得します。ファイルを開く権限があれば、追加の権限は必要ありません。このコマンドはstruct fscrypt_get_policy_ex_argへのポインタを引数として受け取り、以下のように定義されています:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fscrypt_get_policy_ex_arg {
+        __u64 policy_size; /* input/output */
+        union {
+                __u8 version;
+                struct fscrypt_policy_v1 v1;
+                struct fscrypt_policy_v2 v2;
+        } policy; /* output */
+};
+</pre></div>
+</div>
+<p>呼び出し元は <code class="docutils literal notranslate"><span class="pre">policy_size</span></code> ポリシー構造体に割り当て可能なサイズに初期化する必要があります。つまり、 <code class="docutils literal notranslate"><span class="pre">sizeof(arg.policy)</span></code>.</p>
+<p>成功した場合、ポリシー構造体は <code class="docutils literal notranslate"><span class="pre">policy</span></code>に返され、その実際のサイズは <code class="docutils literal notranslate"><span class="pre">policy_size</span></code>.  <code class="docutils literal notranslate"><span class="pre">policy.version</span></code> で確認する必要があります。注意点として、「v1」ポリシーのバージョンコードは実際には0（FSCRYPT_POLICY_V1）です。</p>
+<p>FS_IOC_GET_ENCRYPTION_POLICY_EXは以下のエラーで失敗することがあります:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">EINVAL</span></code>: ファイルは暗号化されていますが、認識されていない暗号化ポリシーのバージョンを使用しています</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">ENODATA</span></code>: ファイルは暗号化されていません</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">ENOTTY</span></code>: このファイルシステムは暗号化を実装していません、またはこのカーネルがFS_IOC_GET_ENCRYPTION_POLICY_EXをサポートしていない（代わりにFS_IOC_GET_ENCRYPTION_POLICYを使用してください）</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">EOPNOTSUPP</span></code>: このファイルシステムの暗号化サポートがカーネルに構成されていない、またはファイルシステムのスーパーブロックに暗号化が有効になっていない</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">EOVERFLOW</span></code>: ファイルは暗号化されており、認識された暗号化ポリシーのバージョンを使用していますが、提供されたバッファにポリシー構造体が収まらない</p></li>
+</ul>
+<p>注意: ファイルが暗号化されているかを確認するだけであれば、ほとんどのファイルシステムではFS_IOC_GETFLAGS ioctlを使用してFS_ENCRYPT_FLを確認するか、statx()システムコールを使用してstx_attributes内のSTATX_ATTR_ENCRYPTEDを確認することも可能です。</p>
+</section>
+<section id="fs-ioc-get-encryption-policy">
+<h4>FS_IOC_GET_ENCRYPTION_POLICY<a class="headerlink" href="#fs-ioc-get-encryption-policy" title="この見出しへのパーマリンク">¶</a></h4>
+<p>FS_IOC_GET_ENCRYPTION_POLICYコマンドも、ディレクトリまたは通常ファイルの暗号化ポリシー（存在する場合）を取得できます。ただし、 <a class="reference internal" href="#fs-ioc-get-encryption-policy-ex">FS_IOC_GET_ENCRYPTION_POLICY_EX</a>とは異なり、FS_IOC_GET_ENCRYPTION_POLICYはもともとのポリシーバージョンのみをサポートしています。このコマンドはstruct fscrypt_policy_v1への直接のポインタを引数として受け取り、struct fscrypt_get_policy_ex_argではなく使用します。</p>
+<p>FS_IOC_GET_ENCRYPTION_POLICYのエラーコードはFS_IOC_GET_ENCRYPTION_POLICY_EXと同様ですが、FS_IOC_GET_ENCRYPTION_POLICYはファイルが新しい暗号化ポリシーのバージョンで暗号化されている場合にも <code class="docutils literal notranslate"><span class="pre">EINVAL</span></code> を返します。</p>
+</section>
+</section>
+<section id="getting-the-per-filesystem-salt">
+<h3>ファイルシステムごとのsaltの取得<a class="headerlink" href="#getting-the-per-filesystem-salt" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ext4やF2FSなどの一部のファイルシステムは、非推奨となったioctl FS_IOC_GET_ENCRYPTION_PWSALTをサポートしています。このioctlは、ファイルシステムのスーパーブロックに保存されているランダムに生成された16バイトの値を取得します。この値は、パスフレーズやその他の低エントロピーのユーザー資格情報をもとに暗号化キーを導出する際のソルトとして使用することを意図しています。</p>
+<p>FS_IOC_GET_ENCRYPTION_PWSALTは非推奨です。代わりに、必要なソルトをユーザー空間で生成・管理することをお勧めします。</p>
+</section>
+<section id="getting-a-file-s-encryption-nonce">
+<h3>ファイルの暗号化ノンスを取得する<a class="headerlink" href="#getting-a-file-s-encryption-nonce" title="この見出しへのパーマリンク">¶</a></h3>
+<p>Linux v5.7以降、ioctl FS_IOC_GET_ENCRYPTION_NONCEがサポートされています。暗号化されたファイルやディレクトリでは、インノデの16バイトノンスを取得し、暗号化されていないファイルやディレクトリではENODATAで失敗します。</p>
+<p>このioctlは、暗号化が正しく行われているかを確認する自動テストに役立ちます。fscryptの通常利用には必要ありません。</p>
+</section>
+<section id="adding-keys">
+<h3>Adding keys<a class="headerlink" href="#adding-keys" title="この見出しへのパーマリンク">¶</a></h3>
+<section id="fs-ioc-add-encryption-key">
+<h4>FS_IOC_ADD_ENCRYPTION_KEY<a class="headerlink" href="#fs-ioc-add-encryption-key" title="この見出しへのパーマリンク">¶</a></h4>
+<p>FS_IOC_ADD_ENCRYPTION_KEY ioctlは、ファイルシステムにマスターエンクリプションキーを追加し、そのキーで暗号化されたファイルシステム上のすべてのファイルが「アンロックス」状態（つまり平文形式）になるようにします。このioctlはターゲットファイルシステム上の任意のファイルやディレクトリで実行できますが、ファイルシステムのルートディレクトリを使用することをお勧めします。このioctlはstruct fscrypt_add_key_argへのポインタを引数として受け取り、以下のように定義されています：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fscrypt_add_key_arg {
+        struct fscrypt_key_specifier key_spec;
+        __u32 raw_size;
+        __u32 key_id;
+        __u32 __reserved[8];
+        __u8 raw[];
+};
+
+#define FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR        1
+#define FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER        2
+
+struct fscrypt_key_specifier {
+        __u32 type;     /* one of FSCRYPT_KEY_SPEC_TYPE_* */
+        __u32 __reserved;
+        union {
+                __u8 __reserved[32]; /* reserve some extra space */
+                __u8 descriptor[FSCRYPT_KEY_DESCRIPTOR_SIZE];
+                __u8 identifier[FSCRYPT_KEY_IDENTIFIER_SIZE];
+        } u;
+};
+
+struct fscrypt_provisioning_key_payload {
+        __u32 type;
+        __u32 __reserved;
+        __u8 raw[];
+};
+</pre></div>
+</div>
+<p>struct fscrypt_add_key_argはゼロ初期化され、次のように初期化します：</p>
+<ul>
+<li><p>v1暗号化ポリシーで使用するキーを追加する場合、
+<code class="docutils literal notranslate"><span class="pre">key_spec.type</span></code> FSCRYPT_KEY_SPEC_TYPE_DESCRIPTORを含む必要があります、そして
+<code class="docutils literal notranslate"><span class="pre">key_spec.u.descriptor</span></code> 追加されるキーのディスクリプターを含み、これは
+<code class="docutils literal notranslate"><span class="pre">master_key_descriptor</span></code> 構造体fscrypt_policy_v1の</p>
+<p>フィールドに記載されている値と一致する必要があります。この種のキーを追加するには、呼び出しプロセスが初期ユーザー名前空間でCAP_SYS_ADMINの能力を持つ必要があります。 <code class="docutils literal notranslate"><span class="pre">key_spec.type</span></code> 代わりに、v2暗号化ポリシーで使用するキーを追加する場合、 <code class="docutils literal notranslate"><span class="pre">key_spec.u.identifier</span></code> FSCRYPT_KEY_SPEC_TYPE_IDENTIFIERを含む必要があります、そして <em>出力</em> は、カーネルがキーの暗号ハッシュを埋め込むフィールドです。この種のキーを追加するには、呼び出しプロセスは特権を必要としません。ただし、追加可能なキー数はユーザーのkeyringsサービスのクォータに制限されます（参照：
+<code class="docutils literal notranslate"><span class="pre">Documentation/security/keys/core.rst</span></code>).</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">raw_size</span></code> が、 <code class="docutils literal notranslate"><span class="pre">raw</span></code> フィールドに指定されたキーのサイズ（バイト単位）でなければなりません。あるいは、 <code class="docutils literal notranslate"><span class="pre">key_id</span></code> がゼロでない場合、このフィールドはゼロでなければなりません。その場合、サイズは指定されたLinux keyringキーによって自動的に推測されます。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">key_id</span></code> がゼロの場合は、 <code class="docutils literal notranslate"><span class="pre">raw</span></code>
+フィールドに直接raw keyが指定されています。それ以外の場合、 <code class="docutils literal notranslate"><span class="pre">key_id</span></code> は、タイプ「fscrypt-provisioning」のLinux keyringキーのIDであり、そのペイロードはstruct fscrypt_provisioning_key_payloadで、 <code class="docutils literal notranslate"><span class="pre">raw</span></code> フィールドにraw keyが含まれ、 <code class="docutils literal notranslate"><span class="pre">type</span></code> フィールドが <code class="docutils literal notranslate"><span class="pre">key_spec.type</span></code>と一致する必要があります。_since <code class="docutils literal notranslate"><span class="pre">raw</span></code> 可変長であり、このキーのペイロードの合計サイズは <code class="docutils literal notranslate"><span class="pre">sizeof(struct</span> <span class="pre">fscrypt_provisioning_key_payload)</span></code>
+raw keyのサイズを加えたものでなければなりません。このキーに対して検索権限を有している必要があります。</p>
+<p>ほとんどのユーザーはこの値を0に残し、直接のraw keyを指定するべきです。Linux keyring keyを指定するサポートは、ファイルシステムがアンマウントされ再マウントされる際にraw keyをユーザースペースメモリに保存せずにキーを再追加できるようにするためのものです。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">raw</span></code> 実際のキーを含む可変長フィールドであり、 <code class="docutils literal notranslate"><span class="pre">raw_size</span></code> バイト長です。代替として、 <code class="docutils literal notranslate"><span class="pre">key_id</span></code> がゼロでない場合、このフィールドは使用されません。</p></li>
+</ul>
+<p>v2ポリシーのキーでは、カーネルがこのキーを追加したユーザー（有効ユーザーIDで識別）を記録し、そのユーザーのみ（またはCAP_SYS_ADMIN能力を有する場合のroot）がキーを削除できるようにします。
+<a class="reference internal" href="#fs-ioc-remove-encryption-key-all-users">FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERS</a>.</p>
+<p>ただし、他のユーザーがキーを追加した場合、そのユーザーが意図せず削除することを防ぐことが望ましい場合があります。そのため、FS_IOC_ADD_ENCRYPTION_KEYも使用してv2ポリシーのキーを再追加できます。
+<em>再度</em>、他のユーザーがすでに追加した場合でも。この場合、FS_IOC_ADD_ENCRYPTION_KEYは現在のユーザーに対するキーの主張をインストールするだけで、実際にはキーを再度追加しません（ただし、知識の証明としてraw keyは依然として提供する必要があります）。</p>
+<p>FS_IOC_ADD_ENCRYPTION_KEYは、キーまたはキーの主張が追加されたか、すでに存在する場合、0を返します。</p>
+<p>FS_IOC_ADD_ENCRYPTION_KEYは次のエラーで失敗する場合があります：</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">EACCES</span></code>FSCRYPT_KEY_SPEC_TYPE_DESCRIPTORが指定されたが、呼び出し元が初期ユーザー名前空間でCAP_SYS_ADMIN能力を持っていない、またはLinux key IDでraw keyが指定されたがプロセスがキーに対して検索権限を持っていない。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">EDQUOT</span></code>このユーザーのキークォータがキーを追加することで超過する</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">EINVAL</span></code>無効なキーサイズまたはキー指定子タイプ、または予約ビットが設定されている</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">EKEYREJECTED</span></code>Linux key IDでraw keyが指定されたが、キーのタイプが間違っている</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">ENOKEY</span></code>Linux key IDでraw keyが指定されたが、そのIDのキーが存在しない</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">ENOTTY</span></code>この種のファイルシステムは暗号化を実装していない</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">EOPNOTSUPP</span></code>: このファイルシステムの暗号化サポートがカーネルに構成されていない、またはファイルシステムのスーパーブロックに暗号化が有効になっていない</p></li>
+</ul>
+</section>
+<section id="legacy-method">
+<h4>レガシーメソッド<a class="headerlink" href="#legacy-method" title="この見出しへのパーマリンク">¶</a></h4>
+<p>v1暗号化ポリシーでは、プロセスサブスクライブされたkeyring（例：セッションkeyring、またはユーザーkeyringがセッションkeyringにリンクされている場合のユーザーkeyring）にマスターエンクリプションキーを追加することもできます。</p>
+<p>このメソッドはいくつかの理由により非推奨（v2暗号化ポリシーではサポートされていない）です。まず、FS_IOC_REMOVE_ENCRYPTION_KEYと併用できないため（参照： <a class="reference internal" href="#removing-keys">キーの削除</a>）、キーを削除するにはkeyctl_unlink()と組み合わせたワークアラウンドが必要です。 <code class="docutils literal notranslate"><span class="pre">sync;</span> <span class="pre">echo</span> <span class="pre">2</span> <span class="pre">&gt;</span> <span class="pre">/proc/sys/vm/drop_caches</span></code> 使用する必要があります。第二に、暗号化ファイルのロック/アンロック状態（つまり、平文形式で表示されているか暗号文形式で表示されているか）がグローバルであるという事実と一致していないためです。この不整合により、さまざまな混乱や、異なるUIDで実行されるプロセス（例: コマンドなど）が暗号化ファイルにアクセスする際に実際に生じる問題も発生しています。 <code class="docutils literal notranslate"><span class="pre">sudo</span></code> ただし、プロセスがサブスクライブしたキーリングに鍵を追加するには、add_key()システムコールを使用できます（参照:</p>
+<p>）。キーリングの種類は「logon」でなければなりません。この種類の鍵はカーネルメモリに保持され、ユーザー空間から読み返すことはできません。キーディスクリプションは「fscrypt:」に続いて、暗号化ポリシーで設定された16文字の小文字の16進数表現を記述する必要があります。
+<code class="docutils literal notranslate"><span class="pre">Documentation/security/keys/core.rst</span></code>が設定された暗号化ポリシーで使用される鍵のペイロードは、以下の構造に合致する必要があります:
+<code class="docutils literal notranslate"><span class="pre">master_key_descriptor</span></code> は無視されます; 0に設定してください。実際の鍵は</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#define FSCRYPT_MAX_KEY_SIZE            64
+
+struct fscrypt_key {
+        __u32 mode;
+        __u8 raw[FSCRYPT_MAX_KEY_SIZE];
+        __u32 size;
+};
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">mode</span></code> で示されるサイズ（バイト単位）を示しています。つまり、バイト
+<code class="docutils literal notranslate"><span class="pre">raw</span></code> with <code class="docutils literal notranslate"><span class="pre">size</span></code> (含む)が実際の鍵です。 <code class="docutils literal notranslate"><span class="pre">raw[0..size-1]</span></code> キーディスクリプションの前缀「fscrypt:」は、ファイルシステム固有の前缀（例: 「ext4:」など）に置き換えることもできます。ただし、ファイルシステム固有の前缀は非推奨であり、新しいプログラムでは使用しないでください。</p>
+<p>2つのioctlが、によって追加された鍵を削除するために利用できます:</p>
+</section>
+</section>
+<section id="removing-keys">
+<h3>キーの削除<a class="headerlink" href="#removing-keys" title="この見出しへのパーマリンク">¶</a></h3>
+<p>FS_IOC_REMOVE_ENCRYPTION_KEY
+<a class="reference internal" href="#fs-ioc-add-encryption-key">FS_IOC_ADD_ENCRYPTION_KEY</a>:</p>
+<ul class="simple">
+<li><p><a class="reference internal" href="#fs-ioc-remove-encryption-key">これらの2つのioctlは、v2ポリシー鍵を非rootユーザーが追加または削除する場合を除いては、他の点では違いません。</a></p></li>
+<li><p><a class="reference internal" href="#fs-ioc-remove-encryption-key-all-users">FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERS</a></p></li>
+</ul>
+<p>これらのioctlは、従来のプロセスサブスクライブキーリングメカニズムで追加された鍵には動作しません。</p>
+<p>これらのioctlを使用する前に、</p>
+<p>セクションを読み、これらのioctlのセキュリティ目標と制限についての説明を確認してください。 <a class="reference internal" href="#kernel-memory-compromise">カーネルメモリの侵害</a>
+FS_IOC_REMOVE_ENCRYPTION_KEY ioctlは、ファイルシステムからマスターエンクリプションキーの主張を削除し、場合によってはその鍵自体も削除します。このioctlはターゲットファイルシステム上の任意のファイルまたはディレクトリで実行できますが、ファイルシステムのルートディレクトリを使用することをお勧めします。このioctlは以下の構造体へのポインタを引数として受け取ります:</p>
+<section id="fs-ioc-remove-encryption-key">
+<h4>これらの2つのioctlは、v2ポリシー鍵を非rootユーザーが追加または削除する場合を除いては、他の点では違いません。<a class="headerlink" href="#fs-ioc-remove-encryption-key" title="この見出しへのパーマリンク">¶</a></h4>
+<p>この構造体はゼロ初期化され、次のように初期化する必要があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fscrypt_remove_key_arg {
+        struct fscrypt_key_specifier key_spec;
+#define FSCRYPT_KEY_REMOVAL_STATUS_FLAG_FILES_BUSY      0x00000001
+#define FSCRYPT_KEY_REMOVAL_STATUS_FLAG_OTHER_USERS     0x00000002
+        __u32 removal_status_flags;     /* output */
+        __u32 __reserved[5];
+};
+</pre></div>
+</div>
+<p>削除する鍵は</p>
+<ul>
+<li><p>で指定されます。 <code class="docutils literal notranslate"><span class="pre">key_spec</span></code>:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>v1暗号化ポリシーで使用される鍵を削除するには、
+<code class="docutils literal notranslate"><span class="pre">key_spec.type</span></code> をFSCRYPT_KEY_SPEC_TYPE_DESCRIPTORに設定し、 <code class="docutils literal notranslate"><span class="pre">key_spec.u.descriptor</span></code>を埋めます。この種類の鍵を削除するには、呼び出しプロセスが初期ユーザーネームスペースでCAP_SYS_ADMINの能力を持つ必要があります。</p></li>
+<li><p>v2暗号化ポリシーで使用される鍵を削除するには、
+<code class="docutils literal notranslate"><span class="pre">key_spec.type</span></code> をFSCRYPT_KEY_SPEC_TYPE_IDENTIFIERに設定し、 <code class="docutils literal notranslate"><span class="pre">key_spec.u.identifier</span></code>.</p></li>
+</ul>
+</div></blockquote>
+</li>
+</ul>
+<p>v2ポリシーのキーに対しては、このioctlは非rootユーザーでも使用可能です。ただし、この機能を実現するには、実際には現在のユーザーのキーへの主張を削除するだけであり、FS_IOC_ADD_ENCRYPTION_KEYの単一の呼び出しを元に戻すだけです。すべての主張が削除された後で、キーが本当に削除されるのです。</p>
+<p>例えば、FS_IOC_ADD_ENCRYPTION_KEYがuid 1000で呼び出された場合、キーはuid 10,000に「主張」されるようになり、FS_IOC_REMOVE_ENCRYPTION_KEYはuid 1000としてのみ成功します。あるいは、uid 1000と2000の両方がキーを追加した場合、それぞれのuidに対してFS_IOC_REMOVE_ENCRYPTION_KEYは各自の主張のみを削除します。すべての主張が削除された後で、キーが本当に削除されるのです。(これは、ハードリンクを持つファイルをアンリンクするのと同じです。) <em>両方を組み合わせます</em> キーが本当に削除されるのは、すべての主張が削除された後です。(これは、ハードリンクを持つファイルをアンリンクするのと同じです。)</p>
+<p>FS_IOC_REMOVE_ENCRYPTION_KEYが本当にキーを削除した場合、そのキーでアンロックされていたすべてのファイルを「ロック」しようとします。使用中のファイルはロックされませんので、このioctlはユーザー空間がどのファイルも開いていないことを保証する協力のもとで使用されることが予期されます。ただし、必要に応じて、後でこのioctlを再度実行して残ったファイルのロックを再試行することも可能です。</p>
+<p>FS_IOC_REMOVE_ENCRYPTION_KEYは、以下の情報ステータスフラグが設定されている場合に0を返します。キーが削除された場合（ただし、まだロックが必要なファイルが存在する可能性があります）、ユーザーのキーへの主張が削除された場合、またはキーがすでに削除されたがまだロックが必要なファイルが存在してioctlが再試行してロックした場合などです。 <code class="docutils literal notranslate"><span class="pre">removal_status_flags</span></code> 以下の情報ステータスフラグが設定されます:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">FSCRYPT_KEY_REMOVAL_STATUS_FLAG_FILES_BUSY</span></code>いくつかのファイルが使用中である場合に設定されます。ユーザーのキーへの主張のみが削除された場合でも必ず設定されるとは限りません。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">FSCRYPT_KEY_REMOVAL_STATUS_FLAG_OTHER_USERS</span></code>ユーザーのキーへの主張のみが削除された場合に設定されます。キー自体は削除されていない場合です。</p></li>
+</ul>
+<p>FS_IOC_REMOVE_ENCRYPTION_KEYは以下のエラーで失敗することがあります:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">EACCES</span></code>FSCRYPT_KEY_SPEC_TYPE_DESCRIPTORキー指定子タイプが指定されたが、呼び出し元が初期ユーザー名前空間でCAP_SYS_ADMINの能力を持っていない場合</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">EINVAL</span></code>無効なキー指定子タイプ、または予約ビットが設定されていた場合</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">ENOKEY</span></code>キーオブジェクトが見つからない場合、つまり最初から追加されていないか、すでに完全に削除されてすべてのロック済みファイルを含むか、またはユーザーがキーへの主張を持っていないが、他のユーザーが持っている場合です。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">ENOTTY</span></code>この種のファイルシステムは暗号化を実装していない</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">EOPNOTSUPP</span></code>: このファイルシステムの暗号化サポートがカーネルに構成されていない、またはファイルシステムのスーパーブロックに暗号化が有効になっていない</p></li>
+</ul>
+</section>
+<section id="fs-ioc-remove-encryption-key-all-users">
+<h4>FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERS<a class="headerlink" href="#fs-ioc-remove-encryption-key-all-users" title="この見出しへのパーマリンク">¶</a></h4>
+<p>FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERSは、まさに
+<a class="reference internal" href="#fs-ioc-remove-encryption-key">これらの2つのioctlは、v2ポリシー鍵を非rootユーザーが追加または削除する場合を除いては、他の点では違いません。</a>と同じですが、v2ポリシーのキーに対しては、ALL_USERSバージョンのioctlはすべてのユーザーのキーへの主張を削除します。つまり、キー自体は常に削除され、どのユーザーがキーを追加しても関係ありません。この違いは、非rootユーザーがキーを追加・削除している場合にのみ意味があります。</p>
+<p>このため、FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERSも「root」、つまり初期ユーザーネームスペースにおけるCAP_SYS_ADMINの権限を必要とします。それ以外の場合はEACCESで失敗します。</p>
+</section>
+</section>
+<section id="getting-key-status">
+<h3>鍵の状態を取得する<a class="headerlink" href="#getting-key-status" title="この見出しへのパーマリンク">¶</a></h3>
+<section id="fs-ioc-get-encryption-key-status">
+<h4>FS_IOC_GET_ENCRYPTION_KEY_STATUS<a class="headerlink" href="#fs-ioc-get-encryption-key-status" title="この見出しへのパーマリンク">¶</a></h4>
+<p>FS_IOC_GET_ENCRYPTION_KEY_STATUS ioctlはマスターエンクリプションキーの状態を取得します。これはターゲットファイルシステム上の任意のファイルまたはディレクトリで実行可能ですが、ファイルシステムのルートディレクトリを使用することをお勧めします。このioctlはstruct fscrypt_get_key_status_argへのポインタを引数として受け取り、以下のように定義されています:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fscrypt_get_key_status_arg {
+        /* input */
+        struct fscrypt_key_specifier key_spec;
+        __u32 __reserved[6];
+
+        /* output */
+#define FSCRYPT_KEY_STATUS_ABSENT               1
+#define FSCRYPT_KEY_STATUS_PRESENT              2
+#define FSCRYPT_KEY_STATUS_INCOMPLETELY_REMOVED 3
+        __u32 status;
+#define FSCRYPT_KEY_STATUS_FLAG_ADDED_BY_SELF   0x00000001
+        __u32 status_flags;
+        __u32 user_count;
+        __u32 __out_reserved[13];
+};
+</pre></div>
+</div>
+<p>呼び出し元はすべての入力フィールドをゼロにして、次に <code class="docutils literal notranslate"><span class="pre">key_spec</span></code>:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>v1エンクリプションポリシーの鍵の状態を取得するには、
+<code class="docutils literal notranslate"><span class="pre">key_spec.type</span></code> をFSCRYPT_KEY_SPEC_TYPE_DESCRIPTORに設定し、 <code class="docutils literal notranslate"><span class="pre">key_spec.u.descriptor</span></code>.</p></li>
+<li><p>v2エンクリプションポリシーの鍵の状態を取得するには、
+<code class="docutils literal notranslate"><span class="pre">key_spec.type</span></code> をFSCRYPT_KEY_SPEC_TYPE_IDENTIFIERに設定し、 <code class="docutils literal notranslate"><span class="pre">key_spec.u.identifier</span></code>.</p></li>
+</ul>
+</div></blockquote>
+<p>成功した場合、0が返され、カーネルが出力フィールドを埋めます:</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">status</span></code> 鍵が存在しない、存在する、または不完全に削除されたかを示します。不完全に削除されたとは、マスターセキュリティが削除されたが、一部のファイルがまだ使用中の状態を指します；つまり、
+<a class="reference internal" href="#fs-ioc-remove-encryption-key">これらの2つのioctlは、v2ポリシー鍵を非rootユーザーが追加または削除する場合を除いては、他の点では違いません。</a> 0が返されたが、情報的なステータスフラグFSCRYPT_KEY_REMOVAL_STATUS_FLAG_FILES_BUSYを設定した場合です。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">status_flags</span></code> 以下のようなフラグを含むことができます:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">FSCRYPT_KEY_STATUS_FLAG_ADDED_BY_SELF</span></code> 現在のユーザーによって鍵が追加されたことを示します。これは、 <code class="docutils literal notranslate"><span class="pre">identifier</span></code> によって識別される鍵の場合にのみ設定されます。 <code class="docutils literal notranslate"><span class="pre">descriptor</span></code>.</p></li>
+</ul>
+</div></blockquote>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">user_count</span></code> によって識別される鍵の場合にのみ設定されます。 <code class="docutils literal notranslate"><span class="pre">identifier</span></code> によって識別される鍵の場合にのみ設定されます。 <code class="docutils literal notranslate"><span class="pre">descriptor</span></code>.</p></li>
+</ul>
+<p>FS_IOC_GET_ENCRYPTION_KEY_STATUSは以下のエラーで失敗する場合があります:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">EINVAL</span></code>無効なキー指定子タイプ、または予約ビットが設定されていた場合</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">ENOTTY</span></code>この種のファイルシステムは暗号化を実装していない</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">EOPNOTSUPP</span></code>: このファイルシステムの暗号化サポートがカーネルに構成されていない、またはファイルシステムのスーパーブロックに暗号化が有効になっていない</p></li>
+</ul>
+<p>その他の使用例として、FS_IOC_GET_ENCRYPTION_KEY_STATUSは、ユーザーにパスフレーズを入力して鍵を導出させる前に、特定の暗号化ディレクトリの鍵が追加されているかを確認するために有用です。</p>
+<p>FS_IOC_GET_ENCRYPTION_KEY_STATUSは、ファイルシステムレベルのキーリング（つまり、
+<a class="reference internal" href="#fs-ioc-add-encryption-key">FS_IOC_ADD_ENCRYPTION_KEY</a> および <a class="reference internal" href="#fs-ioc-remove-encryption-key">これらの2つのioctlは、v2ポリシー鍵を非rootユーザーが追加または削除する場合を除いては、他の点では違いません。</a>によって管理されるキーリング）内の鍵の状態のみを取得できます。legacyメカニズムによるプロセスサブスクライブキーリングでのみ追加された鍵の状態は取得できません。</p>
+</section>
+</section>
+</section>
+<section id="access-semantics">
+<h2>アクセスセマンティクス<a class="headerlink" href="#access-semantics" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="with-the-key">
+<h3>鍵<a class="headerlink" href="#with-the-key" title="この見出しへのパーマリンク">¶</a></h3>
+<p>暗号化キーを使用した暗号化された正規ファイル、ディレクトリ、シンボリックリンクは、暗号化されていない counterparts と非常に似ています — なぜなら、暗号化は透明にされるべきだからです。ただし、注意深いユーザーはいくつかの動作の違いに気づくかもしれません:</p>
+<ul>
+<li><p>暗号化されていないファイル、または異なる暗号化ポリシー（つまり、異なるキー、モード、またはフラグ）で暗号化されたファイルは、暗号化されたディレクトリにリネームまたはリンクすることはできません；詳しくは <a class="reference internal" href="#encryption-policy-enforcement">暗号化ポリシーの強制</a>に参照してください。このような操作はEXDEVで失敗します。ただし、暗号化されたファイルは、暗号化されたディレクトリ内でリネームしたり、暗号化されていないディレクトリに移動したりすることは可能です。</p>
+<p>注意: 暗号化されていないファイルを暗号化されたディレクトリに移動する場合（例: mv プログラムを使用する場合）、ユーザー空間でコピー後に削除する方法で実装されます。注意が必要なのは、元の暗号化されていないデータがディスクの空き領域から復元される可能性があるためです。すべてのファイルを最初から暗号化して保存することを推奨します。shred プログラムを使用してソースファイルを上書きすることは可能ですが、すべてのファイルシステムとストレージデバイスで効果が保証されていません。 <cite>mv</cite> ディレクトリに移動する場合、ユーザー空間でコピー後に削除する方法で実装されます。注意が必要なのは、元の暗号化されていないデータがディスクの空き領域から復元される可能性があるためです。すべてのファイルを最初から暗号化して保存することを推奨します。shred プログラムを使用してソースファイルを上書きすることは可能ですが、すべてのファイルシステムとストレージデバイスで効果が保証されていません。 <cite>shred</cite> ディレクトリに移動する場合、ユーザー空間でコピー後に削除する方法で実装されます。注意が必要なのは、元の暗号化されていないデータがディスクの空き領域から復元される可能性があるためです。すべてのファイルを最初から暗号化して保存することを推奨します。shred プログラムを使用してソースファイルを上書きすることは可能ですが、すべてのファイルシステムとストレージデバイスで効果が保証されていません。</p>
+</li>
+<li><p>暗号化されたファイルには直接 I/O がサポートされていません。このようなファイルに直接 I/O を使用しようとすると、バッファード I/O にフォールバックします。</p></li>
+<li><p>暗号化されたファイルでは、fallocate 操作の FALLOC_FL_COLLAPSE_RANGE と FALLOC_FL_INSERT_RANGE はサポートされておらず、EOPNOTSUPP で失敗します。</p></li>
+<li><p>暗号化されたファイルのオンラインデフラグメンテーションはサポートされていません。EXT4_IOC_MOVE_EXT および F2FS_IOC_MOVE_RANGE ioctls は EOPNOTSUPP で失敗します。</p></li>
+<li><p>ext4 ファイルシステムは暗号化された通常ファイルでのデータジャーナリングをサポートしていません。代わりに順序データモードにフォールバックします。</p></li>
+<li><p>DAX（Direct Access）は暗号化されたファイルにはサポートされていません。</p></li>
+<li><p>暗号化されたシンボリックリンクの st_size は POSIX が要求するシンボリックリンクターゲットの長さを必ずしも示しません。実際には、暗号文の長さを示し、NUL-パディングと追加の 2 バイトオーバーヘッドにより、平文よりもやや長くなります。</p></li>
+<li><p>暗号化されたシンボリックリンクの最大長は、未暗号化のシンボリックリンクの最大長より 2 バイト短くなります。たとえば、EXT4 ファイルシステムで 4K ブロックサイズの場合、未暗号化のシンボリックリンクは最大 4095 バイトまで、暗号化されたシンボリックリンクは最大 4093 バイトまで（終端ヌルを除く長さ）です。</p></li>
+</ul>
+<p>mmap がサポートされています。これは、暗号化ファイルのページキャッシュが平文を含むためです。 <em>通常のRCU読み込み側クリティカルセクションは、条件付きでスリープロックを取得することが許容されます（例として</em> mmap がサポートされています。これは、暗号化ファイルのページキャッシュが平文を含むためです。</p>
+</section>
+<section id="without-the-key">
+<h3>キーレス<a class="headerlink" href="#without-the-key" title="この見出しへのパーマリンク">¶</a></h3>
+<p>暗号化された通常ファイル、ディレクトリ、シンボリックリンクでは、暗号化キーが追加される前や削除された後でも、一部のファイルシステム操作が実行可能です:</p>
+<ul>
+<li><p>ファイルメタデータは読み取れます（例: stat() を使用する場合）。</p></li>
+<li><p>ディレクトリは一覧表示され、その場合、ファイル名は暗号文から導出された符号化形式で表示されます。現在の符号化アルゴリズムについては <a class="reference internal" href="#filename-hashing-and-encoding">ファイル名ハッシュと符号化</a>を参照してください。アルゴリズムは変更される可能性がありますが、提示されるファイル名は NAME_MAX バイト以内で、 <code class="docutils literal notranslate"><span class="pre">/</span></code> または <code class="docutils literal notranslate"><span class="pre">\0</span></code> 文字を含まず、ディレクトリエントリを一意に識別します。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">.</span></code> および <code class="docutils literal notranslate"><span class="pre">..</span></code> ディレクトリエントリは特殊です。常に存在し、暗号化または符号化されません。</p>
+</li>
+<li><p>ファイルは削除される可能性があります。つまり、ディレクトリ以外のファイルは通常のunlink()で削除でき、空のディレクトリは通常のrmdir()で削除できます。したがって、 <code class="docutils literal notranslate"><span class="pre">rm</span></code> および <code class="docutils literal notranslate"><span class="pre">rm</span> <span class="pre">-r</span></code> 予期通りに動作します。</p></li>
+<li><p>シンボリックリンクのターゲットは読み取れたり、フォローされたりするかもしれませんが、ディレクトリ内のファイル名と同様に暗号化された形式で表示されるため、有用な場所を指す可能性は低いです。</p></li>
+</ul>
+<p>鍵がない場合、通常のファイルは開けたり、切り詰めたりすることはできません。このような操作を試みるとENOKEYで失敗します。これは、ファイルディスクリプタが必要な通常のファイル操作（read()、write()、mmap()、fallocate()、ioctl()など）も禁止されることを意味します。</p>
+<p>鍵がない場合、どの種類のファイル（ディレクトリを含む）も暗号化されたディレクトリに作成したりリンクしたりすることはできません。また、暗号化されたディレクトリ内の名前はリネームのソースまたはターゲットにもなり得ず、O_TMPFILEの一時ファイルも暗号化されたディレクトリ内に作成できません。このような操作はすべてENOKEYで失敗します。</p>
+<p>暗号化キーなしで暗号化ファイルのバックアップや復元は現在不可能です。これには特別なAPIが必要ですが、それらはまだ実装されていません。</p>
+</section>
+</section>
+<section id="encryption-policy-enforcement">
+<h2>暗号化ポリシーの強制<a class="headerlink" href="#encryption-policy-enforcement" title="この見出しへのパーマリンク">¶</a></h2>
+<p>暗号化ポリシーがディレクトリに設定されると、そのディレクトリ内に作成されるすべての通常ファイル、ディレクトリ、シンボリックリンク（再帰的に）はその暗号化ポリシーを継承します。特殊ファイル（名前付きパイプ、デバイスノード、UNIXドメインソケット）は暗号化されません。</p>
+<p>特殊ファイルを除き、暗号化されたディレクトリツリー内には未暗号化のファイルや、異なる暗号化ポリシーで暗号化されたファイルは存在できません。このようなファイルを暗号化されたディレクトリにリンクしたりリネームしたりするとEXDEVで失敗します。これは-&gt;lookup()の際にも強制されるため、アプリケーションが後で敏感なデータを書き込む可能性のある場所で暗号化を無効化または downgrade しようとするオフライン攻撃に対する制限的な保護を提供します。"検証されたブート"の形式を実装するシステムでは、アクセス前にすべてのトップレベルの暗号化ポリシーを検証することを推奨します。</p>
+</section>
+<section id="implementation-details">
+<h2>実装詳細<a class="headerlink" href="#implementation-details" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="encryption-context">
+<h3>暗号化コンテキスト<a class="headerlink" href="#encryption-context" title="この見出しへのパーマリンク">¶</a></h3>
+<p>暗号化ポリシーはディスク上ではstruct fscrypt_context_v1またはstruct fscrypt_context_v2で表されます。個々のファイルシステムはポリシーをどこに保存するかを決定しますが、通常は隠しの拡張属性に保存されます。これについては <em>ではありません</em> getxattr()やsetxattr()などのxattr関連のシステムコールによって、暗号化xattrの特殊なセマンティクスのため、情報が漏洩する可能性があります。(特に、暗号化ポリシーを空でないディレクトリ以外の何かに追加または削除した場合、混乱が生じる可能性が非常に高いです。) これらの構造体は以下の通り定義されています:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#define FSCRYPT_FILE_NONCE_SIZE 16
+
+#define FSCRYPT_KEY_DESCRIPTOR_SIZE  8
+struct fscrypt_context_v1 {
+        u8 version;
+        u8 contents_encryption_mode;
+        u8 filenames_encryption_mode;
+        u8 flags;
+        u8 master_key_descriptor[FSCRYPT_KEY_DESCRIPTOR_SIZE];
+        u8 nonce[FSCRYPT_FILE_NONCE_SIZE];
+};
+
+#define FSCRYPT_KEY_IDENTIFIER_SIZE  16
+struct fscrypt_context_v2 {
+        u8 version;
+        u8 contents_encryption_mode;
+        u8 filenames_encryption_mode;
+        u8 flags;
+        u8 __reserved[4];
+        u8 master_key_identifier[FSCRYPT_KEY_IDENTIFIER_SIZE];
+        u8 nonce[FSCRYPT_FILE_NONCE_SIZE];
+};
+</pre></div>
+</div>
+<p>コンテキスト構造体は、対応するポリシー構造体(参照 <a class="reference internal" href="#setting-an-encryption-policy">暗号化ポリシーの設定</a>)と同じ情報を含みますが、コンテキスト構造体にはnonceも含まれます。nonceはカーネルによってランダムに生成され、KDFの入力として使用されるか、またはファイルごとに暗号化を異にするようにするための調整値として使用されます。参照 <a class="reference internal" href="#per-file-encryption-keys">ファイルごとの暗号化キー</a> および <a class="reference internal" href="#direct-key-policies">DIRECT_KEYポリシー</a>.</p>
+</section>
+<section id="data-path-changes">
+<h3>データパスの変更<a class="headerlink" href="#data-path-changes" title="この見出しへのパーマリンク">¶</a></h3>
+<p>通常のファイルの読み込みパス(-&gt;readpage())では、ファイルシステムがページキャッシュに暗号文を読み込み、その場で復号することができ、復号が完了するまでページロックを保持する必要があります。これにより、ユーザー空間が早すぎるタイミングでページを参照することを防ぎます。</p>
+<p>通常のファイルの書き込みパス(-&gt;writepage())では、ページキャッシュ内でデータをインプレースで暗号化することはできません。キャッシュされた平文を保持する必要があるためです。代わりに、ファイルシステムは一時バッファや「バウンスページ」に暗号化を行い、その後一時バッファを書き出す必要があります。UBIFSなどの一部のファイルシステムは、暗号化に関係なくすでに一時バッファを使用しています。一方、ext4やF2FSなどの他のファイルシステムは、暗号化のために特別にバウンスページを割り当てる必要があります。</p>
+<p>Fscryptは、ファイルコンテンツの暗号化・復号にカーネル暗号APIではなくインライン暗号化ハードウェアを使用することも可能です。可能であれば、および指定された場合(例: ext4/F2FSファイルシステムで「inlinecrypt」マウントオプションを指定した場合)、FscryptはBIOSに暗号化コンテキストを追加し、blk-cryptoを使用して暗号化・復号を行います。上記の読み込み/書き込みパスの変更を使用しないで処理を行います。もちろん、インライン暗号化を指定されたとしても、選択された暗号アルゴリズムにハードウェアインライン暗号化サポートが存在するか、またはCONFIG_BLK_INLINE_ENCRYPTION_FALLBACKが選択されている場合に限り、Fscryptはインライン暗号化を使用できます。どちらも存在しない場合、Fscryptは上記の読み込み/書き込みパスの変更を使用して暗号化・復号を行います。</p>
+</section>
+<section id="filename-hashing-and-encoding">
+<h3>ファイル名ハッシュと符号化<a class="headerlink" href="#filename-hashing-and-encoding" title="この見出しへのパーマリンク">¶</a></h3>
+<p>現代のファイルシステムは、インデックス付きディレクトリを使用してディレクトリ検索を高速化しています。インデックス付きディレクトリは、ファイル名ハッシュでキー付けされた木構造に組織化されています。-&gt;lookup()が要求された場合、ファイルシステムは通常、検索対象のファイル名をハッシュ化して、対応するディレクトリエントリを素早く見つけることができます。</p>
+<p>暗号化を行う場合、暗号化キーあり・なしの両方で検索がサポートされ、効率的に行われることが必要です。明文のファイル名をハッシュ化することはできません。なぜなら、暗号化キーがないと明文のファイル名は取得できないからです。(明文のファイル名をハッシュ化すると、ファイルシステムの fsck ツールが暗号化されたディレクトリを最適化できなくなるためです。) 代わりに、ファイルシステムは暗号化されたファイル名（つまり、ディレクトリエントリに実際に保存されているバイト）をハッシュ化します。暗号化キーを用いて検索が要求された場合、ファイルシステムはユーザーが指定した名前を暗号化して、暗号化された名前を取得します。</p>
+<p>暗号化キーがない状態での検索はより複雑です。暗号化されたバイトは、ファイル名として不適切な文字を含む可能性があり、そのため readdir() は暗号化された名前を base64 エンコードして表示します。 <code class="docutils literal notranslate"><span class="pre">\0</span></code> および <code class="docutils literal notranslate"><span class="pre">/</span></code> ほとんどのファイル名ではこれで問題ありませんが、-&gt;lookup() が呼ばれた際には、ユーザーが指定した名前を base64 デコードして、暗号化されたバイトに戻します。</p>
+<p>ただし、非常に長いファイル名の場合は、base64 エンコードによりファイル名の長さが NAME_MAX を超えてしまいます。これを防ぐため、readdir() は暗号化されたファイル名の「ハッシュ」を含む略称形式で長ファイル名を表示します。これにより、ファイルシステムは、readdir() で以前に表示されたディレクトリエントリを、高い信頼性で -&gt;lookup() で指定されたファイル名と関連付けることができます。詳細はソースコードの struct fscrypt_nokey_name を参照してください。</p>
+<p>暗号化キーがない状態でユーザー空間に提示されるファイル名の具体的な形式は、今後変更される可能性があります。これは、暗号化ディレクトリでコマンドが期待どおりに動作するための一時的な方法です。
+<code class="docutils literal notranslate"><span class="pre">rm</span> <span class="pre">-r</span></code> ls などのコマンドが期待どおりに動作するようにするためです。</p>
+</section>
+</section>
+<section id="tests">
+<h2>テスト<a class="headerlink" href="#tests" title="この見出しへのパーマリンク">¶</a></h2>
+<p>fscrypt のテストには、Linux の事実上のファイルシステムテストスイートである xfstests を使用します。まず、関連するファイルシステムに「encrypt」グループのすべてのテストを実行してください。また、「inlinecrypt」マウントオプションでテストを実行することで、インライン暗号化の実装をテストすることもできます。たとえば、kvm-xfstests を使って ext4 と f2fs の暗号化をテストするには、 <a class="reference external" href="https://github.com/tytso/xfstests-bld/blob/master/Documentation/kvm-quickstart.md">kvm-xfstests</a>:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kvm-xfstests -c ext4,f2fs -g encrypt
+kvm-xfstests -c ext4,f2fs -g encrypt -m inlinecrypt
+</pre></div>
+</div>
+<p>UBIFS の暗号化もこの方法でテストできますが、別個のコマンドで実行し、kvm-xfstests がエミュレートされた UBI ボリュームをセットアップするのに時間がかかるため、注意が必要です。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kvm-xfstests -c ubifs -g encrypt
+</pre></div>
+</div>
+<p>テストが失敗するべきではありません。ただし、非デフォルトの暗号化モード（例: generic/549 および generic/550）を使用するテストは、必要なアルゴリズムがカーネルの暗号APIに組み込まれていない場合、スキップされます。また、raw block device（例: generic/399、generic/548、generic/549、generic/550）にアクセスするテストは、UBIFSでスキップされます。</p>
+<p>「encrypt」グループのテストを実行するだけでなく、ext4およびf2fsでは、「test_dummy_encryption」マウントオプションを使用してほとんどのxfstestsを実行することも可能です。このオプションは、新しいファイルが_dummy_キーで自動的に暗号化されるようにします。API呼び出しを一切行わずに動作をテストします。この方法でkvm-xfstestsを使用する場合、以下の「encrypt」ファイルシステム構成を使用してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kvm-xfstests -c ext4/encrypt,f2fs/encrypt -g auto
+kvm-xfstests -c ext4/encrypt,f2fs/encrypt -g auto -m inlinecrypt
+</pre></div>
+</div>
+<p>この方法は「-g encrypt」よりも多くのテストを実行するため、実行に時間がかかります。そのため、以下の代替案も検討してください： <a class="reference external" href="https://github.com/tytso/xfstests-bld/blob/master/Documentation/gce-xfstests.md">gce-xfstests</a>
+kvm-xfstestsではなく：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>gce-xfstests -c ext4/encrypt,f2fs/encrypt -g auto
+gce-xfstests -c ext4/encrypt,f2fs/encrypt -g auto -m inlinecrypt
+</pre></div>
+</div>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxカーネル内のファイルシステム</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#core-vfs-documentation">コアVFSドキュメンテーション</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#filesystem-support-layers">ファイルシステムサポートレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#filesystems">ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxカーネル内のファイルシステム</a><ul>
+<li>前へ: <a href="journalling.html" title="前章">Linux Journalling API</a></li>
+<li>次へ: <a href="fsverity.html" title="次章">fs-verity: 読み取り専用のファイルベースの正当性保護</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/filesystems/fscrypt.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

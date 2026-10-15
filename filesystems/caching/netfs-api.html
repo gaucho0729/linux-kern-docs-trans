@@ -1,0 +1,721 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>FS-Cache Network Filesystem API — The Linux Kernel ドキュメント</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="operations.html" rel="next" title="非同期操作の処理"/>
+<link href="cachefiles.html" rel="prev" title="CacheFiles: キャッシュON 既にマウント済みファイルシステム"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="fs-cache-network-filesystem-api">
+<h1>FS-CacheネットワークファイルシステムAPI<a class="headerlink" href="#fs-cache-network-filesystem-api" title="この見出しへのパーマリンク">¶</a></h1>
+<p>ネットワークファイルシステムがFS-Cacheの機能を活用できるようにするAPIがあります。これはいくつかの原則に基づいています：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>キャッシュはさまざまなオブジェクトタイプを保存できます。主なオブジェクトタイプはインデックスとファイルです。インデックスはFS-Cacheがオブジェクトを素早く見つけやすく、複数のオブジェクトの廃止を容易にする特別なタイプです。</p></li>
+<li><p>すべてのインデックス、ファイル、またはその他のオブジェクトはクッキーで表されます。このクッキーには何かが関連付けられているかどうかは関係ありませんが、netfsは気にする必要がありません。</p></li>
+<li><p>トップレベルのインデックス（キャッシュされたnetfsごとに1つのエントリ）を除き、各netfsのインデックス階層はnetfsの都合に応じて構造化されます。</p></li>
+</ol>
+</div></blockquote>
+<p>このAPIは&lt;linux/fscache.h&gt;で宣言されています。</p>
+<section id="network-filesystem-definition">
+<h2>ネットワークファイルシステムの定義<a class="headerlink" href="#network-filesystem-definition" title="この見出しへのパーマリンク">¶</a></h2>
+<p>FS-Cacheはネットワークファイルシステムの説明が必要です。これは次の構造を持つレコードを使用して指定されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fscache_netfs {
+        uint32_t                        version;
+        const char                      *name;
+        struct fscache_cookie           *primary_index;
+        ...
+};
+</pre></div>
+</div>
+<p>最初の2つのフィールドは登録前に埋め込まれるべきで、3番目のフィールドは登録関数によって埋め込まれます。他のフィールドは無視され、内部使用のみのものです。</p>
+<p>フィールドは次の通りです：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>ネットワークファイルシステムの名前（トップレベルインデックスでのキーとして使用されます）。</p></li>
+<li><p>ネットワークファイルシステムのバージョン（名前が一致してもバージョンが一致しない場合、このnetfsのキャッシュされた階層全体が破棄され、新たに開始されます）。</p></li>
+<li><p>プライマリインデックスを表すクッキーは、登録関数に渡された他のパラメータに基づいて割り当てられます。</p></li>
+</ol>
+</div></blockquote>
+<p>たとえば、kAFS（linux/fs/afs/）は次の定義を使用して自身を記述します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fscache_netfs afs_cache_netfs = {
+        .version        = 0,
+        .name           = "afs",
+};
+</pre></div>
+</div>
+</section>
+<section id="index-definition">
+<h2>インデックスの定義<a class="headerlink" href="#index-definition" title="この見出しへのパーマリンク">¶</a></h2>
+<p>インデックスは2つの目的に使用されます：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>複数のキー（AFSの「cell」、「volume ID」、「vnode ID」など）に基づいてファイルを検索するのを支援します。</p></li>
+<li><p>特定のキーに基づいてキャッシュされたファイルのサブセットを削除するのを容易にするため、例えばAFSのボリュームの削除を模倣します。</p></li>
+</ol>
+</div></blockquote>
+<p>しかし、どの2つのネットワークファイルシステムもインデックス階層をまったく同じように定義したいとは思わないため、FS-Cacheはインデックスの構造やツリーでの配置にできるだけ多くの制限を課していません。ネットワークファイルシステムは、同じレベルでインデックスとデータファイルを混在させることもできますが、推奨されません。</p>
+<p>各インデックスエントリは、長さが不定のキーと、長さも不定の補助データから構成されます。</p>
+<p>インデックスにはいくつかの制限があります：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>非インデックスオブジェクトを含むインデックスは、単一のキャッシュに制限されるべきです。このようなオブジェクトがインデックス内で作成されると、常に最初のキャッシュにのみ作成されます。インデックスが作成されるキャッシュはキャッシュタグ（以下参照）によって制御できます。</p></li>
+<li><p>エントリデータは原子的にジャーナル可能でなければならないため、現在は約400バイトに制限されています。少なくとも400バイトは利用可能です。</p></li>
+<li><p>検索機能が再帰的であるため、インデックスツリーの深さは慎重に判断する必要があります。層が多すぎるとカーネルのスタックをオーバーフローさせます。</p></li>
+</ol>
+</div></blockquote>
+</section>
+<section id="object-definition">
+<h2>オブジェクトの定義<a class="headerlink" href="#object-definition" title="この見出しへのパーマリンク">¶</a></h2>
+<p>オブジェクトを定義するには、次の構造の型を埋め込む必要があります。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fscache_cookie_def
+{
+        uint8_t name[16];
+        uint8_t type;
+
+        struct fscache_cache_tag *(*select_cache)(
+                const void *parent_netfs_data,
+                const void *cookie_netfs_data);
+
+        enum fscache_checkaux (*check_aux)(void *cookie_netfs_data,
+                                           const void *data,
+                                           uint16_t datalen,
+                                           loff_t object_size);
+
+        void (*get_context)(void *cookie_netfs_data, void *context);
+
+        void (*put_context)(void *cookie_netfs_data, void *context);
+
+        void (*mark_pages_cached)(void *cookie_netfs_data,
+                                  struct address_space *mapping,
+                                  struct pagevec *cached_pvec);
+};
+</pre></div>
+</div>
+<p>これは次のフィールドを持ちます：</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>オブジェクトのタイプ [必須]</p>
+<p>これは次の値のいずれかです：</p>
+<blockquote>
+<div><dl class="simple">
+<dt>FSCACHE_COOKIE_TYPE_INDEX</dt><dd><p>これは特殊なFS-Cache型のインデックスを定義します。</p>
+</dd>
+<dt>FSCACHE_COOKIE_TYPE_DATAFILE</dt><dd><p>これは通常のデータファイルを定義します。</p>
+</dd>
+<dt>2〜255の間の他の値</dt><dd><p>これはXATTRなどの特異なオブジェクトを定義します。</p>
+</dd>
+</dl>
+</div></blockquote>
+</li>
+<li><p>オブジェクトタイプの名前（NUL終端でない場合、最大16文字まで）[任意]</p></li>
+<li><p>インデックスを保存するキャッシュを選択する関数 [任意]</p>
+<p>非インデックスオブジェクトのインスタンス化中にインデックスをキャッシュにインスタンス化する必要がある場合、この関数が呼び出されます。非インデックスオブジェクトの直下のインデックス親のみが照会されます。階層上にあるインデックスは複数のキャッシュに保存される可能性があります。非インデックスオブジェクトまたはインデックス子のみを持つインデックスにはこの関数を提供する必要はありません。</p>
+<p>この関数が提供されていないかNULLを返す場合、親のリストの最初のキャッシュが選ばれます。親のリストにない場合は、マスターリストの最初のキャッシュが選ばれます。</p>
+</li>
+<li><p>補助データを検証する関数 [任意]</p>
+<p>この関数は、キャッシュ内のこのオブジェクトの一致が有効であるかを確認するために呼び出されます。例えばAFSでは、サーバーから返されたデータバージョン番号と補助データを比較して、キャッシュ内のインデックスエントリがまだ有効かどうかを確認できます。</p>
+<p>この関数が存在しない場合、キャッシュ内の一致するオブジェクトは常に有効とみなされます。</p>
+<p>この関数にはキャッシュが持つオブジェクトサイズの概念が渡され、これを使って整合性を管理することもできます。</p>
+<p>存在する場合、この関数は次の値のいずれかを返す必要があります：</p>
+<blockquote>
+<div><dl class="simple">
+<dt>FSCACHE_CHECKAUX_OKAY</dt><dd><ul class="simple">
+<li><p>エントリがそのままでは問題ない</p></li>
+</ul>
+</dd>
+<dt>FSCACHE_CHECKAUX_NEEDS_UPDATE</dt><dd><ul class="simple">
+<li><p>エントリが更新が必要</p></li>
+</ul>
+</dd>
+<dt>FSCACHE_CHECKAUX_OBSOLETE</dt><dd><ul class="simple">
+<li><p>エントリが削除されるべき</p></li>
+</ul>
+</dd>
+</dl>
+</div></blockquote>
+<p>この関数は、キャッシュ内の補助データからデータを抽出してネットファイルシステム（netfs）の構造体にコピーすることもできます。</p>
+</li>
+<li><p>完了コールバックのコンテキストを管理する関数のペア [任意]</p>
+<p>キャッシュの読み書き関数は、コンテキストを渡され、その後そのコンテキストがI/O完了コールバック関数に渡されます。I/O完了が呼び出されるまでこのコンテキストが有効であることを確保するため、2つの関数が提供されることがあります：コンテキストに追加の参照を取得する関数と、参照を解除する関数。</p>
+<p>コンテキストが使用されないか、またはスコープ外にならないオブジェクトのタイプである場合、これらの関数は必要ありません。インデックスについては、インデックスにデータが含まれないため、これらの関数は必要ありません。これらの関数は割込みコンテキストで呼び出されるため、スリープを許容しません。</p>
+</li>
+<li><p>ページをキャッシュメタデータを保持するようにマークする関数[オプション]</p>
+<p>これはキャッシュがこのページにメモリ内情報を保持していることを示し、netfsが完了後にこのページをアンキャッシュするようにするためのものです。この処理はディスクにデータがあるかどうかを示すものではありません。複数のページが一度にマークされる可能性があることに注意してください。</p>
+<p>この関数が呼び出される前にPG_fscacheビットがページに設定されているため、この設定が十分であれば関数は提供する必要がありません。</p>
+<p>インデックスについては、データが許可されていないため、この関数は必要ありません。</p>
+</li>
+<li><p>キャッシュメタデータを保持するすべてのページをアンマークする関数[必須]</p>
+<p>これはFS-Cacheがバックイングストアをクッキーからアンバインドしていることを示し、ページ上のすべてのマークをクリアして混乱を防ぐことを意味します。注意点として、キャッシュはすでにすべてのトラッキング情報を破棄しているため、ページを明示的にアンキャッシュする必要はありません。</p>
+<p>インデックスについては、データが許可されていないため、この関数は必要ありません。</p>
+</li>
+</ol>
+</div></blockquote>
+</section>
+<section id="network-filesystem-un-registration">
+<h2>ネットワークファイルシステムの（登録と解除）<a class="headerlink" href="#network-filesystem-un-registration" title="この見出しへのパーマリンク">¶</a></h2>
+<p>最初のステップはネットワークファイルシステムをキャッシュに宣言することです。これにはプライマリインデックスのレイアウト（AFSの場合、「セル」レベル）を指定することも含まれます。</p>
+<p>登録関数は以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int fscache_register_netfs(struct fscache_netfs *netfs);
+</pre></div>
+</div>
+<p>これはネットfsの定義へのポインタを渡します。適切に0またはエラーを返します。</p>
+<p>kAFSの場合、登録は以下の通り行われます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>ret = fscache_register_netfs(&amp;afs_cache_netfs);
+</pre></div>
+</div>
+<p>最後のステップは、もちろんアンレジストレーションです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void fscache_unregister_netfs(struct fscache_netfs *netfs);
+</pre></div>
+</div>
+</section>
+<section id="cache-tag-lookup">
+<h2>キャッシュタグの検索<a class="headerlink" href="#cache-tag-lookup" title="この見出しへのパーマリンク">¶</a></h2>
+<p>FS-Cacheは複数のキャッシュの使用を許可しています。特定のインデックスサブツリーを特定のキャッシュにバインドするためには、2番目のステップとしてキャッシュ表現タグを検索する必要があります。このステップはオプションであり、FS-Cacheがどのキャッシュを使用するかを完全に決定するのも可能です。ただし、その問題点はFS-Cacheが常に最初に登録されたキャッシュを選択するためです。</p>
+<p>名前付きタグの表現を取得するには：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fscache_cache_tag *fscache_lookup_cache_tag(const char *name);
+</pre></div>
+</div>
+<p>これは名前としてテキスト文字列を渡し、タグの表現を返します。エラーを返すことは決してありません。メモリが不足した場合、ダミータグを返す可能性があります。これにより、このタグでのキャッシュが抑制されます。</p>
+<p>取得した表現は、この関数に渡すことで解放しなければなりません：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void fscache_release_cache_tag(struct fscache_cache_tag *tag);
+</pre></div>
+</div>
+<p>FS-Cacheは、オブジェクト定義操作 select_cache() を呼び出すときにこのタグを取得します。</p>
+</section>
+<section id="index-registration">
+<h2>インデックスの登録<a class="headerlink" href="#index-registration" title="この見出しへのパーマリンク">¶</a></h2>
+<p>3番目のステップは、ファイルを検索するために使用できるインデックス階層の一部をFS-Cacheに通知することです。これは、ファイルへのパス内の各インデックスに対してクッキーを要求することで実現されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fscache_cookie *
+fscache_acquire_cookie(struct fscache_cookie *parent,
+                       const struct fscache_object_def *def,
+                       const void *index_key,
+                       size_t index_key_len,
+                       const void *aux_data,
+                       size_t aux_data_len,
+                       void *netfs_data,
+                       loff_t object_size,
+                       bool enable);
+</pre></div>
+</div>
+<p>この関数は、親によって表されるインデックス内のインデックスエントリを作成し、defによって指される操作を呼び出してインデックスエントリを埋めます。</p>
+<p>親内のオブジェクトを表す一意のキーは、index_key によって指され、その長さは index_key_len です。</p>
+<p>キャッシュ内に保存される補助データのオプションなblobは、aux_data によって指され、その長さは aux_data_len でなければなりません。これは通常、整合性データの保存に使用されます。</p>
+<p>netfsはnetfs_dataに任意の値を渡すことができます。これは、呼び出し元からの呼び出しの際にこの値が提示されます。また、トレースやメッセージのロギングにも使用できます。</p>
+<p>キャッシュはオブジェクトに添付されたデータのサイズを追跡し、この値を object_size に設定します。インデックスの場合、この値は0でなければなりません。この値は -&gt;check_aux() コールバックに渡されます。</p>
+<p>この関数はエラーを返しません - すべてのエラーは内部で処理されます。ただし、クッキーがないことを示すためにNULLを返すこともできます。このトークンを別の取得（または、解放クッキー、読み込みページ、書き込みページ関数など - 以下参照）の親としてこの関数に戻すことは問題ありません。</p>
+<p>さらに、階層の下で非インデックスオブジェクトが作成されるまで、キャッシュ内にインデックスが実際に作成されません。また、インデックスは複数の異なるキャッシュで異なるタイミングで独立して作成される可能性があります。これはすべて透明に処理され、netfsはこれらを認識しません。</p>
+<p>enabled が false の場合、クッキーは無効状態で作成されます。クッキーを使用するには有効にする必要があります。無効なクッキーは fscache_enable_cookie() を呼び出して有効にできます（以下参照）。</p>
+<p>たとえば、AFSでは、セルがプライマリインデックスに追加されます。このインデックスエントリには、このセル内のボリュームマッピングを含む依存インノードがあります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>cell-&gt;cache =
+        fscache_acquire_cookie(afs_cache_netfs.primary_index,
+                               &amp;afs_cell_cache_index_def,
+                               cell-&gt;name, strlen(cell-&gt;name),
+                               NULL, 0,
+                               cell, 0, true);
+</pre></div>
+</div>
+<p>その後、特定のボリュームはIDによってこのインデックスに追加され、 vnode（AFSインノードの同等物）用の別のインデックスが作成されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>volume-&gt;cache =
+        fscache_acquire_cookie(volume-&gt;cell-&gt;cache,
+                               &amp;afs_volume_cache_index_def,
+                               &amp;volume-&gt;vid, sizeof(volume-&gt;vid),
+                               NULL, 0,
+                               volume, 0, true);
+</pre></div>
+</div>
+</section>
+<section id="data-file-registration">
+<h2>データファイルの登録<a class="headerlink" href="#data-file-registration" title="この見出しへのパーマリンク">¶</a></h2>
+<p>4番目のステップは、キャッシュ内にデータファイルを作成するリクエストです。これはインデックスクッキーの取得と同一です。違いは、オブジェクト定義のタイプがインデックスタイプ以外であることです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>vnode-&gt;cache =
+        fscache_acquire_cookie(volume-&gt;cache,
+                               &amp;afs_vnode_cache_object_def,
+                               &amp;key, sizeof(key),
+                               &amp;aux, sizeof(aux),
+                               vnode, vnode-&gt;status.size, true);
+</pre></div>
+</div>
+</section>
+<section id="miscellaneous-object-registration">
+<h2>その他のオブジェクトの登録<a class="headerlink" href="#miscellaneous-object-registration" title="この見出しへのパーマリンク">¶</a></h2>
+<p>オプションのステップとして、キャッシュに雑種のタイプのオブジェクトを作成するリクエストを行うことができます。これはインデックスクッキーの取得とほぼ同じです。違いは、オブジェクト定義におけるタイプがインデックスタイプ以外であることです。親オブジェクトがインデックスである可能性もありますが、より可能性が高いのは、データファイルなどの他のタイプのオブジェクトです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>xattr-&gt;cache =
+        fscache_acquire_cookie(vnode-&gt;cache,
+                               &amp;afs_xattr_cache_object_def,
+                               &amp;xattr-&gt;name, strlen(xattr-&gt;name),
+                               NULL, 0,
+                               xattr, strlen(xattr-&gt;val), true);
+</pre></div>
+</div>
+<p>雑種のオブジェクトは、拡張属性やディレクトリエントリなどを保存するために使用されることがあります。</p>
+</section>
+<section id="setting-the-data-file-size">
+<h2>データファイルサイズの設定<a class="headerlink" href="#setting-the-data-file-size" title="この見出しへのパーマリンク">¶</a></h2>
+<p>第5ステップは、ファイルの物理属性（サイズなど）を設定することです。これはキャッシュにスペースを自動的に確保しないですが、キャッシュがデータ追跡用のメタデータを適切に調整できるようにします:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int fscache_attr_changed(struct fscache_cookie *cookie);
+</pre></div>
+</div>
+<p>キャッシュは、バックイングキャッシュが存在しないか、キャッシュに必要な追加メタデータのスペースがなければ -ENOBUFS を返します。</p>
+<p>このサイズを超えてキャッシュ内のデータページを読み書きしようとした場合、-ENOBUFS で拒否される可能性があります。</p>
+<p>この操作は、将来の時点で非同期に属性調整をスケジュールします。そのため、関数が呼び出し元に戻る後でも発生する可能性があります。属性調整は読み込みおよび書き込み操作を除きます。</p>
+</section>
+<section id="page-alloc-read-write">
+<h2>ページの割り当て/読み込み/書き込み<a class="headerlink" href="#page-alloc-read-write" title="この見出しへのパーマリンク">¶</a></h2>
+<p>第6ステップは、キャッシュ内でページを保存および取得することです。これを行うための関数は3つあります。</p>
+<p>注意:</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>ページを再読み込みまたは再割当する前に、まずキャッシュから外す必要があります。</p></li>
+<li><p>ネットファイルシステム（netfs）のページがページキャッシュから解放される際には、そのページをキャッシュから外す必要があります。</p></li>
+<li><p>ページをキャッシュに書き込む前に、以前に読み込まれたか、または割当されたかを確認する必要があります。</p></li>
+</ol>
+</div></blockquote>
+<p>これにより、キャッシュがページ追跡を正しい順序で維持できます。</p>
+<section id="page-read">
+<h3>ページ読み込み<a class="headerlink" href="#page-read" title="この見出しへのパーマリンク">¶</a></h3>
+<p>まず、netfs は FS-Cache に、特定のファイルの特定のページがキャッシュされている場合にその内容を読み込み、そうでない場合はスペースを割当てるよう依頼します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>typedef
+void (*fscache_rw_complete_t)(struct page *page,
+                              void *context,
+                              int error);
+
+int fscache_read_or_alloc_page(struct fscache_cookie *cookie,
+                               struct page *page,
+                               fscache_rw_complete_t end_io_func,
+                               void *context,
+                               gfp_t gfp);
+</pre></div>
+</div>
+<p>クッキー引数には、インデックスでないオブジェクトのクッキーを指定する必要があります。指定されたページにはデータがロードされ（またページ番号を指定する役割も果たします）、gfp 引数はメモリ割当の方法を制御します。</p>
+<p>クッキーが inode がキャッシュされていないことを示している場合:</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>関数は -ENOBUFS を返します。</p></li>
+</ol>
+</div></blockquote>
+<p>それ以外に、キャッシュにページのコピーが存在する場合:</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>そのページに mark_pages_cached() クッキー操作が呼び出されます。</p></li>
+<li><p>関数は、指定されたページに直接キャッシュのバックイングデバイスからデータを読み込むリクエストを送信します。</p></li>
+<li><p>関数は 0 を返します。</p></li>
+<li><p>読み込みが完了した後、end_io_func() が呼び出されます:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>クッキーが作成されたときに提供されたnetfsデータ。</p></li>
+<li><p>ページ記述子。</p></li>
+<li><p>上記の関数に渡されたコンテキスト引数。これは上記のget_context/put_context関数を使用して維持されます。</p></li>
+<li><p>成功時は0、エラー時は負のエラーコードを表す引数。</p></li>
+</ul>
+</div></blockquote>
+<p>エラーが発生した場合、ページに利用可能なデータが含まれていないと想定されるため、fscache_readpages_cancel()を呼び出す必要があります。</p>
+<p>読み込みがエラーとなった場合、end_io_func()はプロセスコンテキストで呼び出されます。ただし、読み込みが成功した場合は割込みコンテキストで呼び出される可能性があります。</p>
+</li>
+</ol>
+</div></blockquote>
+<p>キャッシュにコピーが存在しないが、キャッシュがページを保存できる場合:</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>そのページに mark_pages_cached() クッキー操作が呼び出されます。</p></li>
+<li><p>キャッシュにブロックが予約され、オブジェクトに適切な場所にアタッチされる可能性があります。</p></li>
+<li><p>関数は-ENODATAを返します。</p></li>
+</ol>
+</div></blockquote>
+<p>この関数は-ENOMEMまたは-EINTRを返すこともあり、その場合キャッシュからデータを読み取っていません。</p>
+</section>
+<section id="page-allocate">
+<h3>ページ割り当て<a class="headerlink" href="#page-allocate" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ファイルが拡張されてキャッシュにデータが存在しないと予想される場合、ブロックを単純に割り当てることができます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int fscache_alloc_page(struct fscache_cookie *cookie,
+                       struct page *page,
+                       gfp_t gfp);
+</pre></div>
+</div>
+<p>これはfscache_read_or_alloc_page()関数に似ていますが、キャッシュからデータを読み取らない点が異なります。ブロックが割り当てられた場合0を返し、他の関数では-ENODATAを返します。キャッシュへの書き込み前にどちらか一方を実行する必要があります。</p>
+<p>成功した場合、mark_pages_cached() クッキー操作がページに呼び出されます。</p>
+</section>
+<section id="page-write">
+<h3>ページ書き込み<a class="headerlink" href="#page-write" title="この見出しへのパーマリンク">¶</a></h3>
+<p>netfsがページの内容を変更した場合（初期ダウンロードによるものか、ユーザーが書き込みを行った場合でも）、ページをキャッシュに書き戻す必要があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int fscache_write_page(struct fscache_cookie *cookie,
+                       struct page *page,
+                       loff_t object_size,
+                       gfp_t gfp);
+</pre></div>
+</div>
+<p>クッキー引数にはデータファイルのクッキーを指定し、ページには書き込むデータを含める必要があります（またページ番号を指定するためにも使用されます）。object_sizeはオブジェクトの再定義されたサイズで、gfp引数はメモリ割当の方法を制御します。</p>
+<p>ページはまず読み込まれたり、割り当てられたりした成功した状態でなければならず、書き込み前にキャッシュされていない必要があります。</p>
+<p>クッキーがインノードがキャッシュされていないことを示している場合:</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>関数は -ENOBUFS を返します。</p></li>
+</ol>
+</div></blockquote>
+<p>それ以外に、キャッシュにこのページを保持するために空間を確保できる場合:</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>PG_fscache_writeがページに設定されます。</p></li>
+<li><p>関数は、指定されたページからデータをキャッシュのバックイングデバイスに直接書き込むリクエストを送信します。</p></li>
+<li><p>関数は 0 を返します。</p></li>
+<li><p>書き込みが完了すると、ページのPG_fscache_writeがクリアされ、そのビットを待っているすべてのプロセスが起動されます。</p></li>
+</ol>
+</div></blockquote>
+<p>キャッシュに空きがなければ -ENOBUFS が返されます。予期せぬ状況（ディスクエラーなど）により書き込みが行われなかったにもかかわらず PG_fscache_write ビットがクリアされる可能性もあります。</p>
+<p>書き込みは非同期で行われます。</p>
+</section>
+<section id="multiple-page-read">
+<h3>複数ページの読み込み<a class="headerlink" href="#multiple-page-read" title="この見出しへのパーマリンク">¶</a></h3>
+<p>readpages() アドレス空間操作で要求されたように、複数のページを一度に読み込む機能が提供されています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int fscache_read_or_alloc_pages(struct fscache_cookie *cookie,
+                                struct address_space *mapping,
+                                struct list_head *pages,
+                                int *nr_pages,
+                                fscache_rw_complete_t end_io_func,
+                                void *context,
+                                gfp_t gfp);
+</pre></div>
+</div>
+<p>fscache_read_or_alloc_page() と同様の仕組みで動作しますが、以下の点が異なります。</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>データを取得できるページは pages から削除され、nr_pages も減らされ、ディスクに読み込まれるよう送信されます。ディスク上の隣接するページの読み込みは効率を高めるためにマージされることがあります。</p></li>
+<li><p>複数のページが読み込まれたり割当先になった場合、mark_pages_cached() コークレート操作が一括で呼び出されます。</p></li>
+<li><p>一般的なエラーが発生した場合は、そのエラーが返されます。</p>
+<p>また、一部のページが割当先にできなかったり読み込めなかった場合、-ENOBUFS が返されます。</p>
+<p>一部のページが読み込めなかったが割当先にされた場合、-ENODATA が返されます。</p>
+<p>すべてのページが読み込まれた場合、0 が返され、リストは空になり、 <code class="docutils literal notranslate"><span class="pre">*nr_pages</span></code> 値は 0 になります。</p>
+</li>
+<li><p>読み込みが完了するごとに end_io_func が各ページに対して呼び出されます。エラーが発生した場合（error != 0）はプロセスコンテキストで呼び出されますが、エラーがない場合は割込みコンテキストで呼び出される可能性があります。</p></li>
+</ol>
+</div></blockquote>
+<p>注意：-ENODATA、-ENOBUFS またはその他のエラーが返されたとしても、一部のページが読み込まれ、一部が割当先になる可能性があります。そのようなページは適切にマークされ、キャッシュ解除が必要です。</p>
+</section>
+<section id="cancellation-of-unread-pages">
+<h3>未読ページのキャンセル<a class="headerlink" href="#cancellation-of-unread-pages" title="この見出しへのパーマリンク">¶</a></h3>
+<p>fscache_read_or_alloc_pages() に1つ以上のページが渡され、キャッシュから読み込まれず、下位ファイルシステムからも読み込まれなかった場合、そのページのマークや予約を削除する必要があります。これは以下の関数を呼び出すことで実現できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void fscache_readpages_cancel(struct fscache_cookie *cookie,
+                              struct list_head *pages);
+</pre></div>
+</div>
+<p>呼び出し元に戻る前に呼び出してください。cookie 引数は fscache_read_or_alloc_pages() に渡されたものと同じにしてください。pages リスト内のすべてのページが検査され、PG_fscache が設定されているページはキャッシュ解除されます。</p>
+</section>
+</section>
+<section id="page-uncaching">
+<h2>ページのアンキャッシュ<a class="headerlink" href="#page-uncaching" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ページをキャッシュ解除するには、この関数を呼び出してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void fscache_uncache_page(struct fscache_cookie *cookie,
+                          struct page *page);
+</pre></div>
+</div>
+<p>この関数は、ネットFS ページに対するキャッシュ内のメモリ表現を解放するためのものです。この関数は、上記の読み込みまたは書き込みページ関数が呼び出されたすべてのページに対して1回ずつ呼び出さなければなりません。キャッシュのメモリ内の追跡情報を正しく破壊するためです。</p>
+<p>注意：ページはデータファイルから明示的に削除できません。データファイル全体を廃止する必要があります（下記の relinquish コークレート関数を参照してください）。</p>
+<p>さらに、この操作はread/allocおよびwrite関数によって開始された非同期読み込みまたは書き込み操作をキャンセルしないことに注意してください。そのため、ページ無効化関数は以下のものを使用しなければなりません。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>bool fscache_check_page_write(struct fscache_cookie *cookie,
+                              struct page *page);
+</pre></div>
+</div>
+<p>キャッシュにページが書き込まれているかを確認するためのもので、</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void fscache_wait_on_page_write(struct fscache_cookie *cookie,
+                                struct page *page);
+</pre></div>
+</div>
+<p>書き込まれている場合は待機するためのものです。</p>
+<p>releasepage()を実装する際には、vmscanがページを強制的に排出しようとしている場合のヒューリスティクスを管理する特別なFS-Cache関数が存在します。これは、キャッシュがページをキャッシュに書き込もうとしている場合（その場合、メモリの割当が必要になることもあります）と衝突する可能性があるためです。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>bool fscache_maybe_release_page(struct fscache_cookie *cookie,
+                                struct page *page,
+                                gfp_t gfp);
+</pre></div>
+</div>
+<p>この関数はnetfsのcookieと、releasepage()に渡されたページおよびgfp引数を取ります。ページが何らかの理由でまだ解放できない場合はfalseを返し、trueを返すとページがキャッシュから解除され、解放可能になったことを示します。</p>
+<p>ページの解放を可能にするため、この関数は進行中のストレージ要求を待機するか、またはストレージ要求をキャンセルするかを選択します。後者の場合は、そのページは今回はキャッシュに保存されません。</p>
+<section id="bulk-image-page-uncache">
+<h3>Bulk Image Page Uncache<a class="headerlink" href="#bulk-image-page-uncache" title="この見出しへのパーマリンク">¶</a></h3>
+<p>inodeにアタッチされているすべてのページに対してuncacheを実行するための簡易ルーチンが提供されています。これは、inode上のページがキャッシュ上のページと1対1で対応していると仮定しています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void fscache_uncache_all_inode_pages(struct fscache_cookie *cookie,
+                                     struct inode *inode);
+</pre></div>
+</div>
+<p>この関数は、ページがキャッシュされた際に使用されたnetfsのcookieと、ページがアタッチされているinodeを取ります。この関数は、キャッシュへのページの書き込みが完了するのを待機し、キャッシュがページを一般に処理を終了するのを待機します。エラーは返されません。</p>
+</section>
+</section>
+<section id="index-and-data-file-consistency">
+<h2>インデックスとデータファイルの整合性<a class="headerlink" href="#index-and-data-file-consistency" title="この見出しへのパーマリンク">¶</a></h2>
+<p>オブジェクトの補助データがキャッシュ内で最新であるかを確認するには、次の関数を呼び出せます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int fscache_check_consistency(struct fscache_cookie *cookie,
+                              const void *aux_data);
+</pre></div>
+</div>
+<p>この関数はnetfsに呼び戻して、cookieに関連する補助データが正しいかを確認します。aux_dataがNULLでない場合、まず補助データバッファを更新します。正しい場合は0を、正しい場合は-ESTALEを返します。また、-ENOMEMや-ERESTARTSYSも返す可能性があります。</p>
+<p>インデックスやその他のオブジェクトのインデックスデータの更新を要求するには、次の関数を呼び出さなければなりません。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void fscache_update_cookie(struct fscache_cookie *cookie,
+                           const void *aux_data);
+</pre></div>
+</div>
+<p>この関数は、aux_dataがNULLでない場合、cookieの補助データバッファをaux_dataから更新し、その後、そのデータをディスクに保存するスケジュールを設定します。親インデックス定義の更新メソッドが呼び出されてデータを転送します。</p>
+<p>一部の更新は、データブロックがデータファイルオブジェクトに追加されるなど、他のタイミングで自動的に発生する可能性があります。</p>
+</section>
+<section id="cookie-enablement">
+<h2>クッキーの有効化<a class="headerlink" href="#cookie-enablement" title="この見出しへのパーマリンク">¶</a></h2>
+<p>クッキーは有効または無効の2つの状態のいずれかに存在します。クッキーが無効の場合、子クッキーの取得や状態の確認・更新・無効化、バックイングページの割り当て・読み込み・書き込みを無視しますが、ページのアンキャッシュ化やクッキーの解放は依然として可能です。</p>
+<p>初期の有効状態はfscache_acquire_cookie()によって設定されますが、後でクッキーを有効または無効にすることも可能です。クッキーを無効にするには、以下を呼び出します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void fscache_disable_cookie(struct fscache_cookie *cookie,
+                            const void *aux_data,
+                            bool invalidate);
+</pre></div>
+</div>
+<p>クッキーがすでに無効でない場合、この関数は他の有効化・無効化操作をブロックし、クッキーを無効化中とマークし、バックイングオブジェクトを破棄または無効化し、関連するオブジェクトの活動が停止するのを待ってからクッキーをアンロックします。</p>
+<p>すべての可能性のある失敗は内部で処理されます。呼び出し元は、すべてのページのマーキングをクリアするためにfscache_uncache_all_inode_pages()を呼び出すことを検討すべきです。</p>
+<p>クッキーは有効化または再有効化するには、以下を使用します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void fscache_enable_cookie(struct fscache_cookie *cookie,
+                           const void *aux_data,
+                           loff_t object_size,
+                           bool (*can_enable)(void *data),
+                           void *data)
+</pre></div>
+</div>
+<p>クッキーがすでに有効でない場合、この関数は他の有効化・無効化操作をブロックし、can_enable()を呼び出し、クッキーがインデックスクッキーでない場合、バックイングオブジェクトの取得手順を開始します。</p>
+<p>オプションのcan_enable()関数はdata引数を受け取り、有効化が実際に開始されるべきかどうかを判断して返します。</p>
+<p>すべての可能性のある失敗は内部で処理されます。一時的なバックイングオブジェクトが割り当てられた場合に限り、クッキーが有効とマークされます。</p>
+<p>オブジェクトのデータサイズはobject_sizeから更新され、-&gt;check_aux()関数に渡されます。</p>
+<p>有効化ロック内でaux_dataがNULLでない場合、クッキーの補助データバッファはaux_dataから更新されます。</p>
+</section>
+<section id="miscellaneous-cookie-operations">
+<h2>その他のクッキー操作<a class="headerlink" href="#miscellaneous-cookie-operations" title="この見出しへのパーマリンク">¶</a></h2>
+<p>いくつかの操作を用いてクッキーを制御できます:</p>
+<blockquote>
+<div><blockquote>
+<div><ul>
+<li><p>クッキーのピン固定:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int fscache_pin_cookie(struct fscache_cookie *cookie);
+void fscache_unpin_cookie(struct fscache_cookie *cookie);
+</pre></div>
+</div>
+</li>
+</ul>
+<p>これらの操作はデータクッキーをキャッシュにピン固定し、ピン固定を解除するのを許可します。インデックスクッキーには適用されません。</p>
+<p>ピン固定関数は成功時に0を返し、クッキーがキャッシュでサポートされていない場合は-ENOBUFS、キャッシュがピン固定をサポートしていない場合は-EOPNOTSUPP、十分なスペースがない場合は-ENOSPC、その他の問題がある場合は-ENOMEMまたは-EIOを返します。</p>
+</div></blockquote>
+<ul>
+<li><p>データ領域の予約:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int fscache_reserve_space(struct fscache_cookie *cookie, loff_t size);
+</pre></div>
+</div>
+<p>これはネットファイルシステムがファイルの指定された量をキャッシュに予約するのを許可します。ファイルの現在のサイズを超える量を要求しても、今後の拡張を考慮するため許可されます。</p>
+<p>sizeがゼロの場合、予約はキャンセルされます。</p>
+<p>操作が成功した場合は0を返します。クッキーがキャッシュによってサポートされていない場合は-ENOBUFSを、キャッシュが予約をサポートしていない場合は-EOPNOTSUPPを、操作を実行するための十分なスペースがない場合は-ENOSPCを、それ以外の問題がある場合は-ENOMEMまたは-EIOを返します。</p>
+<p>この操作はキャッシュ内のオブジェクトを固定しません。使用されていない場合は、スペースを確保するために削除される可能性があります。</p>
+</li>
+</ul>
+</div></blockquote>
+</section>
+<section id="cookie-unregistration">
+<h2>クッキーの解除<a class="headerlink" href="#cookie-unregistration" title="この見出しへのパーマリンク">¶</a></h2>
+<p>クッキーを削除するには、この関数を呼び出す必要があります。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void fscache_relinquish_cookie(struct fscache_cookie *cookie,
+                               const void *aux_data,
+                               bool retire);
+</pre></div>
+</div>
+<p>retireがゼロでない場合、オブジェクトは再利用のためにマークされ、そのオブジェクトが存在するすべてのアクティブなキャッシュから削除されます。さらに、すべての子オブジェクトもリタイアされます。</p>
+<p>retireがゼロの場合、次の取得関数が呼び出されるときにオブジェクトが再び利用可能になる可能性があります。ここでリタイアはクッキーのピン固定を上書きします。</p>
+<p>aux_dataがNULLでない場合、クッキーの補助データが更新され、キャッシュがディスク上でこれを非同期に更新します。</p>
+<p>非常に重要な注意点があります - 「子」インデックス、オブジェクト、ページのすべてのクッキーがリリクィッシュされた後に、クッキーに対してリリクィッシュを呼び出す必要があります。</p>
+</section>
+<section id="index-invalidation">
+<h2>インデックスの無効化<a class="headerlink" href="#index-invalidation" title="この見出しへのパーマリンク">¶</a></h2>
+<p>インデックスサブツリーを直接無効化する方法はありません。これを実行するには、現在所有しているクッキーをリリクィッシュし、リタイアした後、新しいクッキーを取得する必要があります。</p>
+</section>
+<section id="data-file-invalidation">
+<h2>データファイルの無効化<a class="headerlink" href="#data-file-invalidation" title="この見出しへのパーマリンク">¶</a></h2>
+<p>データを含むオブジェクトを無効化する必要がある場合があります。これは通常、サーバーがネットFSに外的な変更を通知したときに発生します。その際、ネットFSはインノードに関するすべての状態を破棄し、サーバーから再読み込みする必要があります。</p>
+<p>キャッシュオブジェクトを無効化する必要がある場合、次の関数を呼び出すことができます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void fscache_invalidate(struct fscache_cookie *cookie);
+</pre></div>
+</div>
+<p>スピンロックを保持しながら呼び出すことができます。この関数はスレッドプールに作業をdeferします。この時点ですべての既存のストレージ、取得、属性変更操作はキャンセルされ破棄されます。一部の将来の操作は、キャッシュが操作キューにバリアを挿入するまで拒否されます。その後、無効化操作の後に操作が再びキューに追加されます。</p>
+<p>無効化操作は属性変更操作と補助データ更新操作を行います。これらが変更される可能性が高いからです。</p>
+<p>ネットFSが無効化操作が通常の操作を再開できるポイントに到達するのを待つには、次の関数を使用できます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void fscache_wait_on_invalidate(struct fscache_cookie *cookie);
+</pre></div>
+</div>
+</section>
+<section id="fs-cache-specific-page-flag">
+<h2>FS-cache専用のページフラグ<a class="headerlink" href="#fs-cache-specific-page-flag" title="この見出しへのパーマリンク">¶</a></h2>
+<p>FS-Cacheは自身の目的のためにページフラグPG_private_2を使用します。これはPG_fscacheと別名で呼ばれます。</p>
+<p>PG_fscacheは、ページがキャッシュによって認識されていることを示し、ページが消失する際にはキャッシュに通知する必要があることを表します。これはnetfsに、このページに関心があることを示すフラグであり、関心とはそのページへのポインタ、割り当てられたリソース、または進行中のI/Oなどが含まれます。</p>
+<p>netfsはreleasepage()などのメソッドでこの情報を活用し、ページをアンキャッシュする必要があるかどうか、または更新する必要があるかどうかを判断します。</p>
+<p>さらに、このビットが設定されている場合、PG_privateが設定されていない場合でもreleasepage()およびinvalidatepage()操作が呼び出され、ページを削除します。これにより、fscache_read_or_alloc_pages()が呼ばれる前にキャッシュが試行されることが可能になります。 <a class="reference internal" href="../../core-api/mm-api.html#c.read_cache_pages" title="read_cache_pages"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_cache_pages()</span></code></a> fscache_read_or_alloc_pages()が呼ばれる前にこの操作が呼び出されるため、前者は特定の状況において与えられたページを解放しようとします。</p>
+<p>このビットはPG_privateなどの他のビットと重複しません。これは、ブロックバッファリングコードを使用するファイルシステムでもFS-Cacheを使用可能であることを意味します。</p>
+<p>このフラグには複数の操作が定義されています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int PageFsCache(struct page *page);
+void SetPageFsCache(struct page *page)
+void ClearPageFsCache(struct page *page)
+int TestSetPageFsCache(struct page *page)
+int TestClearPageFsCache(struct page *page)
+</pre></div>
+</div>
+<p>これらの関数は、PG_fscacheのビットのテスト、設定、クリア、テストと設定、テストとクリアの操作です。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxカーネル内のファイルシステム</a><ul class="current">
+<li class="toctree-l2 current"><a class="reference internal" href="../index.html#core-vfs-documentation">コアVFSドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../index.html#filesystem-support-layers">ファイルシステムサポートレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../index.html#filesystems">ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxカーネル内のファイルシステム</a><ul>
+<li><a href="index.html">Filesystem Caching</a><ul>
+<li>前へ: <a href="cachefiles.html" title="前章">CacheFiles: キャッシュON 既にマウント済みファイルシステム</a></li>
+<li>次へ: <a href="operations.html" title="次章">非同期操作の処理</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/filesystems/caching/netfs-api.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

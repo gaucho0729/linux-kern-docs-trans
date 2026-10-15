@@ -1,0 +1,1624 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Linux用USB Gadget API — The Linux Kernelドキュメンテーション</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="anchors.html" rel="next" title="USBアンカー"/>
+<link href="usb.html" rel="prev" title="Linux-USBホスト側API"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="usb-gadget-api-for-linux">
+<h1>Linux用USBガジェットAPI<a class="headerlink" href="#usb-gadget-api-for-linux" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>David Brownell</p>
+</dd>
+<dt class="field-even">日付</dt>
+<dd class="field-even"><p>2004年8月20日</p>
+</dd>
+</dl>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このドキュメントは、Linux-USBの「Gadget」カーネルモードAPIを紹介しており、Linuxを埋め込んだペリフェラルやその他のUSBデバイス内で使用できます。APIの構造概要を説明し、システム開発プロジェクトにおける位置づけを示します。これはLinuxで公開された最初のGadget APIであり、以下の重要な問題に対応しています:</p>
+<ul class="simple">
+<li><p>USB 2.0をサポートし、1秒数十メガバイトのデータストリームを処理する高速デバイスに対応します。</p></li>
+<li><p>数十のエンドポイントを持つデバイスにも、2つの固定機能エンドポイントを持つデバイスにも同様に対応します。Gadgetドライバーは新しいハードウェアへの移植が容易に設計されています。</p></li>
+<li><p>複雑なUSBデバイス機能（複数の設定、複数のインターフェース、コンポジットデバイス、代替インターフェース設定など）を柔軟に公開できるほど汎用性があります。</p></li>
+<li><p>USB「On-The-Go」(OTG)のサポートを、Linux-USBホスト側の更新と併せて実現しています。</p></li>
+<li><p>Linux-USBホスト側APIとデータ構造やAPIモデルを共有しています。これによりOTGサポートが強化され、今後ホスト側とデバイス側で同じI/Oモデルが使用されるより対称的なフレームワークへの準備が整います。</p></li>
+<li><p>ミニマリスト設計により、新しいデバイスコントローラハードウェアのサポートが容易です。I/O処理はメモリやCPUリソースへの大きな負担を伴いません。</p></li>
+</ul>
+<p>ほとんどのLinux開発者は、PCやワークステーション、サーバーにUSBハードウェアがあるため、このAPIを使用できません。 <code class="docutils literal notranslate"><span class="pre">host</span></code> Linuxユーザーで埋め込みシステムを持つのは、USBペリフェラルハードウェアを持つ場合がより一般的です。このようなハードウェア内で動作するドライバーを、より一般的なLinux「USBデバイスドライバー」と区別するために、異なる用語が使われます。ペリフェラル内に存在するドライバーは「USB Gadgetドライバー」と呼ばれます。USBプロトコルのやり取りにおいて、デバイスドライバーはマスター（または「クライアントドライバー」）であり、Gadgetドライバーはスレーブ（または「ファンクションドライバー」）です。</p>
+<p>Gadget APIはホスト側Linux-USB APIと同様に、リクエストオブジェクトのキューを使用してI/Oバッファをパッケージングし、そのリクエストを送信またはキャンセルできます。標準USBの共通定義も共有しています <em>第9章</em> メッセージ、構造、定数も含まれます。また、両方のAPIはドライバをデバイスにバインドおよびアンバインドします。APIは詳細に違いがあります。なぜなら、ホスト側の現在のURBフレームワークは、ギッジットAPIに不適切な実装詳細や仮定を公開しているからです。制御転送と設定管理のモデルは必然的に異なります（一方はハードウェア中立的なマスター、他方はハードウェアを意識したスレーブ）、しかしここに使用されているエンドポイントI/O APIは、オーバーヘッドが削減されたホスト側APIにも利用可能であるべきです。</p>
+</section>
+<section id="structure-of-gadget-drivers">
+<h2>ギッジットドライバの構造<a class="headerlink" href="#structure-of-gadget-drivers" title="この見出しへのパーマリンク">¶</a></h2>
+<p>USBペリフェラル内に実行されているシステムは、USBプロトコル処理を扱うための少なくとも3つのレイヤーをカーネル内に持つことが通常あり、ユーザー空間コード内に追加のレイヤーを持つ場合もあります。この <code class="docutils literal notranslate"><span class="pre">gadget</span></code> APIは中間レイヤーが最低レイヤー（ハードウェアを直接処理するレイヤー）とやり取りするためのものです。</p>
+<p>Linuxでは、下から上へとこれらのレイヤーは以下の通りです：</p>
+<dl>
+<dt><em>USBコントローラードライバ</em></dt><dd><p>これは最低レイヤーのソフトウェアです。これは唯一ハードウェアとやり取りするレイヤーであり、レジスタ、フィフオ、DMA、IRQ、その他の手段を通じてです。この
+<code class="docutils literal notranslate"><span class="pre">&lt;linux/usb/gadget.h&gt;</span></code> APIはペリフェラルコントローラーのエンドポイントハードウェアを抽象化します。このハードウェアはエンドポイントオブジェクトを通じて公開され、IN/OUTバッファのストリームを受け入れ、ギッジットドライバとやり取りするコールバックを通じて公開されます。通常のUSBデバイスは1つのアップストリームポートしか持たないため、これらドライバのうち1つだけを持ちます。コントローラードライバは複数のギッジットドライバをサポートできますが、一度に1つだけが使用可能です。</p>
+<p>このようなコントローラーハードウェアの例には、PCIベースのNetChip 2280 USB 2.0高速コントローラー、SA-11x0またはPXA-25x UDC（多くのPDAに内蔵）、および多様なその他の製品が含まれます。</p>
+</dd>
+<dt><em>ギッジットドライバ</em></dt><dd><p>このドライバの下限は、コントローラードライバへの呼び出しを用いてハードウェア中立的なUSB機能を実装します。このようなハードウェアは能力や制限が大きく異なり、埋め込み環境で空間が限られているため、ギッジットドライバは通常コンパイル時に特定のコントローラーがサポートするエンドポイントと動作するように設定されます。ギッジットドライバは条件付きコンパイルを用いて複数の異なるコントローラーに移植可能ですが、（最近のカーネルは、新しいハードウェアをサポートする作業を大幅に簡素化するために、 <em>自動設定</em> 多数のバULK向きドライバに対してエンドポイントを自動的に設定します。）ギッジットドライバの責任は以下の通りです：</p>
+<ul class="simple">
+<li><p>セットアップリクエストの処理（ep0プロトコル応答）およびクラス固有の機能の処理</p></li>
+<li><p>設定および文字列デスクリプタの返却</p></li>
+<li><p>設定とインターフェースのオプション設定を再設定し、エンドポイントの有効化および構成を含む</p></li>
+<li><p>ライフサイクルイベントを処理し、ハードウェアへのバインディングの管理、USBのスリープ/再開、リモートウェイクアップ、USBホストからの切断などの処理を行う</p></li>
+<li><p>現在有効化されているすべてのエンドポイントにおけるINおよびOUT転送を管理する</p></li>
+</ul>
+<p>このようなドライバーは特許コードのモジュールとして存在する場合もあるが、Linuxコミュニティではこのアプローチは推奨されていない</p>
+</dd>
+<dt><em>上位レイヤー</em></dt><dd><p>ほとんどのギアドライバーは、Linux内のあるLinuxドライバーまたはフレームワークに接続する上位境界を持ち、ギアドライバーがプロトコル転送を介して生成・消費するデータがこの境界を通じて流れる。例として、</p>
+<ul class="simple">
+<li><p>ユーザーモードコードで、汎用的な（gadgetfs）またはアプリケーション固有のファイルを使用する <code class="docutils literal notranslate"><span class="pre">/dev</span></code></p></li>
+<li><p>ネットワークサブシステム（ネットワークギア、例えばCDC Ethernetモデルギアドライバーなど）</p></li>
+<li><p>データキャプチャドライバー、例えばvideo4Linuxやスキャナードライバー、またはテスト・測定機器</p></li>
+<li><p>入力サブシステム（HIDギア）</p></li>
+<li><p>音声サブシステム（オーディオギア）</p></li>
+<li><p>ファイルシステム（PTPギア）</p></li>
+<li><p>ブロックI/Oサブシステム（usb-storageギア）</p></li>
+<li><p>…など</p></li>
+</ul>
+</dd>
+<dt><em>追加レイヤー</em></dt><dd><p>他のレイヤーも存在する可能性がある。これらにはネットワークプロトコルスタックなどのカーネルレイヤー、標準POSIXシステムコールAPI（例： <code class="docutils literal notranslate"><span class="pre">open()</span></code>, <code class="docutils literal notranslate"><span class="pre">close()</span></code>,
+<code class="docutils literal notranslate"><span class="pre">read()</span></code> および <code class="docutils literal notranslate"><span class="pre">write()</span></code>）を基盤にしたユーザーモードアプリケーションが含まれる。新しいシステムではPOSIX非同期I/Oコールが選択肢となる場合がある。このようなユーザーモードコードはGNU一般公衆許諾契約書（GPL）の制約から外れる可能性がある</p>
+</dd>
+</dl>
+<p>OTG対応システムでは、標準Linux-USBホスト側スタックを含める必要があり、 <code class="docutils literal notranslate"><span class="pre">usbcore</span></code>、1つまたは複数の <em>ホストコントローラードライバー</em>
+（HCDs）、 <em>USBデバイスドライバー</em> を用いてOTG「ターゲットペリフェラルリスト」をサポートし、その他にも必要となる。また、 <em>OTGコントローラードライバー</em>も存在し、これはギアおよびデバイスドライバ開発者には間接的にしか見えない。これはホスト側とデバイス側のUSBコントローラーが2つの新しいOTGプロトコル（HNPおよびSRP）を実装するのを支援する</p>
+<p>時間とともに、再利用可能なユーティリティは、一部のデバイスドライバのタスクを簡略化するのに役立つように進化しています。たとえば、インターフェースおよびエンドポイントの設定デスクリプタからベクターデスクリプタを構築する作業は自動化され、多くのドライバでは自動設定を用いてハードウェアエンドポイントを選択し、デスクリプタを初期化するようになっています。特に注目すべき例として、HID、ネットワーク、ストレージ、オーディオクラスなどの標準USB-IFプロトコルを実装するコードが挙げられます。一部の開発者は、ターゲットハードウェアをリモートでデバッグできるようにするため、KDBやKGDBのフックに興味を持っています。このようなUSBプロトコルコードは、ネットワークプロトコル（X11、HTTP、NFSなど）と同様に、ハードウェア固有のものではなくなりつつあります。このようなギガット側のインターフェースドライバは最終的に複合デバイスを実装するために統合されるべきです。</p>
+</section>
+<section id="kernel-mode-gadget-api">
+<h2>カーネルモードギガットAPI<a class="headerlink" href="#kernel-mode-gadget-api" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ギガットドライバはstruct
+<a class="reference internal" href="#c.usb_gadget_driver" title="usb_gadget_driver"><code class="xref c c-type docutils literal notranslate"><span class="pre">usb_gadget_driver</span></code></a>を通じて自身を宣言します。これは、ギガットの <a class="reference internal" href="#c.usb_gadget" title="usb_gadget"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_gadget</span></code></a>の列挙の大部分を担当します。set_configurationの応答には、ギガットが公開する <a class="reference internal" href="#c.usb_ep" title="usb_ep"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_ep</span></code></a> オブジェクトの1つまたは複数を有効化し、データを転送するために1つまたは複数の <a class="reference internal" href="#c.usb_request" title="usb_request"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_request</span></code></a> バッファを送信する作業が含まれます。これらの4つのデータタイプとその操作を理解すれば、このAPIの仕組みを理解できるでしょう。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>「Chapter 9」のデータタイプ以外の、重要なデータタイプおよび関数の多くはここに記述されています。</p>
+<p>ただし、読んでいる情報には重要な情報が省略されている可能性があります。その例としてエンドポイント自動設定が挙げられます。APIを完全に理解するには、ヘッダーファイルを読み、例として「Gadget Zero」のソースコードなどの例を参照する必要があります。</p>
+<p>APIが実装する基本的なドライバ機能の一部は、使用中のLinuxカーネルのバージョンに依存します。2.6以降のカーネルでは、 <em>ドライバモデル</em> フレームワークが含まれており、それ以前のカーネルには存在しません。そのため、ギガットAPIのこの部分は完全に移植性がありません。（2.4カーネルでは別の方法で実装されています。）また、ドライバモデルの状態は、kerneldocツールが無視するAPIの一部でもあります。</p>
+</div>
+<p>コアAPIはすべてのハードウェア機能を公開しません。むしろ、最も広く利用可能な機能のみを公開しています。デバイス間DMA（メモリバッファに一時保存することなく）などの重要なハードウェア機能は、ハードウェア固有のAPIを用いて追加される必要があります。</p>
+<p>このAPIは、ドライバーが条件付きコンパイルを使用して、異なるハードウェアのエンドポイント機能を処理できるようにしますが、必須ではありません。ハードウェアは転送タイプ、アドレッシング、パケットサイズ、バッファリング、利用可能性などに関する任意の制限を持つ傾向があります。一般的に、このような違いは「エンドポイントゼロ」の論理にのみ関係し、これはデバイスの設定と管理を処理します。このAPIは、エンドポイントの命名規則を通じて、制限された実行時での機能検出をサポートしています。多くのドライバーは少なくとも部分的に自動設定できるようになります。特に、ドライバーの初期化セクションには、ハードウェアのエンドポイントリストをスキャンして、ドライバーの要件に一致するエンドポイントを見つける自動設定論理が含まれており（これらの規則に依存）、条件付きコンパイルの主な理由のいくつかを排除します。</p>
+<p>Linux-USBホスト側APIと同様に、このAPIはUSBメッセージの「チャンキー」な性質を公開しています。I/Oリクエストは1つ以上の「パケット」で表現され、パケット境界はドライバーに見えます。RS-232シリアルプロトコルと比較すると、USBはHDLCなどの同期プロトコル（フレームごとにNバイト、マルチポイントアドレッシング、ホストが主なステーションでデバイスが副次的なステーション）に似ており、非同期プロトコル（ttyスタイル：フレームごとに8データビット、パリティなし、1停止ビット）よりです。したがって、コントローラードライバーは、単一バイトの書き込みを2バイトのUSB INパケットにバッファリングしないですが、ギャッジードライバーは、パケット境界（および「短パケット」）が重要でないプロトコルを実装する場合にこれを行うことがあります。</p>
+<section id="driver-life-cycle">
+<h3>ドライバーのライフサイクル<a class="headerlink" href="#driver-life-cycle" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ギャッジードライバーは、ハードウェアの詳細を知る必要なくエンドポイントI/Oリクエストをハードウェアに送信できますが、ドライバーのセットアップ/設定コードはいくつかの違いを処理する必要があります。APIは次のように使用してください：</p>
+<ol class="arabic simple">
+<li><p>net2280（USB 2.0）のPCI、Linux PDAに見られるsa11x0やpxa25x、などといった特定のデバイス側USBコントローラハードウェアにドライバーを登録します。この時点でデバイスは論理的にUSB ch9の初期状態（<code class="docutils literal notranslate"><span class="pre">attached</span></code>）にあり、電力を消費せず利用できません（まだエナメーションをサポートしていないため）。どのホストもこのデバイスを認識しません。なぜなら、ホストがデバイスを検出するために使用するデータラインプルアップがまだアクティブでないからです。VBUS電源が利用可能であってもです。</p></li>
+<li><p>ある高レベルのデバイス機能を実装するギャッジードライバーを登録します。これにより、 <a class="reference internal" href="#c.usb_gadget" title="usb_gadget"><code class="xref c c-type docutils literal notranslate"><span class="pre">usb_gadget</span></code></a>にバインド（bind）し、VBUSを検出後にデータラインプルアップをアクティブ化します。</p></li>
+<li><p>ハードウェアドライバーは今やエナメーションを開始できます。処理するステップはUSBを <code class="docutils literal notranslate"><span class="pre">power</span></code> および <code class="docutils literal notranslate"><span class="pre">set_address</span></code> リクエスト。他のステップはギアドライバーによって処理されます。ホストがエナメレーションを開始する前にギアドライバーモジュールがアンロードされると、ステップ7以前のステップはスキップされます。</p></li>
+<li><p>ギアドライバーの <code class="docutils literal notranslate"><span class="pre">setup()</span></code> コールは、バスインターフェースハードウェアが提供する内容と実装する機能に基づいてUSBデスクリプタを返します。これは代替設定や構成を含む場合があります（ハードウェアがその操作を防ぐ場合を除く）。OTGデバイスでは、各構成デスクリプタにはOTGデスクリプタが含まれます。</p></li>
+<li><p>ギアドライバーは、USBホストがコールを発行した際のエナメレーションの最後のステップを処理します。 <code class="docutils literal notranslate"><span class="pre">set_configuration</span></code> コール。その構成で使用されるすべてのエンドポイントを有効にし、すべてのインターフェースをデフォルト設定にします。これはハードウェアのエンドポイント一覧を使用し、各エンドポイントをそのデスクリプタに基づいて有効にするプロセスを含みます。また、VBUSからより多くの電力を引き出すことも含まれる場合があります。
+<code class="docutils literal notranslate"><span class="pre">usb_gadget_vbus_draw</span></code> VBUSからより多くの電力を引き出すための設定。OTGデバイスでは、構成の設定にはHNP機能の報告を通じたユーザーインターフェースの利用も含まれることがあります。</p></li>
+<li><p>実際の作業を行い、データ転送を実行し、インターフェース設定の変更や新しい構成への切り替えを含む処理を続けます。デバイスがホストから接続を解除されるまで、各エンドポイントに任意の数の転送リクエストをキューイングします。接続解除されるまでに複数回スリープと再開が発生する可能性があります。接続解除時にドライバーはステップ3（上記）に戻ります。</p></li>
+<li><p>ギアドライバーモジュールがアンロードされる際、ドライバーのunbind()コールバックが発行されます。これによりコントローラードライバーがアンロードされます。</p></li>
+</ol>
+<p>通常、ギアドライバーモジュール（またはLinuxカーネルに静的にリンク）をロードすることでペリフェラルデバイスのエナメレーションが可能にされるよう構成されていますが、一部のドライバーではより上位のコンポーネント（ユーザーモードデーモンなど）が有効化するまでエナメレーションを延期する場合があります。注意点として、最も下位レベルではep0の設定ロジックの実装方法に関するポリシーは存在せず、USB仕様に準拠することが求められます。このような問題はギアドライバーの領域に属し、一部のUSBコントローラーが課す実装制約を理解するか、複合デバイスが再利用可能なコンポーネントを統合して構築される可能性を認識する必要があります。</p>
+<p>上記のライフサイクルはOTGデバイスではやや異なります。構成ごとに追加のOTGデスクリプタを提供する以外、ドライバーコードに特に顕著に見えるのはHNP関連の違いです。これらは、エナメレーション中の報告要件に関与します。 <code class="docutils literal notranslate"><span class="pre">SET_CONFIGURATION</span></code>
+リクエスト、および一部のスリープコールバック中にHNPを呼び出すオプション。また、SRPはセマンティクスをやや変更します。 <code class="docutils literal notranslate"><span class="pre">usb_gadget_wakeup</span></code> やや。</p>
+</section>
+<section id="usb-2-0-chapter-9-types-and-constants">
+<h3>USB 2.0 Chapter 9 型と定数<a class="headerlink" href="#usb-2-0-chapter-9-types-and-constants" title="この見出しへのパーマリンク">¶</a></h3>
+<p>Gadgetドライバは、linux/usb/ch9.hヘッダーファイルで定義されている共通のUSB構造と定数に依存しています。 <a class="reference internal" href="usb.html#usb-chapter9"><span class="std std-ref">linux/usb/ch9.h</span></a> ヘッダーファイルで、Linux 2.6以降のカーネルで標準です。これらはホスト側ドライバ（およびusbcore）で使用される同じ型と定数です。</p>
+</section>
+<section id="core-objects-and-methods">
+<h3>コアオブジェクトとメソッド<a class="headerlink" href="#core-objects-and-methods" title="この見出しへのパーマリンク">¶</a></h3>
+<p>これらは宣言されています <code class="docutils literal notranslate"><span class="pre">&lt;linux/usb/gadget.h&gt;</span></code>、GadgetドライバがUSBペリフェラルコントローラードライバとやり取りするために使用されます。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.usb_request">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_request</span></span></span><a class="headerlink" href="#c.usb_request" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>1つのI/Oリクエストを記述します</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct usb_request {
+  void *buf;
+  unsigned length;
+  dma_addr_t dma;
+  struct scatterlist      *sg;
+  unsigned num_sgs;
+  unsigned num_mapped_sgs;
+  unsigned stream_id:16;
+  unsigned is_last:1;
+  unsigned no_interrupt:1;
+  unsigned zero:1;
+  unsigned short_not_ok:1;
+  unsigned dma_mapped:1;
+  void (*complete)(struct usb_ep *ep, struct usb_request *req);
+  void *context;
+  struct list_head        list;
+  unsigned frame_number;
+  int status;
+  unsigned actual;
+  ANDROID_KABI_RESERVE(1);
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">buf</span></code></dt><dd><p>データ用のバッファです。常に提供してください；一部のコントローラーはPIOのみを使用するか、特定のエンドポイントではDMAを使用しない場合があります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">length</span></code></dt><dd><p>そのデータの長さ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dma</span></code></dt><dd><p>bufに対応するDMAアドレスです。このフィールドを設定しない場合、USBコントローラーが必要な場合は、バッファのマッピングとアンマッピングを担当します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">sg</span></code></dt><dd><p>SG対応コントローラー用のスキャタリストリート</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">num_sgs</span></code></dt><dd><p>SGエントリの数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">num_mapped_sgs</span></code></dt><dd><p>DMAにマッピングされたSGエントリの数（内部）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">stream_id</span></code></dt><dd><p>USB3.0バーストストリームが使用されている場合のストリームID</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">is_last</span></code></dt><dd><p>異なるストリームに切り替える前のstream_idの最後のリクエストかどうかを示します（DWC3コントローラーでは必須）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">no_interrupt</span></code></dt><dd><p>trueの場合、完了IRQが不要であることを示します。DMAコントローラーが直接処理する深いリクエストキューの処理には、有効なヒントになります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">zero</span></code></dt><dd><p>trueの場合、データを書き込む際、必要に応じてゼロ長パケットを追加して最後のパケットを「短い」ものにします;</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">short_not_ok</span></code></dt><dd><p>データを読み込む際、短いパケットはエラーとして扱われます（キューはクリーンアップまで進まない）。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dma_mapped</span></code></dt><dd><p>リクエストがDMAにマッピングされているかどうかを示します（内部）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">complete</span></code></dt><dd><p>リクエストが完了したときに呼び出される関数です。このリクエストとそのバッファは再利用可能になります。この関数は常に割り込みが無効な状態で呼び出され、スリープしてはいけません。読み取りは短いパケットで終了するか、バッファが満杯になるまで進みます。書き込みが終了した場合、通常はいくつかのデータバイトがまだ進行中です（ハードウェアFIFOに保存されていることが多い）。エラー（読み取りまたは書き込みの場合）は、完了関数が返るまでキューの進みを停止します。これにより、エラーによって無効化されたすべての転送が最初にキューから外されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">context</span></code></dt><dd><p>完了コールバックで使用するため</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">list</span></code></dt><dd><p>Gadgetドライバで使用するため</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">frame_number</span></code></dt><dd><p>等時転送が送信または受信された（マイクロ）フレームの間隔番号を報告します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">status</span></code></dt><dd><p>完了コードを報告します。ゼロまたは負のerrnoです。通常、エラーは完了コールバックが返るまで転送キューの進みをブロックします。コード「-ESHUTDOWN」はデバイス切断によって引き起こされた完了またはドライバがエンドポイントを無効にした場合を示します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">actual</span></code></dt><dd><p>バッファに転送されたバイト数を報告します。読み取り（OUT転送）の場合、これはリクエストされた長さよりも小さくなることがあります。short_not_ok フラグが設定されている場合、ステータスが成功と示されている場合でも短い読み取りはエラーとして扱われます。注意点として、書き込み（IN転送）の場合、リクエストが完了と報告された後でもデバイス側のFIFOにデータバイトが残っている可能性があります。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>これらは使用されているエンドポイントを通じて割り当てられ/解放されます。ハードウェアのドライバは、メモリを返す際にリクエストごとに追加のデータを追加することがあり、これにより後でリクエストがキューイングされる際の別個のメモリ割り当て（潜在的な失敗）を回避できます。</p>
+<p>リクエストフラグはリクエストの処理に影響を与えます。ゼロ長パケットが書き込まれるかどうか（「zero」フラグ）、短い読み取りがエラーとして扱われるべきかどうか（ブロッキングリクエストキューの進展、short_not_ok フラグ）、または割り込みが不要であることを示唆する（deep request queues 用の no_interrupt フラグ）などです。</p>
+<p>バルクエンドポイントは任意のサイズのバッファを使用でき、また割り込み転送にも使用できます。割り込み専用エンドポイントは機能が大幅に制限されることがあります。</p>
+<p><strong>注意</strong></p>
+<p>これはホスト側の「<a class="reference internal" href="usb.html#c.urb" title="urb"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">urb</span></code></a>」に類似していますが、より薄く、事前割り当てを促進しています。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.usb_ep_caps">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_ep_caps</span></span></span><a class="headerlink" href="#c.usb_ep_caps" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>エンドポイントの機能説明</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct usb_ep_caps {
+  unsigned type_control:1;
+  unsigned type_iso:1;
+  unsigned type_bulk:1;
+  unsigned type_int:1;
+  unsigned dir_in:1;
+  unsigned dir_out:1;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">type_control</span></code></dt><dd><p>コントロールタイプをサポート（ep0専用）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">type_iso</span></code></dt><dd><p>イソクロノス転送をサポート</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">type_bulk</span></code></dt><dd><p>バルク転送をサポート</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">type_int</span></code></dt><dd><p>割り込み転送をサポート</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dir_in</span></code></dt><dd><p>IN方向をサポート</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dir_out</span></code></dt><dd><p>OUT方向をサポート</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.usb_ep">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_ep</span></span></span><a class="headerlink" href="#c.usb_ep" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>USBエンドポイントのデバイス側表現</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct usb_ep {
+  void *driver_data;
+  const char              *name;
+  const struct usb_ep_ops *ops;
+  struct list_head        ep_list;
+  struct usb_ep_caps      caps;
+  bool claimed;
+  bool enabled;
+  unsigned maxpacket:16;
+  unsigned maxpacket_limit:16;
+  unsigned max_streams:16;
+  unsigned mult:2;
+  unsigned maxburst:5;
+  u8 address;
+  const struct usb_endpoint_descriptor    *desc;
+  const struct usb_ss_ep_comp_descriptor  *comp_desc;
+#if defined(CONFIG_ARCH_ROCKCHIP) &amp;&amp; defined(CONFIG_NO_GKI);
+  u8 transfer_type;
+#endif;
+  ANDROID_KABI_RESERVE(1);
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">driver_data</span></code></dt><dd><p>ギアットドライバによって使用されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">name</span></code></dt><dd><p>エンドポイントの識別子、たとえば「ep-a」や「ep9in-bulk」</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ops</span></code></dt><dd><p>ハードウェア固有の操作にアクセスするための関数ポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ep_list</span></code></dt><dd><p>ギアットの ep_list はすべてのエンドポイントを保持しています</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">caps</span></code></dt><dd><p>エンドポイントがサポートするタイプと方向を記述する構造体</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">claimed</span></code></dt><dd><p>このエンドポイントが関数によって取得されている場合に真</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">enabled</span></code></dt><dd><p>現在のエンドポイントの有効/無効状態</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">maxpacket</span></code></dt><dd><p>このエンドポイントで使用される最大パケットサイズ。初期値はハードウェアの許容範囲内で場合によっては減少することがあります（エンドポイントディスクリプタで設定された値に基づく）。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">maxpacket_limit</span></code></dt><dd><p>このエンドポイントが処理可能な最大パケットサイズ値。UDCドライバがエンドポイントを初期化する際に一度設定され、変更してはなりません。maxpacket と混同しないでください。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">max_streams</span></code></dt><dd><p>このEPがサポートするストリームの最大数（0 - 16、実際の数は2^n）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mult</span></code></dt><dd><p>マルチプレイヤー、SS イソクロノスエンドポイントの mult 値</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">maxburst</span></code></dt><dd><p>このEPがサポートする最大バースト数（usb3 用）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">address</span></code></dt><dd><p>接続速度に一致するディスクリプタを検索する際のエンドポイントの識別に使用されます</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">desc</span></code></dt><dd><p>エンドポイント記述子。このポインタはエンドポイントが有効になる前に設定され、エンドポイントが無効になるまで有効なままです。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">comp_desc</span></code></dt><dd><p>SuperSpeedサポートがある場合、このエンドポイントコンパニオン記述子はエンドポイントの設定に使用されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">transfer_type</span></code></dt><dd><p>エンドポイントの転送タイプを指定するために使用されます。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>バスコントローラードライバーは、gadget-&gt;ep_listに一般的な用途のエンドポイントをすべてリストします。コントロールエンドポイント（gadget-&gt;ep0）はこのリストに含まれず、ドライバーセットアップ()コールバックの応答のみでアクセスされます。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.usb_gadget">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_gadget</span></span></span><a class="headerlink" href="#c.usb_gadget" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>USBデバイスを表します。</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct usb_gadget {
+  struct work_struct              work;
+  struct usb_udc                  *udc;
+  const struct usb_gadget_ops     *ops;
+  struct usb_ep                   *ep0;
+  struct list_head                ep_list;
+  enum usb_device_speed           speed;
+  enum usb_device_speed           max_speed;
+  enum usb_ssp_rate               ssp_rate;
+  enum usb_ssp_rate               max_ssp_rate;
+  enum usb_device_state           state;
+  const char                      *name;
+  struct device                   dev;
+  unsigned isoch_delay;
+  unsigned out_epnum;
+  unsigned in_epnum;
+  unsigned mA;
+  struct usb_otg_caps             *otg_caps;
+  unsigned sg_supported:1;
+  unsigned is_otg:1;
+  unsigned is_a_peripheral:1;
+  unsigned b_hnp_enable:1;
+  unsigned a_hnp_support:1;
+  unsigned a_alt_hnp_support:1;
+  unsigned hnp_polling_support:1;
+  unsigned host_request_flag:1;
+  unsigned quirk_ep_out_aligned_size:1;
+  unsigned quirk_altset_not_supp:1;
+  unsigned quirk_stall_not_supp:1;
+  unsigned quirk_zlp_not_supp:1;
+  unsigned quirk_avoids_skb_reserve:1;
+  unsigned is_selfpowered:1;
+  unsigned deactivated:1;
+  unsigned connected:1;
+  unsigned lpm_capable:1;
+  int irq;
+  ANDROID_KABI_RESERVE(1);
+  ANDROID_KABI_RESERVE(2);
+  ANDROID_KABI_RESERVE(3);
+  ANDROID_KABI_RESERVE(4);
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">work</span></code></dt><dd><p>(内部使用) sysfs_notify()用のワークキュー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">udc</span></code></dt><dd><p>このgadget用のstruct usb_udcポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ops</span></code></dt><dd><p>ハードウェア固有の操作にアクセスするための関数ポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ep0</span></code></dt><dd><p>エンドポイントゼロ。ドライバーセットアップ()リクエストへの応答を読み書きする際に使用します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ep_list</span></code></dt><dd><p>デバイスがサポートする他のエンドポイントの一覧。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">speed</span></code></dt><dd><p>現在のUSBホストへの接続速度。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">max_speed</span></code></dt><dd><p>UDCが処理可能な最大速度。UDCはこの速度とすべての遅い速度をサポートしなければなりません。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ssp_rate</span></code></dt><dd><p>現在のSuperSpeed Plusシグナルレートおよびレーン数。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">max_ssp_rate</span></code></dt><dd><p>UDCが処理可能な最大SuperSpeed Plusシグナルレートおよびレーン数。UDCはこの速度とすべての遅い速度および少ないレーン数をサポートしなければなりません。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">state</span></code></dt><dd><p>現在の状態（接続済み、停止中、設定済みなど）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">name</span></code></dt><dd><p>コントローラーハードウェアタイプを識別します。診断や設定時に使用されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dev</span></code></dt><dd><p>この抽象デバイスのドライバーモデル状態。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">isoch_delay</span></code></dt><dd><p>Set Isoch Delayリクエストからの値。SS/SSPでのみ有効です。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">out_epnum</span></code></dt><dd><p>最後に使用したアウトエンドポイント番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">in_epnum</span></code></dt><dd><p>最後に使用したインエンドポイント番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mA</span></code></dt><dd><p>最後に設定したmA値</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">otg_caps</span></code></dt><dd><p>このgadgetのOTG機能</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">sg_supported</span></code></dt><dd><p>スキャッターガatherを処理できる場合true</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">is_otg</span></code></dt><dd><p>USBデバイスポートがMini-ABジャックを使用する場合、gadgetドライバーがOTG記述子を提供しなければならないことを示します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">is_a_peripheral</span></code></dt><dd><p>is_otgでない限りfalse。Mini-ABジャックにUSBケーブルの「A」端が接続され、HNPが使用されて「A」デバイスが現在A-Peripheralとして動作している場合を除きます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">b_hnp_enable</span></code></dt><dd><p>OTGデバイス機能フラグ。A-HostがHNPをサポートしていることを示します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">a_hnp_support</span></code></dt><dd><p>OTGデバイス機能フラグ。A-HostがこのポートでHNPをサポートしていることを示します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">a_alt_hnp_support</span></code></dt><dd><p>OTGデバイス機能フラグ。A-Hostが他のルートポートでのみHNPをサポートしていることを示します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">hnp_polling_support</span></code></dt><dd><p>OTGデバイス機能フラグ。OTGデバイスがペリフェラルモードでHNPポーリングをサポートできるかを示します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">host_request_flag</span></code></dt><dd><p>OTGデバイス機能フラグ。A-PeripheralまたはB-Peripheralがホストロールを取得したいかを示します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">quirk_ep_out_aligned_size</span></code></dt><dd><p>epoutはバッファサイズがMaxPacketSizeに合わせてアライメントされている必要があります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">quirk_altset_not_supp</span></code></dt><dd><p>UDCコントローラーは代替設定をサポートしていません。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">quirk_stall_not_supp</span></code></dt><dd><p>UDCコントローラーはストールをサポートしていません。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">quirk_zlp_not_supp</span></code></dt><dd><p>UDCコントローラーはZLPをサポートしていません。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">quirk_avoids_skb_reserve</span></code></dt><dd><p>udc/platformが回避したい <a class="reference internal" href="../../networking/kapi.html#c.skb_reserve" title="skb_reserve"><code class="xref c c-func docutils literal notranslate"><span class="pre">skb_reserve()</span></code></a> パフォーマンス向上のためu_ether.cで使用。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">is_selfpowered</span></code></dt><dd><p>gadgetが自己電源であるかどうか。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">deactivated</span></code></dt><dd><p>gadgetが非アクティブ化されている場合true。非アクティブ化された状態では接続できません。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">connected</span></code></dt><dd><p>接続されている場合にtrueを返す。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">lpm_capable</span></code></dt><dd><p>gadget max_speedがFULLまたはHIGHの場合、このフラグはLPM ECNおよびエラタに従ってLPMをサポートしていることを示します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq</span></code></dt><dd><p>デバイスコントローラーの割り込み番号。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ギアドットは、デバイス機能を実装するほぼ移植可能な「ギアドットドライバー」を持ち、すべてのUSB構成とインターフェースを処理します。ギアドットドライバーはハードウェア固有のコードを間接的に操作し、opsベクターを通じて通信します。これにより、ギアドットドライバーはハードウェアの詳細から隔離され、ハードウェアエンドポイントがジェネリックなI/Oキューを通じてパッケージ化されます。「usb_gadget」および「usb_ep」インターフェースがハードウェアとの隔離を提供します。</p>
+<p>ドライバーデータを除き、この構造体のすべてのフィールドはギアドットドライバーに対して読み取り専用です。このドライバーデータは2.6（以降）のカーネルにおける「ドライバーモデル」インフラストラクチャの一部であり、以前のシステムではカーネルの他の部分に知られていなかった類似の構造にグループ化されています。</p>
+<p>OTGデバイス機能フラグの値は、USB_REQ_SET_CONFIGURATIONに対応するsetup()呼び出しの前およびドライバースリープ()呼び出しの前に更新されます。これらはis_otgであり、デバイスがB-Peripheralとして動作している場合（is_a_peripheralがfalseの場合）にのみ有効です。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_ep_align">
+<span class="n"><span class="pre">size_t</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_ep_align</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_ep" title="usb_ep"><span class="n"><span class="pre">usb_ep</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ep</span></span>, <span class="n"><span class="pre">size_t</span></span><span class="w"> </span><span class="n"><span class="pre">len</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_ep_align" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>が返します <strong>len</strong> epのmaxpacketsizeに合わせてアライメントされています。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_ep</span> <span class="pre">*ep</span></code></dt><dd><p>maxpacketsizeが使用されるエンドポイント <strong>len</strong></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">size_t</span> <span class="pre">len</span></code></dt><dd><p>バッファサイズのアライメント長 <strong>ep</strong>のmaxpacketsize</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>このアシスタントは、バッファのサイズをepのmaxpacketsizeに合わせるために使用されます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_ep_align_maybe">
+<span class="n"><span class="pre">size_t</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_ep_align_maybe</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_gadget" title="usb_gadget"><span class="n"><span class="pre">usb_gadget</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">g</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_ep" title="usb_ep"><span class="n"><span class="pre">usb_ep</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ep</span></span>, <span class="n"><span class="pre">size_t</span></span><span class="w"> </span><span class="n"><span class="pre">len</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_ep_align_maybe" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>が返します <strong>len</strong> gadgetがquirk_ep_out_aligned_sizeを必要とする場合、epのmaxpacketsizeに合わせてアライメントされ、それ以外の場合はlenを返します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_gadget</span> <span class="pre">*g</span></code></dt><dd><p>quirkを確認するコントローラー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_ep</span> <span class="pre">*ep</span></code></dt><dd><p>maxpacketsizeが使用されるエンドポイント <strong>len</strong></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">size_t</span> <span class="pre">len</span></code></dt><dd><p>バッファサイズのアライメント長 <strong>ep</strong>のmaxpacketsize</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>任意の理由でバッファのサイズをepのmaxpacketsizeに合わせて確認・アライメントする必要がある場合にこのアシスタントが使用されます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.gadget_is_altset_supported">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">gadget_is_altset_supported</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_gadget" title="usb_gadget"><span class="n"><span class="pre">usb_gadget</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">g</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.gadget_is_altset_supported" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ハードウェアがaltsettingsをサポートしている場合にtrueを返します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_gadget</span> <span class="pre">*g</span></code></dt><dd><p>quirkを確認するコントローラー</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.gadget_is_stall_supported">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">gadget_is_stall_supported</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_gadget" title="usb_gadget"><span class="n"><span class="pre">usb_gadget</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">g</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.gadget_is_stall_supported" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ハードウェアがstallingをサポートしている場合にtrueを返します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_gadget</span> <span class="pre">*g</span></code></dt><dd><p>quirkを確認するコントローラー</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.gadget_is_zlp_supported">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">gadget_is_zlp_supported</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_gadget" title="usb_gadget"><span class="n"><span class="pre">usb_gadget</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">g</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.gadget_is_zlp_supported" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ハードウェアがzlpをサポートしている場合にtrueを返します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_gadget</span> <span class="pre">*g</span></code></dt><dd><p>quirkを確認するコントローラー</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.gadget_avoids_skb_reserve">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">gadget_avoids_skb_reserve</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_gadget" title="usb_gadget"><span class="n"><span class="pre">usb_gadget</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">g</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.gadget_avoids_skb_reserve" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ハードウェアがskb_reserveを回避してパフォーマンスを向上させることを希望する場合にtrueを返します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_gadget</span> <span class="pre">*g</span></code></dt><dd><p>quirkを確認するコントローラー</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.gadget_is_dualspeed">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">gadget_is_dualspeed</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_gadget" title="usb_gadget"><span class="n"><span class="pre">usb_gadget</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">g</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.gadget_is_dualspeed" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ハードウェアが高速を処理できる場合にtrueを返します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_gadget</span> <span class="pre">*g</span></code></dt><dd><p>高速とフルスピードをサポートする可能性のあるコントローラー</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.gadget_is_superspeed">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">gadget_is_superspeed</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_gadget" title="usb_gadget"><span class="n"><span class="pre">usb_gadget</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">g</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.gadget_is_superspeed" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ハードウェアがスーパースピードを処理できる場合にtrueを返します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_gadget</span> <span class="pre">*g</span></code></dt><dd><p>スーパースピードをサポートする可能性のあるコントローラー</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.gadget_is_superspeed_plus">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">gadget_is_superspeed_plus</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_gadget" title="usb_gadget"><span class="n"><span class="pre">usb_gadget</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">g</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.gadget_is_superspeed_plus" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ハードウェアがスーパースピードプラスを処理できる場合にtrueを返します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_gadget</span> <span class="pre">*g</span></code></dt><dd><p>スーパースピードプラスをサポートする可能性のあるコントローラー</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.gadget_is_otg">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">gadget_is_otg</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_gadget" title="usb_gadget"><span class="n"><span class="pre">usb_gadget</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">g</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.gadget_is_otg" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ハードウェアがOTG準備ができている場合にtrueを返します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_gadget</span> <span class="pre">*g</span></code></dt><dd><p>ミニABコネクタを搭載する可能性のあるコントローラー</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>これはランタイムテストです。USB-OTGスタックを持つカーネルは、Mini-B（またはMini-A）コネクタのみを搭載したボードで動作することがあります。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.usb_gadget_driver">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_gadget_driver</span></span></span><a class="headerlink" href="#c.usb_gadget_driver" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>USB gadgetデバイス用ドライバー</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct usb_gadget_driver {
+  char *function;
+  enum usb_device_speed   max_speed;
+  int (*bind)(struct usb_gadget *gadget, struct usb_gadget_driver *driver);
+  void (*unbind)(struct usb_gadget *);
+  int (*setup)(struct usb_gadget *, const struct usb_ctrlrequest *);
+  void (*disconnect)(struct usb_gadget *);
+  void (*suspend)(struct usb_gadget *);
+  void (*resume)(struct usb_gadget *);
+  void (*reset)(struct usb_gadget *);
+  struct device_driver    driver;
+  char *udc_name;
+  struct list_head        pending;
+  unsigned match_existing_only:1;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">function</span></code></dt><dd><p>ギガットの機能を説明する文字列</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">max_speed</span></code></dt><dd><p>ドライバーが処理できる最大速度</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bind</span></code></dt><dd><p>ドライバーのbindコールバック</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unbind</span></code></dt><dd><p>ドライバーがギガットからアンバインドされるときに呼び出されます。通常はrmmodから呼び出され、切断が報告された後です。割込み処理中で呼び出されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">setup</span></code></dt><dd><p>ep0制御リクエストでハードウェアレベルドライバーが処理しない場合に呼び出されます。ほとんどの呼び出しはギガットドライバーが処理しなければなりません（デスクリプタや設定管理を含む）。セットアップデータの16ビットメンバーはUSBバイト順です。割込み処理中で呼び出されます（スリープはできません）。ドライバーはep0に応答をキューイングするか、負の値を返してストールします。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">disconnect</span></code></dt><dd><p>すべての転送が停止した後、ホストが切断されたときに呼び出されます。割込み処理中で呼び出される可能性があります（スリープはできません）。一部のデバイスは切断を検出できないため、コントローラーのシャットダウン時以外に呼び出されない場合があります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">suspend</span></code></dt><dd><p>USBスリープ時に呼び出されます。割込み処理中で呼び出される可能性があります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">resume</span></code></dt><dd><p>USB再開時に呼び出されます。割込み処理中で呼び出される可能性があります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">reset</span></code></dt><dd><p>USBバスリセット時に呼び出されます。すべてのギガットドライバーで必須であり、割込み処理中で呼び出される必要があります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">driver</span></code></dt><dd><p>このドライバーのドライバーモデル状態</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">udc_name</span></code></dt><dd><p>このドライバーがバインドされるUDCの名前。udc_nameがNULLの場合、このドライバーは任意の利用可能なUDCにバインドされます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">pending</span></code></dt><dd><p>このドライバーの遅延プローブに使用されるUDCコアプライベートデータ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">match_existing_only</span></code></dt><dd><p>UDCが見つからない場合、エラーを返してこのギガットドライバーを待機リストに追加しない</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>デバイスはギガットドライバーが成功裏にbind()するまで無効です。つまり、ドライバーは設定()リクエストを処理してエナメレーション（および「第9章」の要件を満たす）後、何か役に立つ作業を行います。</p>
+<p>ギガット-&gt;is_otgがtrueの場合、ギガットドライバーはENUMERATION中にOTGデスクリプタを提供しなければなりません。そうでない場合、bind()呼び出しは失敗します。このような場合、USBトラフィックはbind()がusb_gadget_disconnect()を呼び出さずに成功した後で、USBホストスタックが初期化した後まで流れません。</p>
+<p>ドライバーはハードウェア固有の知識を使用してUSBハードウェアを構成します。エンドポイントアドレス指定は、ep0実装がセットアップ()呼び出しで返すデスクリプタ内の複数のハードウェア特性のうちのひとつにすぎません。</p>
+<p>ep0実装を除き、ほとんどのドライバー コードは異なるUSBコントローラー上で動作するための変更は必要ありません。それはep0実装が設定したエンドポイントを使用します。</p>
+<p>USBコントローラードライバーはいくつかの標準的なUSBリクエストを処理します。これらには、set_address、デバイス、インターフェース、エンドポイントの機能フラグ（get_status、set_feature、clear_featureリクエスト）が含まれます。</p>
+<p>そのため、ドライバーのsetup()コールバックは常にget_descriptorリクエストを実装しなければなりません。少なくともデバイス記述子と構成記述子を返す必要があります。ドライバーはエンドポイント記述子がハードウェアの制約と一致することを確認しなければなりません。一部のハードウェアでは他の記述子にも制約がかかることがあります。（pxa250は構成1、2、または3のみを許可します）</p>
+<p>ドライバーのsetup()コールバックはset_configurationを実装しなければならず、set_interface、get_configuration、get_interfaceも実装すべきです。構成（またはインターフェース）を設定する際には、エンドポイントがアクティブ化されるか、または（構成0）停止されるべきです。</p>
+<p>(デフォルトのコントロールエンドポイントのみがサポートされています。ホストもしくはデバイスは通常、ep0以外でコントロールトラフィックをサポートしません。)</p>
+<p>ほとんどのデバイスはUSBのスリープ/再開操作を無視し、そのためこれらのコールバックを提供しません。しかし、一部のデバイスではホストがそれらのアクティビティを制御しなくなったときにモードを変更する必要があります。例えば、ローカルコントロール（ボタン、ダイヤルなど）を再び有効化する必要があるかもしれません（リモートホストがそれを行うことができなくなったため）；またはエラー状態をクリアし、電源が維持されているかどうかに関係なくデバイスが同じように動作するようにするかもしれません。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_gadget_probe_driver">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_gadget_probe_driver</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_gadget_driver" title="usb_gadget_driver"><span class="n"><span class="pre">usb_gadget_driver</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ドライバ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_gadget_probe_driver" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>gadgetドライバーをプローブする</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_gadget_driver</span> <span class="pre">*driver</span></code></dt><dd><p>登録されているドライバー</p>
+</dd>
+</dl>
+<p><strong>コンテキスト</strong></p>
+<p>スリープ可能</p>
+<p><strong>説明</strong></p>
+<p>あなたのgadgetドライバーのモジュール初期化関数内でこの関数を呼び出して、基盤となるUSBコントローラードライバーにあなたのドライバーを通知します。その後、この登録呼び出しの戻り値前に、bind()関数が呼ばれてドライバーがgadgetにバインドされます。 <strong>bind()</strong> 関数がinitセクションに含まれていると期待されます。 <strong>bind()</strong> 関数がexitセクションに含まれていると期待されます。そのため、一部のカーネルではリンクされない可能性があります。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_gadget_unregister_driver">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_gadget_unregister_driver</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_gadget_driver" title="usb_gadget_driver"><span class="n"><span class="pre">usb_gadget_driver</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ドライバ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_gadget_unregister_driver" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>gadgetドライバーをアンレジストする</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_gadget_driver</span> <span class="pre">*driver</span></code></dt><dd><p>登録を解除されるドライバー</p>
+</dd>
+</dl>
+<p><strong>コンテキスト</strong></p>
+<p>スリープ可能</p>
+<p><strong>説明</strong></p>
+<p>あなたのgadgetドライバーのモジュールクリーンアップ関数内でこの関数を呼び出して、基盤となるUSBコントローラーにあなたのドライバーが不要になったことを通知します。コントローラーがUSBホストに接続されている場合、まずdisconnect()が呼ばれます。この手順が最終的に戻る前に、ドライバーはunbind()を呼び出してデバイス状態をクリーンアップする必要があります。unbind()関数がexitセクションに含まれていると期待されます。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.usb_string">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_string</span></span></span><a class="headerlink" href="#c.usb_string" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>C文字列とそのUSB IDをラップする</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct usb_string {
+  u8 id;
+  const char              *s;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">id</span></code></dt><dd><p>この文字列の（ゼロではない）ID</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">s</span></code></dt><dd><p>UTF-8エンコーディングでの文字列</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>あなたが <a class="reference internal" href="#c.usb_gadget_get_string" title="usb_gadget_get_string"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_gadget_get_string()</span></code></a>を使用している場合、この関数で文字列とそのIDを一緒にラップします。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.usb_gadget_strings">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_gadget_strings</span></span></span><a class="headerlink" href="#c.usb_gadget_strings" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>特定の言語のUSB文字列のセット</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct usb_gadget_strings {
+  u16 language;
+  struct usb_string       *strings;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">language</span></code></dt><dd><p>文字列の言語を識別（en-usは0x0409）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">strings</span></code></dt><dd><p>IDごとの文字列の配列</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>あなたが <a class="reference internal" href="#c.usb_gadget_get_string" title="usb_gadget_get_string"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_gadget_get_string()</span></code></a>、特定の言語のすべての文字列をラップするために使用してください。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_free_descriptors">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_free_descriptors</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">usb_descriptor_header</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">v</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_free_descriptors" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>が返すフリーデスクリプタ <a class="reference internal" href="#c.usb_copy_descriptors" title="usb_copy_descriptors"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_copy_descriptors()</span></code></a></p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_descriptor_header</span> <span class="pre">**v</span></code></dt><dd><p>デスクリプタのベクター</p>
+</dd>
+</dl>
+</section>
+<section id="optional-utilities">
+<h3>オプションのユーティリティ<a class="headerlink" href="#optional-utilities" title="この見出しへのパーマリンク">¶</a></h3>
+<p>コアAPIはUSB Gadget Driverを書くのに十分ですが、いくつかのオプションのユーティリティが提供されており、一般的なタスクを簡略化します。これらのユーティリティにはエンドポイントの自動構成が含まれます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_gadget_get_string">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_gadget_get_string</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_gadget_strings" title="usb_gadget_strings"><span class="n"><span class="pre">usb_gadget_strings</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">table</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">id</span></span>, <span class="n"><span class="pre">u8</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">buf</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_gadget_get_string" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>文字列ディスクリプタを埋める</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">struct</span> <span class="pre">usb_gadget_strings</span> <span class="pre">*table</span></code></dt><dd><p>UTF-8でエンコードされたC文字列</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">id</span></code></dt><dd><p>文字列ID、get stringディスクリプタのwValueの低バイトから</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">u8</span> <span class="pre">*buf</span></code></dt><dd><p>少なくとも256バイト、16ビットアライメントが必要</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>UTF-8文字列をIDに一致させる、それをutf16-le形式の文字列ディスクリプタに変換。ディスクリプタの長さ（常に偶数）または負のエラー番号を返す</p>
+<p>ドライバが複数の言語の文字列を必要する場合、ep0文字列ディスクリプタロジックで「switch (wIndex) { … }」を使用し、このルーチンを適切なUTF-8文字列セットを選択後に使用します。注意：US-ASCIIはUTF-8の厳密なサブセットであり、8番目のビットが設定されている文字列バイトは多バイトUTF-8文字であり、ISO-8859/1文字（C文字列で広く使用される）ではありません。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_validate_langid">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_validate_langid</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">u16</span></span><span class="w"> </span><span class="n"><span class="pre">langid</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_validate_langid" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>USB言語識別子を検証</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">u16</span> <span class="pre">langid</span></code></dt><dd><p>USB言語識別子</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>有効な言語識別子の場合trueを返し、それ以外はfalse</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_descriptor_fillbuf">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_descriptor_fillbuf</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">buf</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="n"><span class="pre">buflen</span></span>, <span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">usb_descriptor_header</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">src</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_descriptor_fillbuf" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>バッファにディスクリプタを埋める</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*buf</span></code></dt><dd><p>埋めるバッファ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">buflen</span></code></dt><dd><p>bufのサイズ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">struct</span> <span class="pre">usb_descriptor_header</span> <span class="pre">**src</span></code></dt><dd><p>nullポインタで終了するディスクリプタポインタの配列</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ディスクリプタをバッファにコピーし、すべてがコピーできない場合負のエラーコードを返す。複合デバイスのインターフェースセットを構成する際のディスクリプタのアセンブリや、ディスクリプタのセットをマーシャルする他のケースで役立つ</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_gadget_config_buf">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_gadget_config_buf</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">usb_config_descriptor</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">config</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">buf</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="n"><span class="pre">length</span></span>, <span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">usb_descriptor_header</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">desc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_gadget_config_buf" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>完全なコンフィギュレーションディスクリプタを構築</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">struct</span> <span class="pre">usb_config_descriptor</span> <span class="pre">*config</span></code></dt><dd><p>ディスクリプタのヘッダー、電力要件やインターフェース数などの特性を含む</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*buf</span></code></dt><dd><p>結果のコンフィギュレーションディスクリプタのバッファ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">length</span></code></dt><dd><p>バッファの長さ。この長さがコンフィギュレーションディスクリプタ全体を収容できない場合、エラーコードが返される</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">struct</span> <span class="pre">usb_descriptor_header</span> <span class="pre">**desc</span></code></dt><dd><p>null終端のディスクリプタポインタのベクター（インターフェース、エンドポイントなど）で、このデバイスコンフィギュレーションのすべてのファンクションを定義</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この関数はディスクリプタを応答バッファにコピーし、コンフィギュレーションのディスクリプタを構築します。バッファ長または負のステータスコードを返します。config.wTotalLengthフィールドは結果の長さに一致しますが、他のディスクリプタフィールド（電力使用量やインターフェース数を含む）は呼び出し元で設定する必要があります。</p>
+<p>ギッデットドライバーは、USB_REQ_GET_DESCRIPTORに応じて構成デスクリプタを構築する際にこの機能を使用できます。USB_DT_OTHER_SPEED_CONFIGが必要な場合、結果のbDescriptorType値を修正する必要があります。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_copy_descriptors">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">usb_descriptor_header</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">usb_copy_descriptors</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">usb_descriptor_header</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">src</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_copy_descriptors" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>USBデスクリプタのベクターをコピーする</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_descriptor_header</span> <span class="pre">**src</span></code></dt><dd><p>null終端のベクターをコピーする</p>
+</dd>
+</dl>
+<p><strong>コンテキスト</strong></p>
+<p>初期化コードで、スリープする可能性がある</p>
+<p><strong>説明</strong></p>
+<p>USBデスクリプタのベクターのコピーを作成します。主に複数のコピーを持つusb_functionオブジェクトをサポートするために使用され、各コピーが異なるデスクリプタを必要とする場合があります。関数は静的なデスクリプタテーブルを持つ場合があり、テンプレートとして使用され、インターフェース、文字列、エンドポイントなど、特定の関数インスタンスに応じて識別子でカスタマイズされます。</p>
+</section>
+<section id="composite-device-framework">
+<h3>コンポジットデバイスフレームワーク<a class="headerlink" href="#composite-device-framework" title="この見出しへのパーマリンク">¶</a></h3>
+<p>コアAPIは、複数の機能を持つコンポジットUSBデバイス（1つのコンフィギュレーション内でのみ）や、複数のコンフィギュレーションを持つマルチコンフィギュレーションデバイス（複数の機能を持つが、必ずしも同じコンフィギュレーションを共有する必要はない）のドライバー作成に十分です。ただし、関数を再利用および組み合わせやすくするためのオプションのフレームワークもあります。</p>
+<p>このフレームワークを使用するデバイスは、 <a class="reference internal" href="#c.usb_composite_driver" title="usb_composite_driver"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_composite_driver</span></code></a>を提供し、これにより1つ以上の <a class="reference internal" href="#c.usb_configuration" title="usb_configuration"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_configuration</span></code></a>
+インスタンスを提供します。このような各コンフィギュレーションには少なくとも1つの構造体
+<a class="reference internal" href="#c.usb_function" title="usb_function"><code class="xref c c-type docutils literal notranslate"><span class="pre">usb_function</span></code></a>が含まれます。これは「ネットワークリンク」や「マスストレージデバイス」などのユーザーが見える役割をパッケージ化します。管理機能も存在する場合があります（例：デバイスファームウェアアップグレード）。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.usb_os_desc_ext_prop">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_os_desc_ext_prop</span></span></span><a class="headerlink" href="#c.usb_os_desc_ext_prop" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>1つの「拡張プロパティ」を記述します</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct usb_os_desc_ext_prop {
+  struct list_head        entry;
+  u8 type;
+  int name_len;
+  char *name;
+  int data_len;
+  char *data;
+  struct config_item      item;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">entry</span></code></dt><dd><p>拡張プロパティの一覧を保持するために使用されます</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">type</span></code></dt><dd><p>拡張プロパティのタイプ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">name_len</span></code></dt><dd><p>拡張プロパティのユニコード名長さ（終端の'0'を含む）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">name</span></code></dt><dd><p>拡張プロパティの名前</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">data_len</span></code></dt><dd><p>拡張プロパティのblobの長さ（ユニコードストアの倍長）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">data</span></code></dt><dd><p>拡張プロパティのblob</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">item</span></code></dt><dd><p>configfsでこの拡張プロパティを表します</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.usb_os_desc">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_os_desc</span></span></span><a class="headerlink" href="#c.usb_os_desc" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>1つのインターフェースに関連するOSデスクリプタを記述します</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct usb_os_desc {
+  char *ext_compat_id;
+  struct list_head        ext_prop;
+  int ext_prop_len;
+  int ext_prop_count;
+  struct mutex            *opts_mutex;
+  struct config_group     group;
+  struct module           *owner;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">ext_compat_id</span></code></dt><dd><p>16バイトの「互換ID」および「サブ互換ID」</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ext_prop</span></code></dt><dd><p>拡張プロパティリスト</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ext_prop_len</span></code></dt><dd><p>拡張プロパティblobの総長さ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ext_prop_count</span></code></dt><dd><p>拡張プロパティの数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">opts_mutex</span></code></dt><dd><p>usb_function_instanceのconfigデータを保護するオプションのミューテックス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">group</span></code></dt><dd><p>configfsでインターフェースに関連するOSデスクリプタを表します</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">owner</span></code></dt><dd><p>このOSデスクリプタに関連するモジュール</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.usb_os_desc_table">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_os_desc_table</span></span></span><a class="headerlink" href="#c.usb_os_desc_table" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>usb_functionの1つのインターフェースに関連するOSデスクリプタを記述します</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct usb_os_desc_table {
+  int if_id;
+  struct usb_os_desc      *os_desc;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">if_id</span></code></dt><dd><p>インターフェースID</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">os_desc</span></code></dt><dd><p>インターフェースの「拡張互換ID」および「拡張プロパティ」</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>各インターフェースは最大1つの「拡張互換ID」と複数の「拡張プロパティ」を持つことができます。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.usb_function">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_function</span></span></span><a class="headerlink" href="#c.usb_function" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>コンフィギュレーションの1つの機能を記述します</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct usb_function {
+  const char                      *name;
+  struct usb_gadget_strings       **strings;
+  struct usb_descriptor_header    **fs_descriptors;
+  struct usb_descriptor_header    **hs_descriptors;
+  struct usb_descriptor_header    **ss_descriptors;
+  struct usb_descriptor_header    **ssp_descriptors;
+  struct usb_configuration        *config;
+  struct usb_os_desc_table        *os_desc_table;
+  unsigned os_desc_n;
+  int (*bind)(struct usb_configuration *, struct usb_function *);
+  void (*unbind)(struct usb_configuration *, struct usb_function *);
+  void (*free_func)(struct usb_function *f);
+  struct module           *mod;
+  int (*set_alt)(struct usb_function *, unsigned interface, unsigned alt);
+  int (*get_alt)(struct usb_function *, unsigned interface);
+  void (*disable)(struct usb_function *);
+  int (*setup)(struct usb_function *, const struct usb_ctrlrequest *);
+  bool (*req_match)(struct usb_function *,const struct usb_ctrlrequest *, bool config0);
+  void (*suspend)(struct usb_function *);
+  void (*resume)(struct usb_function *);
+  int (*get_status)(struct usb_function *);
+  int (*func_suspend)(struct usb_function *, u8 suspend_opt);
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">name</span></code></dt><dd><p>診断のために、機能を識別します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">strings</span></code></dt><dd><p>bind()で割り当てられた識別子および制御リクエストで提供された言語IDによってキー付けされた文字列のテーブル</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">fs_descriptors</span></code></dt><dd><p>フルスピード（またはローコースト）デスクリプターのテーブル。インターフェースおよび文字列識別子はインターフェースやクラスデスクリプター、エンドポイント、I/Oバッファなど、利用可能なリソースにバインドされる際の割り当てに基づく。 <strong>bind()</strong>このポインタがnullの場合、関数はフルスピード（またはローコースト）で利用不可になります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">hs_descriptors</span></code></dt><dd><p>ハイスピードデスクリプターのテーブル。インターフェースおよび文字列識別子はインターフェースやクラスデスクリプター、エンドポイント、I/Oバッファなど、利用可能なリソースにバインドされる際の割り当てに基づく。 <strong>bind()</strong>このポインタがnullの場合、関数はハイスピードで利用不可になります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ss_descriptors</span></code></dt><dd><p>スーパースピードデスクリプターのテーブル。インターフェースおよび文字列識別子はインターフェースやクラスデスクリプター、エンドポイント、I/Oバッファなど、利用可能なリソースにバインドされる際の割り当てに基づく。 <strong>bind()</strong>このポインタが初期化後nullの場合、関数はスーパースピードで利用不可になります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ssp_descriptors</span></code></dt><dd><p>スーパースピードプラスデスクリプターのテーブル。インターフェースおよび文字列識別子はインターフェースやクラスデスクリプター、エンドポイント、I/Oバッファなど、利用可能なリソースにバインドされる際の割り当てに基づく。 <strong>bind()</strong>このポインタが初期化後nullの場合、関数はスーパースピードプラスで利用不可になります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">config</span></code></dt><dd><p>bind()が呼ばれたときに割り当てられる； <strong><a class="reference internal" href="#c.usb_add_function" title="usb_add_function"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_add_function()</span></code></a></strong> この関数に関連付けられた設定です。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">os_desc_table</span></code></dt><dd><p>（インターフェースID、OSデスクリプター）のペアのテーブル。関数は複数のインターフェースを露出できます。インターフェースがIAD（インターフェースアソシエーションデスクリプター）のメンバーである場合、IADの最初のインターフェースのみテーブルにエントリが存在します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">os_desc_n</span></code></dt><dd><p>os_desc_tableのエントリ数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bind</span></code></dt><dd><p>ギグットが登録できる前に、すべての機能がbind()を呼び出して利用可能なリソース（文字列およびインターフェース識別子を含むインターフェースやクラスデスクリプター、エンドポイント、I/Oバッファなど）にバインドされます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unbind</span></code></dt><dd><p>逆転 <strong>bind</strong>；ドライバがこの機能を追加した際のアンレジストレーションの副作用として呼び出されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">free_func</span></code></dt><dd><p>を解放する <a class="reference internal" href="#c.usb_function" title="usb_function"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_function</span></code></a>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mod</span></code></dt><dd><p>（内部）この構造体を作成したモジュールへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">set_alt</span></code></dt><dd><p>（必須）代替設定を再構成します。機能ドライバは、この関数が使用されるときにusb_ep.driverデータを初期化できます。インターフェースを現在の代替設定に設定するとインターフェース状態がリセットされ、すべてのインターフェースは無効状態を持ちます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">get_alt</span></code></dt><dd><p>アクティブな代替設定を返します。この情報が提供されない場合、みつめ代替設定のみがサポートされます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">disable</span></code></dt><dd><p>（必須）この機能を無効にする必要があります。理由にはホストのリセットやギグットの再構成、接続解除などが含まれます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">setup</span></code></dt><dd><p>インターフェース固有の制御リクエストに使用されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">req_match</span></code></dt><dd><p>この機能が処理できるクラスリクエストかどうかをテストします。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">suspend</span></code></dt><dd><p>ホストがUSBトラフィックを停止したときに関数を通知します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">resume</span></code></dt><dd><p>ホストがUSBトラフィックを再開したときに関数を通知します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">get_status</span></code></dt><dd><p>GetStatus()リクエストに対する応答として、受信者がインターフェースである場合の関数状態を返します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">func_suspend</span></code></dt><dd><p>SetFeature(FUNCTION_SUSPEND)が受信されたときに呼び出されるコールバック</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>USBファンクションは1つまたは複数のインターフェースを使用し、ほとんどの場合、フルスピードとハイスピードの両方での動作をサポートする必要があります。各ファンクションは、 <strong><a class="reference internal" href="#c.usb_add_function" title="usb_add_function"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_add_function()</span></code></a></strong> 1つの構成に関連付けられ、そのファンクションは <strong>bind()</strong> が呼ばれるようにします。これにより、ギグドライバーの設定中にリソースを割り当てることができます。これらのリソースにはエンドポイントが含まれ、これらは <strong>usb_ep_autoconfig()</strong>.</p>
+<p>デュアルスピード動作をサポートするため、ファンクションドライバーはハイスピードとフルスピードの両方での動作に必要なディスクリプタを提供します。バーストエンドポイントを伴わない例外を除き、各スピードには異なるエンドポイントディスクリプタが必要です。</p>
+<p>ファンクションドライバーは、インスタンスデータの管理戦略を各自で選択します。最も簡単な戦略はそれを「静的」と宣言し、これによりファンクションは一度しかアクティベートできないことになります。あるスピードで複数の構成でファンクションを露出する必要がある場合、複数のusb_function構造（各構成ごとに1つずつ）をサポートする必要があります。</p>
+<p>より複雑な戦略は、ドライバ固有のインスタンス構造内に <strong>usb_function</strong> 構造をラップして、複数のアクティベーションを可能にします。複数のアクティベーションの例は、同じ構成内で2つ以上の異なるインスタンスをサポートするCDC ACMファンクションで、USBホストに対して複数の独立した論理データリンクを提供します。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.usb_configuration">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_configuration</span></span></span><a class="headerlink" href="#c.usb_configuration" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>は1つのギグ構成を表します</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct usb_configuration {
+  const char                      *label;
+  struct usb_gadget_strings       **strings;
+  const struct usb_descriptor_header **descriptors;
+  void (*unbind)(struct usb_configuration *);
+  int (*setup)(struct usb_configuration *, const struct usb_ctrlrequest *);
+  u8 bConfigurationValue;
+  u8 iConfiguration;
+  u8 bmAttributes;
+  u16 MaxPower;
+  struct usb_composite_dev        *cdev;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">label</span></code></dt><dd><p>診断には、この構成を記述します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">strings</span></code></dt><dd><p>識別子でキー付けされた文字列テーブル、および制御リクエストで提供される言語IDによって <strong>bind()</strong>
+と</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">descriptors</span></code></dt><dd><p>はすべてのファンクションディスクリプタの前に置かれるディスクリプタのテーブルです。例にはOTGやベンダー固有のディスクリプタがあります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unbind</span></code></dt><dd><p>逆転 <strong>bind</strong>; これはこの構成を追加したドライバをアンレジストレーションする際の副作用として呼ばれます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">setup</span></code></dt><dd><p>標準デバイスインフラストラクチャで処理されない、または特定のインターフェースに向けられた制御リクエストを委譲するために使用されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bConfigurationValue</span></code></dt><dd><p>構成ディスクリプタにコピーされます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">iConfiguration</span></code></dt><dd><p>構成ディスクリプタにコピーされます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bmAttributes</span></code></dt><dd><p>構成ディスクリプタにコピーされます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">MaxPower</span></code></dt><dd><p>mAの消費電流。バススピードを考慮して構成ディスクリプタのbMaxPowerを計算するために使用されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cdev</span></code></dt><dd><p>によって割り当てられます <strong><a class="reference internal" href="#c.usb_add_config" title="usb_add_config"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_add_config()</span></code></a></strong> を呼び出すことができます。 <strong>bind()</strong>; これはこの構成に関連付けられたデバイスです。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>構成は、ファンクションドライバーを中心に構築されたギグドライバーの構成ブロックです。単純なUSBギグは1つのファンクションと1つの構成で構成され、デュアルスピードハードウェアを常に同じ機能で提供します。やや複雑なギグは、あるスピードで複数の単機能構成を持つ場合や、特定のスピードでのみ動作する構成を持つ場合があります。</p>
+<p>コンポジットデバイスとは、構成に複数のファンクションを含むデバイスを指します。</p>
+<p>usb_configurationのライフサイクルには、上述のフィールドの割り当て、初期化、および呼び出しを含みます。 <strong><a class="reference internal" href="#c.usb_add_config" title="usb_add_config"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_add_config()</span></code></a></strong> 内部データを設定し、特定のデバイスにバインドするためのものです。設定の
+<strong>bind()</strong> メソッドはすべての関数を初期化し、その後呼び出すために使用されます。 <strong><a class="reference internal" href="#c.usb_add_function" title="usb_add_function"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_add_function()</span></code></a></strong> それらを呼び出すためのものです。</p>
+<p>これらの関数は通常、他の関数とは独立していますが、これは必須ではありません。CDC WMCデバイスは、関数が他の関数に依存する例であり、一部の関数が他の関数に副次的な場合があります。このような相互依存性は、コンポジットドライバーがbind()ルーチンから戻るまでにすべての記述子が完了することを保証する限り、どのように管理してもかまいません。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.usb_composite_driver">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_composite_driver</span></span></span><a class="headerlink" href="#c.usb_composite_driver" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>設定をギアットにグループ化します。</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct usb_composite_driver {
+  const char                              *name;
+  const struct usb_device_descriptor      *dev;
+  struct usb_gadget_strings               **strings;
+  enum usb_device_speed                   max_speed;
+  unsigned needs_serial:1;
+  int (*bind)(struct usb_composite_dev *cdev);
+  int (*unbind)(struct usb_composite_dev *);
+  void (*disconnect)(struct usb_composite_dev *);
+  void (*suspend)(struct usb_composite_dev *);
+  void (*resume)(struct usb_composite_dev *);
+  struct usb_gadget_driver                gadget_driver;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">name</span></code></dt><dd><p>診断のために、ドライバーを特定します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dev</span></code></dt><dd><p>デバイスのテンプレート記述子、デフォルトのデバイス識別子を含みます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">strings</span></code></dt><dd><p>識別子が割り当てられた際の識別子でキー付けされた文字列のテーブル、 <strong>bind</strong>
+制御リクエストで提供される言語ID。注意: 最初のエントリは予め定義されています。使用可能な最初のエントリはUSB_GADGET_FIRST_AVAIL_IDXです。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">max_speed</span></code></dt><dd><p>ドライバーがサポートする最大速度。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">needs_serial</span></code></dt><dd><p>ギアットがユーザー空間からシリアル番号を提供する必要がある場合、1に設定します。提供されない場合、警告が表示されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bind</span></code></dt><dd><p>(必須) デバイス全体で共有されるリソース（例: 文字列ID）を割り当て、その設定を追加するために使用されます。
+<strong><a class="reference internal" href="#c.usb_add_config" title="usb_add_config"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_add_config()</span></code></a></strong>これは負のerrno値を返して失敗する可能性があります。初期化成功時はゼロを返します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unbind</span></code></dt><dd><p>逆転 <strong>bind</strong>；このドライバーの登録解除の副作用として呼び出されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">disconnect</span></code></dt><dd><p>オプションのドライバー切断メソッド</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">suspend</span></code></dt><dd><p>ホストがUSBトラフィックを停止した後、関数通知後にホストが停止したことを通知します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">resume</span></code></dt><dd><p>ホストがUSBトラフィックを再開した際、関数通知の前に関数の設定を通知します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">gadget_driver</span></code></dt><dd><p>このドライバーを制御するギアットドライバー</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>デバイスはデフォルトで自己電源動作を報告します。バス電源動作に依存するデバイスは、その設定を自分の <strong>bind</strong> メソッドで報告する必要があります。</p>
+<p>戻る前に、 <strong>bind</strong>テンプレート記述子内のさまざまなフィールドが上書きされる可能性があります。これらには、適切なホスト側ドライバーをバインドするために通常使用されるidVendor/idProduct/bcdDevice値、およびユーザーにとって意味のあるデバイス識別子を提供するために通常使用される3つの文字列（iManufacturer、iProduct、iSerialNumber）が含まれます。（文字列は、それらが <strong>dev</strong> および <strong>文字列</strong>。）正しいep0 maxpacketサイズも、基盤となるコントローラードライバーによって定義されるように報告されます。</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.module_usb_composite_driver">
+<span class="sig-name descname"><span class="n"><span class="pre">module_usb_composite_driver</span></span></span><a class="headerlink" href="#c.module_usb_composite_driver" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">module_usb_composite_driver</span> <span class="pre">(__usb_composite_driver)</span></code></p>
+<blockquote>
+<div><p>USBギアットコンポジットドライバーの登録に使用するヘルパーマクロ</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">__usb_composite_driver</span></code></dt><dd><p>usb_composite_driver構造体</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>USBゲッターファブリックのコンポジットドライバの補助マクロで、モジュールの初期化/終了処理で特別な動作を行わない場合に使用します。これにより多くのボイラープレートコードを削減できます。各モジュールはこのマクロを一度だけ使用し、呼び出すことで <a class="reference internal" href="../basics.html#c.module_init" title="module_init"><code class="xref c c-func docutils literal notranslate"><span class="pre">module_init()</span></code></a>
+および <a class="reference internal" href="../basics.html#c.module_exit" title="module_exit"><code class="xref c c-func docutils literal notranslate"><span class="pre">module_exit()</span></code></a></p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.usb_composite_dev">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_composite_dev</span></span></span><a class="headerlink" href="#c.usb_composite_dev" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>1つのコンポジットUSBゲッターデバイスを表します</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct usb_composite_dev {
+  struct usb_gadget               *gadget;
+  struct usb_request              *req;
+  struct usb_request              *os_desc_req;
+  struct usb_configuration        *config;
+  u8 qw_sign[OS_STRING_QW_SIGN_LEN];
+  u8 b_vendor_code;
+  struct usb_configuration        *os_desc_config;
+  unsigned int                    use_os_string:1;
+  unsigned int                    setup_pending:1;
+  unsigned int                    os_desc_pending:1;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">gadget</span></code></dt><dd><p>読み取り専用で、ゲッターデバイスのUSBペリフェラルコントローラーを抽象化します</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">req</span></code></dt><dd><p>コントロール応答用；バッファは事前に確保されています</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">os_desc_req</span></code></dt><dd><p>OS記述子応答用；バッファは事前に確保されています</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">config</span></code></dt><dd><p>現在アクティブな設定</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">qw_sign</span></code></dt><dd><p>OS文字列のqwSignature部分</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">b_vendor_code</span></code></dt><dd><p>OS文字列のbMS_VendorCode部分</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">os_desc_config</span></code></dt><dd><p>OS記述子で使用する設定</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">use_os_string</span></code></dt><dd><p>デフォルトではfalseですが、関心のあるゲッターデバイスが設定します</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">setup_pending</span></code></dt><dd><p>セットアップリクエストがキューイングされているが未完了の場合true</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">os_desc_pending</span></code></dt><dd><p>os_descリクエストがキューイングされているが未完了の場合true</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>これらのデバイスのうち1つは、関連するデバイスドライバのbind()が呼ばれる前に割り当てられ初期化されます。</p>
+<p>オープンな問題：一部のWUSBデバイスは、通常の（有線）ゲッターアンドワイヤレスの組み合わせで構築する必要があります。このゲッターフレームワークの改訂は、このような操作がどれほど問題にならないかを確認する必要があります。</p>
+<p>ワイヤレスUSBデバイスを処理するための考え方の一つは以下の通りです：</p>
+<ol class="loweralpha simple">
+<li><p>ここに2番目のゲッターデバイス、発見メカニズムはTBDですが、おそらく別個の「WUSBゲッターレジスタ/アンレジスタ」呼び出しを必要とします；</p></li>
+<li><p>usb_gadgetの更新にフラグ「ワイヤレスか」、「有線か」を追加し、（おそらくWRAPPER構造体内で）バンドグループとPHY情報も含めます；</p></li>
+<li><p>おそらくワイヤレス_epがusb_epをラップし、maxburstやmaxsequenceなどのワイヤレス固有パラメータを報告します；</p></li>
+<li><p>ワイヤレスリンクに特化した設定；</p></li>
+<li><p>ワイヤレス設定を理解する機能ドライバで、追加の機能インスタンスにもワイヤレスをサポートします；</p></li>
+<li><p>アソシエーション設定（例：CBAF）をサポートする関数、ワイヤレスアダプターを必要としない場合もあります；</p></li>
+<li><p>コンポジットデバイス設定で、1つまたは複数のワイヤレス設定を作成でき、適切なアソシエーション設定サポートを含みます；</p></li>
+<li><p>その他、TBD。</p></li>
+</ol>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.config_ep_by_speed_and_alt">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">config_ep_by_speed_and_alt</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_gadget" title="usb_gadget"><span class="n"><span class="pre">usb_gadget</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">g</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_function" title="usb_function"><span class="n"><span class="pre">usb_function</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">f</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_ep" title="usb_ep"><span class="n"><span class="pre">usb_ep</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">_ep</span></span>, <span class="n"><span class="pre">u8</span></span><span class="w"> </span><span class="n"><span class="pre">alt</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.config_ep_by_speed_and_alt" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定されたエンドポイントをゲッタースピードに応じて設定します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_gadget</span> <span class="pre">*g</span></code></dt><dd><p>ゲッターポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_function</span> <span class="pre">*f</span></code></dt><dd><p>USBファンクション</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_ep</span> <span class="pre">*_ep</span></code></dt><dd><p>設定するエンドポイント</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">u8</span> <span class="pre">alt</span></code></dt><dd><p>代替設定番号</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>エラーコード、成功時は0</p>
+<p><strong>説明</strong></p>
+<p>この関数は、ゲッタースピードと応じた適切な記述子を選択し、エンドポイントdescフィールドに保存します。エンドポイントに既に記述子が割り当てられている場合、現在の記述子に置き換えます。エンドポイントのmaxpacketフィールドは選択された記述子に応じて更新されます。</p>
+<p><strong>注意</strong></p>
+<p>提供されたファンクションはサポートする速度のすべての記述子を保持する必要があります</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.config_ep_by_speed">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">config_ep_by_speed</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_gadget" title="usb_gadget"><span class="n"><span class="pre">usb_gadget</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">g</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_function" title="usb_function"><span class="n"><span class="pre">usb_function</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">f</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_ep" title="usb_ep"><span class="n"><span class="pre">usb_ep</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">_ep</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.config_ep_by_speed" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定されたエンドポイントをゲッタースピードに応じて設定します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_gadget</span> <span class="pre">*g</span></code></dt><dd><p>ゲッターポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_function</span> <span class="pre">*f</span></code></dt><dd><p>USBファンクション</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_ep</span> <span class="pre">*_ep</span></code></dt><dd><p>設定するエンドポイント</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>エラーコード、成功時は0</p>
+<p><strong>説明</strong></p>
+<p>この関数は、ゲッタースピードと応じた適切な記述子を選択し、エンドポイントdescフィールドに保存します。エンドポイントに既に記述子が割り当てられている場合、現在の記述子に置き換えます。エンドポイントのmaxpacketフィールドは選択された記述子に応じて更新されます。</p>
+<p><strong>注意</strong></p>
+<p>提供されたファンクションはサポートする速度のすべての記述子を保持する必要があります</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_add_function">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_add_function</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_configuration" title="usb_configuration"><span class="n"><span class="pre">usb_configuration</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">config</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_function" title="usb_function"><span class="n"><span class="pre">usb_function</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ファンクション</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_add_function" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>設定に関数を追加する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_configuration</span> <span class="pre">*config</span></code></dt><dd><p>設定</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_function</span> <span class="pre">*function</span></code></dt><dd><p>追加中の関数</p>
+</dd>
+</dl>
+<p><strong>コンテキスト</strong></p>
+<p>ギアットのセットアップ中にシングルスレッド</p>
+<p><strong>説明</strong></p>
+<p>初期化後、各設定には1つ以上の関数が追加される必要があります。 <strong>bind()</strong>
+関数を追加するには、インターフェースや文字列識別子、エンドポイントなどのリソースを割り当てるメソッドを呼び出します。</p>
+<p>この関数は、関数のbind()の値を返します。成功時はゼロ、失敗時は負のerrno値になります。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_function_deactivate">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_function_deactivate</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_function" title="usb_function"><span class="n"><span class="pre">usb_function</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ファンクション</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_function_deactivate" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>関数およびギアットの列挙を防止します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_function</span> <span class="pre">*function</span></code></dt><dd><p>まだ準備ができていない関数</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ギアットドライバーがホスト列挙に応答するのをブロックします。これはデータラインプルアップがアクティブ化されるのを防ぐことで実現されます。これは通常、 <strong>bind()</strong> 初期の「応答可能」状態から変更する処理中、または必要なリソースが利用可能になったときに呼び出されます。</p>
+<p>たとえば、ユーザースペースデーモンへのパストスルーとして機能するドライバーは、そのデーモン（例: OBEX、MTP、または印刷サーバー）がホストリクエストを処理できるまで列挙をブロックします。</p>
+<p>すべてのシステムがUSBペリフェラルデータプルアップのソフトウェア制御をサポートしているわけではありません。</p>
+<p>成功時はゼロを返します。失敗時は負のerrno値を返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_function_activate">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_function_activate</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_function" title="usb_function"><span class="n"><span class="pre">usb_function</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ファンクション</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_function_activate" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>関数およびギアットの列挙を許可します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_function</span> <span class="pre">*function</span></code></dt><dd><p>関数の <a class="reference internal" href="#c.usb_function_activate" title="usb_function_activate"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_function_activate()</span></code></a> が呼び出された最後のフレーム</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>の効果を逆転させます。 <a class="reference internal" href="#c.usb_function_deactivate" title="usb_function_deactivate"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_function_deactivate()</span></code></a>もしもさらに関数がアクティベーションを遅延させなければ、ギアットドライバーはホスト列挙プロシージャーに応答します。</p>
+<p>成功時はゼロを返します。失敗時は負のerrno値を返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_interface_id">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_interface_id</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_configuration" title="usb_configuration"><span class="n"><span class="pre">usb_configuration</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">config</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_function" title="usb_function"><span class="n"><span class="pre">usb_function</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ファンクション</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_interface_id" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>未使用のインターフェースIDを割り当てます</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_configuration</span> <span class="pre">*config</span></code></dt><dd><p>インターフェースに関連付けられた設定</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_function</span> <span class="pre">*function</span></code></dt><dd><p>インターフェースを処理する関数</p>
+</dd>
+</dl>
+<p><strong>コンテキスト</strong></p>
+<p>ギアットのセットアップ中にシングルスレッド</p>
+<p><strong>説明</strong></p>
+<p><a class="reference internal" href="#c.usb_interface_id" title="usb_interface_id"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_interface_id()</span></code></a> usb_function.bind()コールバックから呼び出され、新しいインターフェースIDを割り当てます。関数ドライバーはその後、そのIDをインターフェース、アソシエーション、CDCユニオン、その他のデスクリプタに保存します。また、そのインターフェースに宛てられた制御リクエストを処理します。特に、set_alt()を介してaltsettingを変更する場合があります。クラス固有またはベンダー固有のリクエストも処理する場合があります。</p>
+<p>すべてのインターフェース識別子はこのルーチンを使用して割り当てられる必要があります。これにより、異なる関数が同じ識別子に異なる意味を割り当てる誤りを防ぎます。注意点として、インターフェース識別子は設定固有であるため、複数の設定（または1つの設定内で複数回）で使用される関数は、関連するデスクリプタの複数バージョンが必要です。</p>
+<p>割り当てられたインターフェースIDを返します。割り当て可能なインターフェースIDがなくなった場合は-ENODEVを返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_add_config">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_add_config</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_composite_dev" title="usb_composite_dev"><span class="n"><span class="pre">usb_composite_dev</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">cdev</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_configuration" title="usb_configuration"><span class="n"><span class="pre">usb_configuration</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">config</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="p"><span class="pre">(</span></span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">bind</span></span><span class="p"><span class="pre">)</span></span><span class="p"><span class="pre">(</span></span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_configuration" title="usb_configuration"><span class="n"><span class="pre">usb_configuration</span></span></a><span class="p"><span class="pre">*</span></span><span class="p"><span class="pre">)</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_add_config" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>デバイスに設定を追加します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_composite_dev</span> <span class="pre">*cdev</span></code></dt><dd><p>USBギアットをラップします</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_configuration</span> <span class="pre">*config</span></code></dt><dd><p>bConfigurationValueが割り当てられた設定</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">(*bind)(struct</span> <span class="pre">usb_configuration</span> <span class="pre">*)</span></code></dt><dd><p>設定のbind関数</p>
+</dd>
+</dl>
+<p><strong>コンテキスト</strong></p>
+<p>ギアットのセットアップ中にシングルスレッド</p>
+<p><strong>説明</strong></p>
+<p>複合的なものの主要なタスクの一つは <strong>bind()</strong> このルーチンは、サポートしている各設定をこのルーチンを使用して追加します。</p>
+<p>この関数は、設定の値を返します。 <strong>bind()</strong>成功時はゼロ、失敗時は負の errno 値を返します。バインディング設定は、文字列 ID を含むグローバルリソースと、インターフェース ID などの設定ごとのリソースを割り当てます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_string_id">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_string_id</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_composite_dev" title="usb_composite_dev"><span class="n"><span class="pre">usb_composite_dev</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">cdev</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_string_id" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>未使用の文字列 ID を割り当てます</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_composite_dev</span> <span class="pre">*cdev</span></code></dt><dd><p>文字列ディスクリプタ ID が割り当てられているデバイス</p>
+</dd>
+</dl>
+<p><strong>コンテキスト</strong></p>
+<p>ギアットのセットアップ中にシングルスレッド</p>
+<p><strong>説明</strong></p>
+<p><strong><a class="reference internal" href="#c.usb_string_id" title="usb_string_id"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_string_id()</span></code></a></strong> bind() コールバックから呼ばれて文字列 ID を割り当てます。関数、設定、またはギアットのドライバーは、その ID を適切なディスクリプタと文字列テーブルに保存します。</p>
+<p>すべての文字列識別子はこのルーチンを使用して割り当てなければなりません、
+<strong><a class="reference internal" href="#c.usb_string_ids_tab" title="usb_string_ids_tab"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_string_ids_tab()</span></code></a></strong> または <strong><a class="reference internal" href="#c.usb_string_ids_n" title="usb_string_ids_n"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_string_ids_n()</span></code></a></strong> ルーチンを使用して、たとえば異なる関数が同じ識別子に異なる意味を誤って割り当てることを防ぎます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_string_ids_tab">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_string_ids_tab</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_composite_dev" title="usb_composite_dev"><span class="n"><span class="pre">usb_composite_dev</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">cdev</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_string" title="usb_string"><span class="n"><span class="pre">usb_string</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">str</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_string_ids_tab" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>未使用の文字列 ID をバッチで割り当てます</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_composite_dev</span> <span class="pre">*cdev</span></code></dt><dd><p>文字列ディスクリプタ ID が割り当てられているデバイス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_string</span> <span class="pre">*str</span></code></dt><dd><p>割り当てる数字を割り当てる usb_string オブジェクトの配列</p>
+</dd>
+</dl>
+<p><strong>コンテキスト</strong></p>
+<p>ギアットのセットアップ中にシングルスレッド</p>
+<p><strong>説明</strong></p>
+<p><strong>usb_string_ids()</strong> bind() コールバックから呼ばれて文字列 ID を割り当てます。関数、設定、またはギアットのドライバーは、その ID を適切なディスクリプタとその他の言語用の文字列テーブルにコピーします。</p>
+<p>すべての文字列識別子はこのルーチンを使用して割り当てなければなりません、
+<strong><a class="reference internal" href="#c.usb_string_id" title="usb_string_id"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_string_id()</span></code></a></strong> または <strong><a class="reference internal" href="#c.usb_string_ids_n" title="usb_string_ids_n"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_string_ids_n()</span></code></a></strong> ルーチンを使用して、たとえば異なる関数が同じ識別子に異なる意味を誤って割り当てることを防ぎます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_gstrings_attach">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_string" title="usb_string"><span class="n"><span class="pre">usb_string</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">usb_gstrings_attach</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_composite_dev" title="usb_composite_dev"><span class="n"><span class="pre">usb_composite_dev</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">cdev</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_gadget_strings" title="usb_gadget_strings"><span class="n"><span class="pre">usb_gadget_strings</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">sp</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="n"><span class="pre">n_strings</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_gstrings_attach" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ギアット文字列を cdev に接続し、ID を割り当てます</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_composite_dev</span> <span class="pre">*cdev</span></code></dt><dd><p>文字列ディスクリプタ ID が割り当てられ、接続されているデバイス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_gadget_strings</span> <span class="pre">**sp</span></code></dt><dd><p>接続する usb_gadget_strings の配列</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">n_strings</span></code></dt><dd><p>各 usb_strings 配列（sp[]-&gt;strings）のエントリ数</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この関数は、usb_gadget_strings と usb_string の深いコピーを作成し、cdev に接続します。実際の文字列（usb_string.s）はコピーされませんが、参照のみが行われます。The <a class="reference internal" href="#c.usb_gadget_strings" title="usb_gadget_strings"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_gadget_strings</span></code></a>
+配列には複数の言語が含まれていて、NULL 終端にする必要があります。各 -&gt;language ポインタは <a class="reference internal" href="#c.usb_gadget_strings" title="usb_gadget_strings"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_gadget_strings</span></code></a> 同じ数のエントリを含まなければなりません。たとえば：sp[0] は en-US、sp[1] は es-ES です。es-ES の最初の usb_string エントリが en-US の最初の usb_string エントリの翻訳を含むと期待されます。したがって、両方のエントリは同じ ID を割り当てます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_string_ids_n">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_string_ids_n</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_composite_dev" title="usb_composite_dev"><span class="n"><span class="pre">usb_composite_dev</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">c</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="n"><span class="pre">n</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_string_ids_n" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>未使用の文字列 ID をバッチで割り当てます</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_composite_dev</span> <span class="pre">*c</span></code></dt><dd><p>文字列ディスクリプタ ID が割り当てられているデバイス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">n</span></code></dt><dd><p>割り当てる文字列 ID の数</p>
+</dd>
+</dl>
+<p><strong>コンテキスト</strong></p>
+<p>ギアットのセットアップ中にシングルスレッド</p>
+<p><strong>説明</strong></p>
+<p>最初に要求された ID を返します。この ID と次の <strong>n</strong>-1 の ID は今や有効な ID です。少なくとも <strong>n</strong> ゼロでない場合、最後に要求された ID を返します。これは今や非常に有用な情報です。</p>
+<p><strong><a class="reference internal" href="#c.usb_string_ids_n" title="usb_string_ids_n"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_string_ids_n()</span></code></a></strong> bind() コールバックから呼ばれて文字列 ID を割り当てます。関数、設定、またはギアットのドライバーは、その ID を適切なディスクリプタと文字列テーブルに保存します。</p>
+<p>すべての文字列識別子はこのルーチンを使用して割り当てなければなりません、
+<strong><a class="reference internal" href="#c.usb_string_id" title="usb_string_id"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_string_id()</span></code></a></strong> または <strong><a class="reference internal" href="#c.usb_string_ids_n" title="usb_string_ids_n"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_string_ids_n()</span></code></a></strong> ルーチンを使用して、たとえば異なる関数が同じ識別子に異なる意味を誤って割り当てることを防ぎます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_composite_probe">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_composite_probe</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_composite_driver" title="usb_composite_driver"><span class="n"><span class="pre">usb_composite_driver</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ドライバ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_composite_probe" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>複合ドライバーを登録します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_composite_driver</span> <span class="pre">*driver</span></code></dt><dd><p>登録するドライバ</p>
+</dd>
+</dl>
+<p><strong>コンテキスト</strong></p>
+<p>ギアットのセットアップ中にシングルスレッド</p>
+<p><strong>説明</strong></p>
+<p>この関数は、複合ドライバーフレームワークを使用してドライバーを登録するために使用されます。戻り値はゼロ、または負の errno 値です。これらの値は通常、ドライバーの <strong>bind</strong> メソッドで、ドライバーをハードウェアに合わせて設定するすべての作業を行います。</p>
+<p>正常に戻った場合、デバイスはホストからのリクエストに応答できる状態になります。ただし、そのコンポーネントがバインディング中にusb_gadget_disconnect()を呼び出した場合、そのデバイスは通常、ユーザー空間での参加を待つためにこの操作が行われます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_composite_unregister">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_composite_unregister</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_composite_driver" title="usb_composite_driver"><span class="n"><span class="pre">usb_composite_driver</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ドライバ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_composite_unregister" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>複合ドライバーを登録解除する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_composite_driver</span> <span class="pre">*driver</span></code></dt><dd><p>アンバインドするドライバー</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この関数は、複合ドライバーフレームワークを使用して登録されたドライバーを登録解除するために使用されます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.usb_composite_setup_continue">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">usb_composite_setup_continue</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.usb_composite_dev" title="usb_composite_dev"><span class="n"><span class="pre">usb_composite_dev</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">cdev</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.usb_composite_setup_continue" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>コントロール転送を継続する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">usb_composite_dev</span> <span class="pre">*cdev</span></code></dt><dd><p>コントロール転送を待機していた複合デバイス</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>USBファンクションドライバーは、データ/ステータス段階を遅延させるようリクエストした場合、この関数を呼び出してコントロール転送のデータ/ステータス段階を継続する必要があります。USBファンクションのセットアップハンドラ（例：set_alt()）は、USB_GADGET_DELAYED_STATUSを返すことで、複合フレームワークにセットアップリクエストのデータ/ステータス段階の遅延を依頼できます。</p>
+</section>
+<section id="composite-device-functions">
+<h3>複合デバイス機能<a class="headerlink" href="#composite-device-functions" title="この見出しへのパーマリンク">¶</a></h3>
+<p>この執筆時点では、いくつかの現在のゲジェットドライバーがこのフレームワークに変換されています。近い将来の計画には、これらをすべて変換する予定ですが、 <code class="docutils literal notranslate"><span class="pre">gadgetfs</span></code>.</p>
+</section>
+</section>
+<section id="peripheral-controller-drivers">
+<h2>ペリフェラルコントローラードライバー<a class="headerlink" href="#peripheral-controller-drivers" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このAPIをサポートする最初のハードウェアは、NetChip 2280コントローラーで、USB 2.0高速をサポートし、PCIベースのものです。これは、
+<code class="docutils literal notranslate"><span class="pre">net2280</span></code> ドライバーモジュールです。このドライバーはLinuxカーネルバージョン2.4および2.6をサポートしており、開発ボードや製品情報についてはNetChip Technologiesにご連絡ください。</p>
+<p>その他のこの <code class="docutils literal notranslate"><span class="pre">gadget</span></code> フレームワークで動作するハードウェアには、インテルのPXA 25xおよびIXP42xシリーズプロセッサ（<code class="docutils literal notranslate"><span class="pre">pxa2xx_udc</span></code>）、トヨタのTC86c001「Goku-S」（<code class="docutils literal notranslate"><span class="pre">goku_udc</span></code>）、RenesasのSH7705/7727（<code class="docutils literal notranslate"><span class="pre">sh_udc</span></code>）、MediaQ 11xx（<code class="docutils literal notranslate"><span class="pre">mq11xx_udc</span></code>）、Hynix HMS30C7202（<code class="docutils literal notranslate"><span class="pre">h7202_udc</span></code>）、National 9303/4（<code class="docutils literal notranslate"><span class="pre">n9604_udc</span></code>）、Texas Instruments OMAP（<code class="docutils literal notranslate"><span class="pre">omap_udc</span></code>）、Sharp LH7A40x（<code class="docutils literal notranslate"><span class="pre">lh7a40x_udc</span></code>）、などがあります。これらの中の多くはフルスピードコントローラーです。</p>
+<p>この執筆時点では、他のUSBデバイスコントローラー用のドライバー開発が進んでおり、多くのドライバーが広く利用可能になる予定です。</p>
+<p>一部のUSBシミュレータ、 <code class="docutils literal notranslate"><span class="pre">dummy_hcd</span></code> ドライバーは利用可能です。これはnet2280、pxa25x、またはsa11x0のエンドポイントとデバイス速度の可用性に似た動作をし、コントロール、バルク、そしてある程度の割り込み転送をシミュレートします。これにより、特別なハードウェアなしで通常のPCでゲジェットドライバーの一部を開発でき、GDBなどのツールをUser Mode Linuxで使用するなど、支援が得られます。少なくとも1人はこのアプローチをマイクロコントローラーのシミュレータに接続する方法に興味を示しています。このようなシミュレータは、実行時のハードウェアがソフトウェア開発に不親切であったり、まだ利用できない場合のサブシステムのデバッグに役立ちます。</p>
+<p>今後、このドライバーフレームワークが進化するにつれて、他のコントローラーのサポートは開発され、貢献されていく予定です。</p>
+</section>
+<section id="gadget-drivers">
+<h2>ギッジドライバー<a class="headerlink" href="#gadget-drivers" title="この見出しへのパーマリンク">¶</a></h2>
+<p>さらに <em>ギッジゼロ</em> （主にUSBコントローラーのハードウェア用ドライバでテストと開発を行うために使用される）ほかにも、さまざまなギッジドライバーが存在します。</p>
+<p>ある <code class="docutils literal notranslate"><span class="pre">ethernet</span></code> ギッジドライバーで、最も有用なものを実装しています。 <em>通信デバイスクラス</em> （CDC）モデルです。ケーブルモデムの相互運用性の標準の一つは、このイーサネットモデルを二つの必須オプションの一つとして指定しています。このコードを使用するギッジは、USBホストに対してイーサネットアダプターのように振る舞います。これにより、ギッジのCPUがホストとしてネットワークに接続され、そのネットワークに他のネットワークへのブリッジング、ルーティング、ファイアウォールングアクセスが簡単に可能になります。一部のハードウェアではCDCイーサネットの要件を完全に実装できないため、このドライバーはCDCイーサネットの「良い部分のみ」のサブセットを実装しています。（そのサブセットはCDCイーサネットとして自己紹介しないようにして、問題を引き起こさないようにしています。）</p>
+<p>マイクロソフトの <code class="docutils literal notranslate"><span class="pre">RNDIS</span></code> プロトコルのサポートは、PengutronixとAuerswald GmbHによって貢献されています。これはCDCイーサネットに似ていますが、やや異なるUSBハードウェア（CDCサブセットよりも少なめ）で動作します。ただし、主な特徴は、マイクロソフトがバンドルしサポートするドライバを使用して、最近のWindowsバージョンに直接接続できる点です。これにより、Windowsとのネットワーク接続が大幅に簡単になります。</p>
+<p>ユーザーモードギッジドライバーにもサポートがあります、 <code class="docutils literal notranslate"><span class="pre">gadgetfs</span></code>を使用します。これは、 <em>ユーザーモードAPI</em> で、各エンドポイントを単一のファイル記述子として提示します。I/Oは通常の <code class="docutils literal notranslate"><span class="pre">read()</span></code> および <code class="docutils literal notranslate"><span class="pre">read()</span></code> 呼び出しを使用して行われます。GDBやpthreadsなどの一般的なツールを用いてユーザーモードドライバーの開発とデバッグが可能なので、堅牢なコントローラードライバーが利用可能になると、多くのアプリケーションは新しいカーネルモードソフトウェアを必要としなくなります。Linux 2.6 <em>非同期I/O（AIO）</em> サポートが利用可能なので、ユーザーモードソフトウェアはカーネルドライバーと比べてわずかに高いオーバーヘッドでデータストリームを処理できます。</p>
+<p>USBマスストレージクラスドライバーがあります。これは、MS-WindowsやMacOSなどのシステムとの相互運用性を実現するための異なる解決策を提供します。その <em>マスストレージ</em> ドライバーは、ドライブのバックストアとしてファイルまたはブロックデバイスを使用します。これは、 <code class="docutils literal notranslate"><span class="pre">loop</span></code> ドライバーと同様です。USBホストは、マスストレージクラス仕様のBBB、CB、またはCBIバージョンを使用し、透過的なSCSIコマンドを介してバックストアからデータにアクセスします。</p>
+<p>USB経由でのTTYスタイルの操作に使える「シリアルラインドライバー」があります。最新版のこのドライバーはCDC ACMスタイルの操作（USBモデムのように）をサポートしており、ほとんどのハードウェアでMS-Windowsと簡単に相互運用可能です。このドライバーの興味深い用途の一つは、ブートファームウェア（BIOSなど）で、実際のシリアルラインがない非常に小さなシステムでもこのモデルを時折使用することです。</p>
+<p>このドライバーフレームワークが進化するにつれて、他の種類のギッジ（gadget）のサポートは時間とともに開発され、貢献されていく予定です。</p>
+</section>
+<section id="usb-on-the-go-otg">
+<h2>USB On-The-GO (OTG)<a class="headerlink" href="#usb-on-the-go-otg" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Linux 2.6におけるUSB OTGサポートは、最初にテキサスインスツルメンツが <a class="reference external" href="http://www.omap.com">OMAP</a> 16xxおよび17xxシリーズプロセッサのために開発されました。他のOTGシステムも同様の方法で動作するはずですが、ハードウェアレベルの詳細は非常に異なり得ます。</p>
+<p>OTGを実装するには、システムが専用ハードウェアサポートを必要とします。特に、 <em>Mini-AB</em> ジャックと関連するトランシーバーをサポートするために含まれます。
+<em>Dual-Role</em> 動作：システムは標準のLinux-USBホストドライバースタックを使用してホストとして動作するか、この
+<code class="docutils literal notranslate"><span class="pre">gadget</span></code> フレームワークを使用してペリフェラルとして動作するかを選択できます。これを行うには、システムソフトウェアはこれらのプログラミングインターフェースへの小さな拡張と、OTGポートにどのドライバースタックが接続するかを決定する新しい内部コンポーネント（ここでは「OTGコントローラー」と呼ばれます）に依存します。それぞれの役割において、システムは既存のハードウェア中立ドライバーのプールを再利用できます。これはコントローラードライバーアクセスインターフェースの上にレイヤーされています（<code class="xref c c-type docutils literal notranslate"><span class="pre">usb_bus</span></code> または <a class="reference internal" href="#c.usb_gadget" title="usb_gadget"><code class="xref c c-type docutils literal notranslate"><span class="pre">usb_gadget</span></code></a>）。このようなドライバーには最大で微小な変更が必要で、OTGをサポートするために追加されたほとんどのコールも、非OTG製品に有益です。</p>
+<ul>
+<li><p>ギッジドライバーは <code class="docutils literal notranslate"><span class="pre">is_otg</span></code> フラグをテストし、各構成にOTGディスクリプタを含めるかどうかを決定します。</p></li>
+<li><p>ギッジドライバーは、2つの新しいOTGプロトコルをサポートするために変更が必要かもしれません。これは新しいギッジ属性（例えば <code class="docutils literal notranslate"><span class="pre">b_hnp_enable</span></code> フラグ）で公開されています。HNPサポートはユーザーインターフェース（2つのLEDで十分かもしれません）を通じて報告され、ホストがペリフェラルをスリープさせた場合など、一部の状況でトリガーされます。SRPサポートはリモートウェイクアップと同様にユーザーが初期化できるでしょう。おそらく同じボタンを押すことで実現できます。</p></li>
+<li><p>ホスト側では、USBデバイスドライバーにHNPを適切なタイミングでトリガーするように教育する必要があります、 <code class="docutils literal notranslate"><span class="pre">usb_suspend_device()</span></code>。これによりバッテリー電源を節約でき、非OTG構成でも有用です。</p></li>
+<li><p>ホスト側では、ドライバーはOTGの「ターゲットペリフェラルリスト」をサポートする必要があります。これは単なるホワイトリストで、特定のLinux OTGホストでサポートされていないペリフェラルを拒否するために使用されます。 <em>このホワイトリストは製品固有です。各製品は</em> <code class="docutils literal notranslate"><span class="pre">otg_whitelist.h</span></code> <em>を変更して相互運用性仕様に一致させる必要があります。</em></p>
+<p>非OTGのLinuxホスト（PCやワークステーションなど）は、ドライバを追加するための解決策を通常備えており、認識されない周辺機器も最終的にはサポートされる。しかし、ファームウェアのアップグレードが行われない可能性のある消費者製品では、このようなアプローチは現実的ではなく、伝統的なPC/ワークステーション/サーバーのようなサポートモデルを期待するのは通常現実的ではない。たとえば、製品が配布された後ではデバイスファームウェアを変更するのは現実的でないため、出荷後にドライバのバグが発見されても通常修正することはできない。</p>
+</li>
+</ul>
+<p>ハードウェア中立なドライバインターフェースの下で追加の変更が必要である <code class="xref c c-type docutils literal notranslate"><span class="pre">usb_bus</span></code>
+および <a class="reference internal" href="#c.usb_gadget" title="usb_gadget"><code class="xref c c-type docutils literal notranslate"><span class="pre">usb_gadget</span></code></a> ドライバインターフェースの下で追加の変更が必要であり、ここでは詳細には説明されていない。これらは各USBホストまたはペリフェラルコントローラーのハードウェア固有のコードに影響し、HCD（ホストコントローラードライバ）が初期化される方法にも影響する（OTGは単一のポートでしか有効にならないため）。また、OTGトランシーバーの管理やOTGステートマシン論理、OTGポートのルートハブ動作の多くも含まれる。OTGコントローラードライバは、関連するデバイスロールに応じてUSBコントローラーを有効/無効にする必要がある。usbcore内にも関連する変更が必要であり、OTG対応デバイスを識別し、HNPまたはSRPプロトコルに適切に対応できるようにする。
+<em>OTGコントローラードライバー</em>OTGトランシーバーおよびOTGステートマシン論理の管理、およびOTGポートのルートハブ動作の多くを含む。OTGコントローラードライバは、関連するデバイスロールに応じてUSBコントローラーを有効/無効にする必要がある。usbcore内にも関連する変更が必要であり、OTG対応デバイスを識別し、HNPまたはSRPプロトコルに適切に対応できるようにする。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../driver-model/index.html">ドライバモデル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../basics.html">ドライバの基礎</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infrastructure.html">デバイスドライバのインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ioctl.html">ioctlベースのインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../early-userspace/index.html">初期ユーザースペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pm/index.html">CPUおよびデバイスの電源管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../clk.html">共通のCLKフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device-io.html">バスを問わないデバイスアクセス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dma-buf.html">バッファ共有と同期</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device_link.html">デバイスリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../component.html">複合ドライバ用コンポーネントヘルパ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../message-based.html">メッセージベースのデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infiniband.html">InfiniBandおよびリモートDMA（RDMA）インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../frame-buffer.html">フレームバッファライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../regulator.html">電圧および電流レギュレータAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../input.html">入力サブシステム</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">Linux USB API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firewire.html">Firewire（IEEE 1394）ドライバインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pci/index.html">Linux PCIドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../spi.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i2c.html">I<sup>2</sup>CおよびSMBusサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmb.html">衛星MC用IPMBドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmi.html">Linux IPMIドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i3c/index.html">I3Cサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../interconnect.html">汎用システムインターコネクトサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../devfreq.html">デバイス周波数スケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hsi.html">高速同期シリアルインターフェース (HSI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../edac.html">エラー検出と訂正 (EDAC) デバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../scsi.html">SCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../libata.html">libATA開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../target.html">ターゲットおよびiSCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mailbox.html">共通メールボックスフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mtdnand.html">MTD NANDドライバプログラミングインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html">パラレルポートデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#x50-uart-driver">16x50 UARTドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#pulse-width-modulation-pwm">パルス幅変調 (PWM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mei/index.html">インテル(R) マネジメントエンジニアリングインターフェース (インテル(R) MEI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mtd/index.html">メモリ技術デバイス (MTD)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mmc/index.html">MMC/SD/SDIOカードサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nvdimm/index.html">非揮発性メモリデバイス (NVDIMM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../w1.html">W1: ダラスの1ワイヤーバス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rapidio/index.html">Linux RapidIO サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../s390-drivers.html">s390チャネルデバイスドライバの作成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vme.html">VMEデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../80211/index.html">Linux 802.11ドライバ開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../uio-howto.html">ユーザースペースI/O HOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firmware/index.html">LinuxファームウェアAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pinctl.html">PINCTRL (PIN CONTROL)サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../gpio/index.html">汎用入出力 (GPIO)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../md/index.html">RAID</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../media/index.html">メディアサブシステム カーネル内部API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../misc_devices.html">その他のデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nfc/index.html">近距離通信 (NFC)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dmaengine/index.html">DMAエンジンドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../slimbus.html">LinuxカーネルSLIMbusサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../soundwire/index.html">SoundWireドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../thermal/index.html">熱管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../fpga/index.html">FPGAサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../acpi/index.html">ACPI サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../backlight/lp855x-driver.html">カーネルドライバlp855x</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../connector.html">カーネルコンネクタ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../console.html">コンソールドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dcdbas.html">Dellシステム管理ベースドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../eisa.html">EISAバスサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isa.html">ISAドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isapnp.html">ISA Plug &amp; Playサポート (Jaroslav Kysela &lt;perex@suse.cz&gt;)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io-mapping.html">io_mapping関数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io_ordering.html">メモリマップアドレスへのI/O書き込みの順序付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../generic-counter.html">汎用カウンタインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lightnvm-pblk.html">pblk: 物理ブロックデバイスターゲット</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../memory-devices/index.html">メモリコントローラー ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../men-chameleon-bus.html">MEN Chameleon Bus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ntb.html">NTB ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nvmem.html">NVMEM サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../parport-lowlevel.html">PARPORT インターフェース ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pps.html">PPS - パルス毎秒 (Pulse Per Second)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ptp.html">Linux用PTP ハードウェアクロック インフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../phy/index.html">ジェネリック PHY フレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pti_intel_mid.html">インテル MID PTI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pwm.html">パルス幅変調 (PWM) インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html">PLDM ファームウェア フラッシュアップデート ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html#overview-of-the-pldmfw-library">概要: <code class="docutils literal notranslate"><span class="pre">pldmfw</span></code> ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rfkill.html">rfkill - RFキルスイッチサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../serial/index.html">シリアルデバイスのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sm501.html">SM501 ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../switchtec.html">Linux Switchtec サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sync_file.html">シンクファイル API ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio-mediated-device.html">VFIO メディエイテッドデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio.html">VFIO - 「仮想ファンクション I/O」 </a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xilinx/index.html">Xilinx FPGA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xillybus.html">ジェネリックFPGAインターフェース用Xillybusドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../zorro.html">Zorroデバイス用のデバイスドライバの作成</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul>
+<li><a href="index.html">Linux USB API</a><ul>
+<li>前へ: <a href="usb.html" title="前章">Linux-USBホスト側API</a></li>
+<li>次へ: <a href="anchors.html" title="次章">USBアンカー</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/driver-api/usb/gadget.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

@@ -1,0 +1,516 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>オーバーレイファイルシステム — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="proc.html" rel="next" title="The /proc Filesystem"/>
+<link href="orangefs.html" rel="prev" title="ORANGEFS"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<p>執筆者: Neil Brown 質問についてはMAINTAINERSファイルをご参照ください。</p>
+<section id="overlay-filesystem">
+<h1>オーバーレイファイルシステム<a class="headerlink" href="#overlay-filesystem" title="この見出しへのパーマリンク">¶</a></h1>
+<p>このドキュメントでは、Linuxにおいてオーバーレイファイルシステム機能を提供するための新しいアプローチのプロトタイプについて説明します（時折ユニオンファイルシステムと呼ばれることがあります）。オーバーレイファイルシステムは、複数のファイルシステムを重ね合わせた結果を一つのファイルシステムとして提示しようとするものです。</p>
+<section id="overlay-objects">
+<h2>オーバーレイオブジェクト<a class="headerlink" href="#overlay-objects" title="この見出しへのパーマリンク">¶</a></h2>
+<p>オーバーレイファイルシステムのアプローチは「ハイブリッド型」です。なぜなら、ファイルシステムに現れるオブジェクトが常にそのファイルシステムに属すると見なされるとは限らないからです。多くの場合、ユニオンでアクセスしたオブジェクトは、元のファイルシステムからアクセスしたオブジェクトと区別がつきません。これはstat(2)関数が返す'st_dev'フィールドで最も明らかです。</p>
+<p>ディレクトリはオーバーレイファイルシステムからの'st_dev'を報告しますが、非ディレクトリオブジェクトは下位ファイルシステムまたは上位ファイルシステムからの'st_dev'を報告する場合があります。同様に'st_ino'は'st_dev'と組み合わせた場合にのみ一意となり、これら両方の値は非ディレクトリオブジェクトの寿命を通じて変化する可能性があります。多くのアプリケーションやツールはこれらの値を無視するため、影響を受けません。</p>
+<p>すべてのオーバーレイレイヤーが同じ下位ファイルシステムにある特別な場合、すべてのオブジェクトがオーバーレイファイルシステムからの'st_dev'と下位ファイルシステムからの'st_inne'を報告します。これにより、オーバーレイマウントがファイルシステムスキャナにより準拠し、オーバーレイオブジェクトが元のファイルシステム内の対応するオブジェクトと区別できるようになります。</p>
+<p>64ビットシステムでは、すべてのオーバーレイレイヤーが同じ下位ファイルシステムにない場合でも、「xino」機能で同じ準拠した動作を実現できます。「xino」機能は、実際のオブジェクト'st_ino'と下位fsidインデックスを組み合わせて一意なオブジェクト識別子を生成します。</p>
+<p>すべての下位ファイルシステムがNFSファイルハンドルとエクスポートファイルハンドルをサポートし、32ビットインノデ番号エンコーディングを使用している場合（例: ext4）、オーバーレイファイルシステムはインノデ番号の上位ビットをfsidとして使用します。下位ファイルシステムが64ビットインノデ番号を使用していても、ユーザーはオーバーレイマウントオプション「-o xino=on」で「xino」機能を有効化できます。これはxfsやtmpfsなどの下位ファイルシステムで64ビットインノデ番号を使用するが、上位ビットをほとんど使用しない場合に特に役立ちます。下位インノデ番号が上位xinoビットにオーバーフローした場合、オーバーレイファイルシステムはそのインノデに対して非xino動作に戻ります。</p>
+<p>以下の表は、さまざまなオーバーレイ構成における期待される挙動を要約しています。</p>
+<section id="inode-properties">
+<h3>インノデプロパティ<a class="headerlink" href="#inode-properties" title="この見出しへのパーマリンク">¶</a></h3>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 21%"/>
+<col style="width: 7%"/>
+<col style="width: 9%"/>
+<col style="width: 7%"/>
+<col style="width: 9%"/>
+<col style="width: 12%"/>
+<col style="width: 12%"/>
+<col style="width: 12%"/>
+<col style="width: 10%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>設定</p></th>
+<th class="head" colspan="2"><p>永続的な st_ino</p></th>
+<th class="head" colspan="2"><p>一貫した st_dev</p></th>
+<th class="head" colspan="2"><p>st_ino == d_ino</p></th>
+<th class="head" colspan="2"><p>d_ino == i_ino [*]</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td rowspan="2"></td>
+<td rowspan="2"><p>dir</p></td>
+<td rowspan="2"><p>!dir</p></td>
+<td rowspan="2"><p>dir</p></td>
+<td rowspan="2"><p>!dir</p></td>
+<td rowspan="2"><p>dir</p></td>
+<td rowspan="2"><p>!dir</p></td>
+<td rowspan="2"><p>dir</p></td>
+<td rowspan="2"><p>!dir</p></td>
+</tr>
+<tr class="row-odd"></tr>
+<tr class="row-even"><td><p>すべてのレイヤーが同じファイルシステム上</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+</tr>
+<tr class="row-odd"><td><p>同じファイルシステムにないレイヤー、xino=off</p></td>
+<td><p>N</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+<td><p>N</p></td>
+<td><p>N</p></td>
+<td><p>Y</p></td>
+<td><p>N</p></td>
+<td><p>Y</p></td>
+</tr>
+<tr class="row-even"><td><p>xino=on/自動</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+</tr>
+<tr class="row-odd"><td><p>xino=on/自動、インノデオーバーフロー</p></td>
+<td><p>N</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+<td><p>N</p></td>
+<td><p>N</p></td>
+<td><p>Y</p></td>
+<td><p>N</p></td>
+<td><p>Y</p></td>
+</tr>
+</tbody>
+</table>
+<p>[*] nfsd v3 readdirplus は d_ino == i_ino を検証します。i_ino は /proc ファイル（例: /proc/locks または inotify ファイルディスクリプタの /proc/self/fdinfo/&lt;fd&gt;）などから取得可能です。</p>
+</section>
+</section>
+<section id="upper-and-lower">
+<h2>上層と下層<a class="headerlink" href="#upper-and-lower" title="この見出しへのパーマリンク">¶</a></h2>
+<p>オーバーレイファイルシステムは、上層ファイルシステムと下層ファイルシステムの2つのファイルシステムを組み合わせます。同じ名前が上層と下層の両方に存在する場合、上層のオブジェクトが表示され、下層のオブジェクトは隠蔽されるか、ディレクトリの場合は上層のオブジェクトとマージされます。</p>
+<p>上層と下層の「ディレクトリツリー」を参照する方がより正確です。なぜなら、両方のディレクトリツリーが同じファイルシステム上にある可能性があり、上層または下層のルートが必須ではないからです。</p>
+<p>下層ファイルシステムはLinuxがサポートする任意のファイルシステムであり、読み取り専用でも構いません。下層ファイルシステムはまた別のオーバーレイファイルシステムでも良いです。上層ファイルシステムは通常読み取り専用ではなく、trusted.*拡張属性の作成をサポートし、readdir応答で有効なd_typeを提供する必要があります（NFSは不適切です）。</p>
+<p>2つの読み取り専用ファイルシステムの読み取り専用オーバーレイは、任意のファイルシステムタイプを使用できます。</p>
+</section>
+<section id="directories">
+<h2>ディレクトリ<a class="headerlink" href="#directories" title="この見出しへのパーマリンク">¶</a></h2>
+<p>オーバーレイは主にディレクトリに関係します。指定された名前が上層と下層の両方に存在し、どちらかのファイルシステムでディレクトリ以外の項目を指す場合、下層のオブジェクトは隠蔽され、名前は上層のオブジェクトのみを指します。</p>
+<p>上層と下層のオブジェクトがどちらもディレクトリである場合、マージされたディレクトリが形成されます。</p>
+<p>マウント時に、マウントオプションで指定された「lowerdir」と「upperdir」の2つのディレクトリがマージされたディレクトリに組み合わされます：</p>
+<blockquote>
+<div><p>mount -t overlay overlay -olowerdir=/lower,upperdir=/upper,workdir=/work /merged</p>
+</div></blockquote>
+<p>「workdir」は「upperdir」と同じファイルシステム上の空のディレクトリでなければなりません。</p>
+<p>その後、このようなマージされたディレクトリでの検索要求が発生すると、各実際のディレクトリで検索が実行され、結果がオーバーレイファイルシステムのdentryにキャッシュされます。両方の検索がディレクトリを発見した場合、どちらも保存されマージされたディレクトリが作成されますが、それ以外の場合は上層が存在する場合のみ保存されます（上層が存在しない場合は下層が保存されます）。</p>
+<p>ディレクトリからの名前一覧のみがマージされます。メタデータや拡張属性などの他のコンテンツは、上位ディレクトリのみが報告されます。下位ディレクトリの属性は隠蔽されます。</p>
+</section>
+<section id="credentials">
+<h2>credentials<a class="headerlink" href="#credentials" title="この見出しへのパーマリンク">¶</a></h2>
+<p>デフォルトでは、上位、下位、ワークディレクトリへのアクセスは、記録されたマウントャーのMACおよびDAC資格情報に基づきます。入力されたアクセスは、呼び出し元の資格情報と照合されます。</p>
+<p>呼び出し元のMACまたはDAC資格情報が重なっていない場合、古いドライバーバージョンで利用可能なユースケースにおいて、override_credsマウントフラグをオフに設定し、呼び出し元がマウントャーにないにもかかわらず正当な資格を持つ場合に役立ちます。ただし、いくつかの意図せぬ副作用が発生します。特定のキー資格を持たない呼び出し元や、下位権限を持つ呼び出し元は、ファイルやディレクトリの削除、ノードの作成、一部の制限ディレクトリの検索が常に可能でなくなる可能性があります。キャッシュメカニズムが資格情報を再テストしないため、権限のある呼び出し元がキャッシュを満たすと、権限が低い呼び出し元がディレクトリキャッシュを読み取る場合があり、検索や読み込みの機能が不安定になります。キャッシュ、上位ディレクトリ、ワークディレクトリが権限で開かれても、権限昇格を形成せずにアクセスされる非均等なセキュリティモデルは、副作用とセキュリティポリシーを厳密に理解した上でのみ使用すべきです。</p>
+</section>
+<section id="whiteouts-and-opaque-directories">
+<h2>whiteoutsと不透明ディレクトリ<a class="headerlink" href="#whiteouts-and-opaque-directories" title="この見出しへのパーマリンク">¶</a></h2>
+<p>下位ファイルシステムを変更せずにrmとrmdirをサポートするため、オーバーレイファイルシステムは上位ファイルシステムに削除されたファイルを記録する必要があります。これは、ホワイトアウトと不透明なディレクトリ（非ディレクトリは常に不透明）を使用して実現されます。</p>
+<p>ホワイトアウトは、デバイス番号0/0を持つキャラクタデバイスとして作成されます。マージされたディレクトリの上位レベルでホワイトアウトが見つかった場合、下位レベルの一致する名前は無視され、ホワイトアウト自体も隠蔽されます。</p>
+<p>ディレクトリが不透明になるには、「trusted.overlay.opaque」の拡張属性を「y」に設定します。上位ファイルシステムに不透明なディレクトリが含まれる場合、下位ファイルシステムの同じ名前のディレクトリは無視されます。</p>
+</section>
+<section id="readdir">
+<h2>readdir<a class="headerlink" href="#readdir" title="この見出しへのパーマリンク">¶</a></h2>
+<p>マージされたディレクトリに対して'readdir'リクエストが行われる場合、上位と下位のディレクトリがそれぞれ読み込まれ、名前リストが明らかに（上位が先に読み込まれ、その後下位が読み込まれる）方式でマージされます（既に存在するエントリは再追加されません）。このマージされた名前リストは'struct file'にキャッシュされ、ファイルが開いている限り保持されます。ディレクトリが同時に2つのプロセスによって開かれて読み込まれる場合、それぞれが別個のキャッシュを持ちます。ディレクトリの開始位置（オフセット0）への'seekdir'の後、'readdir'を実行するとキャッシュが破棄され再構築されます。</p>
+<p>これは、ディレクトリが読み込まれている間、マージされたディレクトリの変更が表示されないことを意味します。多くのプログラムではこの挙動に気づきにくいでしょう。</p>
+<p>ディレクトリが読み込まれる際、シークオフセットは順番に割り当てられます。そのため、</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>ディレクトリの一部を読み取る</p></li>
+<li><p>オフセットを記憶し、ディレクトリを閉じる</p></li>
+<li><p>ある程度後でディレクトリを再開する</p></li>
+<li><p>記憶したオフセットにシークする</p></li>
+</ul>
+</div></blockquote>
+<p>ファイル名の一覧における古い位置と新しい位置の間には、特にディレクトリに変更があった場合、ほとんど関連性がありません。</p>
+<p>マージされていないディレクトリに対して'readdir'が行われる場合、それは下位のディレクトリ（上位または下位）によって単純に処理されます。</p>
+</section>
+<section id="renaming-directories">
+<h2>ディレクトリのリネーム<a class="headerlink" href="#renaming-directories" title="この見出しへのパーマリンク">¶</a></h2>
+<p>下位レイヤーまたはマージされたディレクトリをリネームする場合（つまり、最初から上位レイヤーで作成されていないディレクトリの場合）、overlayfsは2つの異なる方法で処理できます：</p>
+<ol class="arabic simple">
+<li><p>EXDEVエラーを返す：rename(2)がファイルまたはディレクトリをファイルシステムの境界を越えて移動しようとする場合にこのエラーが返されます。そのため、アプリケーションはこのエラーを通常処理するように設計されています（例：mv(1)はディレクトリツリーを再帰的にコピーします）。これはデフォルトの動作です。</p></li>
+<li><p>「redirect_dir」機能が有効になっている場合、ディレクトリはコピーされますが（中身は含みません）。その後、「trusted.overlay.redirect」拡張属性がオーバーレイのルートからの元の場所のパスに設定されます。最後に、ディレクトリは新しい場所に移動されます。</p></li>
+</ol>
+<p>「redirect_dir」機能はいくつかの方法で調整できます。</p>
+<p>カーネルの設定オプション：</p>
+<ul class="simple">
+<li><dl class="simple">
+<dt>OVERLAY_FS_REDIRECT_DIR：</dt><dd><p>このオプションが有効になっている場合、redirect_dirはデフォルトで有効になります。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>OVERLAY_FS_REDIRECT_ALWAYS_FOLLOW：</dt><dd><p>このオプションが有効になっている場合、デフォルトでリダイレクトが常に追跡されます。このオプションを有効にするとセキュリティが低下するため、カーネルがredirect_dir機能を有効にしてリダイレクトを追跡する古いバージョンとの後方互換性に懸念がある場合にのみ有効にしてください。</p>
+</dd>
+</dl>
+</li>
+</ul>
+<p>モジュールオプション（/sys/module/overlay/parameters/を通じて変更することもできます）：</p>
+<ul class="simple">
+<li><dl class="simple">
+<dt>「redirect_dir=BOOL」：</dt><dd><p>上記のOVERLAY_FS_REDIRECT_DIRカーネル設定オプションを参照してください。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>「redirect_always_follow=BOOL」：</dt><dd><p>上記のOVERLAY_FS_REDIRECT_ALWAYS_FOLLOWカーネル設定オプションを参照してください。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>「redirect_max=NUM」：</dt><dd><p>絶対リダイレクトの最大バイト数（デフォルトは256）。</p>
+</dd>
+</dl>
+</li>
+</ul>
+<p>マウントオプション：</p>
+<ul class="simple">
+<li><dl class="simple">
+<dt>「redirect_dir=on」：</dt><dd><p>リダイレクトが有効になっています。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>「redirect_dir=follow」：</dt><dd><p>リダイレクトは作成されませんが、追跡されます。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>「redirect_dir=off」：</dt><dd><p>リダイレクトは作成されず、カーネル/モジュール設定で「redirect_always_follow」機能が有効になっている場合にのみ追跡されます。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>「redirect_dir=nofollow」：</dt><dd><p>リダイレクトは作成されず、追跡されません（「redirect_dir=off」に等しい場合、カーネル/モジュール設定で「redirect_always_follow」機能が無効になっている場合）。</p>
+</dd>
+</dl>
+</li>
+</ul>
+<p>NFSエクスポート機能が有効な場合、コピーされた上位ディレクトリは下位inodeのファイルハンドルでインデックス化され、上位ディレクトリのファイルハンドルが「trusted.overlay.upper」拡張属性に保存されます。マージされたディレクトリの検索時に、上位ディレクトリがインデックスに保存されたファイルハンドルと一致しない場合、複数の上位ディレクトリが同じ下位ディレクトリにリダイレクトされている可能性があることを示します。その場合、検索はエラーを返し、不整合の可能性を警告します。</p>
+<p>下位レイヤーのリダイレクトをインデックスで検証できないため、上位レイヤーが存在しないオーバレイファイルシステムでNFSエクスポートサポートを有効にするには、リダイレクト追跡をオフにします（例：「redirect_dir=nofollow」）。</p>
+</section>
+<section id="non-directories">
+<h2>非ディレクトリ<a class="headerlink" href="#non-directories" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ディレクトリ以外のオブジェクト（ファイル、シンボリックリンク、デバイス専用ファイルなど）は、上位または下位ファイルシステムから適切に表示されます。下位ファイルシステムのファイルに読み込み書き込みアクセスが必要な場合（例：読み書きアクセスで開く、メタデータの変更など）、ファイルはまず下位ファイルシステムから上位ファイルシステムにコピーされます（copy_up）。注意：ハードリンクの作成もcopy_upを必要としますが、シンボリックリンクの作成は不要です。</p>
+<p>copy_upは必要ない場合があります。たとえば、ファイルが読み書きアクセスで開かれてもデータが変更されない場合です。</p>
+<p>copy_upプロセスはまず、上位ファイルシステムに含むディレクトリが存在することを確認し、必要に応じて作成します。次に、同じメタデータ（所有者、モード、mtime、シンボリックリンク先など）でオブジェクトを作成し、オブジェクトがファイルの場合には、下位から上位ファイルシステムにデータをコピーします。最後に、拡張属性もコピーされます。</p>
+<p>コピー_upが完了した後、オーバーレイファイルシステムは上層ファイルシステムに新たに作成されたファイルへの直接アクセスを提供するだけであり、今後のファイル操作はオーバーレイファイルシステムによってほとんど認識されません（ただし、ファイル名に関する操作（リネームやアンリーナなど）は当然ながら認識され、処理されます）。</p>
+</section>
+<section id="permission-model">
+<h2>パーミッションモデル<a class="headerlink" href="#permission-model" title="この見出しへのパーマリンク">¶</a></h2>
+<p>オーバーレイファイルシステムにおける権限チェックは次の原則に従います：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>権限チェックはコピー_upの前後で同じ結果を返す必要があります</p></li>
+<li><p>オーバーレイマウントを作成するタスクは追加の権限を獲得してはいけません</p></li>
+</ol>
+<p>3) マウントを行わないタスクは、下層または上層ファイルシステムへの直接アクセスと比較して、オーバーレイを通じて追加の権限を獲得する可能性があります</p>
+</div></blockquote>
+<p>これは各アクセスごとに2回の権限チェックを行うことで実現されます</p>
+<blockquote>
+<div><ol class="loweralpha simple">
+<li><p>現在のタスクがローカルDAC（所有者、グループ、モードおよびPOSIX ACL）およびMACチェックに基づいてアクセスを許可されているかを確認します</p></li>
+<li><p>マウントタスクが下層または上層レイヤーに対して実際の操作を許可されているか、基盤となるファイルシステムの権限に基づいて確認します（再度MACチェックを含みます）</p></li>
+</ol>
+</div></blockquote>
+<p>チェック(a)は一貫性(1)を保証します（所有者、グループ、モードおよびPOSIX ACLはコピー_upされるため）。一方で、サーバーによって強制される権限（NFSなどでの使用例）が無視される可能性があります（3）。</p>
+<p>チェック(b)は、マウントタスクが持たない権限を持つ下層レイヤーへのアクセスが発生しないことを保証します（2）。また、一貫性ルール(1)が成立しない設定が作成される可能性もありますが、通常はマウントタスクがすべての操作に十分な権限を持つため、このような状況は起こりません。</p>
+<p>このモデルを示すもう一つの方法は、以下の例を比較することです</p>
+<blockquote>
+<div><p>mount -t overlay overlay -olowerdir=/lower,upperdir=/upper,… /merged</p>
+</div></blockquote>
+<p>および</p>
+<blockquote>
+<div><p>cp -a /lower /upper mount –bind /upper /merged</p>
+</div></blockquote>
+<p>結果として得られるアクセス権限は同じです。違いはコピーのタイミング（オンデマンド対事前）です。</p>
+</section>
+<section id="multiple-lower-layers">
+<h2>複数の下層<a class="headerlink" href="#multiple-lower-layers" title="この見出しへのパーマリンク">¶</a></h2>
+<p>複数の下層レイヤーを指定する際には、ディレクトリ名の間にコロン（:）をセパレータとして使用できます。例えば：</p>
+<blockquote>
+<div><p>mount -t overlay overlay -olowerdir=/lower1:/lower2:/lower3 /merged</p>
+</div></blockquote>
+<p>例のように、"upperdir=" および "workdir=" は省略可能です。その場合、オーバーレイは読み取り専用になります。</p>
+<p>指定された下層ディレクトリは右から左へスタックされます。上記の例ではlower1が上層、lower2が中層、lower3が下層になります。</p>
+</section>
+<section id="metadata-only-copy-up">
+<h2>メタデータのみのコピー上<a class="headerlink" href="#metadata-only-copy-up" title="この見出しへのパーマリンク">¶</a></h2>
+<p>メタデータのみコピー機能が有効な場合、overlayfsはメタデータのみをコピー（ファイル全体ではなく）します。chown/chmodなどのメタデータに特化した操作が行われた際に、この動作が発生します。ファイルが書き込み操作のために開かれた際に、ファイル全体がコピーされます。</p>
+<p>言い換えれば、これは遅延されたデータコピー操作であり、データを実際に変更する必要があるときにデータがコピーされます。</p>
+<p>この機能を有効/無効にする方法は複数あります。CONFIG_OVERLAY_FS_METACOPYという設定オプションを設定または解除することで、デフォルトでこの機能を有効/無効にできます。また、モジュールロード時にモジュールパラメータ metacopy=on/off を指定して有効/無効にもできます。さらに、マウントごとに metacopy=on/off を指定して、各マウントごとにこの機能を有効/無効にすることも可能です。</p>
+<p>信頼できない上層/下層ディレクトリと metacopy=on を同時に使用しないでください。そうすると、攻撃者が適切な REDIRECT と METACOPY xattrs を使って手作成したファイルを作成し、REDIRECT で指す下層のファイルにアクセスできる可能性があります。ローカルシステムでは「trusted.」xattrs を設定するには CAP_SYS_ADMIN が必要なので、これは不可能ですが、ペンドライブなどの信頼外のレイヤーでは可能である可能性があります。</p>
+<p>注意: redirect_dir={off|nofollow|follow[*]} および nfs_export=on のマウントオプションは metacopy=on と競合し、エラーが発生します。</p>
+<p>[*] redirect_dir=follow は upperdir=… が指定されている場合にのみ、metacopy=on と競合します。</p>
+</section>
+<section id="sharing-and-copying-layers">
+<h2>共有とコピー層<a class="headerlink" href="#sharing-and-copying-layers" title="この見出しへのパーマリンク">¶</a></h2>
+<p>下層レイヤーは複数の overlay マウントで共有されることがあり、これは非常に一般的な実装です。overlay マウントは、他の overlay マウントと同じ下層レイヤーのパスを使用したり、他の下層レイヤーのパスよりも上または下にあるパスを使用したりする場合があります。</p>
+<p>既に他の overlay マウントで使用されている上層レイヤーのパスや workdir のパスを使用することは許可されず、EBUSY で失敗する可能性があります。部分的に重なったパスを使用することも許可されず、EBUSY で失敗する可能性があります。2つの overlayfs マウントが同じ上層レイヤーおよび/または workdir パスを共有または重なっている場合、overlay の動作は未定義ですが、クラッシュやデッドロックにはなりません。</p>
+<p>上層レイヤーのパスで overlay をマウントし、その上層レイヤーのパスが以前に別の overlay マウントで使用されていた場合（異なる下層レイヤーのパスと組み合わせて）、この操作は許可されます（ただし、「inodes index」機能または「メタデータのみコピー機能」が有効な場合は除きます）。</p>
+<p>「inodes index」機能により、最初のマウント時に下層のルートディレクトリのNFSファイルハンドルと下層ファイルシステムのUUIDが、「trusted.overlay.origin」拡張属性にエンコードされ保存されます。その後のマウントでは、下層ルートディレクトリのファイルハンドルと下層ファイルシステムUUIDが上層ルートディレクトリに保存されたオリジンと比較されます。下層ルートオリジンの検証に失敗した場合、ESTALEでマウントが失敗します。下層ファイルシステムがNFSエクスポートをサポートしていない、または有効なUUIDを持たない、または上層ファイルシステムが拡張属性をサポートしていない場合、「inodes index」を有効にしたoverlayfsマウントはEOPNOTSUPPで失敗します。</p>
+<p>「metadata only copy up」機能ではマウント時に検証メカニズムがありません。そのため、同じ上層を異なる下層セットでマウントすると、マウントは成功する可能性がありますが、後続で予期せぬ問題が発生する可能性があるため、避けてください。</p>
+<p>現在のoverlayfsは、同じまたは異なる下層ファイルシステムの異なるディレクトリツリーにオーバーレイレイヤーをコピーするという慣習が非常に一般的です。また、別のマシンにもコピーすることがあります。しかし、「inodes index」機能では、コピーされたレイヤーをマウントしようとすると、下層ルートファイルハンドルの検証が失敗します。</p>
+</section>
+<section id="non-standard-behavior">
+<h2>非標準的な動作<a class="headerlink" href="#non-standard-behavior" title="この見出しへのパーマリンク">¶</a></h2>
+<p>現在のoverlayfsは、POSIX準拠のファイルシステムとしてほぼ動作します。</p>
+<p>overlayfsが現在処理していないケースの一覧です：</p>
+<p>a) POSIXでは読み込み時にst_atimeを更新する必要がありますが、ファイルが下層レイヤーにある場合、現在はこの処理が行われていません。</p>
+<p>b) 下層レイヤーにあるファイルを読み取り専用で開き、MAP_SHAREDでメモリマップした場合、ファイルの後続変更はメモリマップに反映されません。</p>
+<p>以下のオプションにより、overlayfsが標準準拠のファイルシステムのように動作します：</p>
+<ol class="arabic simple">
+<li><p>「redirect_dir」</p></li>
+</ol>
+<p>マウントオプションまたはモジュールオプションで「redirect_dir=on」を指定するか、カーネル構成オプションCONFIG_OVERLAY_FS_REDIRECT_DIR=yを有効にします。</p>
+<p>この機能が無効の場合、下層またはマージドディレクトリのrename(2)はEXDEV（「Invalid cross-device link」）で失敗します。</p>
+<ol class="arabic simple" start="2">
+<li><p>「inode index」</p></li>
+</ol>
+<p>マウントオプションまたはモジュールオプションで「index=on」を指定するか、カーネル構成オプションCONFIG_OVERLAY_FS_INDEX=yを有効にします。</p>
+<p>この機能が無効で、複数のハードリンクを持つファイルをコピーした場合、リンクが「壊れる」可能性があります。変更は他の同じinodeを参照する名前には伝播しません。</p>
+<ol class="arabic simple" start="3">
+<li><p>「xino」</p></li>
+</ol>
+<p>マウントオプション「xino=auto」または「xino=on」、モジュールオプション「xino_auto=on」、またはカーネル構成オプションCONFIG_OVERLAY_FS_XINO_AUTO=yで有効になります。また、上位レイヤーのすべてのレイヤーで同じ下位ファイルシステムを使用する場合、これは暗黙的に有効になります。</p>
+<p>この機能が無効になっているか、または下位ファイルシステムのインODE番号に十分な空きビットがない場合、overlayfsはstat(2)で返されるst_inoおよびst_devの値、およびreaddir(3)で返されるd_inoの値が通常のファイルシステムと同様の動作をすることを保証できません。例えば、同じoverlayファイルシステム内の2つのオブジェクトでst_devの値が異なる可能性があり、ディレクトリオブジェクトのst_inoの値は一貫せず、マウントされているoverlayファイルシステム中にいても変化する可能性があります。詳しくは、上記の表をご参照ください。 <a class="reference internal" href="#inode-properties">インノデプロパティ</a> 上記の表にまとめられています。</p>
+</section>
+<section id="changes-to-underlying-filesystems">
+<h2>下位ファイルシステムへの変更<a class="headerlink" href="#changes-to-underlying-filesystems" title="この見出しへのパーマリンク">¶</a></h2>
+<p>オーバーレイがマウントされていない場合、上位または下位のツリーへのオフライン変更は許可されます。</p>
+<p>マウントされているオーバーレイファイルシステム内での下位ファイルシステムへの変更は許可されません。下位ファイルシステムが変更された場合、オーバーレイの動作は未定義ですが、クラッシュやデッドロックにはなりません。</p>
+<p>オーバーレイNFSエクスポート機能が有効な場合、下位下位レイヤーのオフライン変更時のオーバーレイファイルシステムの動作は、NFSエクスポートが無効な場合と異なります。</p>
+<p>すべてのcopy_up操作において、下位インODEのNFSファイルハンドルと下位ファイルシステムのUUIDが、上位インODEの拡張属性「trusted.overlay.origin」にエンコードされ保存されます。</p>
+<p>NFSエクスポート機能が有効な場合、マージされたディレクトリの検索中に検索パスまたは「trusted.overlay.redirect」拡張属性が指すパスに下位ディレクトリが見つかった場合、その下位ディレクトリのファイルハンドルと下位ファイルシステムUUIDがcopy_up時の元のファイルハンドルと一致することを確認します。見つかった下位ディレクトリが保存された元と一致しない場合、そのディレクトリは上位ディレクトリとマージされません。</p>
+</section>
+<section id="nfs-export">
+<h2>NFSエクスポート<a class="headerlink" href="#nfs-export" title="この見出しへのパーマリンク">¶</a></h2>
+<p>下位ファイルシステムがNFSエクスポートをサポートし、「nfs_export」機能が有効な場合、オーバーレイファイルシステムがNFSにエクスポートされることがあります。</p>
+<p>「nfs_export」機能により、任意の下位オブジェクトのcopy_up時に、インデックスディレクトリ下にインデックスエントリが作成されます。インデックスエントリの名前は、copy_upの元となるファイルハンドルの16進数表現です。非ディレクトリオブジェクトの場合、インデックスエントリは上位inodeへのハードリンクとなります。ディレクトリオブジェクトの場合、インデックスエントリには「trusted.overlay.upper」という拡張属性が設定され、上位ディレクトリinodeの符号化されたファイルハンドルが含まれます。</p>
+<p>オーバーレイファイルシステムオブジェクトのファイルハンドルを符号化する際には、以下のルールが適用されます：</p>
+<ol class="arabic simple">
+<li><p>非上位オブジェクトの場合、下位inodeから下位ファイルハンドルを符号化します</p></li>
+<li><p>インデックスオブジェクトの場合、copy_upの元となる下位ファイルハンドルを符号化します</p></li>
+<li><p>純粋な上位オブジェクトおよび既存の非インデックス上位オブジェクトの場合、上位inodeから上位ファイルハンドルを符号化します</p></li>
+</ol>
+<dl class="simple">
+<dt>符号化されたオーバーレイファイルハンドルには次の要素が含まれます：</dt><dd><ul class="simple">
+<li><p>パスタイプ情報（例：lower/upper）を含むヘッダー</p></li>
+<li><p>下位ファイルシステムのUUID</p></li>
+<li><p>下位inodeの下位ファイルシステム符号化</p></li>
+</ul>
+</dd>
+</dl>
+<p>この符号化形式は、拡張属性「trusted.overlay.origin」に保存されているファイルハンドルの符号化形式と同一です。</p>
+<p>オーバーレイファイルハンドルをデコードする際には、以下の手順が実行されます：</p>
+<ol class="arabic simple">
+<li><p>UUIDとパスタイプ情報に基づき、下位レイヤーを特定します。</p></li>
+<li><p>下位ファイルシステムのファイルハンドルをデコードし、下位dentryに変換します。</p></li>
+<li><p>下位ファイルハンドルの場合、インデックスディレクトリ内から名前を指定してハンドルを検索します。</p></li>
+<li><p>インデックスにwhiteoutが見つかった場合、ESTALEを返します。これは、ファイルハンドルが符号化された後でオーバーレイオブジェクトが削除されたことを表します。</p></li>
+<li><p>非ディレクトリの場合、デコードされた下位dentry、パスタイプ、およびインデックスinode（存在する場合）から切断されたオーバーレイdentryを生成します。</p></li>
+<li><p>ディレクトリの場合、接続された下位デコードdentry、パスタイプ、およびインデックスを用いて接続されたオーバーレイdentryを検索します。</p></li>
+</ol>
+<p>非ディレクトリファイルハンドルのデコードは切断されたdentryを返す可能性があります。その切断されたdentryのcopy_upは、上位インデックスエントリを生成し、上位アリアスを持たない状態になります。</p>
+<p>オーバーレイファイルシステムが複数の下層レイヤーを持つ場合、中間レイヤーのディレクトリが下層ディレクトリへの「リダイレクト」を持つことがあります。中間レイヤーの「リダイレクト」はインデックス化されていないため、リダイレクトの元となるディレクトリからエンコードされた下層ファイルハンドルは、中間または上層レイヤーのディレクトリを検索できません。同様に、リダイレクトの元となるディレクトリのサブディレクトリからエンコードされた下層ファイルハンドルは、接続されたオーバーレイパスを再構築できません。このような下層ファイルハンドルでデコードできないディレクトリを回避するため、これらのディレクトリはエンコード時に上層ファイルハンドルとしてコピーされます。上層レイヤーがないオーバーレイファイルシステムではこの回避策は使用できません。この設定ではNFSエクスポートには「redirect_dir=nofollow」などのリダイレクトフォローリングをオフにする必要があります。</p>
+<p>オーバーレイファイルシステムは非ディレクトリの接続可能なファイルハンドルをサポートしていません。そのため、「subtree_check」エクスポートfsの設定でエクスポートすると、NFS経由でのファイル検索に失敗します。</p>
+<p>NFSエクスポート機能が有効な場合、マウント時にすべてのディレクトリインデックスエントリが確認され、上層ファイルハンドルが不正確でないことをチェックします。この確認作業は一部のケースでは大きなオーバーヘッドを引き起こす可能性があります。</p>
+<p>注意: マウントオプション「index=off,nfs_export=on」は読み書き可能なマウントでは競合し、エラーが発生します。</p>
+</section>
+<section id="volatile-mount">
+<h2>揮発性マウント<a class="headerlink" href="#volatile-mount" title="この見出しへのパーマリンク">¶</a></h2>
+<p>この機能は「volatile」マウントオプションで有効になります。volatileマウントはクラッシュ後にデータが保証されないため、オーバーレイに書き込まれたデータが簡単に再構築できる場合に限り使用することをお勧めします。</p>
+<p>「volatile」オプションでマウントする利点は、上層ファイルシステムへのすべての同期呼び出しを省略できる点です。</p>
+<p>誤った安全性の感覚を避けるため、volatileマウントのsyncfs（およびfsync）セマンティクスはVFSの他の部分とはやや異なります。volatileマウントが行われた後、上層ディレクトリのファイルシステムで何らかの書き戻しエラーが発生した場合、すべての同期関数はエラーを返します。この状態に達した後、ファイルシステムは復旧できず、その後のすべての同期呼び出しはエラーを返します（上層ディレクトリが最後の同期呼び出し以降に新たなエラーを経験していない場合でも）</p>
+<p>「volatile」オプションでオーバーレイがマウントされる場合、ディレクトリ「$workdir/work/incompat/volatile」が作成されます。次回のマウント時にオーバーレイはこのディレクトリを確認し、存在する場合はマウントを拒否します。これはユーザーが上層ディレクトリとワークディレクトリを破棄して新たに作成するべきであるという強い合図です。ただし、システムがクラッシュしていないことをユーザーが確認でき、上層ディレクトリの内容が健全である極めて限られたケースでは、「volatile」ディレクトリを削除できます。</p>
+</section>
+<section id="testsuite">
+<h2>テストスイート<a class="headerlink" href="#testsuite" title="この見出しへのパーマリンク">¶</a></h2>
+<p>David Howellsによって最初に開発され、現在はAmir Goldsteinがメンテナンスしているテストスイートは以下のURLで確認できます:</p>
+<blockquote>
+<div><p><a class="reference external" href="https://github.com/amir73il/unionmount-testsuite.git">https://github.com/amir73il/unionmount-testsuite.git</a></p>
+</div></blockquote>
+<p>rootとして実行:</p>
+<blockquote>
+<div><p># cd unionmount-testsuite # ./run –ov –verify</p>
+</div></blockquote>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxカーネル内のファイルシステム</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#core-vfs-documentation">コアVFSドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#filesystem-support-layers">ファイルシステムサポートレイヤー</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#filesystems">ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxカーネル内のファイルシステム</a><ul>
+<li>前へ: <a href="orangefs.html" title="前章">ORANGEFS</a></li>
+<li>次へ: <a href="proc.html" title="次章">The /proc Filesystem</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/filesystems/overlayfs.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

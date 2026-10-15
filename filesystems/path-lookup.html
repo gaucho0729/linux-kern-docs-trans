@@ -1,0 +1,612 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>パスナムの検索 — Linuxカーネルのドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="api-summary.html" rel="next" title="Linux Filesystems API サマリー"/>
+<link href="vfs.html" rel="prev" title="Linux仮想ファイルシステムの概要"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="pathname-lookup">
+<h1>パスネーム検索<a class="headerlink" href="#pathname-lookup" title="この見出しへのパーマリンク">¶</a></h1>
+<p>この記事はlwn.netで公開された3つの記事に基づいています:</p>
+<ul class="simple">
+<li><p>&lt;<a class="reference external" href="https://lwn.net/Articles/649115/">https://lwn.net/Articles/649115/</a>&gt; Linuxにおけるパスナムの検索</p></li>
+<li><p>&lt;<a class="reference external" href="https://lwn.net/Articles/649729/">https://lwn.net/Articles/649729/</a>&gt; RCU-walk: Linuxにおける高速なパスナム検索</p></li>
+<li><p>&lt;<a class="reference external" href="https://lwn.net/Articles/650786/">https://lwn.net/Articles/650786/</a>&gt; シンボリックリンクを巡る歩き</p></li>
+</ul>
+<p>Neil Brownが執筆し、Al ViroおよびJon Corbetの協力により作成されました。その後、カーネルの変更に応じて更新されています。含まれる変更点には、ディレクトリごとの並列名検索などが含まれます。</p>
+<ul class="simple">
+<li><p>resolution restriction flags.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">openat2()</span></code> パスナム検索の最も明らかな特徴は、その複雑さです。この点についてはほとんど探索を必要とせずとも気づくことができます。多くのルールや特殊なケース、実装の選択肢が組み合わさり、無知な読者を混乱させます。コンピュータ科学ではこのような複雑さに長年慣れ親しんでおり、それを管理するためのツールがあります。我々が広く利用するツールの一つが「分けて考える（divide and conquer）」です。分析の初期段階ではシンボリックリンクを分離し、最終段階で取り扱います。シンボリックリンクに到達する前にも、VFSのロック処理のアプローチに基づいた大きな分岐があります。これにより「REF-walk」と「RCU-walk」を別々に検討できます。しかし、我々はまだその段階に達していません。いくつか重要な低レベルの区別を明確にする必要があります。</p></li>
+</ul>
+<section id="introduction-to-pathname-lookup">
+<h2>pathname検索の紹介<a class="headerlink" href="#introduction-to-pathname-lookup" title="この見出しへのパーマリンク">¶</a></h2>
+<p>2種類の…</p>
+<section id="there-are-two-sorts-of">
+<h3>パスナム（時折「ファイル名」とも呼ばれる）は、ファイルシステム内のオブジェクトを識別するためのもので、読者には馴染みがあるでしょう。これらは2種類の要素から構成されています：1つ以上の「/」文字からなる「スラッシュ」、および1つ以上の「/」以外の文字からなる「コンポーネント」です。これらは2種類のパスを形成します。スラッシュで始まるパスは「絶対パス」であり、ファイルシステムのルートから始まります。それ以外のパスは「相対パス」であり、現在のディレクトリから始まるか、ファイル記述子が指定する他の場所から始まります。このファイル記述子は、「openat()」などのシステムコールで提供されます。<a class="headerlink" href="#there-are-two-sorts-of" title="この見出しへのパーマリンク">¶</a></h3>
+<p>パスナムは、2種類の要素から構成されています：1つ以上の「/」文字からなる「スラッシュ」、および1つ以上の「/」以外の文字からなる「コンポーネント」です。これらは2種類のパスを形成します。スラッシュで始まるパスは「絶対パス」であり、ファイルシステムのルートから始まります。それ以外のパスは「相対パス」であり、現在のディレクトリから始まるか、ファイル記述子が指定する他の場所から始まります。このファイル記述子は、「openat()」などのシステムコールで提供されます。<code class="docutils literal notranslate"><span class="pre">/</span></code>パスナムは、2種類の要素から構成されています：1つ以上の「/」文字からなる「スラッシュ」、および1つ以上の「/」以外の文字からなる「コンポーネント」です。これらは2種類のパスを形成します。スラッシュで始まるパスは「絶対パス」であり、ファイルシステムのルートから始まります。それ以外のパスは「相対パス」であり、現在のディレクトリから始まるか、ファイル記述子が指定する他の場所から始まります。このファイル記述子は、「openat()」などのシステムコールで提供されます。<code class="docutils literal notranslate"><span class="pre">/</span></code>パスナムは、2種類の要素から構成されています：1つ以上の「/」文字からなる「スラッシュ」、および1つ以上の「/」以外の文字からなる「コンポーネント」です。これらは2種類のパスを形成します。スラッシュで始まるパスは「絶対パス」であり、ファイルシステムのルートから始まります。それ以外のパスは「相対パス」であり、現在のディレクトリから始まるか、ファイル記述子が指定する他の場所から始まります。このファイル記述子は、「openat()」などのシステムコールで提供されます。<code class="docutils literal notranslate"><span class="pre">*at()</span></code>パスナムは、2種類の要素から構成されています：1つ以上の「/」文字からなる「スラッシュ」、および1つ以上の「/」以外の文字からなる「コンポーネント」です。これらは2種類のパスを形成します。スラッシュで始まるパスは「絶対パス」であり、ファイルシステムのルートから始まります。それ以外のパスは「相対パス」であり、現在のディレクトリから始まるか、ファイル記述子が指定する他の場所から始まります。このファイル記述子は、「openat()」などのシステムコールで提供されます。 <a class="reference external" href="http://man7.org/linux/man-pages/man2/openat.2.html">openat()</a>.</p>
+<p>パスナムは、2種類の要素から構成されています：1つ以上の「/」文字からなる「スラッシュ」、および1つ以上の「/」以外の文字からなる「コンポーネント」です。これらは2種類のパスを形成します。スラッシュで始まるパスは「絶対パス」であり、ファイルシステムのルートから始まります。それ以外のパスは「相対パス」であり、現在のディレクトリから始まるか、ファイル記述子が指定する他の場所から始まります。このファイル記述子は、「openat()」などのシステムコールで提供されます。<code class="docutils literal notranslate"><span class="pre">*at()</span></code>POSIXでは一般的に禁止されていますが、Linuxの一部の「」システムコールでは、flagが指定されている場合にこれを許可しています。たとえば、実行可能なファイルのオープンファイル記述子をもつ場合、空のパスを渡して「execveat()」を呼び出すことで実行できます。 <code class="docutils literal notranslate"><span class="pre">AT_EMPTY_PATH</span></code> execveat() <a class="reference external" href="http://man7.org/linux/man-pages/man2/execveat.2.html">パスナムは、2種類の要素から構成されています：1つ以上の「/」文字からなる「スラッシュ」、および1つ以上の「/」以外の文字からなる「コンポーネント」です。これらは2種類のパスを形成します。スラッシュで始まるパスは「絶対パス」であり、ファイルシステムのルートから始まります。それ以外のパスは「相対パス」であり、現在のディレクトリから始まるか、ファイル記述子が指定する他の場所から始まります。このファイル記述子は、「openat()」などのシステムコールで提供されます。</a> execveat() <code class="docutils literal notranslate"><span class="pre">AT_EMPTY_PATH</span></code> フラグを設定します。</p>
+<p>パスナムは、2種類の要素から構成されています：1つ以上の「/」文字からなる「スラッシュ」、および1つ以上の「/」以外の文字からなる「コンポーネント」です。これらは2種類のパスを形成します。スラッシュで始まるパスは「絶対パス」であり、ファイルシステムのルートから始まります。それ以外のパスは「相対パス」であり、現在のディレクトリから始まるか、ファイル記述子が指定する他の場所から始まります。このファイル記述子は、「openat()」などのシステムコールで提供されます。 <code class="docutils literal notranslate"><span class="pre">ENOENT</span></code> または <code class="docutils literal notranslate"><span class="pre">ENOTDIR</span></code> パスナムは、2種類の要素から構成されています：1つ以上の「/」文字からなる「スラッシュ」、および1つ以上の「/」以外の文字からなる「コンポーネント」です。これらは2種類のパスを形成します。スラッシュで始まるパスは「絶対パス」であり、ファイルシステムのルートから始まります。それ以外のパスは「相対パス」であり、現在のディレクトリから始まるか、ファイル記述子が指定する他の場所から始まります。このファイル記述子は、「openat()」などのシステムコールで提供されます。</p>
+<p>最終的なコンポーネントはそれほど単純ではありません。異なるシステムコールはこのコンポーネントをかなり異なる方法で解釈します（例：一部は作成し、一部は作成しない）。また、このコンポーネントは存在しない可能性もあります：空のパス名やスラッシュだけを含むパス名は最終的なコンポーネントを持ちません。存在する場合でも、"" または "" という形になることがあります。これらは他のコンポーネントとはかなり異なる方法で処理されます。<code class="docutils literal notranslate"><span class="pre">.</span></code>"" または "" という形になることがあります。これらは他のコンポーネントとはかなり異なる方法で処理されます。<code class="docutils literal notranslate"><span class="pre">..</span></code>"" という形になることがあります。これらは他のコンポーネントとはかなり異なる方法で処理されます。</p>
+<p>パス名がスラッシュで終わる場合、例えば "" など、最終的なコンポーネントが空であると考えたくなるかもしれません。多くの場合、これにより正しい結果が得られますが、常にそうではありません。特に、<code class="docutils literal notranslate"><span class="pre">/tmp/foo/</span></code>"" など、最終的なコンポーネントで指定されたディレクトリを作成または削除する操作が行われ、パス名が "" で終わる場合でも動作する必要があります。 <code class="docutils literal notranslate"><span class="pre">mkdir()</span></code> および <code class="docutils literal notranslate"><span class="pre">rmdir()</span></code> "" で終わるパス名は、最後のスラッシュ前のパス名コンポーネントが既存のディレクトリまたは解決後に直ちに作成されるディレクトリのエントリを指している場合にのみ、解決が成功する必要があります。<code class="docutils literal notranslate"><span class="pre">/</span></code>Linuxのパス名処理コード（主に "" に記述されています）は、これらの問題をすべて処理しています：パス名をコンポーネントに分割し、"everything else" を最終コンポーネントとは別に処理し、許可されていない場所で末尾スラッシュが使用されないことを確認しています。また、同時アクセスという重要な問題にも対応しています。 <a class="reference external" href="https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap04.html#tag_04_12">パス名を検索している間に別のプロセスが変更を加える可能性があります。極端な例として、"a/b" が "a/c/b" にリネームされる間に別のプロセスが "a/b/.." を検索している場合、そのプロセスが "a/c" を成功裏に解決する可能性があります。ほとんどの競合状態はもっと微妙で、パス名検索の主要なタスクの一つはこれらが有害な影響を与えないようにすることです。多くの競合状態は "dcache" の文脈で最も明確に現れます。この "dcache" の理解はパス名検索を理解する上で中心的な役割を果たします。</a>:</p>
+<blockquote>
+<div><p>キャッシュ以上のもの</p>
+</div></blockquote>
+<p>"dcache" は、各ファイルシステム内の名前の情報をキャッシュして、検索時に迅速に利用可能にします。各エントリ（"dentry" と呼ばれます）には3つの重要なフィールドがあります：コンポーネント名、親の "dentry" へのポインタ、そして "inode" へのポインタです。"inode" は、親ディレクトリ内の指定された名前のオブジェクトに関する追加情報を含みます。"inode" ポインタは <code class="docutils literal notranslate"><span class="pre">fs/namei.c</span></code>"" に記述されています）は、これらの問題をすべて処理しています：パス名をコンポーネントに分割し、"everything else" を最終コンポーネントとは別に処理し、許可されていない場所で末尾スラッシュが使用されないことを確認しています。また、同時アクセスという重要な問題にも対応しています。</p>
+<p>"" で終わるパス名は、最後のスラッシュ前のパス名コンポーネントが既存のディレクトリまたは解決後に直ちに作成されるディレクトリのエントリを指している場合にのみ、解決が成功する必要があります。</p>
+</section>
+<section id="more-than-just-a-cache">
+<h3>"" に記述されています）は、これらの問題をすべて処理しています：パス名をコンポーネントに分割し、"everything else" を最終コンポーネントとは別に処理し、許可されていない場所で末尾スラッシュが使用されないことを確認しています。また、同時アクセスという重要な問題にも対応しています。<a class="headerlink" href="#more-than-just-a-cache" title="この見出しへのパーマリンク">¶</a></h3>
+<p>"" に記述されています）は、これらの問題をすべて処理しています：パス名をコンポーネントに分割し、"everything else" を最終コンポーネントとは別に処理し、許可されていない場所で末尾スラッシュが使用されないことを確認しています。また、同時アクセスという重要な問題にも対応しています。 <code class="docutils literal notranslate"><span class="pre">NULL</span></code> 親のディレクトリにその名前が存在しないことを示しています。ディレクトリのdentryが子のdentryにリンクしている場合がありますが、そのリンクはパス名検索には使用されず、ここでは考慮しません。</p>
+<p>dcacheはパス名検索の加速以外にも複数の用途があります。特に重要なのは、マウントテーブルと密接に統合されている点です。マウントテーブルが実際に保存しているのは、どのdentryの上にどのdentryがマウントされているかです。</p>
+<p>dcacheを考慮する際、もう一つの「二つのタイプ」の区別があります。ファイルシステムには二つのタイプがあります。</p>
+<p>一部のファイルシステムは、dcache内の情報が常に完全に正確であることを保証しています（ただし、完全である必要はなく）。これにより、VFSはファイルシステムに問い合わせることなく特定のファイルが存在するかどうかを判断でき、ファイルシステムを特定の競合条件や他の問題から保護できます。このようなファイルシステムは通常、ext3、XFS、Btrfsなどのローカルファイルシステムです。</p>
+<p>他のファイルシステムはこの保証を提供できません。これは、ネットワークを介して共有されるファイルシステム（例: NFSや9Pなどのリモートファイルシステム、ocfs2やcephfsなどのクラスタファイルシステム）のためです。このようなファイルシステムでは、VFSがキャッシュされた情報を再検証でき、独自の方法で競合条件への対応を実装しなければなりません。VFSは、dentryのフラグが設定されていることでこれらのファイルシステムを検出できます。
+<code class="docutils literal notranslate"><span class="pre">DCACHE_OP_REVALIDATE</span></code> dentryのフラグが設定されていることで識別されます。</p>
+</section>
+<section id="ref-walk-simple-concurrency-management-with-refcounts-and-spinlocks">
+<h3>REF-walk: 参照カウントとスピニングロックによる単純な並行制御<a class="headerlink" href="#ref-walk-simple-concurrency-management-with-refcounts-and-spinlocks" title="この見出しへのパーマリンク">¶</a></h3>
+<p>これらの区別が丁寧に分類されたら、パスをたどる実際のプロセスを確認できます。特に、「パス名のすべての他の部分」の処理に焦点を当て、「REF-walk」による並行制御のアプローチを検討します。このコードは以下の関数にあります。 <code class="docutils literal notranslate"><span class="pre">link_path_walk()</span></code> 関数内で、"RCU-walk"が設定されている場合を除けば、すべての条件を無視します。<code class="docutils literal notranslate"><span class="pre">LOOKUP_RCU</span></code>（"RCU-walk"の使用を示しています）</p>
+<p>REF-walkはロックと参照カウントの使用がかなり強引です。古い「ビッグカーネルロック」時代ほどではありませんが、必要な場合はロックを取得することを恐れません。さまざまな並行制御メカニズムを使用しています。各種のプリミティブについての背景知識は前提とされ、必要であれば他に記載されている『ロックャーたち』から学ぶことができます。 <a class="reference external" href="https://lwn.net/Articles/453685/">『ロックャーたち』</a>.</p>
+<p>REF-walkで使用されるロックメカニズムには以下のものがあります：</p>
+<section id="dentry-d-lockref">
+<h4>dentry-&gt;d_lockref<a class="headerlink" href="#dentry-d-lockref" title="この見出しへのパーマリンク">¶</a></h4>
+<p>これはlockrefプリミティブを使用して、スピンロックと参照カウントの両方を提供します。このプリミティブの特徴は、論理的なシーケンス「lock; inc_ref; unlock;」が、しばしば単一のアトミックメモリ操作で実行できる点です。</p>
+<p>dentryに参照を保持することで、dentryが突然解放され他の用途に使われることを防ぎ、さまざまなフィールドの値が予想通り動作します。また、inodeへの参照もある程度保護しています。 <code class="docutils literal notranslate"><span class="pre">-&gt;d_inode</span></code> inodeへの参照をある程度保護しています。</p>
+<p>dentryとinodeの関連性は比較的永続的です。たとえば、ファイルがリネームされるとき、dentryとinodeは一緒に新しい場所へ移動します。ファイルが作成されるとき、dentryは最初に負の状態（つまり、 <code class="docutils literal notranslate"><span class="pre">d_inode</span></code> 通常のRCU読み込み側クリティカルセクションは、条件付きでスリープロックを取得することが許容されます（例として <code class="docutils literal notranslate"><span class="pre">NULL</span></code>）となり、作成行為の一環として新しいinodeに割り当てられます。</p>
+<p>ファイルが削除されるとき、この変化はキャッシュ内で「 <code class="docutils literal notranslate"><span class="pre">d_inode</span></code> に（木の下から葉に向かって） <code class="docutils literal notranslate"><span class="pre">NULL</span></code>」を設定するか、または親ディレクトリで名前を検索するためのハッシュテーブル（後述）からdentryを削除するかのいずれかで反映されます。dentryがまだ使用されている場合、2番目のオプションが使用されます。これは、削除後もオープンファイルを引き続き使用することが完全に合法であり、dentryが残ることで利便性が得られるためです。dentryが他の用途で使用されていない場合（つまり、参照カウントが <code class="docutils literal notranslate"><span class="pre">d_lockref</span></code> ）のみ、
+<code class="docutils literal notranslate"><span class="pre">d_inode</span></code> が設定され、 <code class="docutils literal notranslate"><span class="pre">NULL</span></code>にします。この方法は非常に一般的なケースにおいて効率的です。</p>
+<p>したがって、dentryに参照が保持されている限り、非-<code class="docutils literal notranslate"><span class="pre">NULL</span></code> <code class="docutils literal notranslate"><span class="pre">-&gt;d_inode</span></code>
+値は決して変更されません。</p>
+</section>
+<section id="dentry-d-lock">
+<h4>dentry-&gt;d_lock<a class="headerlink" href="#dentry-d-lock" title="この見出しへのパーマリンク">¶</a></h4>
+<p><code class="docutils literal notranslate"><span class="pre">d_lock</span></code> は、上記の <code class="docutils literal notranslate"><span class="pre">d_lockref</span></code> に含まれるスピンロックの別名です。私たちの目的において、このロックを保持することで、dentryがリネームまたはアンリンクされるのを防ぎます。特に、その親（<code class="docutils literal notranslate"><span class="pre">d_parent</span></code>）および名前（<code class="docutils literal notranslate"><span class="pre">d_name</span></code>）は変更できず、dentryハッシュテーブルから削除されることもありません。</p>
+<p>ディレクトリ内での名前を検索する際、REF-walkはハッシュテーブル内で見つける各候補dentryに対して <code class="docutils literal notranslate"><span class="pre">d_lock</span></code> を実行し、その後親と名前が正しいかを確認します。したがって、キャッシュ内で検索する際には親をロックせず、子だけをロックします。</p>
+<p>特定の名前の親を検索する際（"<code class="docutils literal notranslate"><span class="pre">..</span></code>"を処理するため）、REF-walkは <code class="docutils literal notranslate"><span class="pre">d_lock</span></code> を取得して、 <code class="docutils literal notranslate"><span class="pre">d_parent</span></code>への安定した参照を確保しますが、最初に軽量なアプローチを試みます。
+<code class="docutils literal notranslate"><span class="pre">dget_parent()</span></code>で示されているように、親に参照を取得でき、その後 <code class="docutils literal notranslate"><span class="pre">d_parent</span></code> が変更されていないことが確認されれば、子のロックを実際に取得する必要はありません。</p>
+</section>
+<section id="rename-lock">
+<h4>rename_lock<a class="headerlink" href="#rename-lock" title="この見出しへのパーマリンク">¶</a></h4>
+<p>特定のディレクトリ内の名前を検索するには、名前とディレクトリのdentryからハッシュを計算し、ハッシュテーブルのその位置にアクセスし、見つかったリンクリストを検索します。</p>
+<p>dentryがリネームされる場合、名前と親のdentryの両方が変更されるため、ハッシュ値もほぼ間違いなく変化します。これにより、dentryがハッシュテーブル内の別のチェーンに移動します。ファイル名の検索がこのような移動をしたdentryを検出していた場合、誤ったチェーンを引き続き検索してしまう可能性があり、正しいチェーンの一部を無視するかもしれません。</p>
+<p>名前検索プロセス（<code class="docutils literal notranslate"><span class="pre">d_lookup()</span></code>）は <em>ではありません</em> これを防ぐことを試みますが、発生した場合にのみ検出します。
+<code class="docutils literal notranslate"><span class="pre">rename_lock</span></code> seqlockであり、どのdentryもリネームされるたびに更新されます。もし <code class="docutils literal notranslate"><span class="pre">d_lookup</span></code> ハッシュテーブル内のチェーンをスキャン中にリネームが発生した場合、単に再試行します。</p>
+<p><code class="docutils literal notranslate"><span class="pre">rename_lock</span></code> 潜在的な攻撃を検出および防御するためにも使用されます。 <code class="docutils literal notranslate"><span class="pre">LOOKUP_BENEATH</span></code> および <code class="docutils literal notranslate"><span class="pre">LOOKUP_IN_ROOT</span></code> 「..」を解決する際（親ディレクトリがルートの外に移動し、 <code class="docutils literal notranslate"><span class="pre">path_equal()</span></code>
+チェックを回避する場合）。もし <code class="docutils literal notranslate"><span class="pre">rename_lock</span></code> 検索中に更新され、パスが「..」に遭遇した場合、潜在的な攻撃が発生しました。 <code class="docutils literal notranslate"><span class="pre">handle_dots()</span></code> 早期に終了します。
+<code class="docutils literal notranslate"><span class="pre">-EAGAIN</span></code>.</p>
+</section>
+<section id="inode-i-rwsem">
+<h4>inode-&gt;i_rwsem<a class="headerlink" href="#inode-i-rwsem" title="この見出しへのパーマリンク">¶</a></h4>
+<p><code class="docutils literal notranslate"><span class="pre">i_rwsem</span></code> 特定のディレクトリへのすべての変更をシリアル化する読み書きセマフォです。これにより、たとえば、 <code class="docutils literal notranslate"><span class="pre">unlink()</span></code> ビットのワードと <code class="docutils literal notranslate"><span class="pre">rename()</span></code>
+同時に発生することはできません。ファイルシステムがdcacheに現在存在しない名前を検索するとき、またはディレクトリのエントリ一覧を取得する際（オプションで） <code class="docutils literal notranslate"><span class="pre">readdir()</span></code>.</p>
+<p>これは...の補完的な役割を果たします。 <code class="docutils literal notranslate"><span class="pre">d_lock</span></code>: <code class="docutils literal notranslate"><span class="pre">i_rwsem</span></code> ディレクトリに適用するとそのディレクトリ内のすべての名前を保護します。一方で、 <code class="docutils literal notranslate"><span class="pre">d_lock</span></code>
+名前に適用するとディレクトリ内の特定の名前だけを保護します。dcache のほとんどの変更は、 <code class="docutils literal notranslate"><span class="pre">i_rwsem</span></code> 関連するディレクトリ inode に作用し、一時的に
+<code class="docutils literal notranslate"><span class="pre">d_lock</span></code> 一か所または複数の dentry を取得しながら変更が行われます。ただし、メモリ圧力によりアイドルな dentry が dcache から削除される場合、この処理は <code class="docutils literal notranslate"><span class="pre">d_lock</span></code>ただし、 <code class="docutils literal notranslate"><span class="pre">i_rwsem</span></code> 役割を果たしません。</p>
+<p>セマフォラはパス名検索に2つの異なる方法で影響を与えます。まず、ディレクトリ内の名前の検索中に変更を防ぐことで、  <code class="docutils literal notranslate"><span class="pre">walk_component()</span></code> 使用しています。
+<code class="docutils literal notranslate"><span class="pre">lookup_fast()</span></code> まず、名前がキャッシュにあるかを確認します。この確認は、 <code class="docutils literal notranslate"><span class="pre">d_lock</span></code> 名前が見つからない場合、 <code class="docutils literal notranslate"><span class="pre">walk_component()</span></code>
+キャッシュにない場合、 <code class="docutils literal notranslate"><span class="pre">lookup_slow()</span></code> 共有ロックを取得し、 <code class="docutils literal notranslate"><span class="pre">i_rwsem</span></code>再度名前がキャッシュにないことを確認し、ファイルシステムに問い合わせて確定的な答えを得ます。結果に関わらず、新しい dentry がキャッシュに追加されます。</p>
+<p>次に、パス名検索が最終コンポーネントに到達した場合、必要な排他を実現するために、最後の検索を行う前に <code class="docutils literal notranslate"><span class="pre">i_rwsem</span></code> 排他ロックを取得する必要があります。パス名検索がどのようにロックを取得するか、または取得しないかは、次のセクションで説明する問題の一つです。 <code class="docutils literal notranslate"><span class="pre">i_rwsem</span></code> これは次のセクションで説明する問題の一つです。</p>
+<p>2つのスレッドが同じ名前を同時に検索しようとした場合（その名前はまだdcacheに存在していない場合）共有ロックが取得されている状態でも、両方のスレッドが同じ名前の新しいdentryを追加する可能性があります。これは混乱を招くため、プライマリハッシュテーブル（ <code class="docutils literal notranslate"><span class="pre">i_rwsem</span></code> )とセカンダリハッシュテーブル（<code class="docutils literal notranslate"><span class="pre">in_lookup_hashtable</span></code>)、および各dentryごとのフラグビット（<code class="docutils literal notranslate"><span class="pre">DCACHE_PAR_LOOKUP</span></code>).</p>
+<p>）を保持している状態で、新しいdentryをキャッシュに追加するには、スレッドが
+<code class="docutils literal notranslate"><span class="pre">i_rwsem</span></code>を呼び出す必要があります。この関数はdentryを割り当て、必要な名前と親をその中に保存し、プライマリまたはセカンダリハッシュテーブルにすでに同じ名前のdentryが存在するかを確認します。存在しない場合、新たに割り当てたdentryをセカンダリハッシュテーブルに保存し、 <code class="docutils literal notranslate"><span class="pre">d_alloc_parallel()</span></code>フラグを設定します。 <code class="docutils literal notranslate"><span class="pre">DCACHE_PAR_LOOKUP</span></code> プライマリハッシュテーブルに一致するdentryが見つかった場合、そのdentryが返され、呼び出し元は他のスレッドがこのエントリを追加した競合状態で失敗したことを知ります。どちらのキャッシュにも一致するdentryが見つからない場合、新たに割り当てたdentryが返され、呼び出し元は</p>
+<p>フラグの存在からこの状態を検出します。この場合、競合状態で勝ち抜けたことを知り、ファイルシステムに検索を依頼し、一致するinodeを取得する責任が発生します。検索が完了した後、呼び出し元は <code class="docutils literal notranslate"><span class="pre">DCACHE_PAR_LOOKUP</span></code>を呼び出す必要があります。この関数はフラグをクリアし、メンテナンスを含む他の処理を行います。これによりセカンダリハッシュテーブルからdentryが削除され、通常はすでにプライマリハッシュテーブルに追加されているはずです。注意点として、 <code class="docutils literal notranslate"><span class="pre">d_lookup_done()</span></code> はこの <code class="docutils literal notranslate"><span class="pre">struct</span>
+<span class="pre">waitqueue_head</span></code> は、 <code class="docutils literal notranslate"><span class="pre">d_alloc_parallel()</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">d_lookup_done()</span></code> を呼び出す必要があります。 <code class="docutils literal notranslate"><span class="pre">waitqueue_head</span></code> まだ適用範囲内です。</p>
+<p>二次ハッシュテーブルで一致するdentryが見つかった場合、
+<code class="docutils literal notranslate"><span class="pre">d_alloc_parallel()</span></code> さらにいくつかの作業が必要です。まず、
+<code class="docutils literal notranslate"><span class="pre">DCACHE_PAR_LOOKUP</span></code> クリアされるのを待機するため、インスタンスに渡されたwait_queueを使用して <code class="docutils literal notranslate"><span class="pre">d_alloc_parallel()</span></code> 競争で勝ったインスタンスで、呼び出しによって目覚めることになる <code class="docutils literal notranslate"><span class="pre">d_lookup_done()</span></code>プライマリハッシュテーブルに追加されているか確認します。追加されている場合、dentryが返され、呼び出し元は競争を失ったと認識します。追加されていない場合、最も可能性が高い説明は、別のdentryが
+<code class="docutils literal notranslate"><span class="pre">d_splice_alias()</span></code>いずれにしても、 <code class="docutils literal notranslate"><span class="pre">d_alloc_parallel()</span></code> すべての検索を再び開始し、通常はプライマリハッシュテーブルから何かを返します。</p>
+</section>
+<section id="mnt-mnt-count">
+<h4>mnt-&gt;mnt_count<a class="headerlink" href="#mnt-mnt-count" title="この見出しへのパーマリンク">¶</a></h4>
+<p><code class="docutils literal notranslate"><span class="pre">mnt_count</span></code> 「」構造体のCPUごとの参照カウンタです。CPUごとの意味は、カウントをインクリメントする操作はCPUローカルのメモリを使用するため安価ですが、カウントがゼロかどうかを確認する操作はすべてのCPUをチェックする必要があるため高コストです。<code class="docutils literal notranslate"><span class="pre">mount</span></code>取得することで <code class="docutils literal notranslate"><span class="pre">mnt_count</span></code> マウント構造体が通常のアンマウント操作によって消失しないようにしますが、「ラズィ」アンマウントを防ぐことはできません。そのため
+<code class="docutils literal notranslate"><span class="pre">mnt_count</span></code> マウントが名前空間に残る保証はなく、特にマウント先のdentryへのリンクを安定化する保証もありません。ただし、データ構造が整合性を保つことを保証し、マウントされたファイルシステムのルートdentryへの参照を提供します。 <code class="docutils literal notranslate"><span class="pre">mount</span></code> 参照を通じて、マウントされたdentryへの安定した参照が得られますが、マウント先のdentryにはなりません。 <code class="docutils literal notranslate"><span class="pre">-&gt;mnt_count</span></code> mount_lock</p>
+</section>
+<section id="mount-lock">
+<h4>グローバルなseqlockであり、少し<a class="headerlink" href="#mount-lock" title="この見出しへのパーマリンク">¶</a></h4>
+<p><code class="docutils literal notranslate"><span class="pre">mount_lock</span></code> に似ています。これにより、どのマウントポイントにも変更が行われたかを確認できます。 <code class="docutils literal notranslate"><span class="pre">rename_lock</span></code>木を下る際（ルートから遠ざかる方向）に、マウントポイントを越える際にはこのロックを使用して、安全な移動であるかを確認します。つまり、seqlockの値を読み取り、その後コードが現在のディレクトリにマウントされているマウントポイントを検索し（存在する場合）、</p>
+<p>をインクリメントします。 <code class="docutils literal notranslate"><span class="pre">mnt_count</span></code>の値を最後に <code class="docutils literal notranslate"><span class="pre">mount_lock</span></code> の古い値と比較します。変更がなければ移動は安全であり、変更があれば <code class="docutils literal notranslate"><span class="pre">mnt_count</span></code> をデクリメントし、全体のプロセスを再試行します。</p>
+<p>木を上る際（ルートに向かう方向）で「..」リンクをたどる際には、より注意が必要です。この場合、seqlock（カウンタとスピンロックを含む）を完全にロックして、マウントポイントの変更を防ぎます。このロックは、マウント自体の参照カウントでは保証できないマウント先のdentryへのリンクを安定化するために必要です。</p>
+<p><code class="docutils literal notranslate"><span class="pre">mount_lock</span></code> 潜在的な攻撃を検出および防御するためにも使用されます。 <code class="docutils literal notranslate"><span class="pre">LOOKUP_BENEATH</span></code> および <code class="docutils literal notranslate"><span class="pre">LOOKUP_IN_ROOT</span></code> 「..」を解決する際（親ディレクトリがルートの外に移動し、 <code class="docutils literal notranslate"><span class="pre">path_equal()</span></code>
+チェックを回避する場合）。もし <code class="docutils literal notranslate"><span class="pre">mount_lock</span></code> 検索中に更新され、パスが「..」に遭遇した場合、潜在的な攻撃が発生しました。 <code class="docutils literal notranslate"><span class="pre">handle_dots()</span></code> 早期に終了します。
+<code class="docutils literal notranslate"><span class="pre">-EAGAIN</span></code>.</p>
+</section>
+<section id="rcu">
+<h4>RCU<a class="headerlink" href="#rcu" title="この見出しへのパーマリンク">¶</a></h4>
+<p>最後に、グローバル（ただし非常に軽量）なRCU読み取りロックが定期的に取得され、特定のデータ構造が不意に解放されないようにします。</p>
+<p>特に、dcacheハッシュテーブルやマウントポイントハッシュテーブルのチェーンをスキャンしている間、保持されます。</p>
+</section>
+</section>
+<section id="bringing-it-together-with-struct-nameidata">
+<h3>これを <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">nameidata</span></code><a class="headerlink" href="#bringing-it-together-with-struct-nameidata" title="この見出しへのパーマリンク">¶</a></h3>
+<p>パスをたどる過程では、現在の状態が <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">nameidata</span></code>に保存され、「namei」は伝統的な名前で、 <a class="reference external" href="https://minnie.tuhs.org/cgi-bin/utree.pl?file=V1/u2.s">初版Unix</a> から続く、名前をinodeに変換する関数の名前です。  <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">nameidata</span></code> には（他にもフィールドがありますが）</p>
+<section id="struct-path-path">
+<h4><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">path</span> <span class="pre">path</span></code><a class="headerlink" href="#struct-path-path" title="この見出しへのパーマリンク">¶</a></h4>
+<p>A <code class="docutils literal notranslate"><span class="pre">path</span></code> を含みます（これは <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">vfsmount</span></code> に埋め込まれています） <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">mount</span></code>と、 <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dentry</span></code>も含まれます。これらは、たどりの現在の状態を記録します。初期状態では、開始点（現在の作業ディレクトリ、ルートディレクトリ、またはファイル記述子で指定された他のディレクトリ）を参照し、各ステップごとに更新されます。 <code class="docutils literal notranslate"><span class="pre">d_lockref</span></code> および <code class="docutils literal notranslate"><span class="pre">mnt_count</span></code> を通じた参照は常に保持されます。</p>
+</section>
+<section id="struct-qstr-last">
+<h4><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">qstr</span> <span class="pre">last</span></code><a class="headerlink" href="#struct-qstr-last" title="この見出しへのパーマリンク">¶</a></h4>
+<p>これは文字列と長さ（つまり、 <em>ではありません</em> <code class="docutils literal notranslate"><span class="pre">nul</span></code> で終端）を含み、パス名の「次の」コンポーネントです。</p>
+</section>
+<section id="int-last-type">
+<h4><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">last_type</span></code><a class="headerlink" href="#int-last-type" title="この見出しへのパーマリンク">¶</a></h4>
+<p>これは <code class="docutils literal notranslate"><span class="pre">LAST_NORM</span></code>, <code class="docutils literal notranslate"><span class="pre">LAST_ROOT</span></code>, <code class="docutils literal notranslate"><span class="pre">LAST_DOT</span></code> または <code class="docutils literal notranslate"><span class="pre">LAST_DOTDOT</span></code>の部分で、 <code class="docutils literal notranslate"><span class="pre">last</span></code> のフィールドは、タイプが <code class="docutils literal notranslate"><span class="pre">LAST_NORM</span></code>.</p>
+</section>
+<section id="struct-path-root">
+<h4><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">path</span> <span class="pre">root</span></code><a class="headerlink" href="#struct-path-root" title="この見出しへのパーマリンク">¶</a></h4>
+<p>これは、ファイルシステムの有効なルートへの参照を保持するために使用されます。通常、この参照は必要ありませんので、このフィールドは初めて使用するとき、または非標準のルートが要求されたときにのみ割り当てられます。この参照を保持することで、 <code class="docutils literal notranslate"><span class="pre">nameidata</span></code> パスの走査全体で1つのルートのみが有効になることを保証します。これは、 <code class="docutils literal notranslate"><span class="pre">chroot()</span></code> システムコールで読み取ることができます。</p>
+<p>の場合に注意すべき点は、 <code class="docutils literal notranslate"><span class="pre">LOOKUP_IN_ROOT</span></code> または
+<code class="docutils literal notranslate"><span class="pre">LOOKUP_BENEATH</span></code>が、 <code class="docutils literal notranslate"><span class="pre">openat2()</span></code> （これらを公開する <code class="docutils literal notranslate"><span class="pre">LOOKUP_</span></code> フラグ）。</p>
+<p>ルートが必要なのは、次の2つの条件のいずれかが成立する場合です：（1）パス名またはシンボリックリンクが「/」で始まる場合、または（2）「<code class="docutils literal notranslate"><span class="pre">..</span></code>」コンポーネントが処理される場合です。なぜなら、「<code class="docutils literal notranslate"><span class="pre">..</span></code>」は常にルートに残るからです。使用される値は通常、呼び出しプロセスの現在のルートディレクトリです。代替のルートは、
+<code class="docutils literal notranslate"><span class="pre">sysctl()</span></code> 呼び出します <code class="docutils literal notranslate"><span class="pre">file_open_root()</span></code>、およびNFSv4またはBtrfsが
+<code class="docutils literal notranslate"><span class="pre">mount_subtree()</span></code>を呼び出す場合に提供できます。それぞれの場合、ファイルシステムの非常に特定の部分でパス名が検索され、そのサブツリーから脱出しないように検索を制限する必要があります。これはローカルの <code class="docutils literal notranslate"><span class="pre">chroot()</span></code>.</p>
+<p>に少し似ています。シンボリックリンクの処理を無視して、今から「<code class="docutils literal notranslate"><span class="pre">link_path_walk()</span></code>」関数を説明します。これは、最後のコンポーネントを除くすべての検索を処理します：</p>
+<blockquote>
+<div><p>パス（<code class="docutils literal notranslate"><span class="pre">name</span></code>）とnameidata構造体（<code class="docutils literal notranslate"><span class="pre">nd</span></code>）を指定して、現在のディレクトリが実行許可を持っているか確認し、次に進みながら <code class="docutils literal notranslate"><span class="pre">name</span></code>
+を更新します。それが最後のコンポーネントだった場合、戻ります。それ以外の場合は、 <code class="docutils literal notranslate"><span class="pre">last_type</span></code> および <code class="docutils literal notranslate"><span class="pre">last</span></code>を呼び出してから、最初から繰り返します。
+<code class="docutils literal notranslate"><span class="pre">walk_component()</span></code> はさらに簡単です。コンポーネントが</p>
+</div></blockquote>
+<p><code class="docutils literal notranslate"><span class="pre">walk_component()</span></code> の場合、 <code class="docutils literal notranslate"><span class="pre">LAST_DOTS</span></code>を呼び出します。これはすでに説明した通り必要なロックを実行します。もし <code class="docutils literal notranslate"><span class="pre">handle_dots()</span></code> コンポーネントを見つけた場合、まず「 <code class="docutils literal notranslate"><span class="pre">LAST_NORM</span></code> 」を呼び出します。これはdcacheのみを参照しますが、その種のファイルシステムであればファイルシステムに結果を再検証を依頼します。その結果が良くなかった場合、「<code class="docutils literal notranslate"><span class="pre">lookup_fast()</span></code>」を呼び出します。これは<code class="docutils literal notranslate"><span class="pre">lookup_slow()</span></code>を再確認し、その後ファイルシステムに明確な答えを求める処理を行います。これらすべては、以下の説明で述べる通り、 <code class="docutils literal notranslate"><span class="pre">i_rwsem</span></code>を呼び出してマウントポイントを処理します。
+<code class="docutils literal notranslate"><span class="pre">follow_managed()</span></code> シンボリックリンクがない場合、</p>
+<p>新しい <code class="docutils literal notranslate"><span class="pre">walk_component()</span></code> を作成します。これは新しいdentryへのカウントされた参照と、新しい
+<code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">path</span></code> への参照を含みます。これは以前の <code class="docutils literal notranslate"><span class="pre">vfsmount</span></code> と異なる場合にのみカウントされます。その後、 <code class="docutils literal notranslate"><span class="pre">vfsmount</span></code>を呼び出して新しい
+<code class="docutils literal notranslate"><span class="pre">path_to_nameidata()</span></code> を設定し、不要な参照を削除します。 <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">path</span></code> の
+<code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">nameidata</span></code> この「手順を踏む」方式で、新しいdentryへの参照を取得する前に以前のdentryへの参照を削除するという流れは、明らかに思えるかもしれませんが、RCU-walkバージョンの類似物を認識するために指摘しておく価値があります。</p>
+<p>最後のコンポーネントの処理</p>
+</section>
+</section>
+<section id="handling-the-final-component">
+<h3>は、パスの最後のコンポーネントを参照するまで進みます。ただし、<a class="headerlink" href="#handling-the-final-component" title="この見出しへのパーマリンク">¶</a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">link_path_walk()</span></code> を呼び出すことはありません。 <code class="docutils literal notranslate"><span class="pre">nd-&gt;last</span></code> および
+<code class="docutils literal notranslate"><span class="pre">nd-&gt;last_type</span></code> を参照する。呼び出すことはしません。 <code class="docutils literal notranslate"><span class="pre">walk_component()</span></code> その最後のタイミングでは。その最終的なコンポーネントの処理は、呼び出し元に任されています。これらの呼び出し元は
+<code class="docutils literal notranslate"><span class="pre">path_lookupat()</span></code>, <code class="docutils literal notranslate"><span class="pre">path_parentat()</span></code>, <code class="docutils literal notranslate"><span class="pre">path_mountpoint()</span></code> および
+<code class="docutils literal notranslate"><span class="pre">path_openat()</span></code> それぞれが、さまざまなシステムコールの異なる要件を処理しています。</p>
+<p><code class="docutils literal notranslate"><span class="pre">path_parentat()</span></code> これは明らかに最も簡単です - これには少しの管理処理をラップするだけです <code class="docutils literal notranslate"><span class="pre">link_path_walk()</span></code> そして呼び出し元に親ディレクトリと最終コンポーネントを返します。呼び出し元は、名前を生成する（via <code class="docutils literal notranslate"><span class="pre">filename_create()</span></code>) または名前を削除またはリネームする（その場合 <code class="docutils literal notranslate"><span class="pre">user_path_parent()</span></code> が使用されます）。彼らは
+<code class="docutils literal notranslate"><span class="pre">i_rwsem</span></code> を用いて、検証しながら他の変更を除外し、その後操作を実行します。</p>
+<p><code class="docutils literal notranslate"><span class="pre">path_lookupat()</span></code> これはほぼ同様に簡単です - 既存のオブジェクトが必要な場合、例えば <code class="docutils literal notranslate"><span class="pre">stat()</span></code> または <code class="docutils literal notranslate"><span class="pre">chmod()</span></code>。これは基本的に、 <code class="docutils literal notranslate"><span class="pre">walk_component()</span></code> 最終コンポーネントに対して呼び出しを通じて
+<code class="docutils literal notranslate"><span class="pre">lookup_last()</span></code>.  <code class="docutils literal notranslate"><span class="pre">path_lookupat()</span></code> 最終的なdentryのみを返します。</p>
+<p><code class="docutils literal notranslate"><span class="pre">path_mountpoint()</span></code> マウントされたファイルシステムを再検証しようとしないアンマウントの特別なケースを処理します。これは、呼び出しを通じて <code class="docutils literal notranslate"><span class="pre">mountpoint_last()</span></code>、の代替実装を含んでいます。 <code class="docutils literal notranslate"><span class="pre">lookup_slow()</span></code> そのステップをスキップします。これは、アクセスできないファイルシステムをアンマウントする場合に重要です。たとえば、死んだNFSサーバーによって提供されるファイルシステムなど</p>
+<p>最後に <code class="docutils literal notranslate"><span class="pre">path_openat()</span></code> は...に使用されます <code class="docutils literal notranslate"><span class="pre">open()</span></code> システムコール；これは、「”で始まるサポート関数に含まれており、O_CREAT（O_EXCLありまたはなし）のさまざまな微妙な点を処理するための必要な複雑さを含んでいます。<code class="docutils literal notranslate"><span class="pre">do_last()</span></code>最終的な「”文字および末尾のシンボリックリンクを含んでいます。このシリーズの最終部分でこれらのシンボリックリンクについて再び詳しく説明します。<code class="docutils literal notranslate"><span class="pre">/</span></code>」は、場合によっては、見つける内容によって取ります。<code class="docutils literal notranslate"><span class="pre">do_last()</span></code>」は、場合によっては、見つける内容によって取ります。 <code class="docutils literal notranslate"><span class="pre">i_rwsem</span></code>、見つける内容によって取ります。</p>
+<p>これらまたはこれらを呼び出す関数は、最終的なコンポーネントが <code class="docutils literal notranslate"><span class="pre">LAST_NORM</span></code>でなければなりません。この検索の目的が何かを作成することである場合、
+<code class="docutils literal notranslate"><span class="pre">last_type</span></code> 他に <code class="docutils literal notranslate"><span class="pre">LAST_NORM</span></code> エラーになります。たとえば、 <code class="docutils literal notranslate"><span class="pre">path_parentat()</span></code> レポート <code class="docutils literal notranslate"><span class="pre">LAST_DOTDOT</span></code>、その場合、呼び出し元はその名前を作成しようとしません。また、末尾スラッシュを確認するためにテストします <code class="docutils literal notranslate"><span class="pre">last.name[last.len]</span></code>。最終コンポーネントの後に文字がある場合、それは末尾スラッシュでなければなりません。</p>
+</section>
+<section id="revalidation-and-automounts">
+<h3>再検証と自動マウント<a class="headerlink" href="#revalidation-and-automounts" title="この見出しへのパーマリンク">¶</a></h3>
+<p>シンボリックリンクを除けば、「REF-walk」プロセスの未処理部分は2つだけです。1つは古くなったキャッシュエントリーの処理で、もう1つは自動マウントです。</p>
+<p>必要なファイルシステムでは、検索ルーチンが「
+<code class="docutils literal notranslate"><span class="pre">-&gt;d_revalidate()</span></code> dentryメソッドを呼び出して、キャッシュされた情報が最新であることを確認します。これは通常、有効性を確認したり、サーバーからいくつかの詳細情報を更新したりします。一部のケースでは、パスの上流に変更があったことが判明し、以前に有効とされていたものが実際には有効でないことが判明する場合があります。このような場合、全体のパスの検索が中止され、「<code class="docutils literal notranslate"><span class="pre">LOOKUP_REVAL</span></code>フラグが設定されています。これにより再検証がより丁寧に行われるように強制されます。このリトライプロセスの詳細については次の記事で詳しく説明します。</p>
+<p>オートマウントポイントは、ファイルシステム内の場所で、名前を検索する試みがその検索の処理方法を変更する可能性があります。特に、その場所にファイルシステムをマウントすることで処理が変化します。これらの詳細については、Linuxドキュメンテーションツリーのautofs.txtに記載されていますが、ここではパス検索に特に関連するいくつかの注意点を説明します。</p>
+<p>Linux VFSには「管理された」dentryという概念があり、関数名に「<code class="docutils literal notranslate"><span class="pre">follow_managed()</span></code>」と反映されています。これらのdentryには、3つの異なるフラグが設定される可能性があり、それぞれに興味深い点があります。 <code class="docutils literal notranslate"><span class="pre">dentry-&gt;d_flags</span></code>:</p>
+<section id="dcache-manage-transit">
+<h4><code class="docutils literal notranslate"><span class="pre">DCACHE_MANAGE_TRANSIT</span></code><a class="headerlink" href="#dcache-manage-transit" title="この見出しへのパーマリンク">¶</a></h4>
+<p>このフラグが設定されている場合、ファイルシステムは
+<code class="docutils literal notranslate"><span class="pre">d_manage()</span></code> dentry操作を処理する前にマウントポイントを処理するよう求めています。これは2つの特定のサービスを提供できます：</p>
+<p>競合条件を回避するためにブロックします。オートマウントポイントがアンマウントされている場合、 <code class="docutils literal notranslate"><span class="pre">d_manage()</span></code> 関数は通常、そのプロセスが完了するのを待ってから新しい検索を進めるのを許可し、新しいオートマウントをトリガーする可能性があります。</p>
+<p>特定のプロセスのみがマウントポイントを通過できるように選択的に許可します。サーバープロセスがオートマウントを管理している場合、通常のオートマウント処理をトリガーすることなくディレクトリにアクセスする必要があるかもしれません。そのサーバープロセスは <code class="docutils literal notranslate"><span class="pre">autofs</span></code>
+ファイルシステムに自身を識別し、これにより特別な通過を許可されます。
+<code class="docutils literal notranslate"><span class="pre">d_manage()</span></code> ファイルシステムがそれを返すことで <code class="docutils literal notranslate"><span class="pre">-EISDIR</span></code>.</p>
+</section>
+<section id="dcache-mounted">
+<h4><code class="docutils literal notranslate"><span class="pre">DCACHE_MOUNTED</span></code><a class="headerlink" href="#dcache-mounted" title="この見出しへのパーマリンク">¶</a></h4>
+<p>このフラグはすべてのマウントされたdentryに設定されます。Linuxは複数のファイルシステムネームスペースをサポートしているため、dentryが <em>this</em> ネームスペースにマウントされていない可能性があり、他のネームスペースにのみマウントされている場合があります。そのため、このフラグはヒントとして扱われ、保証ではありません。</p>
+<p>このフラグが設定されている場合、かつ <code class="docutils literal notranslate"><span class="pre">d_manage()</span></code> が返していなかった場合、 <code class="docutils literal notranslate"><span class="pre">-EISDIR</span></code>,
+<code class="docutils literal notranslate"><span class="pre">lookup_mnt()</span></code> 関数はマウントハッシュテーブルを検査します（前述の
+<code class="docutils literal notranslate"><span class="pre">mount_lock</span></code> を尊重しつつ）および新しい <code class="docutils literal notranslate"><span class="pre">vfsmount</span></code>
+と新しい <code class="docutils literal notranslate"><span class="pre">dentry</span></code> （どちらもカウントされた参照を持つ）を返す可能性があります。</p>
+</section>
+<section id="dcache-need-automount">
+<h4><code class="docutils literal notranslate"><span class="pre">DCACHE_NEED_AUTOMOUNT</span></code><a class="headerlink" href="#dcache-need-automount" title="この見出しへのパーマリンク">¶</a></h4>
+<p>もし <code class="docutils literal notranslate"><span class="pre">d_manage()</span></code> これまでこれだけの進展を可能にした <code class="docutils literal notranslate"><span class="pre">lookup_mnt()</span></code> がマウントポイントを発見しなかった場合、このフラグは <code class="docutils literal notranslate"><span class="pre">d_automount()</span></code> dentry操作を呼び出すことになります。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">d_automount()</span></code> 操作は任意に複雑で、サーバープロセスなどと通信する可能性がありますが、最終的にはエラーが発生したか、マウントするものがなかったか、または更新された <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">path</span></code> を提供する必要があります。 <code class="docutils literal notranslate"><span class="pre">dentry</span></code> および <code class="docutils literal notranslate"><span class="pre">vfsmount</span></code>.</p>
+<p>後者の場合、 <code class="docutils literal notranslate"><span class="pre">finish_automount()</span></code> 関数が安全に新しいマウントポイントをマウントテーブルにインストールするため呼び出されます。</p>
+<p>ここではインポートに関する新しいロックは行われず、この処理にロック（参照カウントのみ）が保持されることなく、長時間の遅延が実際に発生する可能性があるため、重要です。次回、RCU-walkを検討する際には、遅延に特に敏感な処理となるため、この点がさらに重要になります。</p>
+</section>
+</section>
+</section>
+<section id="rcu-walk-faster-pathname-lookup-in-linux">
+<h2>RCU-walk - Linuxにおける高速pathname検索<a class="headerlink" href="#rcu-walk-faster-pathname-lookup-in-linux" title="この見出しへのパーマリンク">¶</a></h2>
+<p>RCU-walkはLinuxにおいてパス名検索を行うための別のアルゴリズムです。REF-walkと多くの点で類似しており、共通のコードを共有しています。RCU-walkの重要な違いは、並行アクセスを許可する方法にあります。</p>
+<p>REF-walkは複雑であると指摘しました。これは多くの詳細や特殊なケースがあるためです。RCU-walkはこの複雑さを減らすために、いくつかのケースを処理しないことで、代わりにREF-walkに戻る形で実装されています。RCU-walkの難点は、別の方向から生じるものです：不慣れです。RCUに依存する際のロックのルールは伝統的なロックとは大きく異なり、そのため、それらに触れる際には少し時間をかけて説明します。</p>
+<section id="clear-demarcation-of-roles">
+<h3>役割の明確な区切り<a class="headerlink" href="#clear-demarcation-of-roles" title="この見出しへのパーマリンク">¶</a></h3>
+<p>並行性を管理する最も簡単な方法は、他のスレッドが特定のスレッドが参照しているデータ構造を変更することを強制的に防ぐことです。他のスレッドがデータを変更する可能性すらないと想定される場合、多くのスレッドが同時に読み取りたい場合、これは非常にコストが高くなります。たとえマルチスレッド読み取りを許可するロックを用いても、現在の読み取り数のカウントを更新する単純な動作でも不望なコストが発生します。したがって、他のプロセスが変更していない共有データ構造を読み取る際の目標は、メモリへの一切の書き込みを避けることです。ロックを一切取らない、カウントを増やさない、足跡を残さないことが重要です。</p>
+<p>すでに説明したREF-walkメカニズムはこの原則に従っていませんが、それは他のスレッドがデータを変更する可能性がある場合に設計されています。一方、RCU-walkは、多数の頻繁な読み取りとまれにしか行われない書き込みが発生する一般的な状況に設計されています。これはファイルシステムツリーのすべての部分で一般的ではありませんが、多くの部分ではそうなります。他の部分では、RCU-walkが迅速にREF-walkに戻る機能が重要です。</p>
+<p>パス名の検索は常にRCU-walkモードで開始されますが、検索対象がキャッシュに存在し安定している限りそのモードにとどまります。キャッシュされたファイルシステムイメージを軽やかに下りながら、足跡を残さず、現在の位置を慎重に確認して、転倒しないようにします。何かが変化しているか、変化しているか、またはキャッシュにない場合に気づいたときは、優雅に停止しREF-walkモードに切り替えるように試みます。</p>
+<p>この停止には、現在の
+<code class="docutils literal notranslate"><span class="pre">vfsmount</span></code> および <code class="docutils literal notranslate"><span class="pre">dentry</span></code>にカウントされた参照を取得し、これらがまだ有効であることを確認する必要があります。つまり、REF-walkでパスを歩くと同様のエントリが見つかるという不変性をRCU-walkは保証しなければなりません。RCU-walkが行う決定（次のステップを選択するなど）は、同時に木を下るREF-walkが同じ決定をした場合でも可能である必要があります。優雅な停止が成功すれば、残りのパスは信頼性が高く（ただしやや遅い）REF-walkで処理されます。RCU-walkが優雅な停止を実行できなければ、単純にトップからREF-walkで再実行します。</p>
+<p>「RCU-walkを試み、失敗すればREF-walkを試す」というパターンは、例えば <code class="docutils literal notranslate"><span class="pre">filename_lookup()</span></code>,
+<code class="docutils literal notranslate"><span class="pre">filename_parentat()</span></code>, <code class="docutils literal notranslate"><span class="pre">filename_mountpoint()</span></code>,
+<code class="docutils literal notranslate"><span class="pre">do_filp_open()</span></code>, and <code class="docutils literal notranslate"><span class="pre">do_file_open_root()</span></code>などの関数で明確に確認できます。これらはほぼ4つの <code class="docutils literal notranslate"><span class="pre">path_*()</span></code> 関数に対応しており、それぞれが <code class="docutils literal notranslate"><span class="pre">link_path_walk()</span></code>の部分で、 <code class="docutils literal notranslate"><span class="pre">path_*()</span></code> 関数は、異なるモードフラグで呼び出されるまで、動作するモードを検出するまで呼び出されます。最初は <code class="docutils literal notranslate"><span class="pre">LOOKUP_RCU</span></code> が「RCU-walk」を要求する形で呼び出されます。RCU-walkがエラー <code class="docutils literal notranslate"><span class="pre">ECHILD</span></code> で失敗した場合、特別なフラグを指定せずに「REF-walk」を要求する形で再度呼び出されます。どちらかの呼び出しでエラー <code class="docutils literal notranslate"><span class="pre">ESTALE</span></code> が発生した場合は、最終的に <code class="docutils literal notranslate"><span class="pre">LOOKUP_REVAL</span></code> が設定され（かつ
+<code class="docutils literal notranslate"><span class="pre">LOOKUP_RCU</span></code>は指定されません）キャッシュに存在するエントリが強制的に再検証されるようにします。通常は、ファイルシステムがエントリが古すぎて信頼できないと判断した場合にのみ再検証されます。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">LOOKUP_RCU</span></code> この試行は内部的にそのフラグを解除してREF-walkに切り替えるかもしれませんが、その後RCU-walkに戻ることはありません。RCU-walkを妨げる場所は葉に近いことが多く、そのためRCU-walkに戻すことで多くのメリットがある可能性は極めて低く、ほぼないでしょう。</p>
+</section>
+<section id="rcu-and-seqlocks-fast-and-light">
+<h3>RCUとseqlocks: 高速で軽量<a class="headerlink" href="#rcu-and-seqlocks-fast-and-light" title="この見出しへのパーマリンク">¶</a></h3>
+<p>RCUは、予想通りRCU-walkモードにとって極めて重要です。
+<code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> RCU-walkがパスを歩いている間は、常にロックを保持します。RCUが提供する特定の保証は、ロックが保持されている間、キーとなるデータ構造（dentries、inodes、super_blocks、mounts）が解放されないことです。これらのデータ構造は、ある方法でアンリンクされるか無効化される可能性はありますが、メモリが再利用されないため、さまざまなフィールドの値は依然として意味を持つでしょう。これはRCUが提供する唯一の保証であり、それ以外の処理はseqlocksを使用して行われます。</p>
+<p>上記で見たように、REF-walkは現在のdentryとvfsmountへのカウントされた参照を保持しており、次のdentryやvfsmountへの参照を取得する前にそれらの参照を解放しません。また、時折スピンロックを取得することもあります。これらの参照とロックは、特定の変更が発生しないようにするためのものです。RCU-walkはこれらの参照やロックを取得しないので、このような変更を防ぐことはできません。代わりに、変更が行われたかを確認し、行われていれば中止または再試行します。 <code class="docutils literal notranslate"><span class="pre">d_lock</span></code> 上記の不変性（RCU-walkがREF-walkが行える決定のみを行うこと）を維持するため、RCU-walkはREF-walkが参照を保持する場所とほぼ同じ場所でチェックを行う必要があります。つまり、REF-walkが参照カウントをインクリメントするかスピンロックを取得するとき、RCU-walkはseqlockの状態を、または類似の関数を使用してサンプリングします。</p>
+<p>REF-walkが参照を保持する場所とほぼ同じ場所でチェックを行うため、RCU-walkは参照カウントをデクリメントするかロックを解放するとき、サンプリングした状態がまだ有効かどうかを、または関数を使用して確認します。 <code class="docutils literal notranslate"><span class="pre">read_seqcount_begin()</span></code> ただし、seqlocksにはそれ以上の要素があります。RCU-walkがseqlock保護された構造体の2つの異なるフィールドにアクセスするか、同じフィールドを2回アクセスする場合、それらのアクセス間の整合性は事前に保証されません。整合性が必要な場合（通常はそうなります）、RCU-walkはコピーを取得し、その後、を用いてそのコピーを検証します。
+<code class="docutils literal notranslate"><span class="pre">read_seqcount_retry()</span></code> や同様の方法で処理しなければなりません。</p>
+<p>は、シーケンス番号だけでなく、メモリ読み取り命令が、の呼び出しで遅延されるのを防ぐメモリバリアも課すため、の呼び出しで遅延されるのを防ぐメモリバリアも課します。 <code class="docutils literal notranslate"><span class="pre">read_seqcount_retry()</span></code> の呼び出しで遅延されるのを防ぐメモリバリアも課します。の呼び出しで遅延されるのを防ぐメモリバリアも課します。の呼び出しで遅延されるのを防ぐメモリバリアも課します。</p>
+<p><code class="docutils literal notranslate"><span class="pre">read_seqcount_retry()</span></code> の呼び出しで遅延されるのを防ぐメモリバリアも課します。の呼び出しで遅延されるのを防ぐメモリバリアも課します。の呼び出しで遅延されるのを防ぐメモリバリアも課します。
+<em>before</em> の呼び出しで遅延されるのを防ぐメモリバリアも課します。の呼び出しで遅延されるのを防ぐメモリバリアも課します。 <em>RCU保護データ構造からデータ要素を削除した後、</em> の呼び出しで遅延されるのを防ぐメモリバリアも課します。の呼び出しで遅延されるのを防ぐメモリバリアも課します。
+<code class="docutils literal notranslate"><span class="pre">slow_dentry_cmp()</span></code> の呼び出しで遅延されるのを防ぐメモリバリアも課します。の呼び出しで遅延されるのを防ぐメモリバリアも課します。 <code class="docutils literal notranslate"><span class="pre">read_seqcount_retry()</span></code> の呼び出しで遅延されるのを防ぐメモリバリアも課します。の呼び出しで遅延されるのを防ぐメモリバリアも課します。 <code class="docutils literal notranslate"><span class="pre">-&gt;d_compare()</span></code> の呼び出しで遅延されるのを防ぐメモリバリアも課します。の呼び出しで遅延されるのを防ぐメモリバリアも課します。 <code class="docutils literal notranslate"><span class="pre">dentry_cmp()</span></code> の呼び出しで遅延されるのを防ぐメモリバリアも課します。の呼び出しで遅延されるのを防ぐメモリバリアも課します。 <em>ではありません</em> 使用 <code class="docutils literal notranslate"><span class="pre">read_seqcount_retry()</span></code>の呼び出しで遅延されるのを防ぐメモリバリアも課します。の呼び出しで遅延されるのを防ぐメモリバリアも課します。 <code class="docutils literal notranslate"><span class="pre">read_seqcount_retry()</span></code> の呼び出しで遅延されるのを防ぐメモリバリアも課します。の呼び出しで遅延されるのを防ぐメモリバリアも課します。</p>
+<p>seqlocksに関する簡単な確認を済ませたので、RCU-walkがseqlocksを使用する仕組みの全体像を見てみましょう。</p>
+<section id="mount-lock-and-nd-m-seq">
+<h4><code class="docutils literal notranslate"><span class="pre">mount_lock</span></code> および <code class="docutils literal notranslate"><span class="pre">nd-&gt;m_seq</span></code><a class="headerlink" href="#mount-lock-and-nd-m-seq" title="この見出しへのパーマリンク">¶</a></h4>
+<p>すでに出会った <code class="docutils literal notranslate"><span class="pre">mount_lock</span></code> seqlockはREF-walkがマウントポイントを安全に越えるために使用したものです。RCU-walkも同様に使用しますが、それ以上に多くの用途があります。</p>
+<p>各ノードに対してカウントされた参照を取得する代わりに、 <code class="docutils literal notranslate"><span class="pre">vfsmount</span></code> ツリーを下る際には、初期の状態を取得します。 <code class="docutils literal notranslate"><span class="pre">mount_lock</span></code> ウォークの開始時に状態を取得し、その初期シーケンス番号を
+<code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">nameidata</span></code> の <code class="docutils literal notranslate"><span class="pre">m_seq</span></code> フィールドに保存します。この1つのロックと1つのシーケンス番号は、すべてのアクセスを検証するために使用されます。 <code class="docutils literal notranslate"><span class="pre">vfsmounts</span></code>、およびすべてのマウントポイントの通過も含む。マウントテーブルの変更は相対的にまれであるため、どの「マウント」または「アンマウント」が発生した場合でも、REF-walkにフォールバックするのが合理的です。</p>
+<p><code class="docutils literal notranslate"><span class="pre">m_seq</span></code> は（使用 <code class="docutils literal notranslate"><span class="pre">read_seqretry()</span></code>）でRCU-walkシーケンスの終了時にチェックされ、残りのパスにREF-walkに切り替えるか、パスの終了に到達した場合もチェックされます。また、マウントポイントを下る（ <code class="docutils literal notranslate"><span class="pre">__follow_mount_rcu()</span></code>）または上る（
+<code class="docutils literal notranslate"><span class="pre">follow_dotdot_rcu()</span></code>）際にもチェックされます。変更が検出された場合、全体のRCU-walkシーケンスは中止され、パスが再びREF-walkで処理されます。</p>
+<p>RCU-walkが <code class="docutils literal notranslate"><span class="pre">mount_lock</span></code> が変更されていないと確認した場合、REF-walkが各vfsmountに対してカウントされた参照を取ったとしても結果は同じであると確信できます。これにより、少なくともvfsmount構造体において不変性が保証されます。</p>
+</section>
+<section id="dentry-d-seq-and-nd-seq">
+<h4><code class="docutils literal notranslate"><span class="pre">dentry-&gt;d_seq</span></code> および <code class="docutils literal notranslate"><span class="pre">nd-&gt;seq</span></code><a class="headerlink" href="#dentry-d-seq-and-nd-seq" title="この見出しへのパーマリンク">¶</a></h4>
+<p>のカウントまたはロックを取る代わりに <code class="docutils literal notranslate"><span class="pre">d_reflock</span></code>, RCU-walk samples the per-dentry <code class="docutils literal notranslate"><span class="pre">d_seq</span></code> seqlock, and stores the sequence number in the
+<code class="docutils literal notranslate"><span class="pre">seq</span></code> field of the nameidata structure, so <code class="docutils literal notranslate"><span class="pre">nd-&gt;seq</span></code> should always be the current sequence number of <code class="docutils literal notranslate"><span class="pre">nd-&gt;dentry</span></code>. This number needs to be revalidated after copying, and before using, the name, parent, or inode of the dentry.</p>
+<p>The handling of the name we have already looked at, and the parent is only accessed in <code class="docutils literal notranslate"><span class="pre">follow_dotdot_rcu()</span></code> which fairly trivially follows the required pattern, though it does so for three different cases.</p>
+<p>マウントポイントでない場合、 <code class="docutils literal notranslate"><span class="pre">d_parent</span></code> フォローワークされ、その <code class="docutils literal notranslate"><span class="pre">d_seq</span></code> マウントポイントにある場合、代わりに以下のリンクをフォローワークし、
+<code class="docutils literal notranslate"><span class="pre">mnt-&gt;mnt_mountpoint</span></code> リンクを介して新しいdentryを取得し、そのdentryを収集します
+<code class="docutils literal notranslate"><span class="pre">d_seq</span></code>. その後、ついに見つかった <code class="docutils literal notranslate"><span class="pre">d_parent</span></code> を追跡するためには、我々がマウントポイントに到達したかどうかを確認し、そうであればそのマウントポイントを見つけ出し、 <code class="docutils literal notranslate"><span class="pre">mnt-&gt;mnt_root</span></code> リンクです。これは、パス検索の開始点がマウントされたファイルシステムの一部にあり、ルートから見えないという多少非典型的ですが、確かに起こり得る状況を示唆しています。</p>
+<p>インノードポインタは、 <code class="docutils literal notranslate"><span class="pre">-&gt;d_inode</span></code>は少し興味深いです。inodeは常に少なくとも2回アクセスが必要で、1回はNULLかどうかを確認し、もう1回はアクセス権限を検証するためです。シンボリックリンクの処理にも有効なinodeポインタが必要です。各アクセスごとに再検証するのではなく、最初のアクセス時にコピーを作成し、そのコピーを <code class="docutils literal notranslate"><span class="pre">inode</span></code> の <code class="docutils literal notranslate"><span class="pre">nameidata</span></code> から安全にアクセスできるように保管します。</p>
+<p><code class="docutils literal notranslate"><span class="pre">lookup_fast()</span></code> はRCUモードで使用される唯一の検索ルーチンで、
+<code class="docutils literal notranslate"><span class="pre">lookup_slow()</span></code> は遅くロックを必要とするため、使用されません。これは
+<code class="docutils literal notranslate"><span class="pre">lookup_fast()</span></code> で現在のdentryの「ハンドオーバーハンド」トラッキングが重要です。</p>
+<p>現在の <code class="docutils literal notranslate"><span class="pre">dentry</span></code> と現在の <code class="docutils literal notranslate"><span class="pre">seq</span></code> 番号が
+<code class="docutils literal notranslate"><span class="pre">__d_lookup_rcu()</span></code> に渡され、成功すると新しい <code class="docutils literal notranslate"><span class="pre">dentry</span></code> と新しい <code class="docutils literal notranslate"><span class="pre">seq</span></code> 番号が返されます。  <code class="docutils literal notranslate"><span class="pre">lookup_fast()</span></code> はinodeポインタをコピーし、新しい <code class="docutils literal notranslate"><span class="pre">seq</span></code> 番号を再検証します。その後、古い <code class="docutils literal notranslate"><span class="pre">dentry</span></code>
+番号で古い <code class="docutils literal notranslate"><span class="pre">seq</span></code> 番号を最後に再検証してから処理を続けます。新しいdentryの <code class="docutils literal notranslate"><span class="pre">seq</span></code> 番号を取得し、古いdentryの <code class="docutils literal notranslate"><span class="pre">seq</span></code> 番号を確認するプロセスは、REF-walkで新しいdentryへのカウントされた参照を取得して古いdentryに切り替えるプロセスと完全に一致します。</p>
+</section>
+<section id="no-inode-i-rwsem-or-even-rename-lock">
+<h4>いいえ <code class="docutils literal notranslate"><span class="pre">inode-&gt;i_rwsem</span></code> あるいは <code class="docutils literal notranslate"><span class="pre">rename_lock</span></code><a class="headerlink" href="#no-inode-i-rwsem-or-even-rename-lock" title="この見出しへのパーマリンク">¶</a></h4>
+<p>セマフォはスリープが許可されているときにのみ取得可能な重いロックです。As <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> スリープを禁止しているため、
+<code class="docutils literal notranslate"><span class="pre">inode-&gt;i_rwsem</span></code> はRCU-walkには関与しません。他のスレッドが <code class="docutils literal notranslate"><span class="pre">i_rwsem</span></code> を取得し、RCU-walkが認識するようにディレクトリを変更した場合、結果としてRCU-walkが検索しているdentryを見つけられなくなるか、見つかったdentryが
+<code class="docutils literal notranslate"><span class="pre">read_seqretry()</span></code> 検証されない可能性があります。どちらの場合もRCU-walkはREF-walkモードに降下し、必要なロックを取得して再試行します。</p>
+<p>ただし、 <code class="docutils literal notranslate"><span class="pre">rename_lock</span></code> はスリープを必要としないためRCU-walkで使用可能ですが、RCU-walkは気にしません。REF-walkは <code class="docutils literal notranslate"><span class="pre">rename_lock</span></code> を用いて、dcacheのハッシュチェーンが検索中に変更される可能性を防ぎます。これにより、実際に存在する項目を検索できなくなることがあります。RCU-walkがdentryキャッシュで項目を検索できなかった場合、それが本当に存在するかどうかに関わらず、すでにREF-walkに降下して適切なロックを取得して再試行します。これによりすべてのケースを丁寧に処理できるため、rename_lockへの追加チェックは大きな価値をもたらしません。</p>
+</section>
+</section>
+<section id="unlazy-walk-and-complete-walk">
+<h3><code class="docutils literal notranslate"><span class="pre">unlazy</span> <span class="pre">walk()</span></code> および <code class="docutils literal notranslate"><span class="pre">complete_walk()</span></code><a class="headerlink" href="#unlazy-walk-and-complete-walk" title="この見出しへのパーマリンク">¶</a></h3>
+<p>「RCU-walkからREF-walkへの降下」は通常、
+<code class="docutils literal notranslate"><span class="pre">unlazy_walk()</span></code>という関数呼び出しを含み、この関数は「RCU-walk」が「ラズィー・ウォーク」とも呼ばれるためその名前が付けられています。  <code class="docutils literal notranslate"><span class="pre">unlazy_walk()</span></code> は、現在のvfsmount/dentryペアへのパスをフォローアクセスする際、成功したように見えても次のステップが問題になるときに呼び出されます。これは次の名前がdcacheに見つからない場合、または権限チェックや名前の再検証が完了しなかった場合に発生します。 <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> RCU-walkは、自動マウントポイントが見つかった場合、またはシンボリックリンクに関連するいくつかのケースで保持され（睡眠を禁止する）、また、 <code class="docutils literal notranslate"><span class="pre">complete_walk()</span></code> 検索が最終コンポーネントに到達した場合、またはパスの終わりに達した場合、使用される特定の検索の種類に応じて呼び出されます。</p>
+<p>RCU-walkから抜け出す他の理由で、呼び出しを引き起こさないのは、 <code class="docutils literal notranslate"><span class="pre">unlazy_walk()</span></code> 即座に処理できない不整合が見つかった場合、たとえば、 <code class="docutils literal notranslate"><span class="pre">mount_lock</span></code> またはそのうちの一つの <code class="docutils literal notranslate"><span class="pre">d_seq</span></code>
+seqlocksが変更を報告した場合です。このような場合、関連する関数は <code class="docutils literal notranslate"><span class="pre">-ECHILD</span></code> を返します。これは上位に伝播し、RCU-walkから抜け出して上部から新しい試みをREF-walkで行うまで続きます。</p>
+<p>RCU-walkから抜け出す場合で、 <code class="docutils literal notranslate"><span class="pre">unlazy_walk()</span></code> がオプションである場合、これは保持しているポインタ（vfsmount、dentry、およびおそらくいくつかのシンボリックリンク）の参照を取得し、関連するseqlocksが変更されていないことを確認します。変更があった場合は、同様に <code class="docutils literal notranslate"><span class="pre">-ECHILD</span></code>で中止します。それ以外の場合は、REF-walkへの移行が成功し、検索プロセスが続きます。</p>
+<p>これらのポインタの参照を取得することは、単にカウンターをインクリメントするだけでは簡単ではありません。これはすでに参照を持っている場合（他のオブジェクトを通じて間接的に）に2番目の参照を取得するには有効ですが、まったく参照を持っていない場合は不十分です。そのため、 <code class="docutils literal notranslate"><span class="pre">dentry-&gt;d_lockref</span></code>の場合、カウンターをインクリメントして参照を取得するのは安全ですが、明示的に「死んだ」とマークされている場合は、カウンターを <code class="docutils literal notranslate"><span class="pre">-128</span></code>.
+<code class="docutils literal notranslate"><span class="pre">lockref_get_not_dead()</span></code> に設定することを含みます。これは</p>
+<p>For <code class="docutils literal notranslate"><span class="pre">mnt-&gt;mnt_count</span></code> が安全である限り、
+<code class="docutils literal notranslate"><span class="pre">mount_lock</span></code> で参照を検証します。検証が失敗した場合、これは <em>ではありません</em> 標準的な方法で呼び出すことで参照を解放するのも安全かもしれません。 <code class="docutils literal notranslate"><span class="pre">mnt_put()</span></code> アンマウントが進みすぎた可能性があります。そのため、 <code class="docutils literal notranslate"><span class="pre">legitimize_mnt()</span></code>で、取得した参照が安全でない可能性があると判断した場合、
+<code class="docutils literal notranslate"><span class="pre">MNT_SYNC_UMOUNT</span></code> フラグを確認して、単純な <code class="docutils literal notranslate"><span class="pre">mnt_put()</span></code> が正しいか、それともカウントを減らして何もなかったかのように装うべきかを判断します。</p>
+</section>
+<section id="taking-care-in-filesystems">
+<h3>ファイルシステムでの注意<a class="headerlink" href="#taking-care-in-filesystems" title="この見出しへのパーマリンク">¶</a></h3>
+<p>RCU-walkはほぼすべてキャッシュされた情報に依存しており、ファイルシステムに呼び出すことはほとんどありません。ただし、すでに述べたコンポーネント名の比較以外の2つの場所で、ファイルシステムがRCU-walkに含まれる可能性があり、その際には注意が必要です。</p>
+<p>ファイルシステムが非標準の権限チェック要件を持つ場合（ネットワークファイルシステムなど、サーバーに確認が必要な場合）、 <code class="docutils literal notranslate"><span class="pre">i_op-&gt;permission</span></code> インターフェースがRCU-walk中に呼び出される可能性があります。この場合、追加の「<code class="docutils literal notranslate"><span class="pre">MAY_NOT_BLOCK</span></code>」フラグが渡され、睡眠せずに即座に返すようにします。 <code class="docutils literal notranslate"><span class="pre">-ECHILD</span></code> 即座に完了できない場合は、  <code class="docutils literal notranslate"><span class="pre">i_op-&gt;permission</span></code> inodeポインタが渡されるため、dentryを気にする必要がありません。ただし、他のファイルシステムデータ構造にアクセスする場合は、それらが単に保持されている状態でアクセス可能であることを確認する必要があります。 <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code>
+保持されている状態でアクセス可能であることを確認する必要があります。これは通常、特定の関数を使用して解放する必要があります。 <code class="docutils literal notranslate"><span class="pre">kfree_rcu()</span></code> や同様の方法で処理しなければなりません。</p>
+<p>ファイルシステムがdcacheエントリを再検証する必要がある場合、
+<code class="docutils literal notranslate"><span class="pre">d_op-&gt;d_revalidate</span></code> RCU-walkでも呼び出されることがあります。このインターフェースは
+<em>通常のRCU読み込み側クリティカルセクションは、条件付きでスリープロックを取得することが許容されます（例として</em> dentryを渡すが、その <code class="docutils literal notranslate"><span class="pre">inode</span></code> …または…、
+<code class="docutils literal notranslate"><span class="pre">seq</span></code> 数値は <code class="docutils literal notranslate"><span class="pre">nameidata</span></code>から取得できないため、dentryのフィールドにアクセスする際には特に注意が必要です。この「追加の注意」は通常、  <a class="reference external" href="https://lwn.net/Articles/624126/">READ_ONCE()</a> を使用してフィールドにアクセスし、使用する前に結果がNULLでないことを確認する必要があります。このパターンは
+<code class="docutils literal notranslate"><span class="pre">nfs_lookup_revalidate()</span></code>.</p>
+</section>
+<section id="a-pair-of-patterns">
+<h3>のペアのパターン<a class="headerlink" href="#a-pair-of-patterns" title="この見出しへのパーマリンク">¶</a></h3>
+<p>REF-walkとRCU-walkの詳細部分および全体像において、いくつかの関連するパターンが存在し、注意が必要です。</p>
+<p>最初のパターンは「素早く試して確認し、失敗すればゆっくりと試す」です。これはまずRCU-walkを試し、その後REF-walkに移行する高レベルのアプローチや、 <code class="docutils literal notranslate"><span class="pre">unlazy_walk()</span></code> が使用される場所で見られます。また、 <code class="docutils literal notranslate"><span class="pre">dget_parent()</span></code> で「<code class="docutils literal notranslate"><span class="pre">..</span></code>」リンクをたどる際にも同様のパターンが見られます。素早く参照を取得しようとし、必要に応じてロックを取得して戻ります。</p>
+<p>2番目のパターンは「素早く試して確認し、失敗すれば繰り返し試す」です。これはREF-walkでの <code class="docutils literal notranslate"><span class="pre">rename_lock</span></code> および
+<code class="docutils literal notranslate"><span class="pre">mount_lock</span></code> の使用で見られます。RCU-walkではこのパターンは使われません。何かが間違った場合、より慎重なアプローチに移行する方が安全です。</p>
+<p>ここでの強調点は「素早く試して確認する」ことです。実際には「素早く <em>丁寧に</em>確認してから試す」ことが望ましいです。確認が必要なのは、システムが動的であり、常に安全な操作が限られていることを示しています。このプロセスでのエラーの主な原因は、何かが安全であると仮定しているにもかかわらず、実際には安全でないことであることです。各アクセスの安全性を保証する正確な条件を考慮することが必要です。</p>
+</section>
+</section>
+<section id="a-walk-among-the-symlinks">
+<h2>シンボリックリンクの中を歩く<a class="headerlink" href="#a-walk-among-the-symlinks" title="この見出しへのパーマリンク">¶</a></h2>
+<p>シンボリックリンクの処理を理解するために検討する基本的な問題はいくつかあります：シンボリックリンクスタックとキャッシュの有効期間は、シンボリックリンクの再帰的な処理を理解するのに役立ち、最終的なコンポーネントに必要な特別な注意を導きます。その後、アクセス時間の更新と、検索を制御するさまざまなフラグの概要を考慮することで、話は終わります。</p>
+<section id="the-symlink-stack">
+<h3>シンボリックリンクスタック<a class="headerlink" href="#the-symlink-stack" title="この見出しへのパーマリンク">¶</a></h3>
+<p>パスの最後のコンポーネントの前で意味を持つファイルシステムオブジェクトは、ディレクトリとシンボリックリンクの2種類のみです。ディレクトリの処理は非常に簡単で、新しいディレクトリはパスの次のコンポーネントを解釈する開始点になります。シンボリックリンクの処理にはやや複雑な作業が必要です。</p>
+<p>概念的には、シンボリックリンクはパスを編集することで処理できます。コンポーネント名がシンボリックリンクを指している場合、そのコンポーネントはリンクの本文に置き換えられ、その本文が「/」で始まっている場合、パスの前の部分はすべて破棄されます。これは「<code class="docutils literal notranslate"><span class="pre">readlink</span> <span class="pre">-f</span></code>」コマンドが行う処理ですが、同時に「<code class="docutils literal notranslate"><span class="pre">.</span></code>」および「<code class="docutils literal notranslate"><span class="pre">..</span></code>」コンポーネントも編集しています。</p>
+<p>パス文字列を直接編集する必要はパスの検索時にはありませんし、早期のコンポーネントを破棄するのも無駄です。それらは検索対象外なのでです。残りのコンポーネントをすべて追跡する必要がありますが、もちろん別々に保持すればよいですし、連結する必要はありません。1つのシンボリックリンクが別のシンボリックリンクを指し、それがさらに別のものに指す場合など、複数のパスの残りコンポーネントを保持する必要があります。これらは処理が完了するたびに処理されるパスの残り部分であり、制限されたサイズのスタックに保持されます。</p>
+<p>1つのパス検索中に含まれるシンボリックリンクの数に制限を設ける理由は2つあります。最も明らかなのはループを避けるためです。シンボリックリンクが自分自身や間接的に自分自身を指している場合、リンクをたどる操作は決して成功しません。「 <code class="docutils literal notranslate"><span class="pre">ELOOP</span></code> 」エラーが返される必要があります。ループは制限を設けずに検出可能ですが、制限は最も簡単な解決策であり、2番目の制限理由を考慮すると十分です。</p>
+<p>2番目の理由は <a class="reference external" href="http://thread.gmane.org/gmane.linux.kernel/1934390/focus=1934550">最近、リンスによって説明されました。</a> 「</p>
+<blockquote>
+<div><p>」はレイテンシーおよびDoS問題にも関係します。真のループには適切に対応する必要がありますが、「非常に深い」非ループにも対応する必要があります。これはメモリ使用量ではなく、ユーザーが不合理的なCPUリソースを引き起こすことに起因します。</p>
+</div></blockquote>
+<p>Linuxは任意のパス名の長さに制限を課しています： <code class="docutils literal notranslate"><span class="pre">PATH_MAX</span></code>」で、4096文字です。この制限にはいくつかの理由がありますが、カーネルが1つのパスにあまり多くの時間を費やすのを防ぐのはその一つです。シンボリックリンクを使用すると、実質的に非常に長いパスを生成できるため、同様の理由で制限が必要です。Linuxは1つのパス検索中に最大40個のシンボリックリンクを許可しています。以前は再帰の最大深さに8という追加制限を課していましたが、別個のスタックが実装されたため、40に引き上げられました。現在はこれだけの制限です。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">nameidata</span></code> 以前の記事で出会った構造体には、最大で2つのシンボリックリンクの残り部分を保存できる小さなスタックが含まれています。多くの場合これは十分ですが、不足する場合は、40個のシンボリックリンクを保存できる別スタックが割り当てられます。パス名の検索は常にこのスタックを超えないため、40番目のシンボリックリンクが検出されると即座にエラーが返されます。</p>
+<p>このスタックに保存すべきものは名前の残り部分だけのように思えるかもしれませんが、もう少し必要な情報があります。その必要性を理解するには、キャッシュの有効期限について見ていく必要があります。</p>
+</section>
+<section id="storage-and-lifetime-of-cached-symlinks">
+<h3>キャッシュされたシンボリックリンクの保存と有効期限<a class="headerlink" href="#storage-and-lifetime-of-cached-symlinks" title="この見出しへのパーマリンク">¶</a></h3>
+<p>インODEやディレクトリエントリなどの他のファイルシステムリソース同様に、Linuxは外部ストレージへの繰り返しのコストのかかるアクセスを避けるため、シンボリックリンクをキャッシュします。RCU-walkがこれらのキャッシュされたエントリを検索し、一時的に保持できることが特に重要であり、REF-walkに下りることを防ぎます。</p>
+<p>各ファイルシステムは独自の選択が可能ですが、シンボリックリンクは通常2つの場所のいずれかに保存されます。短いシンボリックリンクはインODE内に直接保存されることが多く、ファイルシステムがインODEを割り当てるとき、 <code class="docutils literal notranslate"><span class="pre">struct</span>
+<span class="pre">inode</span></code> 通常はプライベートデータを保存するための追加領域を確保します（これは一般的な <a class="reference external" href="https://lwn.net/Articles/446317/">オブジェクト指向のデザインパターン</a> カーネル内での設計です）。これは場合によってはシンボリックリンクの保存領域を含むことがあります。もう一つの一般的な場所はページキャッシュで、通常ファイルの内容を保存します。シンボリックリンク内のパス名はそのシンボリックリンクの内容とみなせ、ファイル内容同様にページキャッシュに簡単に保存できます。</p>
+<p>インODEやページキャッシュのいずれにも適さない場合、ファイルシステムは一時的なメモリを割り当て、必要なときにそのメモリにシンボリックリンクの内容をコピーまたは構築します。</p>
+<p>シンボリックリンクがインODE内に保存されている場合、インODEと同じ有効期限を持ち、インODE自身はdentry上のカウントされた参照またはRCUによって保護されています。これにより、パス名検索がdcacheとicache（インODEキャッシュ）に安全にアクセスするためのメカニズムは、一部のキャッシュされたシンボリックリンクに安全にアクセスするのに十分です。このような場合、 <code class="docutils literal notranslate"><span class="pre">i_link</span></code> インODE内のポインタはシンボリックリンクが保存されている場所を指し、必要に応じて直接アクセスできます。</p>
+<p>シンボリックリンクがページキャッシュやその他の場所に保存されている場合、状況はそれほど単純ではありません。dentryやインODE上の参照は、そのインODEのキャッシュされたページへの参照を示すものではなく、すら <code class="docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code> ページが消失しないことを保証するには、この方法だけでは不十分です。そのため、これらのシンボリックリンクでは、パス名の検索コードがファイルシステムに安定した参照を提供してもらう必要があります。さらに重要なのは、使用が終わったらその参照を解放することです。</p>
+<p>キャッシュページへの参照を取得することは、RCU-walkモードでも多くの場合可能です。ただし、メモリへの変更が必要となるため、避けたいですが、それほど大きなコストにはならず、RCU-walkモードから完全に抜け出すよりも優れています。連想ファイルシステムがシンボリックリンクをコピーするための領域を割り当てることも可能で、 <code class="docutils literal notranslate"><span class="pre">GFP_ATOMIC</span></code> RCU-walkモードでメモリを割り当てることで成功することが多いです。ファイルシステムがRCU-walkモードで参照を取得できなかった場合、 <code class="docutils literal notranslate"><span class="pre">-ECHILD</span></code> および <code class="docutils literal notranslate"><span class="pre">unlazy_walk()</span></code> REF-walkモードに戻るための呼び出しが行われ、そのモードではファイルシステムがスリープすることが許可されます。</p>
+<p>このような処理はすべて、 <code class="docutils literal notranslate"><span class="pre">i_op-&gt;follow_link()</span></code> inodeメソッドで行われます。現在のメインラインコードでは、このメソッドはRCU-walkモードで実際に呼び出されることはありません。再構築が完全でないためです。今後のリリースでは、RCU-walkモードで呼び出された際には、 <code class="docutils literal notranslate"><span class="pre">inode</span></code> ポインタが渡される可能性が高く、これにより（1）注意を払う必要があること、（2）検証済みのポインタを持つことが可能になります。以前に見た <code class="docutils literal notranslate"><span class="pre">i_op-&gt;permission()</span></code> メソッドと同様に、 <code class="docutils literal notranslate"><span class="pre">-&gt;follow_link()</span></code> すべての参照しているデータ構造が、カウントされた参照を持たずにRCUロックのみでアクセス可能であることを確認する必要があります。ただし、参照を取得する処理はまだRCU-walkモードでは実行されていませんが、その処理が行われたときに参照を解放できるようにコードは準備されています。 <code class="docutils literal notranslate"><span class="pre">-&gt;follow_link()</span></code> シンボリックリンクへの参照をドロップする必要は、大きな複雑さをもたらします。inode操作を呼び出すにはinodeへの参照が必要であり、REF-walkではdentryへの参照を通じてその参照が暗黙的に保持されるため、保持する必要があります。</p>
+<p>inode操作を呼び出すにはinodeへの参照が必要であり、REF-walkではdentryへの参照を通じてその参照が暗黙的に保持されるため、保持する必要があります。
+<code class="docutils literal notranslate"><span class="pre">i_op-&gt;put_link()</span></code> inode操作を呼び出すにはinodeへの参照が必要であり、REF-walkではdentryへの参照を通じてその参照が暗黙的に保持されるため、保持する必要があります。 <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">path</span></code> symlinkの処理は最も簡単です。RCU-walkではinodeへのポインタは別途保持されます。ネストされたsymlinkの処理中にRCU-walkからREF-walkへの切り替えを許可するため、dentryのseq番号も必要です。これにより、切り替えの安全性を確認できます。</p>
+<p>最後に、symlinkへの参照を提供する際、ファイルシステムはopaqueな「cookie」も同時に提供します。このcookieは <code class="docutils literal notranslate"><span class="pre">-&gt;put_link()</span></code> 解放すべきものを把握できるようにするために渡す必要があります。これは割り当てられたメモリ領域であるかもしれない、またはページキャッシュ内のポインタであるかもしれない、あるいはまったく別のものかもしれません。 <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">page</span></code> この'cookie'が何を指すかは、ファイルシステムだけが把握しています。</p>
+<p>walkが完了する際に各symlinkへの参照を解放するためには、RCU-walkまたはREF-walkのいずれの場合でも、symlinkスタックにパスの残骸とともに以下を含める必要があります:</p>
+<ul class="simple">
+<li><p>、そして <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">path</span></code> REF-walkにおけるinodeへの参照を提供する</p></li>
+<li><p>、そして <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">inode</span> <span class="pre">*</span></code> RCU-walkにおけるinodeへの参照を提供する</p></li>
+<li><p>、そして <code class="docutils literal notranslate"><span class="pre">seq</span></code> RCU-walkからREF-walkへのパスの安全な切り替えを可能にする</p></li>
+<li><p>、そして <code class="docutils literal notranslate"><span class="pre">cookie</span></code> その説明は <code class="docutils literal notranslate"><span class="pre">-&gt;put_path()</span></code> 何を置くか。</p></li>
+</ul>
+<p>これは、シンボリックリンクスタックの各エントリが1つのポインタ（パスの残り）ではなく、5つのポインタと整数を保持する必要があることを意味します。64ビットシステムでは、1つのエントリあたり約40バイトとなり、40エントリで合計1600バイト（ページの半分未満）になります。これだけの量に思えるかもしれませんが、決して過剰ではありません。</p>
+<p>注意してください。あるスタックフレームにおいて、パスの残り（<code class="docutils literal notranslate"><span class="pre">name</span></code>)は、他のフィールドが参照するシンボリックリンクの一部ではありません。これは、そのシンボリックリンクが完全に解析された後に続く残りのパスです。</p>
+</section>
+<section id="following-the-symlink">
+<h3>シンボリックリンクの追跡<a class="headerlink" href="#following-the-symlink" title="この見出しへのパーマリンク">¶</a></h3>
+<p>main loopの <code class="docutils literal notranslate"><span class="pre">link_path_walk()</span></code> は、パス内のすべてのコンポーネントと非最終的なシンボリックリンクをスムーズに反復処理します。シンボリックリンクが処理されるたびに、 <code class="docutils literal notranslate"><span class="pre">name</span></code> ポインタは新しいシンボリックリンクを指すように調整されるか、スタックから復元されるため、ループの大部分は気づく必要がありません。この <code class="docutils literal notranslate"><span class="pre">name</span></code> 変数をスタックに載せたり外したりするのは非常に簡単ですが、参照のプッシュとポップはやや複雑です。</p>
+<p>シンボリックリンクが見つかった場合、 <code class="docutils literal notranslate"><span class="pre">walk_component()</span></code> は値を返します <code class="docutils literal notranslate"><span class="pre">1</span></code>
+(<code class="docutils literal notranslate"><span class="pre">0</span></code> は他の成功の種類にはこの値が返され、負数は通常通りエラーインジケーターです）。これにより、 <code class="docutils literal notranslate"><span class="pre">get_link()</span></code> が呼ばれます。その後、ファイルシステムからリンクを取得します。この操作が成功した場合、古いパス <code class="docutils literal notranslate"><span class="pre">name</span></code> がスタックに置かれ、新しい値が <code class="docutils literal notranslate"><span class="pre">name</span></code> しばらく使用されます。パスの終わりが見つかった場合（つまり <code class="docutils literal notranslate"><span class="pre">*name</span></code> 通常のRCU読み込み側クリティカルセクションは、条件付きでスリープロックを取得することが許容されます（例として <code class="docutils literal notranslate"><span class="pre">'\0'</span></code>)、古い <code class="docutils literal notranslate"><span class="pre">name</span></code> がスタックから復元され、パスの探索が続きます。</p>
+<p>参照ポインタ（inode、cookieなど）のプッシュとポップは、テール再帰を処理するための必要性により一部複雑です。シンボリックリンクの最後のコンポーネントがまた別のシンボリックリンクを指している場合、そのシンボリックリンクを処理した後でスタックからポップする必要があります。そうしないと、空のパスの残りが残ってしまい、邪魔になるからです。</p>
+<p>新しいシンボリックリンクの参照をスタックにプッシュする最も便利なタイミングは、 <code class="docutils literal notranslate"><span class="pre">walk_component()</span></code> シンボリックリンクが見つかった直ちにです。
+<code class="docutils literal notranslate"><span class="pre">walk_component()</span></code> これは、最後のコンポーネントを歩く際には古いシンボリックリンクを確認する最後のコードです。そのため、 <code class="docutils literal notranslate"><span class="pre">walk_component()</span></code> は新しいシンボリックリンクの参照情報をプッシュする直前に古いシンボリックリンクを解放し、参照をポップするのを非常に便利にします。これは2つのフラグによって指導されます； <code class="docutils literal notranslate"><span class="pre">WALK_GET</span></code>、シンボリックリンクを見つけたらそれを追跡する許可を与えるフラグ、および
+<code class="docutils literal notranslate"><span class="pre">WALK_PUT</span></code>、シンボリックリンクを追跡した後で現在のシンボリックリンクを解放するように指示するフラグです。  <code class="docutils literal notranslate"><span class="pre">WALK_PUT</span></code> は最初にテストされ、これにより
+<code class="docutils literal notranslate"><span class="pre">put_link()</span></code>.  <code class="docutils literal notranslate"><span class="pre">WALK_GET</span></code> is tested subsequently (by
+<code class="docutils literal notranslate"><span class="pre">should_follow_link()</span></code>) leading to a call to <code class="docutils literal notranslate"><span class="pre">pick_link()</span></code> which sets up the stack frame.</p>
+<section id="symlinks-with-no-final-component">
+<h4>最終コンポーネントを持たないシンボリックリンク<a class="headerlink" href="#symlinks-with-no-final-component" title="この見出しへのパーマリンク">¶</a></h4>
+<p>特殊なケースのシンボリックリンクには少し詳しく説明します。これらは新しい <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">path</span></code> (マウントとdentryを含む)が設定される <code class="docutils literal notranslate"><span class="pre">nameidata</span></code>、そして結果として <code class="docutils literal notranslate"><span class="pre">get_link()</span></code> 返す <code class="docutils literal notranslate"><span class="pre">NULL</span></code>.</p>
+<p>より明確なケースは、「」へのシンボリックリンクです。<code class="docutils literal notranslate"><span class="pre">/</span></code>」。すべての「」で始まるシンボリックリンクは<code class="docutils literal notranslate"><span class="pre">/</span></code>で検出されます <code class="docutils literal notranslate"><span class="pre">get_link()</span></code> がリセットされ、 <code class="docutils literal notranslate"><span class="pre">nameidata</span></code>
+有効なファイルシステムルートを指すようにします。シンボリックリンクが「」のみを含む場合、<code class="docutils literal notranslate"><span class="pre">/</span></code>」の場合、何も処理は必要なく、コンポーネントは一切ありませんので、 <code class="docutils literal notranslate"><span class="pre">NULL</span></code> が返され、シンボリックリンクを解放しスタックフレームを破棄できることが示されます。</p>
+<p>もう一つのケースは、 <code class="docutils literal notranslate"><span class="pre">/proc</span></code> シンボリックリンクに見えますが実際にはそうではないもの（これらは一般的に「マジックリンク」と呼ばれます）：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ls -l /proc/self/fd/1
+lrwx------ 1 neilb neilb 64 Jun 13 10:19 /proc/self/fd/1 -&gt; /dev/pts/4
+</pre></div>
+</div>
+<p>すべてのプロセスで開いているファイルディスクリプタは、 <code class="docutils literal notranslate"><span class="pre">/proc</span></code> シンボリックリンクに見えるもので表されます。これは実際にはターゲットファイルへの参照であり、単なる名前ではありません。 <code class="docutils literal notranslate"><span class="pre">readlink</span></code> これらのオブジェクトを開くと、同じファイルを参照する名前が得られますが、アンリーナまたはマウントされていない場合を除きます。 <code class="docutils literal notranslate"><span class="pre">walk_component()</span></code> これらをたどる場合、 <code class="docutils literal notranslate"><span class="pre">-&gt;follow_link()</span></code> 「procfs」のメソッドは文字列名を返しません。代わりに <code class="docutils literal notranslate"><span class="pre">nd_jump_link()</span></code> を更新します
+<code class="docutils literal notranslate"><span class="pre">nameidata</span></code> そのターゲットを指すようにします。  <code class="docutils literal notranslate"><span class="pre">-&gt;follow_link()</span></code> その後、 <code class="docutils literal notranslate"><span class="pre">NULL</span></code>。また、最終コンポーネントはなく、 <code class="docutils literal notranslate"><span class="pre">get_link()</span></code>
+これを報告するために、 <code class="docutils literal notranslate"><span class="pre">last_type</span></code> の <code class="docutils literal notranslate"><span class="pre">nameidata</span></code> as
+<code class="docutils literal notranslate"><span class="pre">LAST_BIND</span></code>.</p>
+</section>
+</section>
+<section id="following-the-symlink-in-the-final-component">
+<h3>最終コンポーネントのシンボリックリンクをたどる<a class="headerlink" href="#following-the-symlink-in-the-final-component" title="この見出しへのパーマリンク">¶</a></h3>
+<p>これらすべては <code class="docutils literal notranslate"><span class="pre">link_path_walk()</span></code> すべてのコンポーネントをたどり、見つかったシンボリックリンクをすべてたどるまで、最終コンポーネントに到達します。これは <code class="docutils literal notranslate"><span class="pre">last</span></code> の <code class="docutils literal notranslate"><span class="pre">nameidata</span></code>。一部の呼び出し元ではこれだけで十分です。彼らは
+<code class="docutils literal notranslate"><span class="pre">last</span></code> 名前を生成するか、既存の場合はエラーを返すだけです。他の呼び出し元は、シンボリックリンクが見つかった場合にそれをたどり、元のファイル名の最後のコンポーネントではなく、そのシンボリックリンクの最後のコンポーネントに対して特別な処理を適用したい場合があります。これらの呼び出し元は、 <code class="docutils literal notranslate"><span class="pre">link_path_walk()</span></code> 連続するシンボリックリンクを繰り返し呼び出し、他のシンボリックリンクを指さないものを見つけまで行います。</p>
+<p>このケースは、 <code class="docutils literal notranslate"><span class="pre">link_path_walk()</span></code>、例えば
+<code class="docutils literal notranslate"><span class="pre">path_lookupat()</span></code> ループを使用して呼び出す <code class="docutils literal notranslate"><span class="pre">link_path_walk()</span></code>、そして最終コンポーネントを処理します。最終コンポーネントがたどるべきシンボリックリンクである場合、 <code class="docutils literal notranslate"><span class="pre">trailing_symlink()</span></code> が呼び出され、設定が適切に行われ、ループが繰り返され、 <code class="docutils literal notranslate"><span class="pre">link_path_walk()</span></code>
+再度呼び出されます。各シンボリックリンクの最終コンポーネントが他のシンボリックリンクである場合、最大で40回ループする可能性があります。</p>
+<p>最終コンポーネントを調べ、それがシンボリックリンクである可能性を報告するさまざまな関数は <code class="docutils literal notranslate"><span class="pre">lookup_last()</span></code>, <code class="docutils literal notranslate"><span class="pre">mountpoint_last()</span></code>
+および <code class="docutils literal notranslate"><span class="pre">do_last()</span></code>、これらはすべて同じ規約を使用しています。
+<code class="docutils literal notranslate"><span class="pre">walk_component()</span></code> 返す <code class="docutils literal notranslate"><span class="pre">1</span></code> シンボリックリンクが見つかった場合、それを追跡する必要があります。</p>
+<p>これらの中では <code class="docutils literal notranslate"><span class="pre">do_last()</span></code> ファイルを開くために使用されるため、最も興味深いです。一部の <code class="docutils literal notranslate"><span class="pre">do_last()</span></code> 実行され、 <code class="docutils literal notranslate"><span class="pre">i_rwsem</span></code> 保持され、この部分は別の関数にあります： <code class="docutils literal notranslate"><span class="pre">lookup_open()</span></code>.</p>
+<p>説明する <code class="docutils literal notranslate"><span class="pre">do_last()</span></code> 完全に説明するのはこの記事の範囲を超えるため、いくつかのポイントを紹介することで、コードを調べたい読者に役立つでしょう。</p>
+<ol class="arabic">
+<li><p>ターゲットファイルを単に見つけるのではなく、 <code class="docutils literal notranslate"><span class="pre">do_last()</span></code> 開く必要があります。ファイルがdcacheで見つかった場合、 <code class="docutils literal notranslate"><span class="pre">vfs_open()</span></code> これに使用されます。そうでない場合は、 <code class="docutils literal notranslate"><span class="pre">lookup_open()</span></code> 呼び出します。 <code class="docutils literal notranslate"><span class="pre">atomic_open()</span></code> (ファイルシステムが提供する場合)最終的な検索とオープンを組み合わせるか、または別々に実行します。 <code class="docutils literal notranslate"><span class="pre">lookup_real()</span></code> および <code class="docutils literal notranslate"><span class="pre">vfs_create()</span></code> 直接実行します。後者の場合、この新たに見つかったまたは作成されたファイルの実際の「オープン」は、 <code class="docutils literal notranslate"><span class="pre">vfs_open()</span></code>、dcacheで名前が見つかった場合と同じように行われます。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">vfs_open()</span></code> 失敗する可能性があります。 <code class="docutils literal notranslate"><span class="pre">-EOPENSTALE</span></code> キャッシュされた情報が十分最新でなかった場合。再び検索をトップから再開する代わりに、 <code class="docutils literal notranslate"><span class="pre">LOOKUP_REVAL</span></code> が設定されていると、 <code class="docutils literal notranslate"><span class="pre">lookup_open()</span></code> 呼び出されます。これにより、ファイルシステムが小さな不一致を解決する機会が与えられます。それでも効果がない場合、みずから検索をトップから再開します。</p></li>
+<li><p>O_CREATでオープンする場合 <strong>これは、</strong> 最終コンポーネントのシンボリックリンクをフォローします。他の作成システムコール（例 <code class="docutils literal notranslate"><span class="pre">mkdir</span></code>）です。したがって、</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>ln -s bar /tmp/foo
+echo hello &gt; /tmp/foo
+</pre></div>
+</div>
+<p>ファイルを生成します。 <code class="docutils literal notranslate"><span class="pre">/tmp/bar</span></code>。この操作は、
+<code class="docutils literal notranslate"><span class="pre">O_EXCL</span></code> が設定されていない限り、O_CREATでオープンする場合と同様に処理されます： <code class="docutils literal notranslate"><span class="pre">should_follow_link()</span></code> が返します <code class="docutils literal notranslate"><span class="pre">1</span></code>、同様に <code class="docutils literal notranslate"><span class="pre">do_last()</span></code> 、 <code class="docutils literal notranslate"><span class="pre">trailing_symlink()</span></code> 呼び出され、見つかったシンボリックリンクのオープンプロセスが続きます。</p>
+</li>
+</ol>
+</section>
+<section id="updating-the-access-time">
+<h3>アクセスタイムの更新<a class="headerlink" href="#updating-the-access-time" title="この見出しへのパーマリンク">¶</a></h3>
+<p>以前にRCU-walkについて「ロックを取らず、カウントを増やさず、足跡を残さない」と述べましたが、シンボリックリンクをカウントされた参照として処理する際には、一部の「足跡」が必要になることがわかりました（たとえメモリの割当が必要でも）。ただし、これらの足跡はできるだけ最小限に抑えましょう。</p>
+<p>ディレクトリに影響を与えない方法でシンボリックリンクをたどる際、アクセスタイムの更新がそのような足跡を残す場所の一つです。Unix（およびLinux）では、すべてのファイルシステムオブジェクトに「最後にアクセスした時間」、つまり「<code class="docutils literal notranslate"><span class="pre">atime</span></code>」があります。ディレクトリを通過して内部のファイルにアクセスする行為は、
+<code class="docutils literal notranslate"><span class="pre">atime</span></code>；ディレクトリの内容を一覧表示する場合のみ、 <code class="docutils literal notranslate"><span class="pre">atime</span></code>。シンボリックリンクは異なるようです。シンボリックリンクを読み込む（ <code class="docutils literal notranslate"><span class="pre">readlink()</span></code>）および他の宛先に向かう途中でシンボリックリンクを検索する行為は、そのシンボリックリンクのatimeを更新します。</p>
+<p>なぜこのようなことが起こるのかは不明です。POSIXはこの件についてあまり語っていません。 <a class="reference external" href="https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap04.html#tag_04_08">最も明確な記述</a> その実装がPOSIXが指定していない場所でタイムスタンプを更新した場合、その動作は「パス名解決によって引き起こされる変更は記録する必要がない」という例外を除いて必ずドキュメント化しなければならない。これはPOSIXがパス名検索中のアクセス時刻の更新にあまり関心を持っていないことを示唆しているように見える。</p>
+<p>歴史的な調査によると、Linux 1.3.87以前の <a class="reference external" href="https://git.kernel.org/cgit/linux/kernel/git/history/history.git/diff/fs/ext2/symlink.c?id=f806c6db77b8eaa6e00dcfb6b567706feae8dbb8">Linux 1.3.87</a>では、少なくともext2ファイルシステムはリンクをたどる際にはアクセス時刻を更新しなかった。残念なことに、この挙動が変更された理由については記録が残っていない。</p>
+<p>いずれにせよ、アクセス時刻の更新は今では必要であり、その操作はかなり複雑である。RCU-walkを維持しながら行うことは避けた方がよい。幸いなことに、多くの場合、更新をスキップすることが許可されている。 <code class="docutils literal notranslate"><span class="pre">atime</span></code>
+更新はさまざまな領域でパフォーマンスに悪影響を及ぼすため、Linuxは <code class="docutils literal notranslate"><span class="pre">atime</span></code> 更新をサポートしている。 <code class="docutils literal notranslate"><span class="pre">relatime</span></code> マウントオプションで、通常は更新を制限します <code class="docutils literal notranslate"><span class="pre">atime</span></code> 変更されていないファイル（およびシンボリックリンクは作成後は変更されません）に対して1日1回の制限をかけます。Even without（ここに文が途切れています）
+<code class="docutils literal notranslate"><span class="pre">relatime</span></code>、多くのファイルシステムは <code class="docutils literal notranslate"><span class="pre">atime</span></code> 1秒ごとの粒度で記録するため、1秒間に1回の更新のみが必要です。</p>
+<p>RCU-walkモードで更新が必要かどうかをテストするのは簡単です。必要なければ更新をスキップしてRCU-walkモードを継続します。 <code class="docutils literal notranslate"><span class="pre">atime</span></code> 実際に更新が必要な場合のみ、パスウォークがREF-walkに降下します。すべての処理は以下の <code class="docutils literal notranslate"><span class="pre">atime</span></code> で行われます
+<code class="docutils literal notranslate"><span class="pre">get_link()</span></code> function.</p>
+</section>
+<section id="a-few-flags">
+<h3>いくつかのフラグ<a class="headerlink" href="#a-few-flags" title="この見出しへのパーマリンク">¶</a></h3>
+<p>pathname walkingのツアーをまとめるとする適切な方法は、その中に保存できるさまざまなフラグを一覧表示することです。 <code class="docutils literal notranslate"><span class="pre">nameidata</span></code> lookupプロセスをガイドするためのさまざまなフラグをリストアップすることです。これらの多くは最終コンポーネントでのみ意味があり、他のものはpathname lookupの現在の状態を反映し、一部はパスの検索中に遭遇するすべてのパスコンポーネントに制限を課します。</p>
+<p>そして次に <code class="docutils literal notranslate"><span class="pre">LOOKUP_EMPTY</span></code>があります。これは他のものとは概念的に合わない。このフラグが設定されていない場合、空のpathnameは非常に早期にエラーを引き起こします。設定されている場合、空のpathnameはエラーとみなされません。</p>
+<section id="global-state-flags">
+<h4>グローバルな状態フラグ<a class="headerlink" href="#global-state-flags" title="この見出しへのパーマリンク">¶</a></h4>
+<p>すでに2つのグローバルな状態フラグに出会っています： <code class="docutils literal notranslate"><span class="pre">LOOKUP_RCU</span></code> および
+<code class="docutils literal notranslate"><span class="pre">LOOKUP_REVAL</span></code>。これらは、検索のための3つの全体的なアプローチのうちの1つを選択します：RCU-walk、REF-walk、および強制再検証付きREF-walk。</p>
+<p><code class="docutils literal notranslate"><span class="pre">LOOKUP_PARENT</span></code> これは最終コンポーネントがまだ到達していないことを示します。これは主に、監査サブシステムに特定のアクセスの完全なコンテキストを伝えるために使用されます。</p>
+<p><code class="docutils literal notranslate"><span class="pre">LOOKUP_ROOT</span></code> これは <code class="docutils literal notranslate"><span class="pre">root</span></code> 構造体内の <code class="docutils literal notranslate"><span class="pre">nameidata</span></code> が呼び出し元によって提供されたため、必要なくなったときに解放すべきではありません。</p>
+<p><code class="docutils literal notranslate"><span class="pre">LOOKUP_JUMPED</span></code> これは現在のdentryが正しい名前を持っているからではなく、他の理由で選ばれたことを示します。これは「<code class="docutils literal notranslate"><span class="pre">..</span></code>」を追跡するとき、シンボリックリンクを「 <code class="docutils literal notranslate"><span class="pre">/</span></code>」にフォローランするとき、マウントポイントを跨ぐとき、または「<code class="docutils literal notranslate"><span class="pre">/proc/$PID/fd/$FD</span></code>” symlink (also known as a “magic link”). In this case the filesystem has not been asked to revalidate the name (with <code class="docutils literal notranslate"><span class="pre">d_revalidate()</span></code>). In such cases the inode may still need to be revalidated, so <code class="docutils literal notranslate"><span class="pre">d_op-&gt;d_weak_revalidate()</span></code> is called if
+<code class="docutils literal notranslate"><span class="pre">LOOKUP_JUMPED</span></code> is set when the look completes - which may be at the final component or, when creating, unlinking, or renaming, at the penultimate component.</p>
+</section>
+<section id="resolution-restriction-flags">
+<h4>解決制限フラグ<a class="headerlink" href="#resolution-restriction-flags" title="この見出しへのパーマリンク">¶</a></h4>
+<p>In order to allow userspace to protect itself against certain race conditions and attack scenarios involving changing path components, a series of flags are available which apply restrictions to all path components encountered during path lookup. These flags are exposed through <code class="docutils literal notranslate"><span class="pre">openat2()</span></code>’s <code class="docutils literal notranslate"><span class="pre">resolve</span></code> フィールドによって保護されています。</p>
+<p><code class="docutils literal notranslate"><span class="pre">LOOKUP_NO_SYMLINKS</span></code> バインドマウントと通常のマウントを含むすべてのマジックリンクのトラバーサルをブロックします。これは、後述の <code class="docutils literal notranslate"><span class="pre">LOOKUP_FOLLOW</span></code>とは異なり、後者は末尾のシンボリックリンクの追跡を制限するものに限定されます。</p>
+<p><code class="docutils literal notranslate"><span class="pre">LOOKUP_NO_MAGICLINKS</span></code> マジックリンクのトラバーサルをすべてブロックします。ファイルシステムは、 <code class="docutils literal notranslate"><span class="pre">nd_jump_link()</span></code>からエラーを返す必要があります。なぜなら、これが
+<code class="docutils literal notranslate"><span class="pre">LOOKUP_NO_MAGICLINKS</span></code> や他のマジックリンク制限が実装される仕組みだからです。</p>
+<p><code class="docutils literal notranslate"><span class="pre">LOOKUP_NO_XDEV</span></code> すべての <code class="docutils literal notranslate"><span class="pre">vfsmount</span></code> トラバーサルをブロックします（これはバインドマウントと通常のマウントを含みます）。注意点として、 <code class="docutils literal notranslate"><span class="pre">vfsmount</span></code> が含まれる検索の開始点は、パス検索が到達する最初のマウントポイントによって決定されます。絶対パスは <code class="docutils literal notranslate"><span class="pre">vfsmount</span></code> の <code class="docutils literal notranslate"><span class="pre">/</span></code>から始まり、相対パスは <code class="docutils literal notranslate"><span class="pre">dfd</span></code>’s <code class="docutils literal notranslate"><span class="pre">vfsmount</span></code>から始まります。マジックリンクは、パスの開始点が変更されていない場合にのみ許可されます。
+<code class="docutils literal notranslate"><span class="pre">vfsmount</span></code> 開始点の外側に解決するパスコンポーネントをブロックします。これは、</p>
+<p><code class="docutils literal notranslate"><span class="pre">LOOKUP_BENEATH</span></code> をブロックするだけでなく、開始点を飛び出さそうになる「..」もブロックします。 <code class="docutils literal notranslate"><span class="pre">nd_jump_root()</span></code>
+は「..」の解決に対する攻撃を検出するために使用されます。マジックリンクもブロックされます。
+<code class="docutils literal notranslate"><span class="pre">rename_lock</span></code> および <code class="docutils literal notranslate"><span class="pre">mount_lock</span></code> はすべてのパスコンポーネントを、開始点がファイルシステムのルートであるかのように解決します。</p>
+<p><code class="docutils literal notranslate"><span class="pre">LOOKUP_IN_ROOT</span></code> は解決を開始点に戻し、「..」が開始点で無効になります。これは、 <code class="docutils literal notranslate"><span class="pre">nd_jump_root()</span></code> と同様に、攻撃対策として使用されます。マジックリンクもブロックされます。
+<code class="docutils literal notranslate"><span class="pre">LOOKUP_BENEATH</span></code>, <code class="docutils literal notranslate"><span class="pre">rename_lock</span></code> および <code class="docutils literal notranslate"><span class="pre">mount_lock</span></code> は「..」の解決に対する攻撃を検出するために使用されます。マジックリンクもブロックされます。</p>
+</section>
+<section id="final-component-flags">
+<h4>最終コンポーネントフラグ<a class="headerlink" href="#final-component-flags" title="この見出しへのパーマリンク">¶</a></h4>
+<p>これらのフラグの一部は最終コンポーネントを考慮する際にのみ設定され、他のフラグは最終コンポーネントを考慮する際にのみチェックされます。</p>
+<p><code class="docutils literal notranslate"><span class="pre">LOOKUP_AUTOMOUNT</span></code> は、最終コンポーネントがオートマウントポイントである場合、マウントがトリガーされるようにします。一部の操作は自動的にトリガーされますが、 <code class="docutils literal notranslate"><span class="pre">stat()</span></code> などの操作は意図的にトリガーしません。  <code class="docutils literal notranslate"><span class="pre">statfs()</span></code>
+マウントをトリガーする必要がありますが、それ以外の挙動は <code class="docutils literal notranslate"><span class="pre">stat()</span></code>に似ています。そのため、 <code class="docutils literal notranslate"><span class="pre">LOOKUP_AUTOMOUNT</span></code>を設定します。同様に「<code class="docutils literal notranslate"><span class="pre">quotactl()</span></code>」や「<code class="docutils literal notranslate"><span class="pre">mount</span> <span class="pre">--bind</span></code>”.</p>
+<p><code class="docutils literal notranslate"><span class="pre">LOOKUP_FOLLOW</span></code> 」の処理も同様です。これは、 <code class="docutils literal notranslate"><span class="pre">LOOKUP_AUTOMOUNT</span></code> に似た機能を持ちますが、シンボリックリンクに適用されます。一部のシステムコールはこのフラグを暗黙的に設定またはクリアしますが、他のシステムコールはAPIフラグ（例： <code class="docutils literal notranslate"><span class="pre">AT_SYMLINK_FOLLOW</span></code> および
+<code class="docutils literal notranslate"><span class="pre">UMOUNT_NOFOLLOW</span></code> ）で制御します。このフラグの効果はすでに出会った
+<code class="docutils literal notranslate"><span class="pre">WALK_GET</span></code> と同様ですが、異なる方法で使用されます。</p>
+<p><code class="docutils literal notranslate"><span class="pre">LOOKUP_DIRECTORY</span></code> 最終コンポーネントがディレクトリであることを強調しています。さまざまな呼び出し元がこれを設定し、最終コンポーネントの後にスラッシュが続くことが確認された場合にも設定されます。</p>
+<p>最後に <code class="docutils literal notranslate"><span class="pre">LOOKUP_OPEN</span></code>, <code class="docutils literal notranslate"><span class="pre">LOOKUP_CREATE</span></code>, <code class="docutils literal notranslate"><span class="pre">LOOKUP_EXCL</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">LOOKUP_RENAME_TARGET</span></code> VFSは直接使用しませんが、ファイルシステムに提供され、特に <code class="docutils literal notranslate"><span class="pre">-&gt;d_revalidate()</span></code>
+メソッドに利用されます。ファイルシステムは、ファイルを開くか作成するよう要求されることがわかっている場合、過度な再検証を実施する必要がないと判断できます。これらのフラグは以前は <code class="docutils literal notranslate"><span class="pre">-&gt;lookup()</span></code> にも役立ちましたが、の導入により <code class="docutils literal notranslate"><span class="pre">-&gt;atomic_open()</span></code> それらはそこではあまり重要ではありません。</p>
+</section>
+</section>
+<section id="end-of-the-road">
+<h3>終わりの始まり<a class="headerlink" href="#end-of-the-road" title="この見出しへのパーマリンク">¶</a></h3>
+<p>複雑さにもかかわらず、すべてのパス名検索コードは良好な状態にあるようです。さまざまな部分は、数回のリリース前よりも今では理解しやすくなっています。ただし、それが「完成している」というわけではありません。すでに述べたように、RCU-walkはinodeに格納されているシンボリックリンクのみを追跡します。したがって、多くのext4のシンボリックリンクを処理できますが、NFS、XFS、またはBtrfsには対応していません。そのサポートは長期間遅れる可能性は低いです。</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxカーネル内のファイルシステム</a><ul class="current">
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#core-vfs-documentation">コアVFSドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#filesystem-support-layers">ファイルシステムサポートレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#filesystems">ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxカーネル内のファイルシステム</a><ul>
+<li>前へ: <a href="vfs.html" title="前章">Linux仮想ファイルシステムの概要</a></li>
+<li>次へ: <a href="api-summary.html" title="次章">Linux Filesystems API サマリー</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/filesystems/path-lookup.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

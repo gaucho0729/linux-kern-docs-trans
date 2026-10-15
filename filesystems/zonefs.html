@@ -1,0 +1,374 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>ZoneFS - ゾーンブロックデバイス用のゾーンファイルシステム — Linuxカーネルドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="../vm/index.html" rel="next" title="Linuxメモリ管理ドキュメンテーション"/>
+<link href="xfs-self-describing-metadata.html" rel="prev" title="XFS 自己記述メタデータ"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="zonefs-zone-filesystem-for-zoned-block-devices">
+<h1>ZoneFS - ゾーンブロックデバイス用ゾーンファイルシステム<a class="headerlink" href="#zonefs-zone-filesystem-for-zoned-block-devices" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>zonefsは、ゾーンブロックデバイスの各ゾーンをファイルとして公開する非常にシンプルなファイルシステムです。通常のPOSIX準拠ファイルシステム（例：f2fsなど）と異なり、ゾーンブロックデバイスの順序書き込み制約をユーザーに隠蔽しません。デバイスの順序書き込みゾーンを表すファイルは、ファイル末尾から順にしか書けません（追記専用の書き込み）。</p>
+<p>このため、zonefsは本質的にrawブロックデバイスアクセスインターフェースに近いものであり、フル機能のPOSIXファイルシステムとは異なります。zonefsの目的は、アプリケーションにおけるゾーンブロックデバイスのサポート実装を簡素化することであり、rawブロックデバイスファイルアクセスを豊富なファイルAPIに置き換えることで、開発者にとってよりわかりやすい方法を提供します。このアプローチの一例は、LSM（ログ構造マージ）ツリー構造（例：RocksDBやLevelDBで使用されるもの）をゾーンブロックデバイス上で実装することです。SSTablesを通常のファイルシステムのようにゾーンファイルに保存することで、デバイス全体のセクタ範囲ではなく、単一のファイルとして扱います。この「1つのファイルが1つのゾーンを表す」という高レベルな構造の導入により、アプリケーションでの変更量を減らすとともに、さまざまなアプリケーションプログラミング言語のサポートが可能になります。</p>
+<section id="zoned-block-devices">
+<h3>ゾーンブロックデバイス<a class="headerlink" href="#zoned-block-devices" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ゾーンストレージデバイスは、アドレス空間がゾーンに分割されているデバイスのクラスに属します。ゾーンは連続したLBAs（Logical Block Address）のグループで、すべてのゾーンは連続しており（LBAのギャップはありません）、ゾーンにはさまざまなタイプがあります。</p>
+<ul class="simple">
+<li><p>従来型ゾーン：従来型ゾーンに属するLBAsにはアクセス制約がありません。読み取りまたは書き込みアクセスが通常のブロックデバイスと同様に実行可能です。</p></li>
+<li><p>順序ゾーン：これらのゾーンはランダムな読み取りを受けますが、順序でしか書き込めません。各順序ゾーンには、デバイスが保持する書き込みポインタがあり、次の書き込みの必須開始LBA位置を示します。この書き込み制約により、順序ゾーン内のLBAsは上書きできません。順序ゾーンは再び書き込む前に、特別なコマンド（ゾーンリセット）で初期化する必要があります。</p></li>
+</ul>
+<p>ゾーンストレージデバイスは、さまざまな記録およびメディア技術を用いて実装できます。現在最も一般的なゾーンストレージの形式は、SMR（シェルディングマグネットレコーディング）HDD上でSCSIゾーンブロックコマンド（ZBC）およびゾーンATAコマンド（ZAC）インターフェースを使用するものです。</p>
+<p>ソリッドステートディスク（SSD）ストレージデバイスは、ゴミ収集による内部の書込み拡大を減らすなど、ゾーンインターフェースを実装することも可能です。NVMe Zoned NameSpace（ZNS）は、NVMe標準委員会がNVMeプロトコルにゾーンストレージインターフェースを追加するための技術提案です。</p>
+</section>
+</section>
+<section id="zonefs-overview">
+<h2>Zonefs概要<a class="headerlink" href="#zonefs-overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Zonefsは、ゾーンブロックデバイスのゾーンをファイルとして公開します。ゾーンを表すファイルは、ゾーンタイプごとにサブディレクトリでグループ化されます。このファイル構造は、デバイスから提供されるゾーン情報のみで構築されるため、複雑なディスク上のメタデータ構造は必要ありません。</p>
+<section id="on-disk-metadata">
+<h3>ディスク上のメタデータ<a class="headerlink" href="#on-disk-metadata" title="この見出しへのパーマリンク">¶</a></h3>
+<p>zonefsのディスク上のメタデータは、変更不可能なスーパーブロックに簡略化され、永続的にマジックナンバーとオプションの機能フラグおよび値を保存します。マウント時にzonefsはblkdev_report_zones()を使用してデバイスのゾーン構成を取得し、この情報のみに基づいてマウントポイントに静的なファイルツリーを構築します。ファイルサイズは、デバイスが管理するゾーンタイプと書込みポインタの位置から取得されます。</p>
+<p>スーパーブロックは常にディスクのセクタ0に書き込まれます。スーパーブロックを保存しているデバイスの最初のゾーンは、zonefsによってゾーンファイルとして公開されません。スーパーブロックを含むゾーンがシーケンシャルゾーンである場合、mkzonefs形式ツールは常に「ゾーンを終了」し、ゾーンをフル状態に移行して読み取り専用にします。これにより、データの書込みを防ぎます。</p>
+</section>
+<section id="zone-type-sub-directories">
+<h3>ゾーンタイプサブディレクトリ<a class="headerlink" href="#zone-type-sub-directories" title="この見出しへのパーマリンク">¶</a></h3>
+<p>同じタイプのゾーンを表すファイルは、マウント時に自動的に作成される同じサブディレクトリ下にグループ化されます。</p>
+<p>従来のゾーンについては、「cnv」サブディレクトリが使用されます。ただし、このディレクトリはデバイスに利用可能な従来のゾーンがある場合にのみ作成されます。デバイスにセクタ0にのみ1つの従来ゾーンがある場合、そのゾーンはzonefsスーパーブロックを保存するために使用されるため、ファイルとして公開されません。このようなデバイスでは、「cnv」サブディレクトの作成も行われません。</p>
+<p>シーケンシャル書込みゾーンについては、「seq」サブディレクトリが使用されます。</p>
+<p>この2つのディレクトリがzonefsに存在する唯一のディレクトリです。ユーザーは他のディレクトリを作成したり、「cnv」および「seq」サブディレクトリをリネームしたり削除したりすることはできません。</p>
+<p>struct statのst_sizeフィールドで取得されるディレクトリのサイズは、そのディレクトリ下にあるファイル数を示します。これはstat()またはfstat()システムコールによって取得されます。</p>
+</section>
+<section id="zone-files">
+<h3>ゾーンファイル<a class="headerlink" href="#zone-files" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ゾーンファイルは、特定の種類のゾーンセット内でそのゾーンを表す番号によって名付けられます。つまり、「cnv」と「seq」のディレクトリは、それぞれ「0」、「1」、「2」などと名付けられたファイルを含みます。ファイル番号は、デバイス上のゾーンの開始セクタを表す増加する値です。</p>
+<p>ゾーンファイルへの読み込みおよび書き込み操作は、ファイルの最大サイズ（つまり、ゾーン容量）を超えて実行することはできません。ゾーン容量を超えるアクセスは、-EFBIG エラーで失敗します。</p>
+<p>ファイルおよびサブディレクトリの作成、削除、リネーム、または属性の変更は許可されません。</p>
+<p>stat() および fstat() で報告されるファイルのブロック数は、ゾーンファイルの容量、つまり最大ファイルサイズを示します。</p>
+</section>
+<section id="conventional-zone-files">
+<h3>従来のゾーンファイル<a class="headerlink" href="#conventional-zone-files" title="この見出しへのパーマリンク">¶</a></h3>
+<p>従来のゾーンファイルのサイズは、それらが表すゾーンのサイズに固定されています。従来のゾーンファイルはトリムできません。</p>
+<p>これらのファイルは、バッファードI/O、ダイレクトI/O、メモリマップI/O（mmap）など、すべての種類のI/O操作でランダムに読み書きできます。上記のファイルサイズ制限を超えるI/O制約はありません。</p>
+</section>
+<section id="sequential-zone-files">
+<h3>シーケンシャルゾーンファイル<a class="headerlink" href="#sequential-zone-files" title="この見出しへのパーマリンク">¶</a></h3>
+<p>「seq」サブディレクトリにグループ化されたシーケンシャルゾーンファイルのサイズは、ゾーン開始セクタに対するファイルの書き込みポインタ位置を表します。</p>
+<p>シーケンシャルゾーンファイルは、ファイル末尾から順にしか書き込めません。つまり、書き込み操作は常に追加書き込みに限られます。zonefsはランダムな書き込みを受ける試みをしません。ファイルの末尾、または最後に実行された書き込みの末尾（非同期I/O操作の場合）に一致しない開始オフセットを持つ書き込み要求は失敗します。</p>
+<p>ページキャッシュによるディスクリートページの書き戻しは順序的な書き込みパターンを保証しないため、zonefsはシーケンシャルファイルに対してバッファード書き込みおよび共有読み取りマッピングを禁止しています。これらのファイルにはダイレクトI/O書き込みのみが許可されます。zonefsはブロックレイヤーのエレベーターによって実装されるシーケンシャル書き込みの要求の順序的な配達に依存しています。ゾーンブロックデバイスのシーケンシャル書き込み機能を実装したエレベーター（ELEVATOR_F_ZBD_SEQ_WRITE エレベーター機能）を使用する必要があります。このようなエレベーター（例: mq-deadline）は、デバイス初期化時にゾーンブロックデバイスに対してデフォルトで設定されます。</p>
+<p>シーケンシャルゾーンファイルの読み込み用I/Oの種類には制限がありません。バッファードI/O、ダイレクトI/O、共有読み取りマッピングはすべて受け入れられます。</p>
+<p>連続ゾーンファイルのトリムは、0にまで限定され、その場合、ゾーンはリセットされ、ファイルゾーンの書き込みポインタ位置がゾーンの開始位置に戻されます。または、ゾーン容量までにトリムされる場合、ファイルのゾーンはFULL状態に移行し（ゾーン操作を終了します）。</p>
+</section>
+<section id="format-options">
+<h3>フォーマットオプション<a class="headerlink" href="#format-options" title="この見出しへのパーマリンク">¶</a></h3>
+<p>zonefsのいくつかのオプション機能は、フォーマット時に有効化できます。</p>
+<ul class="simple">
+<li><p>従来ゾーンの集約：連続する従来ゾーンの範囲は、1つの大きなファイルに統合されるか、デフォルトの1ファイルあたり1ゾーンの形式から変更できます。</p></li>
+<li><p>ファイル所有権：ゾーンファイルの所有者UIDとGIDはデフォルトで0（root）ですが、有効なUID/GIDに変更できます。</p></li>
+<li><p>ファイルアクセス権限：デフォルトの640アクセス権限を変更できます。</p></li>
+</ul>
+</section>
+<section id="io-error-handling">
+<h3>I/Oエラー処理<a class="headerlink" href="#io-error-handling" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ゾーンブロックデバイスは、通常のブロックデバイスと同様に不良セクタなどの理由でI/Oリクエストが失敗する可能性があります。ただし、ゾーンブロックデバイスの動作規格では、このような既知のI/O失敗パターンに加えて、追加の条件がI/Oエラーを引き起こすと定義されています。</p>
+<ul class="simple">
+<li><p>ゾーンは読み取り専用状態（BLK_ZONE_COND_READONLY）に移行する場合があります：ゾーンにすでに書き込まれたデータは依然として読み取れますが、ゾーンへの書き込みはできなくなります。ユーザーによるゾーン操作（ゾーン管理コマンドや読み書きアクセス）では、ゾーン状態を通常の読み書き状態に戻すことはできません。デバイスがゾーンを読み取り専用状態に移行する理由は規格で定義されていませんが、HDDの不良な書き込みヘッド（このヘッドの下にあるすべてのゾーンが読み取り専用状態に変更される）が典型的な原因です。</p></li>
+<li><p>ゾーンはオフライン状態（BLK_ZONE_COND_OFFLINE）に移行する場合があります：オフラインゾーンは読み取りも書き込みもできません。ユーザーによる操作ではオフラインゾーンを運用可能な状態に戻すことはできません。ゾーン読み取り専用状態の移行と同様に、ドライブがゾーンをオフライン状態に移行する理由は未定義です。典型的な原因は、HDDの不良な読み書きヘッドで、その破損ヘッドの下にあるディスクプレート上のすべてのゾーンがアクセス不能になることです。</p></li>
+<li><p>未アライメントの書き込みエラー: ホストがデバイスが書き込みを実行する際、書き込み要求の開始セクタがゾーン書き込みポインタの位置と一致しない場合に発生します。zonefsは順序的なゾーンに対して順序的なファイル書き込みを強制しますが、非常に大きなダイレクトI/O操作が複数のBIO/要求に分割されたり、非同期I/O操作が原因で部分的な失敗が発生した場合、未アライメントの書き込みエラーが発生する可能性があります。デバイスに送信された順序的な書き込み要求のうち、1つが失敗した場合、その後ろにあるすべての書き込み要求は未アライメントとなり失敗します。</p></li>
+<li><p>遅延書き込みエラー: 通常のブロックデバイスと同様に、デバイス側の書き込みキャッシュが有効な場合、fsync()などのキャッシュフラッシュ時に以前に完了した書き込み範囲でエラーが発生する可能性があります。前記の即時未アライメント書き込みエラーのケースと同様に、遅延書き込みエラーはゾーン内のキャッシュされた順序的なデータストリームを経て伝播し、エラーを引き起こしたセクタ以降のすべてのデータが失われる可能性があります。</p></li>
+</ul>
+<p>zonefsが検出するすべてのI/Oエラーは、エラーを引き起こしたシステムコールのエラーコードでユーザーに通知されます。zonefsがI/Oエラーに対応する回復アクションは、I/Oの種別（読み込み vs 書き込み）とエラーの原因（不良セクタ、未アライメント書き込み、ゾーン状態の変化）に応じて異なります。</p>
+<ul class="simple">
+<li><p>読み込みI/Oエラーの場合、ファイルゾーンがまだ正常状態であり、ファイルinodeサイズとゾーン書き込みポインタ位置に不整合がない限り、zonefsは特定の回復アクションを実行しません。問題が検出された場合、I/Oエラー回復処理が実行されます（下記の表を参照）。</p></li>
+<li><p>書き込みI/Oエラーの場合、zonefsは常にI/Oエラー回復処理を実行します。</p></li>
+<li><p>読み取り専用またはオフラインへのゾーン状態変化も常にzonefs I/Oエラー回復処理をトリガーします。</p></li>
+</ul>
+<p>zonefsの最小限のI/Oエラー回復処理はファイルサイズやファイルアクセス権限を変更する可能性があります。</p>
+<ul class="simple">
+<li><p>ファイルサイズの変更: 連続ゾーンファイルにおける即時または遅延された書き込みエラーは、ファイルinodeのサイズがファイルゾーンに実際に書き込まれたデータ量と不一致になる可能性があります。例えば、複数BIOの大容量書き込み操作が一部失敗した場合、ゾーンの書き込みポインタは一部進むことになりますが、ユーザーに対して全体的な書き込み操作が失敗したと報告されます。このような場合、ファイルinodeのサイズをゾーンの書き込みポインタの変化に合わせて進める必要があります。最終的にユーザーがファイルの末尾から再び書き込みを開始できるようにするためです。また、fsync()で検出された遅延書き込みエラーにより、ファイルサイズが減少することもあります。この場合、ゾーンに実際に書き込まれたデータ量は、ファイルinodeサイズで示されていたものより少なくなります。このようなI/Oエラー後、zonefsは常にファイルinodeサイズを、ファイルゾーンに永続的に保存されたデータ量を反映するように修正します。</p></li>
+<li><p>アクセス権限の変更: ロードレッドゾーン状態への変更は、ファイルのアクセス権限を読み取り専用に変更することで示されます。これにより、ファイル属性の変更やデータの編集が無効になります。オフラインゾーンの場合、ファイルへのすべての権限（読み取りと書き込み）が無効になります。</p></li>
+</ul>
+<p>zonefsのI/Oエラー回復処理で行われる追加の動作は、ユーザーが「errors=xxx」マウントオプションで制御できます。以下の表は、マウントオプションとゾーン状態に応じたzonefsのI/Oエラー処理結果を要約しています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+--------------+-----------+-----------------------------------------+
+|              |           |            Post error state             |
+| "errors=xxx" |  device   |                 access permissions      |
+|    mount     |   zone    | file         file          device zone  |
+|    option    | condition | size     read    write    read    write |
++--------------+-----------+-----------------------------------------+
+|              | good      | fixed    yes     no       yes     yes   |
+| remount-ro   | read-only | as is    yes     no       yes     no    |
+| (default)    | offline   |   0      no      no       no      no    |
++--------------+-----------+-----------------------------------------+
+|              | good      | fixed    yes     no       yes     yes   |
+| zone-ro      | read-only | as is    yes     no       yes     no    |
+|              | offline   |   0      no      no       no      no    |
++--------------+-----------+-----------------------------------------+
+|              | good      |   0      no      no       yes     yes   |
+| zone-offline | read-only |   0      no      no       yes     no    |
+|              | offline   |   0      no      no       no      no    |
++--------------+-----------+-----------------------------------------+
+|              | good      | fixed    yes     yes      yes     yes   |
+| repair       | read-only | as is    yes     no       yes     no    |
+|              | offline   |   0      no      no       no      no    |
++--------------+-----------+-----------------------------------------+
+</pre></div>
+</div>
+<p>追加の注意点:</p>
+<ul class="simple">
+<li><p>「errors=remount-ro」マウントオプションは、エラー用マウントオプションが指定されていない場合のzonefsのI/Oエラー処理のデフォルト動作です。</p></li>
+<li><p>「errors=remount-ro」マウントオプションを使用すると、すべてのファイルに対してアクセス権限を読み取り専用に変更します。ファイルシステムは読み取り専用に再マウットされます。</p></li>
+<li><p>デバイスがゾーンをオフライン状態に移行した際のアクセス権限およびファイルサイズの変更は永続的です。デバイスをmkfs.zonefs（mkzonefs）で再フォーマットしても、オフラインゾーンファイルは良好な状態に戻りません。</p></li>
+<li><p>デバイスがゾーンを読み取り専用状態に移行した際のアクセス権限の変更は永続的です。デバイスを再マウントまたは再フォーマットしても、ファイルの書き込みアクセスを再有効化することはできません。</p></li>
+<li><p>remount-ro、zone-ro、zone-offlineマウントオプションによって示されるアクセス権限の変更は、良好な状態のゾーンでは一時的です。ファイルシステムをマウント解除して再マウントすると、影響を受けたファイルに以前のデフォルト（フォーマット時値）のアクセス権限が復元されます。</p></li>
+<li><p>修復マウントオプションは、最小限のI/Oエラー回復アクションのみをトリガーします。つまり、状態が正常なゾーンのファイルサイズ修正です。デバイスが読み取り専用またはオフラインとして示しているゾーンでも、上記の表に記載されているように、ゾーンファイルのアクセス権限の変更が必要です。</p></li>
+</ul>
+</section>
+<section id="mount-options">
+<h3>マウントオプション<a class="headerlink" href="#mount-options" title="この見出しへのパーマリンク">¶</a></h3>
+<p>zonefsは、「errors=&lt;behavior&gt;」マウントオプションを定義し、ユーザーがI/Oエラー、inodeサイズの不一致、またはゾーン状態の変化に対するzonefsの動作を指定できるようにします。定義された動作は以下の通りです：</p>
+<ul class="simple">
+<li><p>remount-ro (デフォルト)</p></li>
+<li><p>zone-ro</p></li>
+<li><p>zone-offline</p></li>
+<li><p>repair</p></li>
+</ul>
+<p>各動作に定義された実行時のI/Oエラー処理は前記セクションで詳細に説明されています。マウント時のI/Oエラーはマウント操作の失敗を引き起こします。読み取り専用ゾーンの処理はマウント時と実行時の挙動が異なります。マウント時に読み取り専用ゾーンが検出された場合、常にオフラインゾーンと同様に扱われます。つまり、すべてのアクセスが無効化され、ゾーンファイルサイズが0に設定されます。これはZBCおよびZAC規格により読み取り専用ゾーンのライトポインタが無効と定義されているため、ゾーンに書き込まれたデータ量を特定することが不可能なためです。実行時に読み取り専効ゾーンが検出された場合、前記セクションに記載されている通り、ゾーンファイルのサイズは最後に更新された値のままにされます。</p>
+<p>ゾーンブロックデバイス（例：NVMeゾーンナマステッドデバイス）は、アクティブなゾーンの数に制限がある場合があります。つまり、暗黙のオープン、明示的なオープン、またはクローズされた状態にあるゾーンです。この潜在的な制限により、ファイルのゾーンがすでにアクティブでない場合、ユーザーが書き込み要求を発行した際にアプリケーションが書き込みI/Oエラーを検出するリスクがあります。</p>
+<p>これらの潜在的なエラーを回避するため、「explicit-open」マウントオプションは、ファイルが初めて書き込み用に開かれる際に、オープンゾーンコマンドを使用してゾーンをアクティブにします。ゾーンオープンコマンドが成功した場合、アプリケーションは書き込み要求が処理可能であることを保証されます。逆に、「explicit-open」マウントオプションは、ゾーンが満杯でも空でもない場合、ゾーンファイルの最後のclose()呼び出し時にデバイスに対してゾーンクローズコマンドを発行します。</p>
+</section>
+</section>
+<section id="zonefs-user-space-tools">
+<h2>Zonefs User Space Tools<a class="headerlink" href="#zonefs-user-space-tools" title="この見出しへのパーマリンク">¶</a></h2>
+<p>mkzonefsツールは、zonefsで使用するゾーンブロックデバイスをフォーマットするために使用されます。このツールはGitHubで利用可能です：</p>
+<p><a class="reference external" href="https://github.com/damien-lemoal/zonefs-tools">https://github.com/damien-lemoal/zonefs-tools</a></p>
+<p>zonefs-toolsには、任意のゾーンブロックデバイス（包括zonedモードで作成されたnull_blkブロックデバイス）をテストできるテストスイートも含まれています。</p>
+<section id="examples">
+<h3>例<a class="headerlink" href="#examples" title="この見出しへのパーマリンク">¶</a></h3>
+<p>以下は、従来のゾーン集約機能を有効にして15TBのホスト管理SMR HDDを256MBのゾーンでフォーマットする方法です:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># mkzonefs -o aggr_cnv /dev/sdX
+# mount -t zonefs /dev/sdX /mnt
+# ls -l /mnt/
+total 0
+dr-xr-xr-x 2 root root     1 Nov 25 13:23 cnv
+dr-xr-xr-x 2 root root 55356 Nov 25 13:23 seq
+</pre></div>
+</div>
+<p>ゾーンファイルのサブディレクトリのサイズは、各ゾーンタイプごとのファイル数を示します。この例では、従来のゾーンファイルは1つだけあり（すべての従来ゾーンが単一のファイルの下に集約されています）:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># ls -l /mnt/cnv
+total 137101312
+-rw-r----- 1 root root 140391743488 Nov 25 13:23 0
+</pre></div>
+</div>
+<p>この集約された従来ゾーンファイルは通常のファイルとして使用できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># mkfs.ext4 /mnt/cnv/0
+# mount -o loop /mnt/cnv/0 /data
+</pre></div>
+</div>
+<p>「seq」サブディレクトリはシーケンシャル書き込みゾーンのファイルをグループ化しており、この例では55356ゾーンがあります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># ls -lv /mnt/seq
+total 14511243264
+-rw-r----- 1 root root 0 Nov 25 13:23 0
+-rw-r----- 1 root root 0 Nov 25 13:23 1
+-rw-r----- 1 root root 0 Nov 25 13:23 2
+...
+-rw-r----- 1 root root 0 Nov 25 13:23 55354
+-rw-r----- 1 root root 0 Nov 25 13:23 55355
+</pre></div>
+</div>
+<p>シーケンシャル書き込みゾーンファイルの場合、ファイル末尾にデータが追加されるたびにファイルサイズが変化し、通常のファイルシステムと同様です:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># dd if=/dev/zero of=/mnt/seq/0 bs=4096 count=1 conv=notrunc oflag=direct
+1+0 records in
+1+0 records out
+4096 bytes (4.1 kB, 4.0 KiB) copied, 0.00044121 s, 9.3 MB/s
+
+# ls -l /mnt/seq/0
+-rw-r----- 1 root root 4096 Nov 25 13:23 /mnt/seq/0
+</pre></div>
+</div>
+<p>書き込まれたファイルはゾーンサイズにトリミングすることで、さらなる書き込み操作を防ぐことができます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># truncate -s 268435456 /mnt/seq/0
+# ls -l /mnt/seq/0
+-rw-r----- 1 root root 268435456 Nov 25 13:49 /mnt/seq/0
+</pre></div>
+</div>
+<p>0サイズにトリミングすることでファイルゾーンのストレージスペースを解放し、ファイルへの追加書き込みを再開できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># truncate -s 0 /mnt/seq/0
+# ls -l /mnt/seq/0
+-rw-r----- 1 root root 0 Nov 25 13:49 /mnt/seq/0
+</pre></div>
+</div>
+<p>ファイルがディスク上のゾーンに静的にマッピングされているため、stat()およびfstat()で報告されるファイルのブロック数はファイルゾーンの容量を示します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># stat /mnt/seq/0
+File: /mnt/seq/0
+Size: 0             Blocks: 524288     IO Block: 4096   regular empty file
+Device: 870h/2160d  Inode: 50431       Links: 1
+Access: (0640/-rw-r-----)  Uid: (    0/    root)   Gid: (    0/    root)
+Access: 2019-11-25 13:23:57.048971997 +0900
+Modify: 2019-11-25 13:52:25.553805765 +0900
+Change: 2019-11-25 13:52:25.553805765 +0900
+Birth: -
+</pre></div>
+</div>
+<p>ファイルのブロック数（「Blocks」）は512Bブロック単位で、524288 * 512 B = 256 MBの最大ファイルサイズを示し、この例ではデバイスゾーン容量に対応します。注意すべきは「IOブロック」フィールドが常に書き込みの最小I/Oサイズを示し、デバイスの物理セクタサイズに一致することです。</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxカーネル内のファイルシステム</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#core-vfs-documentation">コアVFSドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#filesystem-support-layers">ファイルシステムサポートレイヤー</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#filesystems">ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxカーネル内のファイルシステム</a><ul>
+<li>前へ: <a href="xfs-self-describing-metadata.html" title="前章">XFS 自己記述メタデータ</a></li>
+<li>次へ: <a href="../vm/index.html" title="次章">Linuxメモリ管理ドキュメンテーション</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/filesystems/zonefs.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

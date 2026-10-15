@@ -1,0 +1,1006 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>drm/komeda Arm display driver — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="backlight.html" rel="next" title="バックライトサポート"/>
+<link href="afbc.html" rel="prev" title="アーム・フレームバッファ圧縮（AFBC）"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="drm-komeda-arm-display-driver">
+<h1>drm/komeda アームディスプレイドライバー<a class="headerlink" href="#drm-komeda-arm-display-driver" title="この見出しへのパーマリンク">¶</a></h1>
+<p>drm/komedaドライバは、ArmディスプレイプロセッサD71以降の製品をサポートしており、このドキュメントではドライバ設計の簡単な概要を説明します。ドライバの仕組みやその設計理由について解説します。</p>
+<section id="overview-of-d71-like-display-ips">
+<h2>D71のようなディスプレイIPの概要<a class="headerlink" href="#overview-of-d71-like-display-ips" title="この見出しへのパーマリンク">¶</a></h2>
+<p>D71からは、ArmディスプレイIPが柔軟でモジュール化されたアーキテクチャを採用開始しました。ディスプレイパイプラインは、複数の個別かつ機能的なパイプラインステージ（コンポーネント）で構成され、各コンポーネントは特定の処理能力を持ち、流れ込むピクセルデータに特有の処理を施します。</p>
+<p>典型的なD71コンポーネント:</p>
+<section id="layer">
+<h3>レイヤー<a class="headerlink" href="#layer" title="この見出しへのパーマリンク">¶</a></h3>
+<p>レイヤーは最初のパイプラインステージで、次のステージに向けたピクセルデータを準備します。メモリからピクセルを取得し、AFBCの場合はデコードし、ソース画像を回転させ、YUVピクセルをデバイス内部のRGBピクセルにアンパッキングまたは変換し、必要に応じてピクセルのカラースペースを調整します。</p>
+</section>
+<section id="scaler">
+<h3>スケーラー<a class="headerlink" href="#scaler" title="この見出しへのパーマリンク">¶</a></h3>
+<p>名前の通り、スケーラーはスケーリングを担当し、D71ではスケーラーを用いた画像補正もサポートしています。スケーラーの使用は非常に柔軟で、レイヤー出力に接続してレイヤー内でのスケーリングを行うか、コンポジターに接続して全体のディスプレイフレームをスケーリングし、その後wb_layerに出力データを供給してメモリに書き込むことができます。</p>
+</section>
+<section id="compositor-compiz">
+<h3>コンポジター（compiz）<a class="headerlink" href="#compositor-compiz" title="この見出しへのパーマリンク">¶</a></h3>
+<p>コンポジターは複数のレイヤーやピクセルデータフローを1つのディスプレイフレームにマージします。その出力フレームはポスト画像プロセッサに供給してモニターに表示するか、wb_layerに供給してメモリに同時に書き込むことができます。ユーザーはコンポジターとwb_layerの間にスケーラーを挿入して、ディスプレイフレームを事前にダウンスケーリングし、その後メモリに書き込むことも可能です。</p>
+</section>
+<section id="writeback-layer-wb-layer">
+<h3>Writebackレイヤー（wb_layer）<a class="headerlink" href="#writeback-layer-wb-layer" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ライトバックレイヤーはレイヤーの逆の処理を行います。コンピズに接続し、コンポジット結果をメモリに書き込みます。</p>
+</section>
+<section id="post-image-processor-improc">
+<h3>ポスト画像処理器（improc）<a class="headerlink" href="#post-image-processor-improc" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ポスト画像プロセッサは、モニターの要件に合わせてフレームデータをガンマやカラースペースなどに調整します。</p>
+</section>
+<section id="timing-controller-timing-ctrlr">
+<h3>タイミングコントローラー (timing_ctrlr)<a class="headerlink" href="#timing-controller-timing-ctrlr" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ディスプレイパイプラインの最終段階。タイミングコントローラーはピクセル処理ではなく、ディスプレイタイミングの制御のみを行います。</p>
+</section>
+<section id="merger">
+<h3>マージャー<a class="headerlink" href="#merger" title="この見出しへのパーマリンク">¶</a></h3>
+<p>D71のスケーラーはレイヤーに比べて水平方向の入出力能力が半分程度しかありません。例えばレイヤーが4K入力サイズをサポートする場合、スケーラーは同時には2K入出力のみをサポートします。フルフレームスケーリングを実現するため、D71ではレイヤースプリットを導入しました。これは画像全体を2つの半分の部分に分割し、2つのレイヤーAとBに供給し、それぞれで独立してスケーリングを行います。スケーリング結果はマージャーに供給して2つの部分画像を統合し、その後統合結果をコンピズに出力します。</p>
+</section>
+<section id="splitter">
+<h3>スプリッター<a class="headerlink" href="#splitter" title="この見出しへのパーマリンク">¶</a></h3>
+<p>レイヤースプリットと類似していますが、Splitterは書き戻しに使用され、compizの結果を2つの部分に分割して、それぞれを2つのスケーラーに供給します。</p>
+</section>
+</section>
+<section id="possible-d71-pipeline-usage">
+<h2>D71パイプラインの使用が可能です<a class="headerlink" href="#possible-d71-pipeline-usage" title="この見出しへのパーマリンク">¶</a></h2>
+<p>モジュール化されたアーキテクチャにより、D71パイプラインはさまざまな用途に簡単に調整可能です。D71は2つのパイプラインをサポートしており、2種類の作業モードをサポートしています。</p>
+<ul>
+<li><p>デュアルディスプレイモード 2つのパイプラインが独立して動作し、2つのディスプレイ出力に駆動します。</p></li>
+<li><p>シングルディスプレイモード 2つのパイプラインが協働して、1つのディスプレイ出力のみを駆動します。</p>
+<p>このモードでは、パイプライン_Bは独立して動作せず、その合成結果をパイプライン_Aに送出し、ピクセルタイミングもパイプライン_A.timing_ctrlrから取得します。パイプライン_Bはパイプライン_A（マスター）の「スレーブ」として動作します。</p>
+</li>
+</ul>
+<section id="single-pipeline-data-flow">
+<h3>単一パイプラインデータフロー<a class="headerlink" href="#single-pipeline-data-flow" title="この見出しへのパーマリンク">¶</a></h3>
+<figure class="align-default" id="id1">
+<img alt="単一パイプラインのダイアグラム" src="../_images/DOT-66002ea43d67b166bf5079b6119bec5b363127ba.svg"/><figcaption>
+<p><span class="caption-text">単一パイプラインデータフロー</span><a class="headerlink" href="#id1" title="この画像へのパーマリンク">¶</a></p>
+</figcaption>
+</figure>
+</section>
+<section id="dual-pipeline-with-slave-enabled">
+<h3>Slaveが有効なデュアルパイプライン<a class="headerlink" href="#dual-pipeline-with-slave-enabled" title="この見出しへのパーマリンク">¶</a></h3>
+<figure class="align-default" id="id2">
+<img alt="スレーブパイプラインのダイアグラム" src="../_images/DOT-d59a989ca63363954b8d9c9e03d8cff5effff7e7.svg"/><figcaption>
+<p><span class="caption-text">スレーブパイプライン有効化データフロー</span><a class="headerlink" href="#id2" title="この画像へのパーマリンク">¶</a></p>
+</figcaption>
+</figure>
+</section>
+<section id="sub-pipelines-for-input-and-output">
+<h3>入出力用サブパイプライン<a class="headerlink" href="#sub-pipelines-for-input-and-output" title="この見出しへのパーマリンク">¶</a></h3>
+<p>完全なディスプレイパイプラインは、入出力の使用目的に応じて3つのサブパイプラインに簡単に分割できます。</p>
+<section id="layer-input-pipeline">
+<h4>レイヤー(入力)パイプライン<a class="headerlink" href="#layer-input-pipeline" title="この見出しへのパーマリンク">¶</a></h4>
+<figure class="align-default" id="id3">
+<img alt="レイヤーデータのダイアグラム" src="../_images/DOT-18a2db30442be8a3a7d319b58bde80b777ddc6d3.svg"/><figcaption>
+<p><span class="caption-text">レイヤー（入力）データフロー</span><a class="headerlink" href="#id3" title="この画像へのパーマリンク">¶</a></p>
+</figcaption>
+</figure>
+<figure class="align-default" id="id4">
+<img alt="レイヤースプリットのダイアグラム" src="../_images/DOT-fe8cb898f5142ca0241f8f00c5a38ba8acccf617.svg"/><figcaption>
+<p><span class="caption-text">レイヤースプリットパイプライン</span><a class="headerlink" href="#id4" title="この画像へのパーマリンク">¶</a></p>
+</figcaption>
+</figure>
+</section>
+<section id="writeback-output-pipeline">
+<h4>ライトバック(出力)パイプライン<a class="headerlink" href="#writeback-output-pipeline" title="この見出しへのパーマリンク">¶</a></h4>
+<figure class="align-default" id="id5">
+<img alt="Writebackのダイアグラム" src="../_images/DOT-1c48a6e05371ecefe4b6c024d2bea979a24bc08a.svg"/><figcaption>
+<p><span class="caption-text">書き戻し（出力）データフロー</span><a class="headerlink" href="#id5" title="この画像へのパーマリンク">¶</a></p>
+</figcaption>
+</figure>
+<figure class="align-default" id="id6">
+<img alt="スプリットWritebackのダイアグラム" src="../_images/DOT-f14473fbd2d906d47164f55a2529d4ac78b1bc74.svg"/><figcaption>
+<p><span class="caption-text">書き戻し（出力）スプリットデータフロー</span><a class="headerlink" href="#id6" title="この画像へのパーマリンク">¶</a></p>
+</figcaption>
+</figure>
+</section>
+<section id="display-output-pipeline">
+<h4>ディスプレイ出力パイプライン<a class="headerlink" href="#display-output-pipeline" title="この見出しへのパーマリンク">¶</a></h4>
+<figure class="align-default" id="id7">
+<img alt="ディスプレイのダイアグラム" src="../_images/DOT-d0edc63bffe8e7dca5c56d8d28a47b97ffa80d27.svg"/><figcaption>
+<p><span class="caption-text">ディスプレイ出力データフロー</span><a class="headerlink" href="#id7" title="この画像へのパーマリンク">¶</a></p>
+</figcaption>
+</figure>
+<p>次のセクションでは、これらの3つのサブパイプラインがKMS-plane/wb_conn/crtcそれぞれによって処理されることを確認します。</p>
+</section>
+</section>
+</section>
+<section id="komeda-resource-abstraction">
+<h2>Komedaリソース抽象化<a class="headerlink" href="#komeda-resource-abstraction" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="struct-komeda-pipeline-component">
+<h3>struct komeda_pipeline/component<a class="headerlink" href="#struct-komeda-pipeline-component" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ハードウェアを十分に活用し、簡単にアクセス/設定できるようにするため、ドライバ側も同様のアーキテクチャを使用しています：パイプライン/コンポーネントでハードウェアの機能と能力を記述し、特定のコンポーネントは2つの部分から構成されます。</p>
+<ul class="simple">
+<li><p>データフローの制御。</p></li>
+<li><p>特定のコンポーネントの機能と特徴。</p></li>
+</ul>
+<p>ドライバは共通のヘッダを定義します <a class="reference internal" href="#c.komeda_component" title="komeda_component"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">komeda_component</span></code></a> データフロー制御を記述し、すべての特定コンポーネントはこのベース構造のサブクラスです。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.komeda_component">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">komeda_component</span></span></span><a class="headerlink" href="#c.komeda_component" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct komeda_component {
+  struct drm_private_obj obj;
+  struct komeda_pipeline *pipeline;
+  char name[32];
+  u32 __iomem *reg;
+  u32 id;
+  u32 hw_id;
+  u8 max_active_inputs;
+  u8 max_active_outputs;
+  u32 supported_inputs;
+  u32 supported_outputs;
+  const struct komeda_component_funcs *funcs;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">obj</span></code></dt><dd><p>コンポーネントをプライベートオブジェクトとして扱う</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">pipeline</span></code></dt><dd><p>このコンポーネントが属するkomedaパイプライン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">name</span></code></dt><dd><p>コンポーネント名</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">reg</span></code></dt><dd><p>コンポーネントのレジスタベースアドレス、チップによって初期化されチップ専用で使用される</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">id</span></code></dt><dd><p>コンポーネントID</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">hw_id</span></code></dt><dd><p>コンポーネントのハードウェアID、チップによって初期化されチップ専用で使用される</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">max_active_inputs</span></code></dt><dd><p><strong>最大アクティブ出力数</strong>:</p>
+<p>同時にアクティブになれる入力/出力の最大数。注意：この数値はビット数ではなく <strong>サポートされる入力</strong> または
+<strong>サポートされる出力</strong>、ただしコンポーネントがすべての出力/入力を同時に有効化できない場合、この数値はそれよりも小さくなる可能性があります。 <strong>サポートされる入力</strong>/出力。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">max_active_outputs</span></code></dt><dd><p>最大出力数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">supported_inputs</span></code></dt><dd><p><strong>サポートされる出力</strong>:</p>
+<p>サポートされる入力/出力のBIT(component-&gt;id)のビットマスク、コンポーネントがパイプラインにどのように接続されるかの可能性を記述します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">supported_outputs</span></code></dt><dd><p>サポートされる出力コンポーネントIDのビットマスク</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">funcs</span></code></dt><dd><p>ハードウェアへのアクセス機能を提供するチップの機能</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p><a class="reference internal" href="#c.komeda_component" title="komeda_component"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">komeda_component</span></code></a> コンポーネントをディスプレイパイプラインにどのように接続するかのデータフロー機能を記述します。すべての指定されたコンポーネントはこの構造のサブクラスです。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.komeda_component_output">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">komeda_component_output</span></span></span><a class="headerlink" href="#c.komeda_component_output" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct komeda_component_output {
+  struct komeda_component *component;
+  u8 output_port;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">component</span></code></dt><dd><p>データがどのコンポーネントから来るかを示す</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">output_port</span></code></dt><dd><p>出力ポートの <a class="reference internal" href="#c.komeda_component_output" title="komeda_component_output"><code class="xref c c-type docutils literal notranslate"><span class="pre">komeda_component_output.component</span></code></a></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>コンポーネントが複数の出力を持つ場合、データの出所を知るにはコンポーネントだけでは不十分で、その出力ポートを把握する必要があります</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.komeda_component_state">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">komeda_component_state</span></span></span><a class="headerlink" href="#c.komeda_component_state" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct komeda_component_state {
+  struct drm_private_state obj;
+  struct komeda_component *component;
+  union {
+    struct drm_crtc *crtc;
+    struct drm_plane *plane;
+    struct drm_connector *wb_conn;
+    void *binding_user;
+  };
+  u16 active_inputs;
+  u16 changed_active_inputs;
+  u16 affected_inputs;
+  struct komeda_component_output inputs[KOMEDA_COMPONENT_N_INPUTS];
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">obj</span></code></dt><dd><p>drm_atomic_stateを用いたコンポーネント状態の追跡</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">component</span></code></dt><dd><p>コンポーネントへのバックポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">{unnamed_union}</span></code></dt><dd><p>匿名</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">crtc</span></code></dt><dd><p>ユーザーのcrtc用バックポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">plane</span></code></dt><dd><p>ユーザーのplane用バックポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">wb_conn</span></code></dt><dd><p>ユーザーのwb_connector用バックポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">binding_user</span></code></dt><dd><p>現在バインドされているユーザー、ユーザーは <strong>crtc</strong>, <strong>plane</strong> または <strong>wb_conn</strong>、有効性は <strong>コンポーネント</strong> および <strong>入力</strong></p>
+<ul class="simple">
+<li><p>レイヤー: そのユーザーは常にplaneです</p></li>
+<li><p>compiz/improc/timing_ctrlr: ユーザーはcrtcです</p></li>
+<li><p>wb_layer: wb_conn;</p></li>
+<li><p>スケーラー: 入力がレイヤーの場合はplane、入力がcompizの場合はwb_connです</p></li>
+</ul>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">active_inputs</span></code></dt><dd><p>active_inputsは <strong>入力</strong> index</p>
+<ul class="simple">
+<li><p>active_inputs = changed_active_inputs | unchanged_active_inputs</p></li>
+<li><p>affected_inputs = old-&gt;active_inputs | new-&gt;active_inputs;</p></li>
+<li><p>disabling_inputs = affected_inputs ^ active_inputs;</p></li>
+<li><p>changed_inputs = disabling_inputs | changed_active_inputs;</p></li>
+</ul>
+<p>注意: changed_inputsはすべてのactive_inputを含んでいませんが、
+<strong>changed_active_inputs</strong>のみを含み、このビットマスクはチップレベルでの汚い更新に使用できます</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">changed_active_inputs</span></code></dt><dd><p>変更された <strong>active_inputsのビットマスク</strong></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">affected_inputs</span></code></dt><dd><p>影響を受けた <strong>入力</strong></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">inputs</span></code></dt><dd><p>特定のinputs[i]は、BIT(i)が設定されている場合にのみ有効です
+<strong>active_inputsのビットマスク</strong>、設定されていない場合はinputs[i]は未定義です</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>component_stateはコンポーネントのデータフロー構成であり、すべての特定コンポーネント状態のスーパークラスです。例えば <strong>komeda_layer_state</strong>,
+<strong>komeda_scaler_state</strong></p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.komeda_pipeline">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">komeda_pipeline</span></span></span><a class="headerlink" href="#c.komeda_pipeline" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct komeda_pipeline {
+  struct drm_private_obj obj;
+  struct komeda_dev *mdev;
+  struct clk *pxlclk;
+  int id;
+  u32 avail_comps;
+  u32 standalone_disabled_comps;
+  int n_layers;
+  struct komeda_layer *layers[KOMEDA_PIPELINE_MAX_LAYERS];
+  int n_scalers;
+  struct komeda_scaler *scalers[KOMEDA_PIPELINE_MAX_SCALERS];
+  struct komeda_compiz *compiz;
+  struct komeda_splitter *splitter;
+  struct komeda_merger *merger;
+  struct komeda_layer  *wb_layer;
+  struct komeda_improc *improc;
+  struct komeda_timing_ctrlr *ctrlr;
+  const struct komeda_pipeline_funcs *funcs;
+  struct device_node *of_node;
+  struct device_node *of_output_port;
+  struct device_node *of_output_links[2];
+  bool dual_link;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">obj</span></code></dt><dd><p>drm_atomic_stateのプライベートオブジェクトとしてパイプラインをリンクします</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mdev</span></code></dt><dd><p>親のkomeda_dev</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">pxlclk</span></code></dt><dd><p>ピクセルクロック</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">id</span></code></dt><dd><p>パイプラインID</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">avail_comps</span></code></dt><dd><p>パイプラインの利用可能なコンポーネントマスク</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">standalone_disabled_comps</span></code></dt><dd><p>パイプラインを無効化する際、一部のコンポーネントは他のコンポーネントと同時に無効化できないため、個別に無効化する必要があります。スタンドアロンで無効化するコンポーネントは、スタンドアロンで無効化が必要なコンポーネントであり、この概念は二段階の概念を導入します。第1段階: 共通コンポーネントの無効化。第2段階: スタンドアロンで無効化するコンポーネントの無効化。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">n_layers</span></code></dt><dd><p>レイヤーの数を有効にする <strong>layers</strong></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">layers</span></code></dt><dd><p>パイプラインレイヤー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">n_scalers</span></code></dt><dd><p>スケーラーの数を有効にする <strong>スケーラー</strong></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">scalers</span></code></dt><dd><p>パイプラインスケーラー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">compiz</span></code></dt><dd><p>コンポジター</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">splitter</span></code></dt><dd><p>コンピズの出力を二つの半分のデータフローに分割する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">merger</span></code></dt><dd><p>マージャー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">wb_layer</span></code></dt><dd><p>ライトバックレイヤー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">improc</span></code></dt><dd><p>ポスト画像処理</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ctrlr</span></code></dt><dd><p>タイミングコントローラー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">funcs</span></code></dt><dd><p>チップ専用パイプライン機能</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">of_node</span></code></dt><dd><p>パイプラインDTノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">of_output_port</span></code></dt><dd><p>パイプライン出力ポート</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">of_output_links</span></code></dt><dd><p>出力接続デバイスノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dual_link</span></code></dt><dd><p>of_output_links[0] と [1] がどちらも有効な場合に true</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>完全なディスプレイパイプラインを表し、すべての機能コンポーネントを保持する</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.komeda_pipeline_state">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">komeda_pipeline_state</span></span></span><a class="headerlink" href="#c.komeda_pipeline_state" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct komeda_pipeline_state {
+  struct drm_private_state obj;
+  struct komeda_pipeline *pipe;
+  struct drm_crtc *crtc;
+  u32 active_comps;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">obj</span></code></dt><dd><p>drm_atomic_state でパイプライン_state を追跡する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">pipe</span></code></dt><dd><p>パイプラインへのバックポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">crtc</span></code></dt><dd><p>現在バインドされているcrtc</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">active_comps</span></code></dt><dd><p>ビットマスク - active コンポーネントの BIT(component-&gt;id)</p>
+</dd>
+</dl>
+<p><strong>注意</strong></p>
+<p>パイプラインとは異なり、pipeline_state はコンポーネント_state を収集しない。これはすべてのコンポーネントが drm_atomic_state で管理されるためである。</p>
+</section>
+</section>
+<section id="resource-discovery-and-initialization">
+<h2>リソースの発見と初期化<a class="headerlink" href="#resource-discovery-and-initialization" title="この見出しへのパーマリンク">¶</a></h2>
+<p>パイプラインとコンポーネントはピクセルデータの処理方法を記述する。我々はまだ @<a class="reference internal" href="#c.komeda_dev" title="komeda_dev"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">komeda_dev</span></code></a> デバイス全体のビューを記述し、デバイスの制御機能を示す</p>
+<p>我々は &amp;komeda_dev, &amp;komeda_pipeline, &amp;komeda_component を持つ。現在デバイスをパイプラインで埋める。komeda は D71 だけでなく、今後の製品にも対応するため、異なる製品間で共有できるようにする必要がある。そのため、komeda デバイスを CORE と CHIP の二つのレイヤーに分割する。</p>
+<ul class="simple">
+<li><p>CORE: 共通の機能と能力の処理を行う。</p></li>
+<li><p>CHIP: レジスタプログラミングとハードウェア固有の機能（制限）の処理を行う。</p></li>
+</ul>
+<p>CORE は CHIP にアクセスするための3つのチップ機能構造体を持つ:</p>
+<ul class="simple">
+<li><p><a class="reference internal" href="#c.komeda_dev_funcs" title="komeda_dev_funcs"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">komeda_dev_funcs</span></code></a></p></li>
+<li><p>struct komeda_pipeline_funcs</p></li>
+<li><p>struct komeda_component_funcs</p></li>
+</ul>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.komeda_dev_funcs">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">komeda_dev_funcs</span></span></span><a class="headerlink" href="#c.komeda_dev_funcs" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct komeda_dev_funcs {
+  void (*init_format_table)(struct komeda_dev *mdev);
+  int (*enum_resources)(struct komeda_dev *mdev);
+  void (*cleanup)(struct komeda_dev *mdev);
+  int (*connect_iommu)(struct komeda_dev *mdev);
+  int (*disconnect_iommu)(struct komeda_dev *mdev);
+  irqreturn_t (*irq_handler)(struct komeda_dev *mdev, struct komeda_events *events);
+  int (*enable_irq)(struct komeda_dev *mdev);
+  int (*disable_irq)(struct komeda_dev *mdev);
+  void (*on_off_vblank)(struct komeda_dev *mdev, int master_pipe, bool on);
+  void (*dump_register)(struct komeda_dev *mdev, struct seq_file *seq);
+  int (*change_opmode)(struct komeda_dev *mdev, int new_mode);
+  void (*flush)(struct komeda_dev *mdev, int master_pipe, u32 active_pipes);
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">init_format_table</span></code></dt><dd><p>初期化 <a class="reference internal" href="#c.komeda_dev" title="komeda_dev"><code class="xref c c-type docutils literal notranslate"><span class="pre">komeda_dev-&gt;format_table</span></code></a>, この関数は、 <code class="xref c c-type docutils literal notranslate"><span class="pre">enum_resource</span></code></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">enum_resources</span></code></dt><dd><p>CHIP がパイプラインとコンポーネントリソースを CORE に報告または追加するための関数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cleanup</span></code></dt><dd><p>CHIP の komeda_dev-&gt;chip データをクリーンアップするための呼び出し</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">connect_iommu</span></code></dt><dd><p>オプション、外部 iommu に接続する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">disconnect_iommu</span></code></dt><dd><p>オプション、外部 iommu から切断する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq_handler</span></code></dt><dd><p>割り込みが発生した際、CHIP から CORE がハードウェアイベントを取得するための関数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">enable_irq</span></code></dt><dd><p>割り込みを有効にする</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">disable_irq</span></code></dt><dd><p>割り込みを無効にする</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">on_off_vblank</span></code></dt><dd><p>HWにVBLANKのオン/オフを通知する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dump_register</span></code></dt><dd><p>オプション。seq_fileにレジスタをダンプする</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">change_opmode</span></code></dt><dd><p>HWに新しい表示動作モードへの切り替えを通知する</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">flush</span></code></dt><dd><p>HWにフラッシュまたは更新の開始を通知する</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>チップレベルで提供され、チップエントリーファンクションxxx_identifyによって返される</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.komeda_dev">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">komeda_dev</span></span></span><a class="headerlink" href="#c.komeda_dev" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct komeda_dev {
+  struct device *dev;
+  u32 __iomem   *reg_base;
+  struct device_dma_parameters dma_parms;
+  struct komeda_chip_info chip;
+  struct komeda_format_caps_table fmt_tbl;
+  struct clk *aclk;
+  int irq;
+  struct mutex lock;
+  u32 dpmode;
+  int n_pipelines;
+  struct komeda_pipeline *pipelines[KOMEDA_MAX_PIPELINES];
+  const struct komeda_dev_funcs *funcs;
+  void *chip_data;
+  struct iommu_domain *iommu;
+  struct dentry *debugfs_root;
+  u16 err_verbosity;
+#define KOMEDA_DEV_PRINT_ERR_EVENTS BIT(0);
+#define KOMEDA_DEV_PRINT_WARN_EVENTS BIT(1);
+#define KOMEDA_DEV_PRINT_INFO_EVENTS BIT(2);
+#define KOMEDA_DEV_PRINT_DUMP_STATE_ON_EVENT BIT(8);
+#define KOMEDA_DEV_PRINT_DISABLE_RATELIMIT BIT(12);
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">dev</span></code></dt><dd><p>ベースデバイス構造体</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">reg_base</span></code></dt><dd><p>komeda I/O領域のベースアドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dma_parms</span></code></dt><dd><p>komedaのDMAパラメータ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">chip</span></code></dt><dd><p>基本的なチップ情報</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">fmt_tbl</span></code></dt><dd><p>初期化される <a class="reference internal" href="#c.komeda_dev_funcs" title="komeda_dev_funcs"><code class="xref c c-type docutils literal notranslate"><span class="pre">komeda_dev_funcs-&gt;init_format_table</span></code></a></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">aclk</span></code></dt><dd><p>HWメインエンジンクロック</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">irq</span></code></dt><dd><p>割り込み番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">lock</span></code></dt><dd><p>dpmodeを保護するために使用される</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dpmode</span></code></dt><dd><p>現在の表示モード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">n_pipelines</span></code></dt><dd><p>パイプの数 <strong>パイプライン</strong></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">pipelines</span></code></dt><dd><p>komedaパイプライン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">funcs</span></code></dt><dd><p>チップ機能（HWへのアクセス用）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">chip_data</span></code></dt><dd><p>チップデータは追加される <a class="reference internal" href="#c.komeda_dev_funcs" title="komeda_dev_funcs"><code class="xref c c-type docutils literal notranslate"><span class="pre">komeda_dev_funcs.enum_resources()</span></code></a> および破棄される <a class="reference internal" href="#c.komeda_dev_funcs" title="komeda_dev_funcs"><code class="xref c c-type docutils literal notranslate"><span class="pre">komeda_dev_funcs.cleanup()</span></code></a></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">iommu</span></code></dt><dd><p>iommuドメイン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">debugfs_root</span></code></dt><dd><p>komeda debugfsのルートディレクトリ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">err_verbosity</span></code></dt><dd><p>エラー時に印刷する追加情報のビットマスク</p>
+<p>KOMEDA_DEV_*マクロを参照してください。ロー・バイトはデバッグレベルカテゴリを、ハイ・バイトは追加のデバッグオプションを含みます。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>パイプラインとコンポーネントはピクセルデータの処理方法を記述します。komeda_deviceはデバイス全体のビューと制御機能を記述します。</p>
+</section>
+<section id="format-handling">
+<h2>フォーマット処理<a class="headerlink" href="#format-handling" title="この見出しへのパーマリンク">¶</a></h2>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.komeda_format_caps">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">komeda_format_caps</span></span></span><a class="headerlink" href="#c.komeda_format_caps" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct komeda_format_caps {
+  u32 hw_id;
+  u32 fourcc;
+  u32 supported_layer_types;
+  u32 supported_rots;
+  u32 supported_afbc_layouts;
+  u64 supported_afbc_features;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">hw_id</span></code></dt><dd><p>HWフォーマットID、HW固有の値。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">fourcc</span></code></dt><dd><p>DRM fourccフォーマット。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">supported_layer_types</span></code></dt><dd><p>このフォーマットをサポートするレイヤーを示す</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">supported_rots</span></code></dt><dd><p>このフォーマットの許可された回転</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">supported_afbc_layouts</span></code></dt><dd><p>サポートされるAFBCレイヤーオート</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">supported_afbc_features</span></code></dt><dd><p>サポートされるAFBC機能</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>komeda_format_capsは特定のフォーマットにおけるARMディスプレイ固有の機能と制限を記述し、format_capsはリンクされる
+<code class="xref c c-type docutils literal notranslate"><span class="pre">komeda_framebuffer</span></code> 拡張として <a class="reference internal" href="drm-kms.html#c.drm_format_info" title="drm_format_info"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_format_info</span></code></a>.</p>
+<p><strong>注意</strong></p>
+<p>一つのfourccはfourccとfourcc+modifierのための2つの異なるformat_caps項目を持つ場合があります</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.komeda_format_caps_table">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">komeda_format_caps_table</span></span></span><a class="headerlink" href="#c.komeda_format_caps_table" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>format_capsマネージャー</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct komeda_format_caps_table {
+  u32 n_formats;
+  const struct komeda_format_caps *format_caps;
+  bool (*format_mod_supported)(const struct komeda_format_caps *caps, u32 layer_type, u64 modifier, u32 rot);
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">n_formats</span></code></dt><dd><p>format_capsリストのサイズ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">format_caps</span></code></dt><dd><p>format_capsリスト</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">format_mod_supported</span></code></dt><dd><p>オプション。一部のHWはformat_capsで記述できない特別な要件や制限を持つ場合があります。この関数はHWにさらにHW固有のチェックを行う能力を提供します。</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.komeda_fb">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">komeda_fb</span></span></span><a class="headerlink" href="#c.komeda_fb" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>komeda属性でdrm_framebufferを拡張</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct komeda_fb {
+  struct drm_framebuffer base;
+  const struct komeda_format_caps *format_caps;
+  bool is_va;
+  u32 aligned_w;
+  u32 aligned_h;
+  u32 afbc_size;
+  u32 offset_payload;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">base</span></code></dt><dd><p><a class="reference internal" href="drm-kms.html#c.drm_framebuffer" title="drm_framebuffer"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_framebuffer</span></code></a></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">format_caps</span></code></dt><dd><p>komeda固有の情報を含むdrm_format_infoを拡張</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">is_va</span></code></dt><dd><p>smmuが有効になっている場合、trueになります</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">aligned_w</span></code></dt><dd><p>アライメントされたフレームバッファ幅</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">aligned_h</span></code></dt><dd><p>アライメントされたフレームバッファ高さ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">afbc_size</span></code></dt><dd><p>afbcの最小サイズ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">offset_payload</span></code></dt><dd><p>afbcボディーバッファの開始位置</p>
+</dd>
+</dl>
+</section>
+<section id="attach-komeda-dev-to-drm-kms">
+<h2>komeda_devをDRM-KMSにアタッチ<a class="headerlink" href="#attach-komeda-dev-to-drm-kms" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Komedaはパイプライン/コンポーネントでリソースを抽象化していますが、DRM-KMSはcrtc/plane/connectorを使用します。1つのKMSオブジェクトが単一のコンポーネントを表すことはできません。なぜなら、単一のKMSオブジェクトで要求を満たすことは困難であり、通常複数のコンポーネントが必要です。例えば、KMSのモード設定、ガンマ、CTMはすべてCRTCオブジェクトに依存しますが、Komedaはcompiz、improc、timing_ctrlrの組み合わせでこれらの要求を満たします。また、KMS-Planeは複数のKomedaリソース（layer/scaler/compiz）を必要とする場合があります。</p>
+<p>したがって、1つのKMS-ObjはKomedaのサブパイプラインを表します。</p>
+<ul class="simple">
+<li><p>プレーン: <a class="reference internal" href="#layer-input-pipeline">レイヤー(入力)パイプライン</a></p></li>
+<li><p>Wb_connector: <a class="reference internal" href="#writeback-output-pipeline">ライトバック(出力)パイプライン</a></p></li>
+<li><p>Crtc: <a class="reference internal" href="#display-output-pipeline">ディスプレイ出力パイプライン</a></p></li>
+</ul>
+<p>したがって、KomedaではKMSのcrtc/plane/connectorをパイプラインとコンポーネントのユーザーとして扱い、同時に1つのパイプライン/コンポーネントは1つのユーザーのみが使用可能です。パイプライン/コンポーネントはDRM-KMSのプライベートオブジェクトとして扱われ、drm_atomic_stateで状態を管理します。</p>
+<section id="how-to-map-plane-to-layer-input-pipeline">
+<h3>平面をレイヤー(入力)パイプラインにマッピングする方法<a class="headerlink" href="#how-to-map-plane-to-layer-input-pipeline" title="この見出しへのパーマリンク">¶</a></h3>
+<p>Komedaには複数のレイヤー入力パイプラインがあります、参照:   <a class="reference internal" href="#single-pipeline-data-flow">単一パイプラインデータフロー</a>
+-   <a class="reference internal" href="#dual-pipeline-with-slave-enabled">Slaveが有効なデュアルパイプライン</a></p>
+<p>最も簡単な方法は、プレーンを固定されたレイヤーパイプラインにバインディングすることですが、Komedaの機能を考慮してください:</p>
+<ul>
+<li><p>レイヤースプリット、参照 <a class="reference internal" href="#layer-input-pipeline">レイヤー(入力)パイプライン</a></p>
+<p>レイヤースプリットは複雑な機能で、大きな画像を2つの部分に分割し、2つのレイヤーと2つのスケーラーで個別に処理します。ただし、分割後の画像中央にエッジの問題や効果が生じる可能性があります。このような問題を回避するには、複雑な分割計算とレイヤーおよびスケーラーへの特別な設定が必要です。このようなハードウェア関連の複雑さはユーザー側に隠すべきです。</p>
+</li>
+<li><p>スレーブパイプライン、参照 <a class="reference internal" href="#dual-pipeline-with-slave-enabled">Slaveが有効なデュアルパイプライン</a></p>
+<p>compizコンポーネントはアルファ値を出力しないので、スレーブパイプラインは下層レイヤーの合成にのみ使用可能です。Komedaドライバーはこの制限をユーザーに隠したいです。これを実現するには、plane_state-&gt;zposに基づいて適切なレイヤーを選択します。</p>
+</li>
+</ul>
+<p>したがって、KomedaではKMS-Planeが固定されたkomedaレイヤーパイプラインを表すのではなく、同じ機能を持つ複数のレイヤーを表します。Komedaは1つのKMS-Planeの要件に合った1つまたは複数のレイヤーを選択します。</p>
+</section>
+<section id="make-component-pipeline-to-be-drm-private-obj">
+<h3>component/pipelineをdrm_private_objにする<a class="headerlink" href="#make-component-pipeline-to-be-drm-private-obj" title="この見出しへのパーマリンク">¶</a></h3>
+<p>追加 <a class="reference internal" href="drm-kms.html#c.drm_private_obj" title="drm_private_obj"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_private_obj</span></code></a> に（木の下から葉に向かって） <a class="reference internal" href="#c.komeda_component" title="komeda_component"><code class="xref c c-type docutils literal notranslate"><span class="pre">komeda_component</span></code></a>, <a class="reference internal" href="#c.komeda_pipeline" title="komeda_pipeline"><code class="xref c c-type docutils literal notranslate"><span class="pre">komeda_pipeline</span></code></a></p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">struct</span><span class="w"> </span><span class="nc">komeda_component</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">drm_private_obj</span><span class="w"> </span><span class="n">obj</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="p">...</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="k">struct</span><span class="w"> </span><span class="nc">komeda_pipeline</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">drm_private_obj</span><span class="w"> </span><span class="n">obj</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="p">...</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</pre></div>
+</div>
+</section>
+<section id="tracking-component-state-pipeline-state-by-drm-atomic-state">
+<h3>drm_atomic_stateを用いてcomponent_state/pipeline_stateを追跡<a class="headerlink" href="#tracking-component-state-pipeline-state-by-drm-atomic-state" title="この見出しへのパーマリンク">¶</a></h3>
+<p>追加 <a class="reference internal" href="drm-kms.html#c.drm_private_state" title="drm_private_state"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_private_state</span></code></a> and user to <a class="reference internal" href="#c.komeda_component_state" title="komeda_component_state"><code class="xref c c-type docutils literal notranslate"><span class="pre">komeda_component_state</span></code></a>,
+<a class="reference internal" href="#c.komeda_pipeline_state" title="komeda_pipeline_state"><code class="xref c c-type docutils literal notranslate"><span class="pre">komeda_pipeline_state</span></code></a></p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">struct</span><span class="w"> </span><span class="nc">komeda_component_state</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">drm_private_state</span><span class="w"> </span><span class="n">obj</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="kt">void</span><span class="w"> </span><span class="o">*</span><span class="n">binding_user</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="p">...</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="k">struct</span><span class="w"> </span><span class="nc">komeda_pipeline_state</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">drm_private_state</span><span class="w"> </span><span class="n">obj</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">drm_crtc</span><span class="w"> </span><span class="o">*</span><span class="n">crtc</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="p">...</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</pre></div>
+</div>
+</section>
+<section id="komeda-component-validation">
+<h3>komedaコンポーネント検証<a class="headerlink" href="#komeda-component-validation" title="この見出しへのパーマリンク">¶</a></h3>
+<p>Komedaには複数のコンポーネントタイプがありますが、検証プロセスは通常以下のステップを含みます:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="kt">int</span><span class="w"> </span><span class="nf">komeda_xxxx_validate</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">komeda_component_xxx</span><span class="w"> </span><span class="n">xxx_comp</span><span class="p">,</span><span class="w"></span>
+<span class="w">            </span><span class="k">struct</span><span class="w"> </span><span class="nc">komeda_component_output</span><span class="w"> </span><span class="o">*</span><span class="n">input_dflow</span><span class="p">,</span><span class="w"></span>
+<span class="w">            </span><span class="k">struct</span><span class="w"> </span><span class="nc">drm_plane</span><span class="o">/</span><span class="n">crtc</span><span class="o">/</span><span class="n">connector</span><span class="w"> </span><span class="o">*</span><span class="n">user</span><span class="p">,</span><span class="w"></span>
+<span class="w">            </span><span class="k">struct</span><span class="w"> </span><span class="nc">drm_plane</span><span class="o">/</span><span class="n">crtc</span><span class="o">/</span><span class="n">connector_state</span><span class="p">,</span><span class="w"> </span><span class="o">*</span><span class="n">user_state</span><span class="p">)</span><span class="w"></span>
+<span class="p">{</span><span class="w"></span>
+<span class="w">     </span><span class="n">setup</span><span class="w"> </span><span class="mi">1</span><span class="o">:</span><span class="w"> </span><span class="n">check</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">component</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="n">needed</span><span class="p">,</span><span class="w"> </span><span class="n">like</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">scaler</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="n">optional</span><span class="w"> </span><span class="n">depending</span><span class="w"></span>
+<span class="w">              </span><span class="n">on</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">user_state</span><span class="p">;</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">unneeded</span><span class="p">,</span><span class="w"> </span><span class="n">just</span><span class="w"> </span><span class="k">return</span><span class="p">,</span><span class="w"> </span><span class="n">and</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">caller</span><span class="w"> </span><span class="n">will</span><span class="w"></span>
+<span class="w">              </span><span class="n">put</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">data</span><span class="w"> </span><span class="n">flow</span><span class="w"> </span><span class="n">into</span><span class="w"> </span><span class="n">next</span><span class="w"> </span><span class="n">stage</span><span class="p">.</span><span class="w"></span>
+<span class="w">     </span><span class="n">Setup</span><span class="w"> </span><span class="mi">2</span><span class="o">:</span><span class="w"> </span><span class="n">check</span><span class="w"> </span><span class="n">user_state</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="n">component</span><span class="w"> </span><span class="n">features</span><span class="w"> </span><span class="n">and</span><span class="w"> </span><span class="n">capabilities</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">see</span><span class="w"></span>
+<span class="w">              </span><span class="k">if</span><span class="w"> </span><span class="n">requirements</span><span class="w"> </span><span class="n">can</span><span class="w"> </span><span class="n">be</span><span class="w"> </span><span class="n">met</span><span class="p">;</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">not</span><span class="p">,</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">fail</span><span class="p">.</span><span class="w"></span>
+<span class="w">     </span><span class="n">Setup</span><span class="w"> </span><span class="mi">3</span><span class="o">:</span><span class="w"> </span><span class="n">get</span><span class="w"> </span><span class="n">component_state</span><span class="w"> </span><span class="n">from</span><span class="w"> </span><span class="n">drm_atomic_state</span><span class="p">,</span><span class="w"> </span><span class="n">and</span><span class="w"> </span><span class="n">try</span><span class="w"> </span><span class="n">set</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">set</span><span class="w"></span>
+<span class="w">              </span><span class="n">user</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">component</span><span class="p">;</span><span class="w"> </span><span class="n">fail</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">component</span><span class="w"> </span><span class="n">has</span><span class="w"> </span><span class="n">been</span><span class="w"> </span><span class="n">assigned</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">another</span><span class="w"></span>
+<span class="w">              </span><span class="n">user</span><span class="w"> </span><span class="n">already</span><span class="p">.</span><span class="w"></span>
+<span class="w">     </span><span class="n">Setup</span><span class="w"> </span><span class="mi">3</span><span class="o">:</span><span class="w"> </span><span class="n">configure</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">component_state</span><span class="p">,</span><span class="w"> </span><span class="n">like</span><span class="w"> </span><span class="n">set</span><span class="w"> </span><span class="n">its</span><span class="w"> </span><span class="n">input</span><span class="w"> </span><span class="n">component</span><span class="p">,</span><span class="w"></span>
+<span class="w">              </span><span class="n">convert</span><span class="w"> </span><span class="n">user_state</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">component</span><span class="w"> </span><span class="n">specific</span><span class="w"> </span><span class="n">state</span><span class="p">.</span><span class="w"></span>
+<span class="w">     </span><span class="n">Setup</span><span class="w"> </span><span class="mi">4</span><span class="o">:</span><span class="w"> </span><span class="n">adjust</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">input_dflow</span><span class="w"> </span><span class="n">and</span><span class="w"> </span><span class="n">prepare</span><span class="w"> </span><span class="n">it</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">next</span><span class="w"> </span><span class="n">stage</span><span class="p">.</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</pre></div>
+</div>
+</section>
+<section id="komeda-kms-abstraction">
+<h3>komeda_kms抽象化<a class="headerlink" href="#komeda-kms-abstraction" title="この見出しへのパーマリンク">¶</a></h3>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.komeda_plane">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">komeda_plane</span></span></span><a class="headerlink" href="#c.komeda_plane" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>drm_planeのkomedaインスタンス</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct komeda_plane {
+  struct drm_plane base;
+  struct komeda_layer *layer;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">base</span></code></dt><dd><p><a class="reference internal" href="drm-kms.html#c.drm_plane" title="にヘルパーのvtableを設定します"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_plane</span></code></a></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">layer</span></code></dt><dd><p>このプレーンの利用可能なレイヤー入力パイプラインを表します。</p>
+<p>注意: レイヤーは特定のレイヤーではなく、同じ機能を持つレイヤーのグループを示します。</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.komeda_plane_state">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">komeda_plane_state</span></span></span><a class="headerlink" href="#c.komeda_plane_state" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct komeda_plane_state {
+  struct drm_plane_state base;
+  struct list_head zlist_node;
+  u8 layer_split : 1;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">base</span></code></dt><dd><p><a class="reference internal" href="drm-kms.html#c.drm_plane_state" title="drm_plane_state"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_plane_state</span></code></a></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">zlist_node</span></code></dt><dd><p>zorderリストノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">layer_split</span></code></dt><dd><p>on/off layer_split</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>plane_stateは左右のデータフローに分割され、2つのレイヤーで処理されます <a class="reference internal" href="#c.komeda_plane" title="komeda_plane"><code class="xref c c-type docutils literal notranslate"><span class="pre">komeda_plane.layer</span></code></a> および <a class="reference internal" href="#c.komeda_plane" title="komeda_plane"><code class="xref c c-type docutils literal notranslate"><span class="pre">komeda_plane.layer</span></code></a>.right</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.komeda_wb_connector">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">komeda_wb_connector</span></span></span><a class="headerlink" href="#c.komeda_wb_connector" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct komeda_wb_connector {
+  struct drm_writeback_connector base;
+  struct komeda_layer *wb_layer;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">base</span></code></dt><dd><p><a class="reference internal" href="drm-kms.html#c.drm_writeback_connector" title="drm_writeback_connector"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_writeback_connector</span></code></a></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">wb_layer</span></code></dt><dd><p>komedaの関連するWritebackパイプラインを表します</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.komeda_crtc">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">komeda_crtc</span></span></span><a class="headerlink" href="#c.komeda_crtc" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct komeda_crtc {
+  struct drm_crtc base;
+  struct komeda_pipeline *master;
+  struct komeda_pipeline *slave;
+  u32 slave_planes;
+  struct komeda_wb_connector *wb_conn;
+  struct completion *disable_done;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">base</span></code></dt><dd><p><a class="reference internal" href="drm-kms.html#c.drm_crtc" title="drm_crtc"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_crtc</span></code></a></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">master</span></code></dt><dd><p>みなしはディスプレイ出力を持つ必要があります</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">slave</span></code></dt><dd><p>オプション</p>
+<p>独自のディスプレイ出力を持たず、処理されるデータフローはマスターにマージされます</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">slave_planes</span></code></dt><dd><p>komeda slave planes mask</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">wb_conn</span></code></dt><dd><p>komeda write back connector</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">disable_done</span></code></dt><dd><p>このflip_doneは無効化を追跡するためのものです</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.komeda_crtc_state">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">komeda_crtc_state</span></span></span><a class="headerlink" href="#c.komeda_crtc_state" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct komeda_crtc_state {
+  struct drm_crtc_state base;
+  u32 affected_pipes;
+  u32 active_pipes;
+  u64 clock_ratio;
+  u32 max_slave_zorder;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">base</span></code></dt><dd><p><a class="reference internal" href="drm-kms.html#c.drm_crtc_state" title="drm_crtc_state"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_crtc_state</span></code></a></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">affected_pipes</span></code></dt><dd><p>1つのディスプレイインスタンスにおける影響を受けるパイプライン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">active_pipes</span></code></dt><dd><p>1つのディスプレイインスタンスにおけるアクティブなパイプライン</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">clock_ratio</span></code></dt><dd><p>aclk &lt;&lt; 32 / pxlclkの比率</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">max_slave_zorder</span></code></dt><dd><p>slave zorderの最大値</p>
+</dd>
+</dl>
+</section>
+<section id="komde-kms-functions">
+<h3>komde_kms関数<a class="headerlink" href="#komde-kms-functions" title="この見出しへのパーマリンク">¶</a></h3>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.komeda_crtc_atomic_check">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">komeda_crtc_atomic_check</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="drm-kms.html#c.drm_crtc" title="drm_crtc"><span class="n"><span class="pre">drm_crtc</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">crtc</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="drm-kms.html#c.drm_crtc_state" title="drm_crtc_state"><span class="n"><span class="pre">drm_crtc_state</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">状態</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.komeda_crtc_atomic_check" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ディスプレイ出力データフローを構築</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_crtc</span> <span class="pre">*crtc</span></code></dt><dd><p>DRM crtc</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_crtc_state</span> <span class="pre">*state</span></code></dt><dd><p>crtc_stateオブジェクト</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>crtc_atomic_checkは最終的なチェック段階であり、crtc_stateに基づいてディスプレイデータパイプラインを構築するだけでなく、未確保のパイプラインリソースを解放または無効化する必要があります</p>
+<p><strong>戻り値</strong></p>
+<p>成功時はゼロ、失敗時は-errno</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.komeda_plane_atomic_check">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">komeda_plane_atomic_check</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="drm-kms.html#c.drm_plane" title="にヘルパーのvtableを設定します"><span class="n"><span class="pre">にヘルパーのvtableを設定します</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">plane</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="drm-kms.html#c.drm_plane_state" title="drm_plane_state"><span class="n"><span class="pre">drm_plane_state</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">状態</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.komeda_plane_atomic_check" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>入力データフローを構築</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_plane</span> <span class="pre">*plane</span></code></dt><dd><p>drm_mode_config_helper_funcs</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_plane_state</span> <span class="pre">*state</span></code></dt><dd><p>plane stateオブジェクト</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>成功時はゼロ、失敗時は-errno</p>
+</section>
+</section>
+<section id="build-komeda-to-be-a-linux-module-driver">
+<h2>komedaをLinuxモジュールドライバとして構築<a class="headerlink" href="#build-komeda-to-be-a-linux-module-driver" title="この見出しへのパーマリンク">¶</a></h2>
+<p>現在、2段階のデバイスがあります:</p>
+<ul class="simple">
+<li><p>komeda_dev: 実際のディスプレイハードウェアを記述します</p></li>
+<li><p>komeda_kms_dev: komeda_devをDRM-KMSに接続またはアタッチします</p></li>
+</ul>
+<p>すべてのkomeda操作はkomeda_devまたはkomeda_kms_devによって提供または実行されます。モジュールドライバーはLinuxコマンド（probe/remove/pm）をkomeda_devまたはkomeda_kms_devに渡すための単純なラッパーです</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linux GPUドライバ開発者ガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="introduction.html">はじめに</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-internals.html">DRM内部</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-mm.html">DRMメモリ管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-kms.html">カーネルモード設定 (KMS)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-kms-helpers.html">モード設定ヘルパ関数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-uapi.html">ユーザランドインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-client.html">カーネルクライアント</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="drivers.html">GPUドライバドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="backlight.html">バックライトサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vga-switcheroo.html">VGAスイッチーロー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vgaarbiter.html">VGAアービトラー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="todo.html">TODOリスト</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linux GPUドライバ開発者ガイド</a><ul>
+<li><a href="drivers.html">GPUドライバドキュメンテーション</a><ul>
+<li>前へ: <a href="afbc.html" title="前章">アーム・フレームバッファ圧縮（AFBC）</a></li>
+<li>次へ: <a href="backlight.html" title="次章">バックライトサポート</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/gpu/komeda-kms.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

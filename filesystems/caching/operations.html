@@ -1,0 +1,294 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>非同期操作の処理 — Linux Kernel ドキュメンテーション</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="../porting.html" rel="next" title="2.5.0以降の変更点:"/>
+<link href="netfs-api.html" rel="prev" title="FS-CacheネットワークファイルシステムAPI"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="asynchronous-operations-handling">
+<h1>非同期操作の処理<a class="headerlink" href="#asynchronous-operations-handling" title="この見出しへのパーマリンク">¶</a></h1>
+<p>By: David Howells &lt;<a class="reference external" href="mailto:dhowells%40redhat.com">dhowells<span>@</span>redhat<span>.</span>com</a>&gt;</p>
+<section id="overview">
+<h2>概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>FS-Cache は、データの保存および取得ルーチンのために非同期操作の処理機能を備えています。その操作は fscache_operation struct で表されますが、これらは通常他の構造体に埋め込まれています。</p>
+<p>この機能はキャッシュバックエンドに利用可能であり、使用が期待されています。FS-Cache は操作を生成し、適切なキャッシュバックエンドに渡して完了処理を行います。</p>
+<p>この機能を利用するには、&lt;linux/fscache-cache.h&gt; を #include する必要があります。</p>
+</section>
+<section id="operation-record-initialisation">
+<h2>操作レコードの初期化<a class="headerlink" href="#operation-record-initialisation" title="この見出しへのパーマリンク">¶</a></h2>
+<p>操作は fscache_operation struct に記録されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fscache_operation {
+        union {
+                struct work_struct fast_work;
+                struct slow_work slow_work;
+        };
+        unsigned long           flags;
+        fscache_operation_processor_t processor;
+        ...
+};
+</pre></div>
+</div>
+<p>操作を発行したい場合は、この struct を埋め込んだ構造体を割り当ててください。これを初期化するには、以下の関数を呼び出してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void fscache_operation_init(struct fscache_operation *op,
+                            fscache_operation_release_t release);
+</pre></div>
+</div>
+<p>初期化する操作と、使用するリリース関数を指定してください。</p>
+<p>op-&gt;flags パラメータには、CPU時間の提供と排他性を示す必要があります（パラメータセクションを参照）。</p>
+<p>op-&gt;fast_work、op-&gt;slow_work および op-&gt;processor フラグは、CPU時間の提供に応じて適切に設定する必要があります（パラメータセクションを参照）。</p>
+<p>操作の各送信前に op-&gt;flags に FSCACHE_OP_WAITING を設定し、その後待機する必要があります。</p>
+</section>
+<section id="parameters">
+<h2>パラメータ<a class="headerlink" href="#parameters" title="この見出しへのパーマリンク">¶</a></h2>
+<p>操作レコードのフラグパラメータには、いくつかのパラメータを設定できます。これらの操作で CPU時間の提供には3つのオプションがあります：</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>操作は同期的に実行できます（FSCACHE_OP_MYTHREAD）。スレッドは、他のスレッドにdeferしないで操作自体を処理したい場合にこのオプションを使用します。</p>
+<p>これは、例として CacheFiles でバックイングファイルシステムの readpages() を呼び出す際などに使用されます。readpages() は非同期データフェッチを行いますが、ページが存在するかどうかの判定は同期的に実行され、netfs はこの判定が完了するまで進みません。</p>
+<p>このオプションを使用する場合、FSCACHE_OP_WAITING を op-&gt;flags に設定し、操作を送信する前に実行スレッドが待機する必要があります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>wait_on_bit(&amp;op-&gt;flags, FSCACHE_OP_WAITING,
+            TASK_UNINTERRUPTIBLE);
+</pre></div>
+</div>
+</li>
+<li><p>操作は高速非同期（FSCACHE_OP_FAST）で実行できます。このような操作は I/O で待機することはできません。</p>
+<p>これは、CacheFiles がバックイングfsのページをnetfsのページにコピーする際などに使用されます。</p>
+<p>このオプションを使用する場合、op-&gt;fast_work および op-&gt;processor を初期化する必要があります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>INIT_WORK(&amp;op-&gt;fast_work, do_some_work);
+</pre></div>
+</div>
+</li>
+<li><p>操作は遅延非同期（FSCACHE_OP_SLOW）として処理される場合があり、その場合は遅延処理ファシリティに処理を委譲します。このような操作はI/Oの待機を許可されます。</p>
+<p>これは、FS-Cacheがリモートサーバーから取得したページのバックグラウンド書き込みを処理するために使用される例です。</p>
+<p>このオプションを使用する場合、op-&gt;slow_workとop-&gt;processorは操作を送信する前に初期化しておく必要があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>fscache_operation_init_slow(op, processor)
+</pre></div>
+</div>
+</li>
+</ol>
+</div></blockquote>
+<p>さらに、操作は次の2つのタイプのいずれかです:</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>排他（FSCACHE_OP_EXCLUSIVE）。このタイプの操作は、対象オブジェクト上で他の操作と同時に実行できません。</p>
+<p>例として、属性変更操作があります。この操作では、書き込まれるファイルが切断される可能性があります。</p>
+</li>
+<li><p>共有可能。このタイプの操作は同時に実行可能です。他の操作が同時に実行されている場合でも、操作実装側が干渉を防ぐ必要があります。</p></li>
+</ol>
+</div></blockquote>
+</section>
+<section id="procedure">
+<h2>手順<a class="headerlink" href="#procedure" title="この見出しへのパーマリンク">¶</a></h2>
+<p>操作は次の手順で使用されます:</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>送信スレッドは操作を確保し、自身で初期化する必要があります。通常これは、汎用的なopを内包するより特定の構造体の一部です。</p></li>
+<li><p>送信スレッドは、次の2つの関数のいずれかを使用して操作を処理に送信する必要があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int fscache_submit_op(struct fscache_object *object,
+                      struct fscache_operation *op);
+
+int fscache_submit_exclusive_op(struct fscache_object *object,
+                                struct fscache_operation *op);
+</pre></div>
+</div>
+<p>最初の関数は非排他操作を送信するためのもので、2番目の関数は排他操作を送信するためのものです。呼び出し元は依然としてFSCACHE_OP_EXCLUSIVEフラグを設定する必要があります。</p>
+<p>成功した場合、両方の関数は操作を指定されたオブジェクトに割り当てて0を返します。指定されたオブジェクトが永久に利用不可な場合、-ENOBUFSが返されます。</p>
+<p>オブジェクトがまだ検索中または作成中である場合、操作マネージャーはその操作を遅延します。オブジェクト上で競合する排他性の操作が進行中である場合も同様に操作が遅延されます。</p>
+<p>操作が非同期の場合、マネージャーはその操作の参照を保持します。そのため、呼び出し元は以下の関数に操作を渡して参照を解放する必要があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void fscache_put_operation(struct fscache_operation *op);
+</pre></div>
+</div>
+</li>
+<li><p>送信スレッドが自身で作業を実行したい場合、FSCACHE_OP_MYTHREADで操作をマークした場合は、上記のようにFSCACHE_OP_WAITINGを監視し、必要に応じてオブジェクトの状態を確認する必要があります（オブジェクトがスレッドが待機している間に終了している可能性があります）。</p>
+<p>処理が終了した後、fscache_op_complete()とfscache_put_operation()を呼び出して操作を完了させます。</p>
+</li>
+<li><p>操作はオブジェクトに有効なロックを保持し、他の排他操作が競合するのを防ぎます。必要に応じてCPU時間のプロビジョニングオプションを調整することで、操作をキューイングしてさらに即時非同期処理を実行できます。例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>op-&gt;flags &amp;= ~FSCACHE_OP_TYPE;
+op-&gt;flags |= ~FSCACHE_OP_FAST;
+</pre></div>
+</div>
+<p>呼び出す:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void fscache_enqueue_operation(struct fscache_operation *op)
+</pre></div>
+</div>
+<p>これは、他の処理がワーカースレッドプールを使用できるようにするためのものです。</p>
+</li>
+</ol>
+</div></blockquote>
+</section>
+<section id="asynchronous-callback">
+<h2>非同期コールバック<a class="headerlink" href="#asynchronous-callback" title="この見出しへのパーマリンク">¶</a></h2>
+<p>非同期モードで使用する場合、ワーカースレッドプールは操作へのポインタを伴ってプロセッサメソッドを呼び出します。その後、コンテナ構造体にアクセスするために以下の方法を使用します <a class="reference internal" href="../../driver-api/basics.html#c.container_of" title="container_of"><code class="xref c c-func docutils literal notranslate"><span class="pre">container_of()</span></code></a>:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static void fscache_write_op(struct fscache_operation *_op)
+{
+        struct fscache_storage *op =
+                container_of(_op, struct fscache_storage, op);
+...
+}
+</pre></div>
+</div>
+<p>呼び出し元は操作に参照を保持しており、プロセッサ関数が返るときにfscache_put_operation()を呼び出します。プロセッサ関数はfscache_enqueue_operation()を呼び出すか、追加の参照を取るかを選択できます。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxカーネル内のファイルシステム</a><ul class="current">
+<li class="toctree-l2 current"><a class="reference internal" href="../index.html#core-vfs-documentation">コアVFSドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../index.html#filesystem-support-layers">ファイルシステムサポートレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../index.html#filesystems">ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxカーネル内のファイルシステム</a><ul>
+<li><a href="index.html">Filesystem Caching</a><ul>
+<li>前へ: <a href="netfs-api.html" title="前章">FS-CacheネットワークファイルシステムAPI</a></li>
+<li>次へ: <a href="../porting.html" title="次章">2.5.0以降の変更点:</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/filesystems/caching/operations.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

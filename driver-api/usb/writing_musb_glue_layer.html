@@ -1,0 +1,723 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>MUSB グリュー層の作成 — Linux カーネルドキュメンテーション</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="typec.html" rel="next" title="USB Type-C コネクタ クラス"/>
+<link href="dwc3.html" rel="prev" title="Synopsys DesignWare Core SuperSpeed USB 3.0 Controller"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="writing-a-musb-glue-layer">
+<h1>MUSB Glue Layerの作成<a class="headerlink" href="#writing-a-musb-glue-layer" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Apelete Seketeli</p>
+</dd>
+</dl>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Linux の MUSB サブシステムは、より大きな Linux USB サブシステムの一部です。これは、Universal Host Controller Interface (UHCI) または Open Host Controller Interface (OHCI) を使用しない埋め込み USB デバイスコントローラー (UDC) のサポートを提供します。</p>
+<p>代わりに、これらの埋め込み UDC は USB On-the-Go (OTG) 標準に依存しており、少なくとも部分的にこの標準を実装しています。一般的なシリコンリファレンスデザインは、Mentor Graphics の Inventra™ デザインに含まれる Multipoint USB Highspeed Dual-Role Controller (MUSB HDRC) です。</p>
+<p>自己学習のための練習として、Ingenic JZ4740 SoC 用の MUSB グリュー層を書きました。これは、カーネルソースツリー内の多くの MUSB グリュー層を模範としたものです。この層は以下にあります
+<code class="docutils literal notranslate"><span class="pre">drivers/usb/musb/jz4740.c</span></code>. このドキュメンテーションでは、 <code class="docutils literal notranslate"><span class="pre">jz4740.c</span></code> グリュー層の基本について説明し、自分のデバイスグリュー層を書くために必要なさまざまな要素と実施すべき手順を解説します。</p>
+</section>
+<section id="linux-musb-basics">
+<span id="musb-basics"></span><h2>Linux MUSB基礎<a class="headerlink" href="#linux-musb-basics" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このトピックを始めるには、USB On-the-Go 基本事項 (リソースを参照) を読み、ハードウェアレベルでの USB OTG 操作の紹介を確認してください。Texas Instruments と Analog Devices のいくつかのウィキページも、Linux カーネル MUSB の構成についての概要を提供していますが、これらの会社が提供する特定のデバイスに焦点を当てています。最後に、USB ホームページで USB 標準に詳しくなれば、実際の例として Writing USB Device Drivers ドキュメンテーション（再度リソースを参照）が役立つかもしれません。</p>
+<p>Linux USB スタックはレイヤードアーキテクチャであり、MUSB コントローラーハードウェアが最も下層に位置しています。MUSB コントローラードライバーは、Linux USB スタックに対して MUSB コントローラーハードウェアを抽象化します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>    ------------------------
+    |                      | &lt;------- drivers/usb/gadget
+    | Linux USB Core Stack | &lt;------- drivers/usb/host
+    |                      | &lt;------- drivers/usb/core
+    ------------------------
+               ⬍
+   --------------------------
+   |                        | &lt;------ drivers/usb/musb/musb_gadget.c
+   | MUSB Controller driver | &lt;------ drivers/usb/musb/musb_host.c
+   |                        | &lt;------ drivers/usb/musb/musb_core.c
+   --------------------------
+               ⬍
+---------------------------------
+| MUSB Platform Specific Driver |
+|                               | &lt;-- drivers/usb/musb/jz4740.c
+|       aka "Glue Layer"        |
+---------------------------------
+               ⬍
+---------------------------------
+|   MUSB Controller Hardware    |
+---------------------------------
+</pre></div>
+</div>
+<p>上記のように、グリュー層は実際にはコントローラードライバーとコントローラーハードウェアの間に位置するプラットフォーム固有のコードです。</p>
+<p>Linux USB ドライバーが Linux USB サブシステムに自身を登録するのと同じように、MUSB グリュー層もまず MUSB コントローラードライバーに登録する必要があります。これにより、コントローラードライバーはグリュー層がサポートするデバイスを認識し、サポートされているデバイスが検出または解放されたときに呼び出す関数を把握できます。記憶してください、ここでの話題は埋め込みコントローラーチップなので、実行時での挿入や除去はありません。</p>
+<p>すべての情報は、 <code class="xref c c-type docutils literal notranslate"><span class="pre">platform_driver</span></code> グリュー層で定義された構造体を通じて MUSB コントローラードライバーに渡されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static struct platform_driver jz4740_driver = {
+    .probe      = jz4740_probe,
+    .remove     = jz4740_remove,
+    .driver     = {
+        .name   = "musb-jz4740",
+    },
+};
+</pre></div>
+</div>
+<p>プローブとリムーブ関数ポインタは、マッチングしたデバイスが検出されたときおよび解放されたときにそれぞれ呼ばれます。名前文字列は、このグルー層でサポートされるデバイスを記述します。現在のケースでは、このグルー層が宣言されたプラットフォームデバイス構造と一致します。 <code class="docutils literal notranslate"><span class="pre">arch/mips/jz4740/platform.c</span></code>ここではデバイスツリーのバインディングを使用していません。</p>
+<p>コントローラードライバーに自身を登録するためには、グルー層はいくつかのステップを経ます。基本的にはコントローラーハードウェアリソースを割り当て、いくつかの回路を初期化します。そのためには、これらのステップで使用される情報を追跡する必要があります。これはプライベートな <code class="docutils literal notranslate"><span class="pre">jz4740_glue</span></code> フィールドはRCU読み込み側クリティカルセクションのネストレベルを記録し、</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct jz4740_glue {
+    struct device           *dev;
+    struct platform_device  *musb;
+    struct clk      *clk;
+};
+</pre></div>
+</div>
+<p>devとmusbメンバはどちらもデバイス構造変数です。前者は一般的なデバイス情報を持ち、基本的なデバイス構造であるため、後者はデバイスが登録されているサブシステムに密接に関連する情報を保持します。clk変数はデバイスクロック操作に関連する情報を保持します。</p>
+<p>プローブ関数のステップを確認して、グルー層がコントローラードライバーに登録される流れを見てみましょう。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>読みやすさのため、各関数は論理的な部分に分割され、それぞれが他とは独立しているかのように表示されます。</p>
+</div>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">static</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="nf">jz4740_probe</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">platform_device</span><span class="w"> </span><span class="o">*</span><span class="n">pdev</span><span class="p">)</span><span class="w"></span>
+<span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">platform_device</span><span class="w">      </span><span class="o">*</span><span class="n">musb</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">jz4740_glue</span><span class="w">      </span><span class="o">*</span><span class="n">glue</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">clk</span><span class="w">                      </span><span class="o">*</span><span class="n">clk</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="kt">int</span><span class="w">             </span><span class="n">ret</span><span class="p">;</span><span class="w"></span>
+
+<span class="hll"><span class="w">    </span><span class="n">glue</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">devm_kzalloc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">glue</span><span class="p">),</span><span class="w"> </span><span class="n">GFP_KERNEL</span><span class="p">);</span><span class="w"></span>
+</span><span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">glue</span><span class="p">)</span><span class="w"></span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span><span class="w"></span>
+
+<span class="hll"><span class="w">    </span><span class="n">musb</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">platform_device_alloc</span><span class="p">(</span><span class="s">"musb-hdrc"</span><span class="p">,</span><span class="w"> </span><span class="n">PLATFORM_DEVID_AUTO</span><span class="p">);</span><span class="w"></span>
+</span><span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">musb</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="n">dev_err</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span><span class="w"> </span><span class="s">"failed to allocate musb device</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span><span class="w"></span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="o">-</span><span class="n">ENOMEM</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+
+<span class="hll"><span class="w">    </span><span class="n">clk</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">devm_clk_get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span><span class="w"> </span><span class="s">"udc"</span><span class="p">);</span><span class="w"></span>
+</span><span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">IS_ERR</span><span class="p">(</span><span class="n">clk</span><span class="p">))</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="n">dev_err</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span><span class="w"> </span><span class="s">"failed to get clock</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span><span class="w"></span>
+<span class="w">        </span><span class="n">ret</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">PTR_ERR</span><span class="p">(</span><span class="n">clk</span><span class="p">);</span><span class="w"></span>
+<span class="w">        </span><span class="k">goto</span><span class="w"> </span><span class="n">err_platform_device_put</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+
+<span class="w">    </span><span class="n">ret</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">clk_prepare_enable</span><span class="p">(</span><span class="n">clk</span><span class="p">);</span><span class="w"></span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">ret</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="n">dev_err</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span><span class="w"> </span><span class="s">"failed to enable clock</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span><span class="w"></span>
+<span class="w">        </span><span class="k">goto</span><span class="w"> </span><span class="n">err_platform_device_put</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+
+<span class="w">    </span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">.</span><span class="n">parent</span><span class="w">        </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="n">pdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">;</span><span class="w"></span>
+
+<span class="w">    </span><span class="n">glue</span><span class="o">-&gt;</span><span class="n">dev</span><span class="w">           </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="n">pdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="n">glue</span><span class="o">-&gt;</span><span class="n">musb</span><span class="w">          </span><span class="o">=</span><span class="w"> </span><span class="n">musb</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="n">glue</span><span class="o">-&gt;</span><span class="n">clk</span><span class="w">           </span><span class="o">=</span><span class="w"> </span><span class="n">clk</span><span class="p">;</span><span class="w"></span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"></span>
+
+<span class="nl">err_platform_device_put</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="n">platform_device_put</span><span class="p">(</span><span class="n">musb</span><span class="p">);</span><span class="w"></span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">ret</span><span class="p">;</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</pre></div>
+</div>
+<p>プローブ関数の最初のいくつかの行はグルー、musb、clk変数を割り当ておよび割り当てます。 <code class="docutils literal notranslate"><span class="pre">GFP_KERNEL</span></code> フラグ（行8）は割り当てプロセスでスリープし、メモリを待つことを許可するため、ロック状態でも使用可能です。 <code class="docutils literal notranslate"><span class="pre">PLATFORM_DEVID_AUTO</span></code> フラグ（行12）はデバイスIDの自動割り当てと管理を許可し、明示的なIDによるデバイス名空間の衝突を避けるためのものです。 <a class="reference internal" href="../../core-api/kernel-api.html#c.devm_clk_get" title="devm_clk_get"><code class="xref c c-func docutils literal notranslate"><span class="pre">devm_clk_get()</span></code></a>
+（行18）でグルー層はクロックを割り当てます。この <code class="docutils literal notranslate"><span class="pre">devm_</span></code> プレフィックスは <a class="reference internal" href="../../core-api/kernel-api.html#c.clk_get" title="clk_get"><code class="xref c c-func docutils literal notranslate"><span class="pre">clk_get()</span></code></a> が管理されていることを示します。デバイスが解放されるときに自動的に割り当てられたクロックリソースデータを解放し、それを有効化します。</p>
+<p>次に登録ステップが続きます：</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">static</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="nf">jz4740_probe</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">platform_device</span><span class="w"> </span><span class="o">*</span><span class="n">pdev</span><span class="p">)</span><span class="w"></span>
+<span class="p">{</span><span class="w"></span>
+<span class="hll"><span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">musb_hdrc_platform_data</span><span class="w">  </span><span class="o">*</span><span class="n">pdata</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="n">jz4740_musb_platform_data</span><span class="p">;</span><span class="w"></span>
+</span>
+<span class="hll"><span class="w">    </span><span class="n">pdata</span><span class="o">-&gt;</span><span class="n">platform_ops</span><span class="w">     </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="n">jz4740_musb_ops</span><span class="p">;</span><span class="w"></span>
+</span>
+<span class="hll"><span class="w">    </span><span class="n">platform_set_drvdata</span><span class="p">(</span><span class="n">pdev</span><span class="p">,</span><span class="w"> </span><span class="n">glue</span><span class="p">);</span><span class="w"></span>
+</span>
+<span class="hll"><span class="w">    </span><span class="n">ret</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">platform_device_add_resources</span><span class="p">(</span><span class="n">musb</span><span class="p">,</span><span class="w"> </span><span class="n">pdev</span><span class="o">-&gt;</span><span class="n">resource</span><span class="p">,</span><span class="w"></span>
+</span><span class="w">                        </span><span class="n">pdev</span><span class="o">-&gt;</span><span class="n">num_resources</span><span class="p">);</span><span class="w"></span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">ret</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="n">dev_err</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span><span class="w"> </span><span class="s">"failed to add resources</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span><span class="w"></span>
+<span class="w">        </span><span class="k">goto</span><span class="w"> </span><span class="n">err_clk_disable</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+
+<span class="hll"><span class="w">    </span><span class="n">ret</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">platform_device_add_data</span><span class="p">(</span><span class="n">musb</span><span class="p">,</span><span class="w"> </span><span class="n">pdata</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="o">*</span><span class="n">pdata</span><span class="p">));</span><span class="w"></span>
+</span><span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">ret</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="n">dev_err</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pdev</span><span class="o">-&gt;</span><span class="n">dev</span><span class="p">,</span><span class="w"> </span><span class="s">"failed to add platform_data</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span><span class="w"></span>
+<span class="w">        </span><span class="k">goto</span><span class="w"> </span><span class="n">err_clk_disable</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"></span>
+
+<span class="nl">err_clk_disable</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="n">clk_disable_unprepare</span><span class="p">(</span><span class="n">clk</span><span class="p">);</span><span class="w"></span>
+<span class="nl">err_platform_device_put</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="n">platform_device_put</span><span class="p">(</span><span class="n">musb</span><span class="p">);</span><span class="w"></span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">ret</span><span class="p">;</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</pre></div>
+</div>
+<p>最初のステップは、グルー層が保持しているデバイスデータをコントローラードライバーに通報することです。これは <code class="xref c c-func docutils literal notranslate"><span class="pre">platform_set_drvdata()</span></code>
+（行7）を通じて行われます。次に、デバイスリソース情報も、その時点でのプライベートな情報として <a class="reference internal" href="../infrastructure.html#c.platform_device_add_resources" title="platform_device_add_resources"><code class="xref c c-func docutils literal notranslate"><span class="pre">platform_device_add_resources()</span></code></a> （行9）を通じて通報します。</p>
+<p>最後に、コントローラードライバーにプラットフォーム固有のデータを渡します（行16）。プラットフォームデータについては
+<a class="reference internal" href="#musb-dev-platform-data"><span class="std std-ref">デバイスプラットフォームデータ</span></a>で説明しますが、ここでは
+<code class="docutils literal notranslate"><span class="pre">platform_ops</span></code> 関数ポインタ（行5）を <code class="docutils literal notranslate"><span class="pre">musb_hdrc_platform_data</span></code>
+構造体（行3）内のものです。この関数ポインタは、MUSBコントローラードライバーがデバイス操作に呼び出すべき関数を示します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static const struct musb_platform_ops jz4740_musb_ops = {
+    .init       = jz4740_musb_init,
+    .exit       = jz4740_musb_exit,
+};
+</pre></div>
+</div>
+<p>ここでは、コントローラードライバが必要に応じてのみinitおよびexit関数が呼び出される最小限のケースを示しています。事実、JZ4740 MUSBコントローラーは基本的なコントローラーであり、他のコントローラーに見られる一部の機能が欠如しているため、それ以外の場合は、電源管理関数やOTGモードと非OTGモードの切り替えを行う関数など、いくつかの他の関数へのポインタを持つことも考えられます。</p>
+<p>登録プロセスのこの段階で、コントローラードライバは実際にinit関数を呼び出します：</p>
+<blockquote>
+<div><div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">static</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="nf">jz4740_musb_init</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">musb</span><span class="w"> </span><span class="o">*</span><span class="n">musb</span><span class="p">)</span><span class="w"></span>
+<span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">xceiv</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">usb_get_phy</span><span class="p">(</span><span class="n">USB_PHY_TYPE_USB2</span><span class="p">);</span><span class="w"></span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">xceiv</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="n">pr_err</span><span class="p">(</span><span class="s">"HS UDC: no transceiver configured</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span><span class="w"></span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+
+<span class="w">    </span><span class="cm">/* Silicon does not implement ConfigData register.</span>
+<span class="cm">     * Set dyn_fifo to avoid reading EP config from hardware.</span>
+<span class="cm">     */</span><span class="w"></span>
+<span class="hll"><span class="w">    </span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">dyn_fifo</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">true</span><span class="p">;</span><span class="w"></span>
+</span>
+<span class="hll"><span class="w">    </span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">isr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">jz4740_musb_interrupt</span><span class="p">;</span><span class="w"></span>
+</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</pre></div>
+</div>
+</div></blockquote>
+<p>の目的は、 <code class="docutils literal notranslate"><span class="pre">jz4740_musb_init()</span></code> MUSBコントローラーハードウェアのトランシーバー・ドライバデータを取得し、通常通りMUSBコントローラー・ドライバに渡すことです。トランシーバーとは、USBデータを送受信するためのコントローラー・ハードウェア内の回路であり、OSIモデルの物理層の実装であるため、PHY（Physical Layer）とも呼ばれます。</p>
+<p>の取得は、 <code class="docutils literal notranslate"><span class="pre">MUSB</span> <span class="pre">PHY</span></code> 関数によって行われ、これはドライバインスタンスデータを含む構造体へのポインタを返します。次の数行（行12と14）はクイック処理と割込み処理の設定に使用され、クイック処理と割込み処理については後述します。 <code class="docutils literal notranslate"><span class="pre">usb_get_phy()</span></code>
+probeの対応処理として、exit関数はコントローラー・ハードウェア自体が解放されるときにMUSB PHYドライバを解放します。 <a class="reference internal" href="#musb-dev-quirks"><span class="std std-ref">デバイスの特殊な挙動</span></a> および
+<a class="reference internal" href="#musb-handling-irqs"><span class="std std-ref">IRQの処理</span></a></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static int jz4740_musb_exit(struct musb *musb)
+{
+    usb_put_phy(musb-&gt;xceiv);
+
+    return 0;
+}
+</pre></div>
+</div>
+<p>再び、initとexitはJZ4740コントローラー・ハードウェアの基本的な機能のため、このケースでは非常にシンプルです。より複雑なコントローラー・ハードウェア用のmusb glueレイヤーを書く場合、これらの2つの関数でより多くの処理を行う必要があります。</p>
+<p>init関数から戻る際、MUSBコントローラー・ドライバはprobe関数に戻ります：</p>
+<p>これはデバイス登録プロセスの最後の部分で、glueレイヤーがコントローラー・ハードウェアデバイスをLinuxカーネルのデバイス階層に追加します。この段階では、デバイスに関するすべての既知情報がLinux USBコアスタックに渡されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static int jz4740_probe(struct platform_device *pdev)
+{
+    ret = platform_device_add(musb);
+    if (ret) {
+        dev_err(&amp;pdev-&gt;dev, "failed to register musb device\n");
+        goto err_clk_disable;
+    }
+
+    return 0;
+
+err_clk_disable:
+    clk_disable_unprepare(clk);
+err_platform_device_put:
+    platform_device_put(musb);
+    return ret;
+}
+</pre></div>
+</div>
+<p>probeの対応処理として、remove関数はMUSBコントローラー・ハードウェア（行5）をアンレジストし、クロックを無効化（行6）してゲートをかけるようにします。</p>
+<blockquote>
+<div><div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">static</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="nf">jz4740_remove</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">platform_device</span><span class="w"> </span><span class="o">*</span><span class="n">pdev</span><span class="p">)</span><span class="w"></span>
+<span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">jz4740_glue</span><span class="w">  </span><span class="o">*</span><span class="n">glue</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">platform_get_drvdata</span><span class="p">(</span><span class="n">pdev</span><span class="p">);</span><span class="w"></span>
+
+<span class="hll"><span class="w">    </span><span class="n">platform_device_unregister</span><span class="p">(</span><span class="n">glue</span><span class="o">-&gt;</span><span class="n">musb</span><span class="p">);</span><span class="w"></span>
+</span><span class="hll"><span class="w">    </span><span class="n">clk_disable_unprepare</span><span class="p">(</span><span class="n">glue</span><span class="o">-&gt;</span><span class="n">clk</span><span class="p">);</span><span class="w"></span>
+</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</pre></div>
+</div>
+</div></blockquote>
+<p>さらに、MUSBコントローラー・ハードウェアの基本的な設定と登録に加えて、glueレイヤーは割込み（IRQ）の処理も担当します：</p>
+</section>
+<section id="handling-irqs">
+<span id="musb-handling-irqs"></span><h2>IRQの処理<a class="headerlink" href="#handling-irqs" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ここでは、glueレイヤーは関連するハードウェアレジスタを読み取り、コントローラー・ドライバにその値を渡す必要があります。コントローラー・ドライバが実際にIRQをトリガーしたイベントを処理します。</p>
+<blockquote>
+<div><div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">static</span><span class="w"> </span><span class="n">irqreturn_t</span><span class="w"> </span><span class="nf">jz4740_musb_interrupt</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">irq</span><span class="p">,</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="o">*</span><span class="n">__hci</span><span class="p">)</span><span class="w"></span>
+<span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">long</span><span class="w">   </span><span class="n">flags</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="n">irqreturn_t</span><span class="w">     </span><span class="n">retval</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">IRQ_NONE</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">musb</span><span class="w">     </span><span class="o">*</span><span class="n">musb</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">__hci</span><span class="p">;</span><span class="w"></span>
+
+<span class="hll"><span class="w">    </span><span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span><span class="w"> </span><span class="n">flags</span><span class="p">);</span><span class="w"></span>
+</span>
+<span class="hll"><span class="w">    </span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">int_usb</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">musb_readb</span><span class="p">(</span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">mregs</span><span class="p">,</span><span class="w"> </span><span class="n">MUSB_INTRUSB</span><span class="p">);</span><span class="w"></span>
+</span><span class="hll"><span class="w">    </span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">int_tx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">musb_readw</span><span class="p">(</span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">mregs</span><span class="p">,</span><span class="w"> </span><span class="n">MUSB_INTRTX</span><span class="p">);</span><span class="w"></span>
+</span><span class="hll"><span class="w">    </span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">int_rx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">musb_readw</span><span class="p">(</span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">mregs</span><span class="p">,</span><span class="w"> </span><span class="n">MUSB_INTRRX</span><span class="p">);</span><span class="w"></span>
+</span>
+<span class="w">    </span><span class="cm">/*</span>
+<span class="hll"><span class="cm">     * The controller is gadget only, the state of the host mode IRQ bits is</span>
+</span><span class="cm">     * undefined. Mask them to make sure that the musb driver core will</span>
+<span class="cm">     * never see them set</span>
+<span class="cm">     */</span><span class="w"></span>
+<span class="w">    </span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">int_usb</span><span class="w"> </span><span class="o">&amp;=</span><span class="w"> </span><span class="n">MUSB_INTR_SUSPEND</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">MUSB_INTR_RESUME</span><span class="w"> </span><span class="o">|</span><span class="w"></span>
+<span class="w">        </span><span class="n">MUSB_INTR_RESET</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">MUSB_INTR_SOF</span><span class="p">;</span><span class="w"></span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">int_usb</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">int_tx</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">int_rx</span><span class="p">)</span><span class="w"></span>
+<span class="w">        </span><span class="n">retval</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">musb_interrupt</span><span class="p">(</span><span class="n">musb</span><span class="p">);</span><span class="w"></span>
+
+<span class="hll"><span class="w">    </span><span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span><span class="w"> </span><span class="n">flags</span><span class="p">);</span><span class="w"></span>
+</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">retval</span><span class="p">;</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</pre></div>
+</div>
+</div></blockquote>
+<p>割込みハンドラのクリティカルセクションは、</p>
+<p>ミューテックスによって保護され、
+<code class="xref c c-func docutils literal notranslate"><span class="pre">spin_lock_irqsave()</span></code> 対応する <code class="xref c c-func docutils literal notranslate"><span class="pre">spin_unlock_irqrestore()</span></code>
+関数（それぞれ7行と24行）は、2つの異なるスレッドが同時に割り込みハンドラコードを実行することを防ぐためのものです。</p>
+<p>次に、関連する割り込みレジスタが読み込まれます（9行から11行）：</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">MUSB_INTRUSB</span></code>現在アクティブなUSB割り込みを示します。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">MUSB_INTRTX</span></code>TXエンドポイントの割り込みのうち、現在アクティブなものを示します。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">MUSB_INTRRX</span></code>TXエンドポイントの割り込みのうち、現在アクティブなものを示します。</p></li>
+</ul>
+<p>注意してください <code class="xref c c-func docutils literal notranslate"><span class="pre">musb_readb()</span></code> 8ビットのレジスタを最大で読み込むためのものです。一方、
+<code class="xref c c-func docutils literal notranslate"><span class="pre">musb_readw()</span></code> は16ビットのレジスタを最大で読み込むことができます。デバイスレジスタのサイズに応じて、他の関数も使用可能です。詳しくは <code class="docutils literal notranslate"><span class="pre">musb_io.h</span></code> 詳しくは</p>
+<p>18行目のインストラクションは、JZ4740 USBデバイスコントローラー固有の特殊な挙動であり、後述の <a class="reference internal" href="#musb-dev-quirks"><span class="std std-ref">デバイスの特殊な挙動</span></a>.</p>
+<p>グルー層は依然としてIRQハンドラを登録する必要があります。init関数の14行目のインストラクションを思い出してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static int jz4740_musb_init(struct musb *musb)
+{
+    musb-&gt;isr = jz4740_musb_interrupt;
+
+    return 0;
+}
+</pre></div>
+</div>
+<p>このインストラクションは、グルー層のIRQハンドラ関数へのポインタを設定し、コントローラハードウェアがIRQを発生させた際にハンドラを呼び出すようにします。割り込みハンドラは現在実装され登録されています。</p>
+</section>
+<section id="device-platform-data">
+<span id="musb-dev-platform-data"></span><h2>デバイスプラットフォームデータ<a class="headerlink" href="#device-platform-data" title="この見出しへのパーマリンク">¶</a></h2>
+<p>MUSBグルー層を書くには、コントローラハードウェアのハードウェア能力を記述したデータが必要です。これをプラットフォームデータと呼びます。</p>
+<p>プラットフォームデータはハードウェア固有ですが、幅広いデバイスをカバーする可能性があり、一般的には <code class="docutils literal notranslate"><span class="pre">arch/</span></code>
+ディレクトリに存在します。これはデバイスアーキテクチャに応じて異なります。</p>
+<p>例えば、JZ4740 SoCのプラットフォームデータは
+<code class="docutils literal notranslate"><span class="pre">arch/mips/jz4740/platform.c</span></code>。その中には <code class="docutils literal notranslate"><span class="pre">platform.c</span></code> ファイルに記述されています。JZ4740 SoCの各デバイスは、構造体のセットで記述されます。</p>
+<p>ここに <code class="docutils literal notranslate"><span class="pre">arch/mips/jz4740/platform.c</span></code> が含むUSBデバイスコントローラ（UDC）に関する部分です：</p>
+<blockquote>
+<div><div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="cm">/* USB Device Controller */</span><span class="w"></span>
+<span class="hll"><span class="k">struct</span><span class="w"> </span><span class="nc">platform_device</span><span class="w"> </span><span class="n">jz4740_udc_xceiv_device</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+</span><span class="w">    </span><span class="p">.</span><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">"usb_phy_gen_xceiv"</span><span class="p">,</span><span class="w"></span>
+<span class="w">    </span><span class="p">.</span><span class="n">id</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"></span>
+<span class="p">};</span><span class="w"></span>
+
+<span class="hll"><span class="k">static</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">resource</span><span class="w"> </span><span class="n">jz4740_udc_resources</span><span class="p">[]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+</span><span class="w">    </span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="p">.</span><span class="n">start</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">JZ4740_UDC_BASE_ADDR</span><span class="p">,</span><span class="w"></span>
+<span class="w">        </span><span class="p">.</span><span class="n">end</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="n">JZ4740_UDC_BASE_ADDR</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mh">0x10000</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"></span>
+<span class="w">        </span><span class="p">.</span><span class="n">flags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">IORESOURCE_MEM</span><span class="p">,</span><span class="w"></span>
+<span class="w">    </span><span class="p">},</span><span class="w"></span>
+<span class="w">    </span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="hll"><span class="w">        </span><span class="p">.</span><span class="n">start</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">JZ4740_IRQ_UDC</span><span class="p">,</span><span class="w"></span>
+</span><span class="hll"><span class="w">        </span><span class="p">.</span><span class="n">end</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="n">JZ4740_IRQ_UDC</span><span class="p">,</span><span class="w"></span>
+</span><span class="hll"><span class="w">        </span><span class="p">.</span><span class="n">flags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">IORESOURCE_IRQ</span><span class="p">,</span><span class="w"></span>
+</span><span class="hll"><span class="w">        </span><span class="p">.</span><span class="n">name</span><span class="w">  </span><span class="o">=</span><span class="w"> </span><span class="s">"mc"</span><span class="p">,</span><span class="w"></span>
+</span><span class="w">    </span><span class="p">},</span><span class="w"></span>
+<span class="p">};</span><span class="w"></span>
+
+<span class="hll"><span class="k">struct</span><span class="w"> </span><span class="nc">platform_device</span><span class="w"> </span><span class="n">jz4740_udc_device</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+</span><span class="hll"><span class="w">    </span><span class="p">.</span><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">"musb-jz4740"</span><span class="p">,</span><span class="w"></span>
+</span><span class="w">    </span><span class="p">.</span><span class="n">id</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="mi">-1</span><span class="p">,</span><span class="w"></span>
+<span class="w">    </span><span class="p">.</span><span class="n">dev</span><span class="w">  </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="hll"><span class="w">        </span><span class="p">.</span><span class="n">dma_mask</span><span class="w">          </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="n">jz4740_udc_device</span><span class="p">.</span><span class="n">dev</span><span class="p">.</span><span class="n">coherent_dma_mask</span><span class="p">,</span><span class="w"></span>
+</span><span class="hll"><span class="w">        </span><span class="p">.</span><span class="n">coherent_dma_mask</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">DMA_BIT_MASK</span><span class="p">(</span><span class="mi">32</span><span class="p">),</span><span class="w"></span>
+</span><span class="w">    </span><span class="p">},</span><span class="w"></span>
+<span class="hll"><span class="w">    </span><span class="p">.</span><span class="n">num_resources</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">jz4740_udc_resources</span><span class="p">),</span><span class="w"></span>
+</span><span class="hll"><span class="w">    </span><span class="p">.</span><span class="n">resource</span><span class="w">      </span><span class="o">=</span><span class="w"> </span><span class="n">jz4740_udc_resources</span><span class="p">,</span><span class="w"></span>
+</span><span class="p">};</span><span class="w"></span>
+</pre></div>
+</div>
+</div></blockquote>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">jz4740_udc_xceiv_device</span></code> プラットフォームデバイス構造（2行）は、UDCトランシーバーの名前とID番号でUDCトランシーバーを記述します。</p>
+<p>執筆時点では、 <code class="docutils literal notranslate"><span class="pre">usb_phy_gen_xceiv</span></code> は、組み込みの参照USBIPまたは自律的なトランシーバー（PHYプログラミングを必要としない）に使用するための特定の名前です。対応するトランシーバードライバーを使用するには、 <code class="docutils literal notranslate"><span class="pre">CONFIG_NOP_USB_XCEIV=y</span></code> をカーネル構成に設定する必要があります。idフィールドは-1（
+<code class="docutils literal notranslate"><span class="pre">PLATFORM_DEVID_NONE</span></code>に相当）または-2（ <code class="docutils literal notranslate"><span class="pre">PLATFORM_DEVID_AUTO</span></code>に相当）を設定するか、この種の最初のデバイスに0から始めて特定のID番号を割り当てることもできます。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">jz4740_udc_resources</span></code> リソース構造（7行）はUDCレジスタベースアドレスを定義します。</p>
+<p>最初の配列（9行から11行）はUDCレジスタベースメモリアドレスを定義します：startは最初のレジスタメモリアドレスを、endは最後のレジスタメモリアドレスを、flagsメンバは処理しているリソースの種類を示します。そのため <code class="docutils literal notranslate"><span class="pre">IORESOURCE_MEM</span></code> はレジスタメモリアドレスを定義するために使用されます。2番目の配列（行14〜17）はUDC IRQレジスタアドレスを定義します。JZ4740 UDCには1つのIRQレジスタのみが利用可能なので、startとendは同じアドレスを指します。The <code class="docutils literal notranslate"><span class="pre">IORESOURCE_IRQ</span></code> フラグはIRQリソースを扱っていることを示しており、name <code class="docutils literal notranslate"><span class="pre">mc</span></code> は実際にはMUSBコア内でハードコードされており、コントローラードライバーがこのIRQリソースを名前で照合して取得できるようにしています。</p>
+<p>フィールドは対応するCPUの <code class="docutils literal notranslate"><span class="pre">jz4740_udc_device</span></code> プラットフォームデバイス構造（行21）はUDC自身を記述します。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">musb-jz4740</span></code> 名前（行22）はこのデバイスに使用されるMUSBドライバーを定義しており、これは実際には
+<code class="docutils literal notranslate"><span class="pre">jz4740_driver</span></code> プラットフォームドライバ構造体の <a class="reference internal" href="#musb-basics"><span class="std std-ref">Linux MUSB基礎</span></a>idフィールド（行23）は-1（つまり <code class="docutils literal notranslate"><span class="pre">PLATFORM_DEVID_NONE</span></code>）に設定されています。これはデバイスにIDが不要なためで、MUSBコントローラードライバーはすでに自動的にIDを割り当てる設定になっています。 <a class="reference internal" href="#musb-basics"><span class="std std-ref">Linux MUSB基礎</span></a>devフィールドではDMA関連の情報に注目します。The <code class="docutils literal notranslate"><span class="pre">dma_mask</span></code> フィールド（行25）は使用するDMAマスクの幅を定義し、
+<code class="docutils literal notranslate"><span class="pre">coherent_dma_mask</span></code> （行26）は同様の目的ですが、DMAマッピングに対して適用されます。どちらも32ビットのマスクを使用しています。次にresourceフィールド（行29）は以前に定義したリソース構造へのポインタを示し、the
+<code class="docutils literal notranslate"><span class="pre">alloc_coherent</span></code> フィールド（行28）はリソース構造内で定義された配列の数を記録しています（この場合、以前に2つのリソース配列が定義されていました）。 <code class="docutils literal notranslate"><span class="pre">num_resources</span></code> UDCプラットフォームデータのこの簡単な概観が</p>
+<p>レベルで完了したので、今度は <code class="docutils literal notranslate"><span class="pre">arch/</span></code> のMUSBグルー層特有のプラットフォームデータに戻ります。
+<code class="docutils literal notranslate"><span class="pre">drivers/usb/musb/jz4740.c</span></code>:</p>
+<blockquote>
+<div><div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">static</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">musb_hdrc_config</span><span class="w"> </span><span class="n">jz4740_musb_config</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="cm">/* Silicon does not implement USB OTG. */</span><span class="w"></span>
+<span class="hll"><span class="w">    </span><span class="p">.</span><span class="n">multipoint</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"></span>
+</span><span class="w">    </span><span class="cm">/* Max EPs scanned, driver will decide which EP can be used. */</span><span class="w"></span>
+<span class="hll"><span class="w">    </span><span class="p">.</span><span class="n">num_eps</span><span class="w">    </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span><span class="w"></span>
+</span><span class="w">    </span><span class="cm">/* RAMbits needed to configure EPs from table */</span><span class="w"></span>
+<span class="hll"><span class="w">    </span><span class="p">.</span><span class="n">ram_bits</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="mi">9</span><span class="p">,</span><span class="w"></span>
+</span><span class="hll"><span class="w">    </span><span class="p">.</span><span class="n">fifo_cfg</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">jz4740_musb_fifo_cfg</span><span class="p">,</span><span class="w"></span>
+</span><span class="hll"><span class="w">    </span><span class="p">.</span><span class="n">fifo_cfg_size</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ARRAY_SIZE</span><span class="p">(</span><span class="n">jz4740_musb_fifo_cfg</span><span class="p">),</span><span class="w"></span>
+</span><span class="p">};</span><span class="w"></span>
+<span class="hll">
+</span><span class="k">static</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">musb_hdrc_platform_data</span><span class="w"> </span><span class="n">jz4740_musb_platform_data</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="p">.</span><span class="n">mode</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="n">MUSB_PERIPHERAL</span><span class="p">,</span><span class="w"></span>
+<span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="n">jz4740_musb_config</span><span class="p">,</span><span class="w"></span>
+<span class="p">};</span><span class="w"></span>
+</pre></div>
+</div>
+</div></blockquote>
+<p>まずグルー層はコントローラードライバーの動作に関するコントローラーハードウェアの仕様を設定します。これは <code class="docutils literal notranslate"><span class="pre">jz4740_musb_config</span></code> <code class="xref c c-type docutils literal notranslate"><span class="pre">musb_hdrc_config</span></code> 何らかの理由で、木構造を配列形状ではなく木形状で描くと、平面的な表現を簡単に描くことができます:</p>
+<p>で行われます。コントローラーハードウェアのOTG機能を定義する際、multipointメンバ（行3）は0（つまりfalseに相当）に設定されています。JZ4740 UDCはOTG互換ではありませんので、このように設定しています。次に <code class="docutils literal notranslate"><span class="pre">num_eps</span></code> （行5）はコントローラーハードウェアのUSBエンドポイント数を定義します（エンドポイント0を含む）。ここでは3つのエンドポイント＋エンドポイント0があります。次に <code class="docutils literal notranslate"><span class="pre">ram_bits</span></code> （行7）はMUSBコントローラーハードウェアのRAMアドレスバス幅を示します。コントローラードライバーが関連するコントローラーハードウェアレジスタを読み取ることでエンドポイントを自動的に設定できない場合にこの情報が必要です。この問題については後述の
+<a class="reference internal" href="#musb-dev-quirks"><span class="std std-ref">デバイスの特殊な挙動</span></a>で詳しく説明します。最後の2つのフィールド（行8と9）もデバイスクイックに関するものです： <code class="docutils literal notranslate"><span class="pre">fifo_cfg</span></code> はUSBエンドポイント構成テーブルを指し、 <code class="docutils literal notranslate"><span class="pre">fifo_cfg_size</span></code> はその構成テーブル内のエントリ数のサイズを記録しています。この点については後述の
+<a class="reference internal" href="#musb-dev-quirks"><span class="std std-ref">デバイスの特殊な挙動</span></a>.</p>
+<p>で詳しく説明します。この設定はその後 <code class="docutils literal notranslate"><span class="pre">jz4740_musb_platform_data</span></code>
+<code class="xref c c-type docutils literal notranslate"><span class="pre">musb_hdrc_platform_data</span></code> 構造体（行11）：configは構造体自体へのポインタであり、modeはコントローラードライバーにコントローラーハードウェアがどのように使用可能かを伝える情報です。 <code class="docutils literal notranslate"><span class="pre">MUSB_HOST</span></code> のみ、
+<code class="docutils literal notranslate"><span class="pre">MUSB_PERIPHERAL</span></code> のみ、または <code class="docutils literal notranslate"><span class="pre">MUSB_OTG</span></code> これはデュアルモードです。</p>
+<p>ご注意ください。 <code class="docutils literal notranslate"><span class="pre">jz4740_musb_platform_data</span></code> は、プローブ関数で見たようにプラットフォームデータ情報を伝達するために使用されます。
+<a class="reference internal" href="#musb-basics"><span class="std std-ref">Linux MUSB基礎</span></a>.</p>
+</section>
+<section id="device-quirks">
+<span id="musb-dev-quirks"></span><h2>デバイスの特殊な挙動<a class="headerlink" href="#device-quirks" title="この見出しへのパーマリンク">¶</a></h2>
+<p>デバイス固有のプラットフォームデータを完了する際には、USB On-the-Go仕様の実装が不完全だったり、ハードウェアのバグによって生じるデバイス固有の制限を回避するため、グルーブレイヤーで一部のコードを書く必要があるかもしれません。これらのクイックは、ハードウェアのバグが原因だったり、単にUSB On-the-Go仕様の実装が不完全だったりする可能性があります。</p>
+<p>JZ4740 UDCはこのようなクイックを示しており、これらについて洞察のためここに説明しますが、実際に使用しているコントローラーハードウェアには含まれていない可能性もあります。</p>
+<p>では、最初に初期化関数に戻りましょう：</p>
+<blockquote>
+<div><div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">static</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="nf">jz4740_musb_init</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">musb</span><span class="w"> </span><span class="o">*</span><span class="n">musb</span><span class="p">)</span><span class="w"></span>
+<span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">xceiv</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">usb_get_phy</span><span class="p">(</span><span class="n">USB_PHY_TYPE_USB2</span><span class="p">);</span><span class="w"></span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">xceiv</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="n">pr_err</span><span class="p">(</span><span class="s">"HS UDC: no transceiver configured</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span><span class="w"></span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+
+<span class="w">    </span><span class="cm">/* Silicon does not implement ConfigData register.</span>
+<span class="cm">     * Set dyn_fifo to avoid reading EP config from hardware.</span>
+<span class="cm">     */</span><span class="w"></span>
+<span class="hll"><span class="w">    </span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">dyn_fifo</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">true</span><span class="p">;</span><span class="w"></span>
+</span>
+<span class="w">    </span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">isr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">jz4740_musb_interrupt</span><span class="p">;</span><span class="w"></span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</pre></div>
+</div>
+</div></blockquote>
+<p>行12の指示は、コントローラーハードウェアにUSBエンドポイントの設定に使用されるレジスタが欠如しているという事実を回避するため、MUSBコントローラードライバーに役立ちます。</p>
+<p>これらのレジスタがないため、コントローラードライバーはハードウェアからエンドポイントの設定を読み取ることができません。そのため、行12の指示を使用してシリコンから設定を読み取るのを回避し、代わりにエンドポイントの設定を記述したハードコーディングされたテーブルに依存します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static struct musb_fifo_cfg jz4740_musb_fifo_cfg[] = {
+    { .hw_ep_num = 1, .style = FIFO_TX, .maxpacket = 512, },
+    { .hw_ep_num = 1, .style = FIFO_RX, .maxpacket = 512, },
+    { .hw_ep_num = 2, .style = FIFO_TX, .maxpacket = 64, },
+};
+</pre></div>
+</div>
+<p>上記の構成テーブルを見てみると、各エンドポイントは3つのフィールドで記述されています： <code class="docutils literal notranslate"><span class="pre">hw_ep_num</span></code> はエンドポイント番号、styleは方向（コントローラードライバーがコントローラーハードウェアでパケットを送信するための <code class="docutils literal notranslate"><span class="pre">FIFO_TX</span></code> 、またはハードウェアからパケットを受信するための <code class="docutils literal notranslate"><span class="pre">FIFO_RX</span></code> ）、maxpacketはそのエンドポイントを介して送信可能な各データパケットの最大サイズを定義します。テーブルから読み取ると、コントローラードライバーはエンドポイント1が512バイトのUSBデータパケットを一度に送信および受信可能であることを知り（これは実際にはバースト入出力エンドポイントです）、エンドポイント2が64バイトのデータパケットを一度に送信可能であることを知ります（これは実際には割込みエンドポイントです）。</p>
+<p>エンドポイント0に関する情報はここにはありません。これはすべてのシリコン設計でデフォルトで実装されており、USB仕様に基づいた事前に設定された構成が適用されます。エンドポイント構成テーブルの他の例については、 <code class="docutils literal notranslate"><span class="pre">musb_core.c</span></code>.</p>
+<p>では、中断ハンドラ関数に戻りましょう：</p>
+<blockquote>
+<div><div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">static</span><span class="w"> </span><span class="n">irqreturn_t</span><span class="w"> </span><span class="nf">jz4740_musb_interrupt</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">irq</span><span class="p">,</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="o">*</span><span class="n">__hci</span><span class="p">)</span><span class="w"></span>
+<span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">long</span><span class="w">   </span><span class="n">flags</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="n">irqreturn_t</span><span class="w">     </span><span class="n">retval</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">IRQ_NONE</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">musb</span><span class="w">     </span><span class="o">*</span><span class="n">musb</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">__hci</span><span class="p">;</span><span class="w"></span>
+
+<span class="w">    </span><span class="n">spin_lock_irqsave</span><span class="p">(</span><span class="o">&amp;</span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span><span class="w"> </span><span class="n">flags</span><span class="p">);</span><span class="w"></span>
+
+<span class="w">    </span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">int_usb</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">musb_readb</span><span class="p">(</span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">mregs</span><span class="p">,</span><span class="w"> </span><span class="n">MUSB_INTRUSB</span><span class="p">);</span><span class="w"></span>
+<span class="w">    </span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">int_tx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">musb_readw</span><span class="p">(</span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">mregs</span><span class="p">,</span><span class="w"> </span><span class="n">MUSB_INTRTX</span><span class="p">);</span><span class="w"></span>
+<span class="w">    </span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">int_rx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">musb_readw</span><span class="p">(</span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">mregs</span><span class="p">,</span><span class="w"> </span><span class="n">MUSB_INTRRX</span><span class="p">);</span><span class="w"></span>
+
+<span class="w">    </span><span class="cm">/*</span>
+<span class="cm">     * The controller is gadget only, the state of the host mode IRQ bits is</span>
+<span class="cm">     * undefined. Mask them to make sure that the musb driver core will</span>
+<span class="cm">     * never see them set</span>
+<span class="cm">     */</span><span class="w"></span>
+<span class="hll"><span class="w">    </span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">int_usb</span><span class="w"> </span><span class="o">&amp;=</span><span class="w"> </span><span class="n">MUSB_INTR_SUSPEND</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">MUSB_INTR_RESUME</span><span class="w"> </span><span class="o">|</span><span class="w"></span>
+</span><span class="hll"><span class="w">        </span><span class="n">MUSB_INTR_RESET</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">MUSB_INTR_SOF</span><span class="p">;</span><span class="w"></span>
+</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">int_usb</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">int_tx</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">int_rx</span><span class="p">)</span><span class="w"></span>
+<span class="w">        </span><span class="n">retval</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">musb_interrupt</span><span class="p">(</span><span class="n">musb</span><span class="p">);</span><span class="w"></span>
+
+<span class="w">    </span><span class="n">spin_unlock_irqrestore</span><span class="p">(</span><span class="o">&amp;</span><span class="n">musb</span><span class="o">-&gt;</span><span class="n">lock</span><span class="p">,</span><span class="w"> </span><span class="n">flags</span><span class="p">);</span><span class="w"></span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">retval</span><span class="p">;</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</pre></div>
+</div>
+</div></blockquote>
+<p>行18の指示は、USBホストモード操作に使用される割込みビットがシリコンに存在しないという事実を回避するため、コントローラードライバーが使用する方法です。 <code class="docutils literal notranslate"><span class="pre">MUSB_INTRUSB</span></code> 登録後、ハードウェア状態が未定義のままとなり、このMUSBコントローラーはペリフェラルモードのみで使用されるため、この状態は定義されていません。その結果、グルー層はこれらの欠損しているビットを論理積（AND）演算により読み取った値と実際に実装されているビットを比較することで、寄生割込みを防ぐようにマスク処理を行います。 <code class="docutils literal notranslate"><span class="pre">MUSB_INTRUSB</span></code> これらのビットは、登録から実際に実装されているビットと論理積（AND）演算により、寄生割込みを防ぐようにマスク処理を行います。</p>
+<p>これらはJZ4740 USBデバイスコントローラーに見られる特異な挙動の一部にすぎません。他のいくつかの問題は、MUSBコアで直接対応されており、修正が汎用性が高く、他のコントローラーのハードウェアにも適用可能なため、より効果的な問題解決が可能になりました。</p>
+</section>
+<section id="conclusion">
+<h2>結論<a class="headerlink" href="#conclusion" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Linux MUSBグルー層の実装は、このドキュメンテーションがこの作業の詳細を示すことでよりアクセスしやすいタスクになるでしょう。</p>
+<p>JZ4740 USBデバイスコントローラーは比較的シンプルな設計であるため、このグルー層が探究心のある人にとって良い例になることを願っています。現在のMUSBグルー層と併用することで、このドキュメンテーションは開始するための十分なガイドを提供します。何か問題が発生した場合は、linux-usbメーリングリストアーカイブを参照すると役立ちます。</p>
+</section>
+<section id="acknowledgements">
+<h2>謝辞<a class="headerlink" href="#acknowledgements" title="この見出しへのパーマリンク">¶</a></h2>
+<p>JZ4740グルー層を書く際、私の質問に答えてくれたLars-Peter Clausen氏とMaarten ter Huurne氏に感謝します。また、コードを安定した状態にするために手助けしてくれたことに感謝します。</p>
+<p>Qi-Hardwareコミュニティ全体にも感謝します。明るく丁寧な指導とサポートをありがとうございました。</p>
+</section>
+<section id="resources">
+<h2>リソース<a class="headerlink" href="#resources" title="この見出しへのパーマリンク">¶</a></h2>
+<p>USB ホームページ: <a class="reference external" href="https://www.usb.org">https://www.usb.org</a></p>
+<p>linux-usb メーリングリストアーカイブ: <a class="reference external" href="https://marc.info/?l=linux-usb">https://marc.info/?l=linux-usb</a></p>
+<p>USB On-the-Go 基本情報:
+<a class="reference external" href="https://www.maximintegrated.com/app-notes/index.mvp/id/1822">https://www.maximintegrated.com/app-notes/index.mvp/id/1822</a></p>
+<p><a class="reference internal" href="writing_usb_driver.html#writing-usb-driver"><span class="std std-ref">USBデバイスドライバの作成</span></a></p>
+<p>テキサス・インSTRUMENTS USB設定Wikiページ:
+<a class="reference external" href="http://processors.wiki.ti.com/index.php/Usbgeneralpage">http://processors.wiki.ti.com/index.php/Usbgeneralpage</a></p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../driver-model/index.html">ドライバモデル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../basics.html">ドライバの基礎</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infrastructure.html">デバイスドライバのインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ioctl.html">ioctlベースのインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../early-userspace/index.html">初期ユーザースペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pm/index.html">CPUおよびデバイスの電源管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../clk.html">共通のCLKフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device-io.html">バスを問わないデバイスアクセス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dma-buf.html">バッファ共有と同期</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device_link.html">デバイスリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../component.html">複合ドライバ用コンポーネントヘルパ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../message-based.html">メッセージベースのデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infiniband.html">InfiniBandおよびリモートDMA（RDMA）インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../frame-buffer.html">フレームバッファライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../regulator.html">電圧および電流レギュレータAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../input.html">入力サブシステム</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">Linux USB API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firewire.html">Firewire（IEEE 1394）ドライバインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pci/index.html">Linux PCIドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../spi.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i2c.html">I<sup>2</sup>CおよびSMBusサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmb.html">衛星MC用IPMBドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmi.html">Linux IPMIドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i3c/index.html">I3Cサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../interconnect.html">汎用システムインターコネクトサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../devfreq.html">デバイス周波数スケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hsi.html">高速同期シリアルインターフェース (HSI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../edac.html">エラー検出と訂正 (EDAC) デバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../scsi.html">SCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../libata.html">libATA開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../target.html">ターゲットおよびiSCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mailbox.html">共通メールボックスフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mtdnand.html">MTD NANDドライバプログラミングインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html">パラレルポートデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#x50-uart-driver">16x50 UARTドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#pulse-width-modulation-pwm">パルス幅変調 (PWM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mei/index.html">インテル(R) マネジメントエンジニアリングインターフェース (インテル(R) MEI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mtd/index.html">メモリ技術デバイス (MTD)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mmc/index.html">MMC/SD/SDIOカードサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nvdimm/index.html">非揮発性メモリデバイス (NVDIMM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../w1.html">W1: ダラスの1ワイヤーバス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rapidio/index.html">Linux RapidIO サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../s390-drivers.html">s390チャネルデバイスドライバの作成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vme.html">VMEデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../80211/index.html">Linux 802.11ドライバ開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../uio-howto.html">ユーザースペースI/O HOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firmware/index.html">LinuxファームウェアAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pinctl.html">PINCTRL (PIN CONTROL)サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../gpio/index.html">汎用入出力 (GPIO)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../md/index.html">RAID</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../media/index.html">メディアサブシステム カーネル内部API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../misc_devices.html">その他のデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nfc/index.html">近距離通信 (NFC)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dmaengine/index.html">DMAエンジンドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../slimbus.html">LinuxカーネルSLIMbusサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../soundwire/index.html">SoundWireドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../thermal/index.html">熱管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../fpga/index.html">FPGAサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../acpi/index.html">ACPI サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../backlight/lp855x-driver.html">カーネルドライバlp855x</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../connector.html">カーネルコンネクタ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../console.html">コンソールドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dcdbas.html">Dellシステム管理ベースドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../eisa.html">EISAバスサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isa.html">ISAドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isapnp.html">ISA Plug &amp; Playサポート (Jaroslav Kysela &lt;perex@suse.cz&gt;)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io-mapping.html">io_mapping関数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io_ordering.html">メモリマップアドレスへのI/O書き込みの順序付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../generic-counter.html">汎用カウンタインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lightnvm-pblk.html">pblk: 物理ブロックデバイスターゲット</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../memory-devices/index.html">メモリコントローラー ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../men-chameleon-bus.html">MEN Chameleon Bus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ntb.html">NTB ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nvmem.html">NVMEM サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../parport-lowlevel.html">PARPORT インターフェース ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pps.html">PPS - パルス毎秒 (Pulse Per Second)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ptp.html">Linux用PTP ハードウェアクロック インフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../phy/index.html">ジェネリック PHY フレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pti_intel_mid.html">インテル MID PTI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pwm.html">パルス幅変調 (PWM) インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html">PLDM ファームウェア フラッシュアップデート ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html#overview-of-the-pldmfw-library">概要: <code class="docutils literal notranslate"><span class="pre">pldmfw</span></code> ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rfkill.html">rfkill - RFキルスイッチサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../serial/index.html">シリアルデバイスのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sm501.html">SM501 ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../switchtec.html">Linux Switchtec サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sync_file.html">シンクファイル API ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio-mediated-device.html">VFIO メディエイテッドデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio.html">VFIO - 「仮想ファンクション I/O」 </a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xilinx/index.html">Xilinx FPGA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xillybus.html">ジェネリックFPGAインターフェース用Xillybusドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../zorro.html">Zorroデバイス用のデバイスドライバの作成</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul>
+<li><a href="index.html">Linux USB API</a><ul>
+<li>前へ: <a href="dwc3.html" title="前章">Synopsys DesignWare Core SuperSpeed USB 3.0 Controller</a></li>
+<li>次へ: <a href="typec.html" title="次章">USB Type-C コネクタ クラス</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/driver-api/usb/writing_musb_glue_layer.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

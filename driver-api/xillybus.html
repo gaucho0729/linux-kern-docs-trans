@@ -1,0 +1,385 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Xillybusドライバー　汎用FPGAインターフェース — The Linux Kernelドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="zorro.html" rel="next" title="Zorroデバイス用のデバイスドライバの作成"/>
+<link href="xilinx/eemi.html" rel="prev" title="Xilinx Zynq MPSoC EEMIドキュメンテーション"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="xillybus-driver-for-generic-fpga-interface">
+<h1>ジェネリックFPGAインターフェース用Xillybusドライバ<a class="headerlink" href="#xillybus-driver-for-generic-fpga-interface" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Eli Billauer, Xillybus Ltd. (<a class="reference external" href="http://xillybus.com">http://xillybus.com</a>)</p>
+</dd>
+<dt class="field-even">メール</dt>
+<dd class="field-even"><p><a class="reference external" href="mailto:eli.billauer%40gmail.com">eli<span>.</span>billauer<span>@</span>gmail<span>.</span>com</a> or as advertised on Xillybus’ site.</p>
+</dd>
+</dl>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="background">
+<h3>背景<a class="headerlink" href="#background" title="この見出しへのパーマリンク">¶</a></h3>
+<p>FPGA（Field Programmable Gate Array）は論理ハードウェアの一種で、専用チップとして通常見られる機能（ディスプレイアダプター、ネットワークインターフェースカード、あるいはプロセッサと周辺機器など）をプログラミングによって実現可能。FPGAはハードウェアのLEGOであり、特定のビルディングブロックを基に、好きなように自作できる。市場で既にチップとして提供されている機能を再実装するのは無駄なので、FPGAは特殊な機能が必要で生産量が比較的少ない場合（ASICの開発を正当化しない場合）に主に使用される。</p>
+<p>FPGAの課題は、すべてが非常に低レベルで実装される点である。FPGAデザイナーが特定のプロジェクトに集中できるように、既存のビルディングブロック（IPコア）を活用することが一般的。これらはライブラリ関数に相当するFPGAの対応物で、数学関数や機能単位（例：USBインターフェース）、プロセッサ（例：ARM）など、必要な機能を実装可能。これらを構成要素と考え、他のブロックと接続するための電気配線が左右に付いていると考えてよい。</p>
+<p>FPGA設計における困難なタスクの一つは、フル機能のオペレーティングシステム（実際にはその実行中のプロセッサ）と通信することである。低レベルのバスプロトコルと、ホストとのやや高レベルなインターフェース（レジスタ、割込み、DMAなど）の実装は別なプロジェクトである。FPGAの機能がよく知られている場合（例：ビデオアダプター、NIC）、プロジェクトに特化したインターフェースロジックを設計する意味がある。その場合、カーネルおよび/またはユーザー空間にFPGAを既知のインターフェースとして提示するための特別なドライバーが書かれる。その際、バス上の他のデバイスと同様にFPGAを扱う理由はない。</p>
+<p>しかし、望まれるデータ通信が既存の周辺機器機能に合致しないケースは一般的です。また、データ交換用のエレガントな抽象化設計にかかる労力はしばしば過大視されます。このような場合、より迅速で（おそらくはエレガントでない）解決策が求められます：ドライバがユーザー空間のプログラムとして実装され、カーネル空間部分は単純なデータ転送に限定されます。これにはFPGA用のインターフェースロジックを設計し、カーネル用の簡易なアドホックドライバを書く必要があります。</p>
+</section>
+<section id="xillybus-overview">
+<h3>Xillybus概要<a class="headerlink" href="#xillybus-overview" title="この見出しへのパーマリンク">¶</a></h3>
+<p>XillybusはIPコアであり、Linuxドライバです。これらを組み合わせることで、FPGAとホスト間の基本的なデータ転送を実現するキットが形成され、パイプのようなデータストリームをストレートなユーザーインターフェースで提供します。これはFPGAとホストを組み合わせたプロジェクトにおける低コストな解決策として意図されており、プロジェクト固有のドライバ部分をユーザー空間のプログラムで実行するのに適しています。</p>
+<p>通信要件はFPGAプロジェクトによって大きく異なります（各方向のデータパイプ数や属性など）、そのためXillybus IPコアは特定の論理ブロックで構成されるわけではありません。むしろ、ユーザーが指定した仕様に基づいてIPコアが構成・構築されます。</p>
+<p>XillybusはユーザーにパイプやTCP/IP通信に似た独立したデータストリームを提供します。ホスト側ではパイプファイルと同様にキャラクタデバイスファイルが使用され、FPGA側ではハードウェアFIFOを用いてデータをストリーム処理します。これは固定サイズバッファを用いた通信方法とは異なりますが、Xillybusは内部ではこのようなバッファを用いています。1つのIPコアに百以上ものストリームが存在する場合もありますが、設定によっては1つしか存在しないこともあります。</p>
+<p>Xillybus IPコアの展開を容易にするため、IPコア内に単純なデータ構造が含まれており、これによりコアの設定が完全に定義されます。Linuxドライバは初期化プロセス中にこのデータ構造を取得し、DMAバッファとキャラクタデバイスを適切に設定します。その結果、1つのドライバでどのXillybus IPコアとも即座に動作します。</p>
+<p>先述のデータ構造はPCIの設定空間やフラットテンデバイスツリーとは区別すべきです。</p>
+</section>
+</section>
+<section id="usage">
+<h2>使い方<a class="headerlink" href="#usage" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="user-interface">
+<h3>ユーザーインターフェース<a class="headerlink" href="#user-interface" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ホスト側では、Xillybusとのすべてのインターフェースは、ドライバがロードされる際に自動的に生成される/dev/xillybus_* デバイスファイルを通じて行われます。これらのファイルの名前は、FPGAにロードされたIPコアに依存します（下記の「プローブ」を参照）。FPGAと通信するには、データを送信または受信するハードウェアFIFOに対応するデバイスファイルを開き、通常のパイプと同じようにwrite()またはread()コールを呼び出します。特に、以下の手順を取る必要があります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ cat mydata &gt; /dev/xillybus_thisfifo
+
+$ cat /dev/xillybus_thatfifo &gt; hisdata
+</pre></div>
+</div>
+<p>いくつかの段階でCTRL-Cを押す可能性があります（xillybus_*パイプはEOFを送信する機能を持っていますが、必ずしも使用しない場合があります）。</p>
+<p>ドライバとハードウェアはパイプとしての動作を適切に行うように設計されており、以下の機能をサポートしています：</p>
+<ul class="simple">
+<li><p>非ブロッキングI/Oのサポート（open()時にO_NONBLOCKを設定することによって）。</p></li>
+<li><p>poll()およびselect()のサポート。</p></li>
+<li><p>負荷下でも帯域幅効率を確保（DMAを使用）し、同時にTCP/IPのような小規模なデータ送信にも自動フラッシュによって対応します。</p></li>
+</ul>
+<p>デバイスファイルは読み取り専用、書き込み専用、または双方向のいずれかです。双方向のデバイスファイルは、実装コード内で「チャンネル」構造を共有する以外は、2つの独立したパイプとして扱われます。</p>
+</section>
+<section id="synchronization">
+<h3>同期化<a class="headerlink" href="#synchronization" title="この見出しへのパーマリンク">¶</a></h3>
+<p>Xillybusパイプは（IPコアで）同期的または非同期的に構成できます。同期的なパイプでは、write()はFPGAがデータを受信・確認した後に成功します。これによりバULKデータ転送が遅くなり、一定の速度でデータを要求するストリームとの使用はほぼ不可能です：write()呼び出しの間にFPGAにデータが送信されません（特にプロセスがCPUを失った場合）。</p>
+<p>非同期的なパイプでは、バッファに十分な容量があればwrite()は即座に成功します。</p>
+<p>FPGAからホストへのパイプでは、非同期パイプはデバイスファイルが開かれた時点でデータ転送を開始します（read()呼び出しによるデータ要求とは関係ありません）。同期パイプでは、read()呼び出しで要求されたデータ量だけが送信されます。</p>
+<p>要約すると、同期パイプではホストとFPGA間のデータ転送は、ドライバが処理している現在のread()またはwrite()呼び出しを満たすために行われ、これらの呼び出しは転送完了後に返します。</p>
+<p>注意点として、同期属性はread()またはwrite()が要求されたよりも少ないバイト数を完了する可能性と関係ありません。このような部分的な完了を許可するかどうかは、別個の設定フラグ（"allowpartial"）で決定されます。</p>
+</section>
+<section id="seekable-pipes">
+<h3>シーク可能なパイプ<a class="headerlink" href="#seekable-pipes" title="この見出しへのパーマリンク">¶</a></h3>
+<p>同期パイプは、FPGA側でストリームの位置をユーザー論理に公開するように構成できます。このようなパイプは、ホストAPIでもシーク可能です。この機能により、FPGA側にメモリやレジスタインターフェースをシーク可能なストリームに接続できます。接続されたメモリの特定アドレスへの読み書きは、目的のアドレスにシークし、必要に応じてread()またはwrite()を呼び出すことで実行されます。</p>
+</section>
+</section>
+<section id="internals">
+<h2>内部構造<a class="headerlink" href="#internals" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="source-code-organization">
+<h3>ソースコードの構成<a class="headerlink" href="#source-code-organization" title="この見出しへのパーマリンク">¶</a></h3>
+<p>Xillybusドライバーは、コアモジュールxillybus_core.cと、特定のバスインターフェースに依存するモジュール（xillybus_of.cおよびxillybus_pcie.c）で構成されています。</p>
+<p>バス固有のモジュールは、内核が適切なデバイスを見つけたときにプローブされます。DMAマッピングおよび同期関数（これらは本質的にバス依存です）がコアモジュールで使用されるため、初期化時にコアモジュールにxilly_endpoint_hardware構造体が渡されます。この構造体は、バス上でDMA関連の操作を実行するラッパー関数へのポインタを含んでいます。</p>
+</section>
+<section id="pipe-attributes">
+<h3>パイプ属性<a class="headerlink" href="#pipe-attributes" title="この見出しへのパーマリンク">¶</a></h3>
+<p>各パイプには、FPGAコンポーネント（IPコア）が構築されるときに設定される複数の属性があります。これらは、xilly_setupchannels()関数がxillybus_core.cでIDT（コアの設定を定義するデータ構造、以下「プロービング」を参照）から取得します。</p>
+<ul class="simple">
+<li><p>is_writebuf: パイプの方向性。ゼロでない値はFPGAからホストへのパイプ（FPGAが「書き込み」）を示します。</p></li>
+<li><p>channelnum: ホストとFPGA間通信におけるパイプの識別番号です。</p></li>
+<li><p>format: 基盤となるデータ幅です。以下でデータ粒度を参照してください。</p></li>
+<li><p>allowpartial: ゼロでない値は、read()またはwrite()（どちらか適用）が要求されたバイト数より少ないバイト数で返ることを許可します。一般的な選択肢はゼロでない値で、標準的なUNIX動作に一致します。</p></li>
+<li><p>synchronous: ゼロでない値はパイプが同期していることを示します。上記の同期を参照してください。</p></li>
+<li><p>bufsize: 各DMAバッファのサイズです。常に2の累乗です。</p></li>
+<li><p>bufnum: このパイプに割り当てられたバッファ数です。常に2の累乗です。</p></li>
+<li><p>exclusive_open: ゼロでない値は関連するデバイスファイルの排他開けを強制します。デバイスファイルが双方向であり、すでに一方の方向のみで開かれている場合、反対方向は一度だけ開けられます。</p></li>
+<li><p>seekable: ゼロでない値はパイプがシーク可能であることを示します。上記のシーク可能なパイプを参照してください。</p></li>
+<li><p>supports_nonempty: ゼロでない値（これは典型的です）は、このパイプのselect()およびpoll()をサポートする必要なメッセージをハードウェアが送信することを示します。</p></li>
+</ul>
+</section>
+<section id="host-never-reads-from-the-fpga">
+<h3>ホストはFPGAからデータを読み取らない<a class="headerlink" href="#host-never-reads-from-the-fpga" title="この見出しへのパーマリンク">¶</a></h3>
+<p>PCI Expressは一般的にホットプラグ可能ですが、通常のマザーボードはカードが突然消えることを想定していません。しかし、PCIeカードは再プログラマブルな論理に基づいており、ホストが起動している間、FPGAの誤った再プログラミングによってバスから突然消失する可能性があります。実際にはこのような状況で即座に何もないのですが、ホストがPCI Expressデバイスにマッピングされたアドレスから読み取ろうとすると、一部のマザーボードではシステムが即座にフリーズする場合があります。これはPCIe標準が優雅な復旧を要求しているにもかかわらずです。</p>
+<p>これらのフリーズを避けるため、Xillybusドライバーはデバイスのレジスタ領域から一切読み取らないようにしています。FPGAとホスト間のすべての通信はDMAを通じて行われます。特に、割り込みサービスルーチンは呼び出された際にステータスレジスタを確認するという一般的な実装とは異なり、FPGAは短いメッセージを含む小さなバッファを準備し、ホストに割り込みの内容を通知します。</p>
+<p>統一性を保つため、このメカニズムは非PCIeバスにも適用されています。</p>
+</section>
+<section id="channels-pipes-and-the-message-channel">
+<h3>チャネル、パイプ、およびメッセージチャネル<a class="headerlink" href="#channels-pipes-and-the-message-channel" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ユーザーに提示される（可能であれば双方向の）各パイプは、FPGAとホスト間のデータチャネルを割り当てられます。チャネルとパイプの区別は、割り込み関連メッセージをFPGAから伝達するために使用されるチャネル0の存在により必要です。このチャネル0にはパイプが割り当てられていません。</p>
+</section>
+<section id="data-streaming">
+<h3>データストリーミング<a class="headerlink" href="#data-streaming" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ユーザー側には非セグメント化されたデータストリームが提示されるものの、実装は各チャネルごとに割り当てられるDMAバッファのセットに依存しています。説明のため、FPGAからホストへの方向を例にとると、FPGA内のそれぞれのチャネルインターフェースにデータがストリームインするにつれて、Xillybus IPコアがDMAバッファの一つに書き込みます。バッファが満杯になると、FPGAはホストにその事実を通知します（XILLYMSG_OPCODE_RELEASEBUFメッセージをチャネル0に追加してホストに通知し、必要に応じて割り込みを送信します）。ホストはその後、キャラクターデバイスを通じてデータの読み取りを可能にします。すべてのデータが読み取られると、ホストはFPGAのバッファ制御レジスタに書き込み、バッファの上書きを許可します。双方の側にフロー制御メカニズムがあり、アンダーフローおよびオーバーフローを防いでいます。</p>
+<p>TCP/IPのようなストリームを構築するにはこの程度の精度は不十分です: DMAバッファが満たされる直前にデータフローが一時的に停止した場合、直感的な期待は部分的なデータがバッファに到達することです。これはXILLYMSG_OPCODE_RELEASEBUFメッセージにフィールドを追加することで実現され、FPGAはバッファの提出だけでなく、その中身のデータ量も通知します。</p>
+<p>FPGAはホストが指示するまで部分的に満たされたバッファを提出しません。これはread()メソッドがXILLY_RX_TIMEOUT jiffies（現在10ms）ブロッキングした後、ホストがFPGAにDMAバッファをできるだけ早く提出するよう指示した状況です。このタイムアウトメカニズムはバス帯域効率（多くの部分的に満たされたバッファの送信を防ぐ）とデータの末尾に対する遅延の低さのバランスを取っています。</p>
+<p>ホストからFPGAへの方向にも同様の設定が使われます。ただし部分的なDMAバッファの処理は多少異なります。ユーザーはwrite()メソッドでバイトカウントをゼロに設定することで、ドライバにバッファ内のすべてのデータをFPGAに送信するよう指示できます。これはフラッシュリクエストに似ていますがブロッキングしません。また自動フラッシュメカニズムがあり、最後のwrite()のXILLY_RX_TIMEOUT jiffies後に同等のフラッシュをトリガーします。これによりユーザーは内部のバッファリングメカニズムを気にせず、ストリームのようなインターフェースを楽しめます。</p>
+<p>「synchronous」属性がゼロでないパイプでは部分バッファのフラッシュに関する問題は関係ありません。なぜなら同期パイプはread()とwrite()の間データがDMAバッファに滞在することを許可しないからです。</p>
+</section>
+<section id="data-granularity">
+<h3>データ粒度<a class="headerlink" href="#data-granularity" title="この見出しへのパーマリンク">¶</a></h3>
+<p>FPGAでは「format」属性で設定された8bit、16bit、または32bit幅のワードとしてデータが到達または送信されます。パイプが自然なアライメントと異なる方法でアクセスされる場合、ドライバは可能な限りこの細かい違いを隠します。たとえば32bit粒度のパイプから単一バイトを読み取るには問題ありません。16bitまたは32bit粒度のパイプに単一バイトを書き込むこともできますが、ドライバはFPGAに部分的なワードを送信できないため、最大1ワードの送信はユーザーのデータが完全に満たされるまで保留されます。</p>
+<p>これは、ホストからFPGAへのストリームの処理をやや複雑にします。なぜなら、バッファがフラッシュされるとき、そのバッファにはFPGAでワードを形成しない最大で3バイトが含まれる可能性があり、それらは送信できません。データの喪失を防ぐため、これらの余分なバイトは次のバッファに移動する必要があります。xillybus_core.c内の「leftovers（余分なデータ）」と関連する部分は、この複雑さに関連しています。</p>
+</section>
+<section id="probing">
+<h3>プロービング<a class="headerlink" href="#probing" title="この見出しへのパーマリンク">¶</a></h3>
+<p>前述したように、ドライバがロードされるときに生成されるパイプの数とその属性は、FPGA内のXillybus IPコアに依存します。ドライバの初期化中に、設定情報が含まれたブロブ（Interface Description Table（IDT）と呼ばれるインターフェース記述テーブル）がFPGAからホストに送信されます。ブートストラッププロセスは以下の3段階で行われます。</p>
+<ol class="arabic simple">
+<li><p>IDTの長さを取得し、バッファを確保できるようにします。これは、デバイスにクイエス（静止）コマンドを送ることで実現され、このコマンドのアサーション（応答）にIDTのバッファ長が含まれます。</p></li>
+<li><p>IDT自体を取得します。</p></li>
+<li><p>IDTに基づいてインターフェースを作成します。</p></li>
+</ol>
+</section>
+<section id="buffer-allocation">
+<h3>バッファの割り当て<a class="headerlink" href="#buffer-allocation" title="この見出しへのパーマリンク">¶</a></h3>
+<p>PCIeパケットの不適切な境界を超えないようにする論理を簡素化するため、以下のルールが適用されます：バッファが4KB未満の場合は、4KB境界を越えてはいけません。それ以外の場合は、4KBアライメントする必要があります。xilly_setupchannels()関数は、カーネルからページ単位でメモリを取得し、DMAバッファに分割してバッファを割り当てます。すべてのバッファサイズが2の累乗であるため、このようなバッファを任意にパックして、最大で1ページのメモリを無駄にすることが可能です。</p>
+<p>すべてのバッファはドライバがロードされるときに割り当てられます。これは、システムが新規起動時に大きな連続物理メモリセグメントがより確実に利用可能になるためです。</p>
+<p>バッファメモリの割り当てはIDTに現れる順序で行われます。ドライバは、IDT内でパイプがバッファサイズの降順に並んでいるというルールに依存しています。リクエストされたバッファがページ以上の場合、必要なページ数をカーネルから取得し、そのバッファに使用します。リクエストされたバッファがページ未満の場合、1つのページをカーネルから取得し、そのページを部分的に使用します。あるいは、すでに部分的に使用中のページがある場合、バッファをそのページにパックします。このようにして、カーネルから取得したページ（最後のページを除く）は100％利用されます。</p>
+</section>
+<section id="the-nonempty-message-supporting-poll">
+<h3>「nonempty（空でない）」メッセージ（ポールをサポートする）<a class="headerlink" href="#the-nonempty-message-supporting-poll" title="この見出しへのパーマリンク">¶</a></h3>
+<p>「poll」メソッド（およびselect()）をサポートするためには、FPGAからホストへの方向について小さな問題があります。FPGAはDMAバッファに一部のデータを読み込んでいるかもしれませんが、そのバッファを送信していない場合があります。ホストがFPGAからのバッファ送信を待っている場合、FPGA側でデータが送信されたにもかかわらず、select()呼び出しは依然としてブロッキングする可能性があります。これは、FPGAがチャネルが完全に空からデータを含む状態に変わるときにXILLYMSG_OPCODE_NONEMPTYメッセージを送信することで解決されます。</p>
+<p>これらのメッセージは「poll()」および「select()」のサポートにのみ使用されます。IPコアは帯域幅の軽減のためにこれらのメッセージを送信しないように設定することが可能です。</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxドライバ実装者向けAPIガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="driver-model/index.html">ドライバモデル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="basics.html">ドライバの基礎</a></li>
+<li class="toctree-l2"><a class="reference internal" href="infrastructure.html">デバイスドライバのインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ioctl.html">ioctlベースのインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="early-userspace/index.html">初期ユーザースペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pm/index.html">CPUおよびデバイスの電源管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="clk.html">共通のCLKフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="device-io.html">バスを問わないデバイスアクセス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dma-buf.html">バッファ共有と同期</a></li>
+<li class="toctree-l2"><a class="reference internal" href="device_link.html">デバイスリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="component.html">複合ドライバ用コンポーネントヘルパ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="message-based.html">メッセージベースのデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="infiniband.html">InfiniBandおよびリモートDMA（RDMA）インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="frame-buffer.html">フレームバッファライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="regulator.html">電圧および電流レギュレータAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="iio/index.html">産業用I/O</a></li>
+<li class="toctree-l2"><a class="reference internal" href="input.html">入力サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="usb/index.html">Linux USB API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="firewire.html">Firewire（IEEE 1394）ドライバインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pci/index.html">Linux PCIドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="spi.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="i2c.html">I<sup>2</sup>CおよびSMBusサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipmb.html">衛星MC用IPMBドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipmi.html">Linux IPMIドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="i3c/index.html">I3Cサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="interconnect.html">汎用システムインターコネクトサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="devfreq.html">デバイス周波数スケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hsi.html">高速同期シリアルインターフェース (HSI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="edac.html">エラー検出と訂正 (EDAC) デバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="scsi.html">SCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="libata.html">libATA開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="target.html">ターゲットおよびiSCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mailbox.html">共通メールボックスフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mtdnand.html">MTD NANDドライバプログラミングインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="miscellaneous.html">パラレルポートデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="miscellaneous.html#x50-uart-driver">16x50 UARTドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="miscellaneous.html#pulse-width-modulation-pwm">パルス幅変調 (PWM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mei/index.html">インテル(R) マネジメントエンジニアリングインターフェース (インテル(R) MEI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mtd/index.html">メモリ技術デバイス (MTD)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mmc/index.html">MMC/SD/SDIOカードサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nvdimm/index.html">非揮発性メモリデバイス (NVDIMM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="w1.html">W1: ダラスの1ワイヤーバス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rapidio/index.html">Linux RapidIO サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="s390-drivers.html">s390チャネルデバイスドライバの作成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vme.html">VMEデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="80211/index.html">Linux 802.11ドライバ開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="uio-howto.html">ユーザースペースI/O HOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="firmware/index.html">LinuxファームウェアAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pinctl.html">PINCTRL (PIN CONTROL)サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gpio/index.html">汎用入出力 (GPIO)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="md/index.html">RAID</a></li>
+<li class="toctree-l2"><a class="reference internal" href="media/index.html">メディアサブシステム カーネル内部API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="misc_devices.html">その他のデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nfc/index.html">近距離通信 (NFC)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dmaengine/index.html">DMAエンジンドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="slimbus.html">LinuxカーネルSLIMbusサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="soundwire/index.html">SoundWireドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="thermal/index.html">熱管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="fpga/index.html">FPGAサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="acpi/index.html">ACPI サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="backlight/lp855x-driver.html">カーネルドライバlp855x</a></li>
+<li class="toctree-l2"><a class="reference internal" href="connector.html">カーネルコンネクタ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="console.html">コンソールドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dcdbas.html">Dellシステム管理ベースドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="eisa.html">EISAバスサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="isa.html">ISAドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="isapnp.html">ISA Plug &amp; Playサポート (Jaroslav Kysela &lt;perex@suse.cz&gt;)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="io-mapping.html">io_mapping関数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="io_ordering.html">メモリマップアドレスへのI/O書き込みの順序付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic-counter.html">汎用カウンタインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lightnvm-pblk.html">pblk: 物理ブロックデバイスターゲット</a></li>
+<li class="toctree-l2"><a class="reference internal" href="memory-devices/index.html">メモリコントローラー ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="men-chameleon-bus.html">MEN Chameleon Bus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ntb.html">NTB ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nvmem.html">NVMEM サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="parport-lowlevel.html">PARPORT インターフェース ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pps.html">PPS - パルス毎秒 (Pulse Per Second)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ptp.html">Linux用PTP ハードウェアクロック インフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phy/index.html">ジェネリック PHY フレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pti_intel_mid.html">インテル MID PTI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pwm.html">パルス幅変調 (PWM) インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pldmfw/index.html">PLDM ファームウェア フラッシュアップデート ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pldmfw/index.html#overview-of-the-pldmfw-library">概要: <code class="docutils literal notranslate"><span class="pre">pldmfw</span></code> ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rfkill.html">rfkill - RFキルスイッチサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="serial/index.html">シリアルデバイスのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sm501.html">SM501 ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="switchtec.html">Linux Switchtec サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sync_file.html">シンクファイル API ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vfio-mediated-device.html">VFIO メディエイテッドデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vfio.html">VFIO - 「仮想ファンクション I/O」 </a></li>
+<li class="toctree-l2"><a class="reference internal" href="xilinx/index.html">Xilinx FPGA</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">ジェネリックFPGAインターフェース用Xillybusドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="zorro.html">Zorroデバイス用のデバイスドライバの作成</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxドライバ実装者向けAPIガイド</a><ul>
+<li>前へ: <a href="xilinx/eemi.html" title="前章">Xilinx Zynq MPSoC EEMIドキュメンテーション</a></li>
+<li>次へ: <a href="zorro.html" title="次章">Zorroデバイス用のデバイスドライバの作成</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/driver-api/xillybus.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

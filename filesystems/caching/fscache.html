@@ -1,0 +1,943 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>汎用ファイルシステムキャッシング — Linux Kernel ドキュメンテーション</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="object.html" rel="next" title="カーネル内キャッシュオブジェクトの表現と管理"/>
+<link href="index.html" rel="prev" title="Filesystem Caching"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="general-filesystem-caching">
+<h1>汎用ファイルシステムキャッシング<a class="headerlink" href="#general-filesystem-caching" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="overview">
+<h2>概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>この機能はネットワークファイルシステム用の汎用的なキャッシュですが、ISO9660ファイルシステムなどの他の用途にも利用可能です。</p>
+<p>FS-Cache はキャッシュバックエンド（例: CacheFS など）とネットワークファイルシステムの間で中間として機能します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+---------+
+|         |                        +--------------+
+|   NFS   |--+                     |              |
+|         |  |                 +--&gt;|   CacheFS    |
++---------+  |   +----------+  |   |  /dev/hda5   |
+             |   |          |  |   +--------------+
++---------+  +--&gt;|          |  |
+|         |      |          |--+
+|   AFS   |-----&gt;| FS-Cache |
+|         |      |          |--+
++---------+  +--&gt;|          |  |
+             |   |          |  |   +--------------+
++---------+  |   +----------+  |   |              |
+|         |  |                 +--&gt;|  CacheFiles  |
+|  ISOFS  |--+                     |  /var/cache  |
+|         |                        +--------------+
++---------+
+</pre></div>
+</div>
+<p>別の言い方をすれば、FS-Cache はネットワークファイルシステムにキャッシュ機能を提供するモジュールであり、ユーザーにとってキャッシュが透明性を保つようにします：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+---------+
+|         |
+| Server  |
+|         |
++---------+
+     |                  NETWORK
+~~~~~|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     |
+     |           +----------+
+     V           |          |
++---------+      |          |
+|         |      |          |
+|   NFS   |-----&gt;| FS-Cache |
+|         |      |          |--+
++---------+      |          |  |   +--------------+   +--------------+
+     |           |          |  |   |              |   |              |
+     V           +----------+  +--&gt;|  CacheFiles  |--&gt;|  Ext3        |
++---------+                        |  /var/cache  |   |  /dev/sda6   |
+|         |                        +--------------+   +--------------+
+|   VFS   |                                ^                     ^
+|         |                                |                     |
++---------+                                +--------------+      |
+     |                  KERNEL SPACE                      |      |
+~~~~~|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|~~~~~~|~~~~
+     |                  USER SPACE                        |      |
+     V                                                    |      |
++---------+                                           +--------------+
+|         |                                           |              |
+| Process |                                           | cachefilesd  |
+|         |                                           |              |
++---------+                                           +--------------+
+</pre></div>
+</div>
+<p>FS-Cache は、ネットワークファイルシステム（netfs）で開かれたすべてのファイルを完全にキャッシュにロードしてからアクセスを許可し、そのキャッシュからページを提供するという考え方は採用していません。なぜなら：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>キャッシュなしでの運用が現実的でなければならない。</p></li>
+<li><p>キャッシュのサイズに制限されるファイルのサイズは許容されません。</p></li>
+<li><p>すべての開かれたファイルの合計サイズ（これはマップされたライブラリも含みます）はキャッシュのサイズに制限されるべきではありません。</p></li>
+<li><p>ユーザーはファイル全体をダウンロードする必要があるわけではありません。たとえば「file」プログラムでファイルの一部に一時的なアクセスを行う場合などです。</p></li>
+</ol>
+</div></blockquote>
+<p>代わりに、netfs（使用中の）が要求するたびにPAGE_SIZE単位でキャッシュを提供します。</p>
+<p>FS-Cache は以下の機能を提供します：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>複数のキャッシュを同時に使用できます。キャッシュはタグを指定して明示的に選択できます。</p></li>
+<li><p>キャッシュはいつでも追加または削除できます。</p></li>
+<li><p>netfs にはキャッシュ機能をファイルから引き上げるインターフェースが提供され、これは（2）の要件です。</p></li>
+<li><p>netfs へのインターフェースはエラーをできるだけ少なくし、netfs が無知なままであることを好む。</p></li>
+<li><p>クッキーは netfs に対してインデックス、ファイル、その他のオブジェクトを表します。最も簡単なクッキーは NULL ポインタであり、そこにはキャッシュされていないことを示します。</p></li>
+<li><p>netfs は動的に任意のインデックス階層を提案できますが、インデックス検索機能が再帰的でスタック領域が制限されており、インデックスは常にインデックスの子であることを理解しておく必要があります。</p></li>
+<li><p>データI/Oはnetfsのページを直接行います。netfsは、クッキーCで表されるデータファイルのインデックスBにあるページAが読み込まれるべきか、または書き込まれるべきかを示します。キャッシュバックエンドはそのページにI/Oを開始するかどうかは問いませんが、開始した場合はnetfsのコールバックが完了を示します。I/Oは同期的または非同期的であることができます。</p></li>
+<li><p>クッキーは解放時に「廃止」されます。この時点でFS-Cacheはそれらを非効力とし、そのルートにあるインデックス階層を再利用します。</p></li>
+<li><p>netfsはインデックス検索用に「match」関数を提供しています。この関数はマッチが成功したか否かを示すだけでなく、エントリを更新または削除する指示も指定できます。</p></li>
+</ol>
+</div></blockquote>
+<ol class="arabic simple" start="10">
+<li><p>可能な限り非同期で処理されます。</p></li>
+</ol>
+<p>FS-Cacheは仮想インデックスツリーを維持しており、すべてのインデックス、ファイル、オブジェクト、ページがこのツリーに保持されています。このツリーの一部は1つまたは複数のキャッシュに実際に存在する可能性があります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>                                           FSDEF
+                                             |
+                        +------------------------------------+
+                        |                                    |
+                       NFS                                  AFS
+                        |                                    |
+           +--------------------------+                +-----------+
+           |                          |                |           |
+        homedir                     mirror          afs.org   redhat.com
+           |                          |                            |
+     +------------+           +---------------+              +----------+
+     |            |           |               |              |          |
+   00001        00002       00007           00125        vol00001   vol00002
+     |            |           |               |                         |
+ +---+---+     +-----+      +---+      +------+------+            +-----+----+
+ |   |   |     |     |      |   |      |      |      |            |     |    |
+PG0 PG1 PG2   PG0  XATTR   PG0 PG1   DIRENT DIRENT DIRENT        R/W   R/O  Bak
+                     |                                            |
+                    PG0                                       +-------+
+                                                              |       |
+                                                            00001   00003
+                                                              |
+                                                          +---+---+
+                                                          |   |   |
+                                                         PG0 PG1 PG2
+</pre></div>
+</div>
+<p>上の例では、NFSとAFSの2つのnetfsがバックエンドとして使用されています。これらは異なるインデックス階層を持っています：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>NFSのプライマリインデックスはサーバーごとのインデックスを含みます。各サーバーインデックスはNFSファイルハンドルでインデックス化され、データファイルオブジェクトを取得します。各データファイルオブジェクトはページ配列を持つかもしれませんが、拡張属性やディレクトリエントリなどの子オブジェクトを持つこともできます。拡張属性オブジェクト自体もページ配列の内容を持ちます。</p></li>
+<li><p>AFSのプライマリインデックスはセルごとのインデックスを含みます。各セルインデックスは論理ボリュームごとのインデックスを含み、各ボリュームインデックスはそのボリュームの読み書き用、読み取り専用、バックアップミラー用の最大3つのインデックスを含みます。これらは vnode データファイルオブジェクトを含み、それぞれがページ配列を持つものです。</p></li>
+</ul>
+</div></blockquote>
+<p>最も上位のインデックスは、個々のnetfsがエントリを持つFS-Cacheマスターアイテムです。</p>
+<p>インデックスオブジェクトは、インデックス子を持つ場合を除き、複数のキャッシュに存在する可能性があります。非インデックスオブジェクトを持つインデックスは、1つのキャッシュにのみ存在すると仮定されます。</p>
+<p>FS-Cacheへのnetfs APIは以下の場所にあります：</p>
+<blockquote>
+<div><p><a class="reference internal" href="netfs-api.html"><span class="doc">FS-CacheネットワークファイルシステムAPI</span></a></p>
+</div></blockquote>
+<p>FS-CacheへのキャッシュバックエンドAPIは以下の場所にあります：</p>
+<blockquote>
+<div><p><a class="reference internal" href="backend-api.html"><span class="doc">FS-Cache キャッシュバックエンドAPI</span></a></p>
+</div></blockquote>
+<p>内部表現やオブジェクトステートマシンの説明は以下の場所にあります：</p>
+<blockquote>
+<div><p><a class="reference internal" href="object.html"><span class="doc">カーネル内キャッシュオブジェクトの表現と管理</span></a></p>
+</div></blockquote>
+</section>
+<section id="statistical-information">
+<h2>統計情報<a class="headerlink" href="#statistical-information" title="この見出しへのパーマリンク">¶</a></h2>
+<p>FS-Cacheが以下のオプションでコンパイルされた場合：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>CONFIG_FSCACHE_STATS=y
+CONFIG_FSCACHE_HISTOGRAM=y
+</pre></div>
+</div>
+<p>特定の統計情報を収集し、複数のprocファイルを通じて表示します。</p>
+<section id="proc-fs-fscache-stats">
+<h3>/proc/fs/fscache/stats<a class="headerlink" href="#proc-fs-fscache-stats" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>これはFS-Cache内で発生するイベントのカウントを示します：</p>
+</div></blockquote>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 18%"/>
+<col style="width: 9%"/>
+<col style="width: 72%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>CLASS</p></th>
+<th class="head"><p>EVENT</p></th>
+<th class="head"><p>MEANING</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td rowspan="3"><p>クッキー</p></td>
+<td><p>idx=N</p></td>
+<td><p>インデックスクッキーの割り当て数</p></td>
+</tr>
+<tr class="row-odd"><td><p>dat=N</p></td>
+<td><p>データストレージクッキーの割り当て数</p></td>
+</tr>
+<tr class="row-even"><td><p>spc=N</p></td>
+<td><p>特殊クッキーの割り当て数</p></td>
+</tr>
+<tr class="row-odd"><td rowspan="4"><p>オブジェクト</p></td>
+<td><p>alc=N</p></td>
+<td><p>オブジェクトの割り当て数</p></td>
+</tr>
+<tr class="row-even"><td><p>nal=N</p></td>
+<td><p>オブジェクト割り当て失敗数</p></td>
+</tr>
+<tr class="row-odd"><td><p>avl=N</p></td>
+<td><p>利用可能状態に到達したオブジェクト数</p></td>
+</tr>
+<tr class="row-even"><td><p>ded=N</p></td>
+<td><p>死状態に到達したオブジェクト数</p></td>
+</tr>
+<tr class="row-odd"><td rowspan="4"><p>ChkAux</p></td>
+<td><p>non=N</p></td>
+<td><p>整合性チェックを受けていないオブジェクト数</p></td>
+</tr>
+<tr class="row-even"><td><p>ok=N</p></td>
+<td><p>整合性チェックに通過したオブジェクト数</p></td>
+</tr>
+<tr class="row-odd"><td><p>upd=N</p></td>
+<td><p>コヒーレンシー データの更新が必要なオブジェクト数</p></td>
+</tr>
+<tr class="row-even"><td><p>obs=N</p></td>
+<td><p>無効化されたオブジェクト数</p></td>
+</tr>
+<tr class="row-odd"><td><p>ページ</p></td>
+<td><p>mrk=N unc=N</p></td>
+<td><p>キャッシュにマークされたページ数 無効なキャッシュ ページリクエスト数</p></td>
+</tr>
+<tr class="row-even"><td rowspan="6"><p>取得</p></td>
+<td><p>n=N</p></td>
+<td><p>取得クッキー リクエスト数</p></td>
+</tr>
+<tr class="row-odd"><td><p>nul=N</p></td>
+<td><p>NULL親を持つ取得リクエスト数</p></td>
+</tr>
+<tr class="row-even"><td><p>noc=N</p></td>
+<td><p>キャッシュが利用不可による取得リクエスト拒否数</p></td>
+</tr>
+<tr class="row-odd"><td><p>ok=N</p></td>
+<td><p>取得リクエスト成功数</p></td>
+</tr>
+<tr class="row-even"><td><p>nbf=N</p></td>
+<td><p>エラーによる取得リクエスト拒否数</p></td>
+</tr>
+<tr class="row-odd"><td><p>oom=N</p></td>
+<td><p>ENOMEMによる取得リクエスト失敗数</p></td>
+</tr>
+<tr class="row-even"><td rowspan="5"><p>検索</p></td>
+<td><p>n=N</p></td>
+<td><p>キャッシュバックエンドでの検索呼び出し数</p></td>
+</tr>
+<tr class="row-odd"><td><p>neg=N</p></td>
+<td><p>負の検索呼び出し数</p></td>
+</tr>
+<tr class="row-even"><td><p>pos=N</p></td>
+<td><p>正の検索呼び出し数</p></td>
+</tr>
+<tr class="row-odd"><td><p>crt=N</p></td>
+<td><p>検索によるオブジェクト作成数</p></td>
+</tr>
+<tr class="row-even"><td><p>tmo=N</p></td>
+<td><p>タイムアウトした検索リクエスト再キュー数</p></td>
+</tr>
+<tr class="row-odd"><td rowspan="3"><p>更新</p></td>
+<td><p>n=N</p></td>
+<td><p>更新クッキー リクエスト数</p></td>
+</tr>
+<tr class="row-even"><td><p>nul=N</p></td>
+<td><p>NULL親を持つ更新リクエスト数</p></td>
+</tr>
+<tr class="row-odd"><td><p>run=N</p></td>
+<td><p>CPU時間割当された更新リクエスト数</p></td>
+</tr>
+<tr class="row-even"><td rowspan="3"><p>リリーキング</p></td>
+<td><p>n=N</p></td>
+<td><p>リリーキングクッキー リクエスト数</p></td>
+</tr>
+<tr class="row-odd"><td><p>nul=N</p></td>
+<td><p>NULL親を持つリリーキングリクエスト数</p></td>
+</tr>
+<tr class="row-even"><td><p>wcr=N</p></td>
+<td><p>作成完了を待機したリリーキングリクエスト数</p></td>
+</tr>
+<tr class="row-odd"><td rowspan="5"><p>属性変更</p></td>
+<td><p>n=N</p></td>
+<td><p>属性変更リクエスト数</p></td>
+</tr>
+<tr class="row-even"><td><p>ok=N</p></td>
+<td><p>属性変更リクエストキュー数</p></td>
+</tr>
+<tr class="row-odd"><td><p>nbf=N</p></td>
+<td><p>属性変更リクエスト拒否 -ENOBUFS</p></td>
+</tr>
+<tr class="row-even"><td><p>oom=N</p></td>
+<td><p>属性変更失敗の数 -ENOMEM</p></td>
+</tr>
+<tr class="row-odd"><td><p>run=N</p></td>
+<td><p>属性変更操作の数（CPU時間使用量）</p></td>
+</tr>
+<tr class="row-even"><td rowspan="8"><p>割当</p></td>
+<td><p>n=N</p></td>
+<td><p>観測された割当リクエストの数</p></td>
+</tr>
+<tr class="row-odd"><td><p>ok=N</p></td>
+<td><p>成功した割当リクエストの数</p></td>
+</tr>
+<tr class="row-even"><td><p>wt=N</p></td>
+<td><p>lookup完了を待機した割当リクエストの数</p></td>
+</tr>
+<tr class="row-odd"><td><p>nbf=N</p></td>
+<td><p>割当リクエストが拒否された -ENOBUFS</p></td>
+</tr>
+<tr class="row-even"><td><p>int=N</p></td>
+<td><p>割当リクエストが中断された -ERESTARTSYS</p></td>
+</tr>
+<tr class="row-odd"><td><p>ops=N</p></td>
+<td><p>送信された割当リクエストの数</p></td>
+</tr>
+<tr class="row-even"><td><p>owt=N</p></td>
+<td><p>CPU時間待ちをした割当リクエストの数</p></td>
+</tr>
+<tr class="row-odd"><td><p>abt=N</p></td>
+<td><p>オブジェクト終了により中止された割当リクエストの数</p></td>
+</tr>
+<tr class="row-even"><td rowspan="10"><p>Retrvls</p></td>
+<td><p>n=N</p></td>
+<td><p>観測された取得（読み込み）リクエストの数</p></td>
+</tr>
+<tr class="row-odd"><td><p>ok=N</p></td>
+<td><p>成功した取得リクエストの数</p></td>
+</tr>
+<tr class="row-even"><td><p>wt=N</p></td>
+<td><p>lookup完了を待機した取得リクエストの数</p></td>
+</tr>
+<tr class="row-odd"><td><p>nod=N</p></td>
+<td><p>取得リクエストが -ENODATA で返された数</p></td>
+</tr>
+<tr class="row-even"><td><p>nbf=N</p></td>
+<td><p>取得リクエストが -ENOBUFS で拒否された数</p></td>
+</tr>
+<tr class="row-odd"><td><p>int=N</p></td>
+<td><p>取得リクエストが -ERESTARTSYS で中断された数</p></td>
+</tr>
+<tr class="row-even"><td><p>oom=N</p></td>
+<td><p>取得リクエストが -ENOMEM で失敗した数</p></td>
+</tr>
+<tr class="row-odd"><td><p>ops=N</p></td>
+<td><p>送信された取得リクエストの数</p></td>
+</tr>
+<tr class="row-even"><td><p>owt=N</p></td>
+<td><p>CPU時間待ちをした取得リクエストの数</p></td>
+</tr>
+<tr class="row-odd"><td><p>abt=N</p></td>
+<td><p>オブジェクト終了により中止された取得リクエストの数</p></td>
+</tr>
+<tr class="row-even"><td rowspan="10"><p>Stores</p></td>
+<td><p>n=N</p></td>
+<td><p>観測された保存（書き込み）リクエストの数</p></td>
+</tr>
+<tr class="row-odd"><td><p>ok=N</p></td>
+<td><p>成功した保存リクエストの数</p></td>
+</tr>
+<tr class="row-even"><td><p>agn=N</p></td>
+<td><p>既に保存待ち中のページの保存リクエストの数</p></td>
+</tr>
+<tr class="row-odd"><td><p>nbf=N</p></td>
+<td><p>保存リクエストが -ENOBUFS で拒否された数</p></td>
+</tr>
+<tr class="row-even"><td><p>oom=N</p></td>
+<td><p>保存リクエストが -ENOMEM で失敗した数</p></td>
+</tr>
+<tr class="row-odd"><td><p>ops=N</p></td>
+<td><p>送信された保存リクエストの数</p></td>
+</tr>
+<tr class="row-even"><td><p>run=N</p></td>
+<td><p>CPU時間使用された保存リクエストの数</p></td>
+</tr>
+<tr class="row-odd"><td><p>pgs=N</p></td>
+<td><p>保存処理に使用されたページ数</p></td>
+</tr>
+<tr class="row-even"><td><p>rxd=N</p></td>
+<td><p>トラッキングツリーから削除されたストアリクエストの数</p></td>
+</tr>
+<tr class="row-odd"><td><p>olm=N</p></td>
+<td><p>ストア制限を超えたストアリクエストの数</p></td>
+</tr>
+<tr class="row-even"><td rowspan="4"><p>VmScan</p></td>
+<td><p>nos=N</p></td>
+<td><p>待機中のストアがないページに対するリリースリクエストの数</p></td>
+</tr>
+<tr class="row-odd"><td><p>gon=N</p></td>
+<td><p>タイムロックが承認されたページに対するリリースリクエストの数</p></td>
+</tr>
+<tr class="row-even"><td><p>bsy=N</p></td>
+<td><p>進行中のストアにより無視されたリリースリクエストの数</p></td>
+</tr>
+<tr class="row-odd"><td><p>can=N</p></td>
+<td><p>リリースリクエストによりキャンセルされたページストアの数</p></td>
+</tr>
+<tr class="row-even"><td rowspan="9"><p>Ops</p></td>
+<td><p>pend=N</p></td>
+<td><p>非同期操作が保留キューに追加された回数</p></td>
+</tr>
+<tr class="row-odd"><td><p>run=N</p></td>
+<td><p>非同期操作にCPU時間割り当てられた回数</p></td>
+</tr>
+<tr class="row-even"><td><p>enq=N</p></td>
+<td><p>処理待ちのために非同期操作がキューイングされた回数</p></td>
+</tr>
+<tr class="row-odd"><td><p>can=N</p></td>
+<td><p>非同期操作がキャンセルされた回数</p></td>
+</tr>
+<tr class="row-even"><td><p>rej=N</p></td>
+<td><p>オブジェクト検索/作成失敗により拒否された非同期操作の数</p></td>
+</tr>
+<tr class="row-odd"><td><p>ini=N</p></td>
+<td><p>初期化された非同期操作の数</p></td>
+</tr>
+<tr class="row-even"><td><p>dfr=N</p></td>
+<td><p>遅延リリースのためにキューイングされた非同期操作の数</p></td>
+</tr>
+<tr class="row-odd"><td><p>rel=N</p></td>
+<td><p>リリースされた非同期操作の数（アイドル状態ではini=Nと等しくなるべき）</p></td>
+</tr>
+<tr class="row-even"><td><p>gc=N</p></td>
+<td><p>遅延リリース非同期操作がガベージコレクトされた回数</p></td>
+</tr>
+<tr class="row-odd"><td rowspan="16"><p>CacheOp</p></td>
+<td><p>alo=N</p></td>
+<td><p>進行中のalloc_object()キャッシュ操作の数</p></td>
+</tr>
+<tr class="row-even"><td><p>luo=N</p></td>
+<td><p>進行中のlookup_object()キャッシュ操作の数</p></td>
+</tr>
+<tr class="row-odd"><td><p>luc=N</p></td>
+<td><p>進行中のlookup_complete()キャッシュ操作の数</p></td>
+</tr>
+<tr class="row-even"><td><p>gro=N</p></td>
+<td><p>進行中のgrab_object()キャッシュ操作の数</p></td>
+</tr>
+<tr class="row-odd"><td><p>upo=N</p></td>
+<td><p>進行中のupdate_object()キャッシュ操作の数</p></td>
+</tr>
+<tr class="row-even"><td><p>dro=N</p></td>
+<td><p>進行中のdrop_object()キャッシュ操作の数</p></td>
+</tr>
+<tr class="row-odd"><td><p>pto=N</p></td>
+<td><p>進行中のput_object()キャッシュ操作の数</p></td>
+</tr>
+<tr class="row-even"><td><p>syn=N</p></td>
+<td><p>進行中のsync_cache()キャッシュ操作の数</p></td>
+</tr>
+<tr class="row-odd"><td><p>atc=N</p></td>
+<td><p>進行中のattr_changed()キャッシュ操作の数</p></td>
+</tr>
+<tr class="row-even"><td><p>rap=N</p></td>
+<td><p>進行中のread_or_alloc_page()キャッシュ操作の数</p></td>
+</tr>
+<tr class="row-odd"><td><p>ras=N</p></td>
+<td><p>進行中のread_or_alloc_pages()キャッシュ操作の数</p></td>
+</tr>
+<tr class="row-even"><td><p>alp=N</p></td>
+<td><p>進行中のallocate_page()キャッシュ操作の数</p></td>
+</tr>
+<tr class="row-odd"><td><p>als=N</p></td>
+<td><p>進行中のallocate_pages()キャッシュ操作の数</p></td>
+</tr>
+<tr class="row-even"><td><p>wrp=N</p></td>
+<td><p>進行中のwrite_page()キャッシュ操作の数</p></td>
+</tr>
+<tr class="row-odd"><td><p>ucp=N</p></td>
+<td><p>進行中のuncache_page()キャッシュ操作の数</p></td>
+</tr>
+<tr class="row-even"><td><p>dsp=N</p></td>
+<td><p>進行中のdissociate_pages()キャッシュ操作の数</p></td>
+</tr>
+<tr class="row-odd"><td rowspan="4"><p>CacheEv</p></td>
+<td><p>nsp=N</p></td>
+<td><p>空間不足により拒否されたオブジェクトの検索/作成数</p></td>
+</tr>
+<tr class="row-even"><td><p>stl=N</p></td>
+<td><p>破棄された古くなったオブジェクト数</p></td>
+</tr>
+<tr class="row-odd"><td><p>rtr=N</p></td>
+<td><p>解放時に廃止されたオブジェクト数</p></td>
+</tr>
+<tr class="row-even"><td><p>cul=N</p></td>
+<td><p>除去されたオブジェクト数</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="proc-fs-fscache-histogram">
+<h3>/proc/fs/fscache/histogram<a class="headerlink" href="#proc-fs-fscache-histogram" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>cat /proc/fs/fscache/histogram
+JIFS  SECS  OBJ INST  OP RUNS   OBJ RUNS  RETRV DLY RETRIEVLS
+===== ===== ========= ========= ========= ========= =========
+</pre></div>
+</div>
+<p>これは、0 jiffiesからHZ-1 jiffiesまでの時間ごとのタスクの実行にかかった時間の分解を示しています。列は以下の通りです：</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 14%"/>
+<col style="width: 86%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>列</p></th>
+<th class="head"><p>時間測定</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>OBJ INST</p></td>
+<td><p>オブジェクトのインスタンス化にかかる時間</p></td>
+</tr>
+<tr class="row-odd"><td><p>OP RUNS</p></td>
+<td><p>操作処理にかかる時間</p></td>
+</tr>
+<tr class="row-even"><td><p>OBJ RUNS</p></td>
+<td><p>オブジェクトイベント処理にかかる時間</p></td>
+</tr>
+<tr class="row-odd"><td><p>RETRV DLY</p></td>
+<td><p>読み込み要求から検索完了までの時間</p></td>
+</tr>
+<tr class="row-even"><td><p>RETRIEVLS</p></td>
+<td><p>リトリーブの開始から終了までの時間</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>各行は特定の時間範囲を要したイベント数を示します。各ステップは1 jiffy単位です。JIFS列はカバーするjiffy範囲を、SECSフィールドはそれに相当する秒数を示します。</p>
+</div></blockquote>
+</section>
+</section>
+<section id="object-list">
+<h2>オブジェクト一覧<a class="headerlink" href="#object-list" title="この見出しへのパーマリンク">¶</a></h2>
+<p>CONFIG_FSCACHE_OBJECT_LISTが有効な場合、FS-Cache機能は現在割り当てられているすべてのオブジェクトのリストを保持し、以下の方法で確認できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/proc/fs/fscache/objects
+</pre></div>
+</div>
+<p>これは以下のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>[root@andromeda ~]# head /proc/fs/fscache/objects
+OBJECT   PARENT   STAT CHLDN OPS OOP IPR EX READS EM EV F S | NETFS_COOKIE_DEF TY FL NETFS_DATA       OBJECT_KEY, AUX_DATA
+======== ======== ==== ===== === === === == ===== == == = = | ================ == == ================ ================
+   17e4b        2 ACTV     0   0   0   0  0     0 7b  4 0 0 | NFS.fh           DT  0 ffff88001dd82820 010006017edcf8bbc93b43298fdfbe71e50b57b13a172c0117f38472, e567634700000000000000000000000063f2404a000000000000000000000000c9030000000000000000000063f2404a
+   1693a        2 ACTV     0   0   0   0  0     0 7b  4 0 0 | NFS.fh           DT  0 ffff88002db23380 010006017edcf8bbc93b43298fdfbe71e50b57b1e0162c01a2df0ea6, 420ebc4a000000000000000000000000420ebc4a0000000000000000000000000e1801000000000000000000420ebc4a
+</pre></div>
+</div>
+<p>「|」の前の最初の列はオブジェクトを説明しています:</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 10%"/>
+<col style="width: 90%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>列</p></th>
+<th class="head"><p>DESCRIPTION</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>オブジェクト</p></td>
+<td><p>オブジェクトのデバッグID（一部のデバッグメッセージではOBJ%xとして表示されます）</p></td>
+</tr>
+<tr class="row-odd"><td><p>PARENT</p></td>
+<td><p>親オブジェクトのデバッグID</p></td>
+</tr>
+<tr class="row-even"><td><p>STAT</p></td>
+<td><p>オブジェクトの状態</p></td>
+</tr>
+<tr class="row-odd"><td><p>CHLDN</p></td>
+<td><p>このオブジェクトの子オブジェクトの数</p></td>
+</tr>
+<tr class="row-even"><td><p>OPS</p></td>
+<td><p>このオブジェクトに待機中の操作の数</p></td>
+</tr>
+<tr class="row-odd"><td><p>OOP</p></td>
+<td><p>待機中の子オブジェクト管理操作の数</p></td>
+</tr>
+<tr class="row-even"><td><p>IPR</p></td>
+<td></td>
+</tr>
+<tr class="row-odd"><td><p>EX</p></td>
+<td><p>待機中の排他操作の数</p></td>
+</tr>
+<tr class="row-even"><td><p>READS</p></td>
+<td><p>待機中の読み取り操作の数</p></td>
+</tr>
+<tr class="row-odd"><td><p>EM</p></td>
+<td><p>オブジェクトのイベントマスク</p></td>
+</tr>
+<tr class="row-even"><td><p>EV</p></td>
+<td><p>このオブジェクトで発生したイベント</p></td>
+</tr>
+<tr class="row-odd"><td><p>F</p></td>
+<td><p>オブジェクトフラグ</p></td>
+</tr>
+<tr class="row-even"><td><p>S</p></td>
+<td><p>オブジェクトワークアイテムのビジー状態マスク（1:待機中 2:実行中）</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>そして、2番目の列はオブジェクトのクッキー（存在する場合）を説明しています:</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 23%"/>
+<col style="width: 77%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>列</p></th>
+<th class="head"><p>DESCRIPTION</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>NETFS_COOKIE_DEF</p></td>
+<td><p>netfsクッキー定義の名前</p></td>
+</tr>
+<tr class="row-odd"><td><p>TY</p></td>
+<td><p>クッキーのタイプ（IX - インデックス、DT - データ、hex - 特殊）</p></td>
+</tr>
+<tr class="row-even"><td><p>FL</p></td>
+<td><p>クッキーのフラグ</p></td>
+</tr>
+<tr class="row-odd"><td><p>NETFS_DATA</p></td>
+<td><p>クッキーに保存されたnetfsのプライベートデータ</p></td>
+</tr>
+<tr class="row-even"><td><p>OBJECT_KEY</p></td>
+<td><p>オブジェクトキー } 1列、区切りはカンマ</p></td>
+</tr>
+<tr class="row-odd"><td><p>AUX_DATA</p></td>
+<td><p>オブジェクトの補助データの存在は設定可能です</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>表示されるデータは、ファイルを表示する前に適切なキーリングにキーをアタッチしてフィルタリングできます。例えば：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>keyctl add user fscache:objlist &lt;restrictions&gt; @s
+</pre></div>
+</div>
+<p>&lt;restrictions&gt; は以下の文字から選択します：</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 3%"/>
+<col style="width: 97%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>K</p></td>
+<td><p>オブジェクトキーのヘックスダンプを表示 (指定されていない場合は表示しない)</p></td>
+</tr>
+<tr class="row-even"><td><p>A</p></td>
+<td><p>オブジェクト補助データのヘックスダンプを表示 (指定されていない場合は表示しない)</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>以下のペアリングされた文字も選択可能です：</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 3%"/>
+<col style="width: 97%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>C</p></td>
+<td><p>クッキーを持つオブジェクトを表示</p></td>
+</tr>
+<tr class="row-even"><td><p>c</p></td>
+<td><p>クッキーを持たないオブジェクトを表示</p></td>
+</tr>
+<tr class="row-odd"><td><p>B</p></td>
+<td><p>ビジー状態のオブジェクトを表示</p></td>
+</tr>
+<tr class="row-even"><td><p>b</p></td>
+<td><p>ビジー状態でないオブジェクトを表示</p></td>
+</tr>
+<tr class="row-odd"><td><p>W</p></td>
+<td><p>待機中の書き込みを持つオブジェクトを表示</p></td>
+</tr>
+<tr class="row-even"><td><p>w</p></td>
+<td><p>待機中の書き込みを持たないオブジェクトを表示</p></td>
+</tr>
+<tr class="row-odd"><td><p>R</p></td>
+<td><p>待受中の読み込みを持つオブジェクトを表示</p></td>
+</tr>
+<tr class="row-even"><td><p>r</p></td>
+<td><p>待受中の読み込みを持たないオブジェクトを表示</p></td>
+</tr>
+<tr class="row-odd"><td><p>S</p></td>
+<td><p>キューに待機中の作業を持つオブジェクトを表示</p></td>
+</tr>
+<tr class="row-even"><td><p>s</p></td>
+<td><p>キューに待機中の作業を持たないオブジェクトを表示</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>文字ペアのどちらも指定されていない場合、両方を含むとみなされます。例えば：</p>
+<blockquote>
+<div><p>keyctl add user fscache:objlist KB @s</p>
+</div></blockquote>
+<p>ビジー状態のオブジェクトを表示し、オブジェクトキーを一覧表示しますが、補助データのダンプは行いません。また「CcWwRrSs」も含意されますが、「B」が指定されているため、「b」は含意されません。</p>
+<p>デフォルトではすべてのオブジェクトとすべてのフィールドが表示されます。</p>
+</section>
+<section id="debugging">
+<h2>デバッグ<a class="headerlink" href="#debugging" title="この見出しへのパーマリンク">¶</a></h2>
+<p>CONFIG_FSCACHE_DEBUG が有効な場合、FS-Cache 機能の実行時デバッグを有効にするには、以下の値を調整します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/module/fscache/parameters/debug
+</pre></div>
+</div>
+<p>これは有効にするデバッグストリームのビットマスクです：</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 10%"/>
+<col style="width: 10%"/>
+<col style="width: 46%"/>
+<col style="width: 34%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>ビット</p></th>
+<th class="head"><p>VALUE</p></th>
+<th class="head"><p>ストリーム</p></th>
+<th class="head"><p>ポイント</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>0</p></td>
+<td><p>1</p></td>
+<td><p>キャッシュ管理</p></td>
+<td><p>関数エントリートレース</p></td>
+</tr>
+<tr class="row-odd"><td><p>1</p></td>
+<td><p>2</p></td>
+<td></td>
+<td><p>関数エクスイットトレース</p></td>
+</tr>
+<tr class="row-even"><td><p>2</p></td>
+<td><p>4</p></td>
+<td></td>
+<td><p>一般</p></td>
+</tr>
+<tr class="row-odd"><td><p>3</p></td>
+<td><p>8</p></td>
+<td><p>クッキー管理</p></td>
+<td><p>関数エントリートレース</p></td>
+</tr>
+<tr class="row-even"><td><p>4</p></td>
+<td><p>16</p></td>
+<td></td>
+<td><p>関数エクスイットトレース</p></td>
+</tr>
+<tr class="row-odd"><td><p>5</p></td>
+<td><p>32</p></td>
+<td></td>
+<td><p>一般</p></td>
+</tr>
+<tr class="row-even"><td><p>6</p></td>
+<td><p>64</p></td>
+<td><p>ページ処理</p></td>
+<td><p>関数エントリートレース</p></td>
+</tr>
+<tr class="row-odd"><td><p>7</p></td>
+<td><p>128</p></td>
+<td></td>
+<td><p>関数エクスイットトレース</p></td>
+</tr>
+<tr class="row-even"><td><p>8</p></td>
+<td><p>256</p></td>
+<td></td>
+<td><p>一般</p></td>
+</tr>
+<tr class="row-odd"><td><p>9</p></td>
+<td><p>512</p></td>
+<td><p>操作管理</p></td>
+<td><p>関数エントリートレース</p></td>
+</tr>
+<tr class="row-even"><td><p>10</p></td>
+<td><p>1024</p></td>
+<td></td>
+<td><p>関数エクスイットトレース</p></td>
+</tr>
+<tr class="row-odd"><td><p>11</p></td>
+<td><p>2048</p></td>
+<td></td>
+<td><p>一般</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>適切な値をORで結合し、結果を制御ファイルに書き込みます。例えば：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo $((1|8|64)) &gt;/sys/module/fscache/parameters/debug
+</pre></div>
+</div>
+<p>すべての関数エントリーデバッグを有効にします。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxカーネル内のファイルシステム</a><ul class="current">
+<li class="toctree-l2 current"><a class="reference internal" href="../index.html#core-vfs-documentation">コアVFSドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../index.html#filesystem-support-layers">ファイルシステムサポートレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../index.html#filesystems">ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxカーネル内のファイルシステム</a><ul>
+<li><a href="index.html">Filesystem Caching</a><ul>
+<li>前へ: <a href="index.html" title="前章">Filesystem Caching</a></li>
+<li>次へ: <a href="object.html" title="次章">カーネル内キャッシュオブジェクトの表現と管理</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/filesystems/caching/fscache.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

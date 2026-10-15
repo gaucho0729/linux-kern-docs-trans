@@ -1,0 +1,276 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>RPC Cache — The Linux Kernel documentation</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="rpc-server-gss.html" rel="next" title="カーネルRPCサーバー用rpcsec_gssサポート"/>
+<link href="pnfs.html" rel="prev" title="pnfsにおける参照カウント"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="rpc-cache">
+<h1>RPCキャッシュ<a class="headerlink" href="#rpc-cache" title="この見出しへのパーマリンク">¶</a></h1>
+<p>このドキュメントでは、特にNFS認証に使用されるsunrpcレイヤー内のキャッシュメカニズムについて簡潔に紹介します。</p>
+<section id="caches">
+<h2>キャッシュ<a class="headerlink" href="#caches" title="この見出しへのパーマリンク">¶</a></h2>
+<p>キャッシュは古いエクスポートテーブルの代わりに使用され、幅広い値をキャッシュする機能を提供します。</p>
+<p>構造は似ていますが、内容や用途が大きく異なるキャッシュがいくつかあります。これらのキャッシュを管理するための共通コードが存在します。</p>
+<p>必要となるキャッシュの例としては、以下のものが挙げられます：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>IPアドレスからクライアント名へのマッピング</p></li>
+<li><p>クライアント名とファイルシステムからエクスポートオプションへのマッピング</p></li>
+<li><p>UIDからGIDの一覧へのマッピング（NFSの16つのGID制限を回避するため）</p></li>
+<li><p>ローカルUID/GIDとリモートUID/GIDの間のマッピング（UID割当が統一されていないサイト向け）</p></li>
+<li><p>ネットワーク識別子から公開鍵へのマッピング（暗号認証用）</p></li>
+</ul>
+</div></blockquote>
+<p>共通コードは以下の機能を提供します：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>正しいロックを用いた一般的なキャッシュ検索</p></li>
+<li><p>「NEGATIVE」のエントリもサポート</p></li>
+<li><p>キャッシュ項目にEXPIRED時間の設定、期限切れ後の削除、使用状態がなくなった後の削除</p></li>
+<li><p>ユーザー空間へのリクエストを介したキャッシュエントリの補完</p></li>
+<li><p>ユーザー空間がキャッシュに直接エントリを設定できるようにする</p></li>
+<li><p>未完成なキャッシュエントリに依存するRPCリクエストを一時的に延期し、キャッシュエントリが完成したタイミングで再実行</p></li>
+<li><p>期限切れとなった古いエントリを削除する</p></li>
+</ul>
+</div></blockquote>
+<section id="creating-a-cache">
+<h3>キャッシュの作成<a class="headerlink" href="#creating-a-cache" title="この見出しへのパーマリンク">¶</a></h3>
+<ul>
+<li><p>キャッシュには保存するためのデータが必要です。これは、struct cache_headを要素として含む構造体定義の形式です（通常は最初の要素）。また、キーといくつかのコンテンツも含まれます。各キャッシュ要素は参照カウントされ、キャッシュ管理に使用する期限や更新時間も保持します。</p></li>
+<li><p>キャッシュには「cache_detail」構造体が必要です。これはハッシュテーブル、キャッシュ管理のパラメータ、および特定のキャッシュ項目を操作する方法を記述します。</p>
+<p>操作は以下の通りです：</p>
+<blockquote>
+<div><dl class="simple">
+<dt>struct cache_head *alloc(void)</dt><dd><p>これは適切なメモリを割り当て、構造体内のcache_detailへのポインタを返します</p>
+</dd>
+<dt>void cache_put(struct kref *)</dt><dd><p>項目への最後の参照が解除されたときに呼ばれます。渡されるポインタはcache_head内の「ref」フィールドです。cache_putは「cache_init」で作成された参照を解放し、CACHE_VALIDが設定されている場合は「cache_update」で作成された参照も解放します。その後、「alloc」で割り当てたメモリを解放します。</p>
+</dd>
+<dt>int match(struct cache_head *orig, struct cache_head *new)</dt><dd><p>2つの構造体のキーが一致するかテストします。一致する場合は1を、一致しない場合は0を返します。</p>
+</dd>
+<dt>void init(struct cache_head *orig, struct cache_head *new)</dt><dd><p>「new」の「key」フィールドを「orig」から設定します。これは共有オブジェクトへの参照を取る可能性があります。</p>
+</dd>
+<dt>void update(struct cache_head *orig, struct cache_head *new)</dt><dd><p>「new」の「content」フィールドを「orig」から設定します。</p>
+</dd>
+<dt>int cache_show(struct seq_file *m, struct cache_detail *cd, struct cache_head *h)</dt><dd><p>オプションです。キャッシュの内容をリスト表示する/procファイルを提供するために使用します。1項目を1行で表示する必要があります。</p>
+</dd>
+<dt>int cache_request(struct cache_detail *cd, struct cache_head *h, char **bpp, int *blen)</dt><dd><p>ユーザー空間に送信するリクエストをフォーマットします。*bppは*blenサイズのバッファです。bppは符号化されたメッセージを進めていくことで移動し、*blenは残りの空き容量を示すように減らします。成功時は0を、空き容量が不足またはその他の問題時は負数を返します。</p>
+</dd>
+<dt>int cache_parse(struct cache_detail *cd, char *buf, int len)</dt><dd><p>ユーザー空間からのメッセージが到着し、キャッシュ項目を埋めるために使用されます。このメッセージは「buf」に長さ「len」で格納されています。「buf」を解析し、sunrpc_cache_lookup_rcuを使用してキャッシュ内の項目を検索し、sunrpc_cache_updateで項目を更新します。</p>
+</dd>
+</dl>
+</div></blockquote>
+</li>
+<li><p>キャッシュはcache_register()を使用して登録する必要があります。これは定期的に古いデータを削除するためのキャッシュリストに追加されます。</p></li>
+</ul>
+</section>
+<section id="using-a-cache">
+<h3>キャッシュの使用<a class="headerlink" href="#using-a-cache" title="この見出しへのパーマリンク">¶</a></h3>
+<p>キャッシュ内の値を検索するには、サンプル項目の「key」フィールドを埋めたキャッシュ_headへのポインタを渡してsunrpc_cache_lookup_rcuを呼び出します。このポインタは-&gt;matchを介してターゲット項目を識別します。項目が見つからない場合は、新しい項目を作成してキャッシュに追加し、有効データとしてマークされません。</p>
+<p>返却された項目は通常、cache_checkに渡されます。cache_checkはデータが有効かどうかを確認し、必要に応じてアップコールを実行します。項目が無効またはアップコールが必要ですが実行不可能な場合は-ENOENTを、アップコールが待機中の場合は-EAGAINを、データが有効な場合は0を返します。</p>
+<p>cache_checkには「struct cache_req*」を渡すことができます。この構造体は通常、実際のリクエストに埋め込まれており、deferred copy（struct cache_deferred_req）を作成するために使用されます。見つかったキャッシュ項目が最新でないが、ユーザー空間が情報を提供する可能性があると推測される場合に実行されます。キャッシュ項目が有効になるとき、deferred copyされたリクエストは-&gt;revisitで再検討されます。このメソッドがリクエストの処理を再スケジュールするものと期待されます。</p>
+<p>sunrpc_cache_lookup_rcu によって返された値は、sunrpc_cache_update に渡してアイテムの内容を設定することも可能です。この際、内容を保持するアイテムの2番目の引数を渡します。_lookup で見つけたアイテムが有効なデータを保持している場合、そのデータは破棄され新しいアイテムが作成されます。これにより、アイテムの内容が検査中に変化する心配をユーザーから完全に排除できます。_lookup で見つけたアイテムが有効なデータを保持していない場合、その内容がコピーされ CACHE_VALID が設定されます。</p>
+</section>
+<section id="populating-a-cache">
+<h3>キャッシュの初期化<a class="headerlink" href="#populating-a-cache" title="この見出しへのパーマリンク">¶</a></h3>
+<p>各キャッシュは名前を持ち、キャッシュが登録される際には /proc/net/rpc にその名前のディレクトリが作成されます。</p>
+<p>このディレクトリには「channel」というファイルが含まれており、これはカーネルとユーザースペース間でキャッシュを初期化するための通信チャネルです。このディレクトリは今後、キャッシュとやり取りするための他のファイルも含む可能性があります。</p>
+<p>「channel」はデータグラムソケットと少し似た仕組みで動作します。各「write」はキャッシュに全体として渡され、パースおよび解釈されます。各キャッシュは「write」リクエストを異なる方法で処理できますが、メッセージに含まれるべき要素は以下の通りです：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>キー</p></li>
+<li><p>有効期限</p></li>
+<li><p>コンテンツ。</p></li>
+</ul>
+</div></blockquote>
+<p>このようにして、キャッシュ内の指定されたキーを持つアイテムが作成または更新され、指定されたコンテンツが設定され、そのアイテムの有効期限が設定される予定です。</p>
+<p>チャネルからの読み取りは少し複雑です。キャッシュの検索が失敗した場合、または検索が成功したがそのエントリがすぐに期限切れになる可能性がある場合、ユーザースペースからそのキャッシュアイテムを更新するリクエストが生成されます。これらのリクエストはチャネルファイルに表示されます。</p>
+<p>連続する読み取りは連続するリクエストを返します。返すリクエストがなくなった場合、read は EOF を返しますが、read 用の select または poll は次のリクエストが追加されるのを待つまでブロックします。</p>
+<p>そのため、ユーザースペースのアシスタントは以下のような動作をします：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>open the channel.
+  select for readable
+  read a request
+  write a response
+loop.
+</pre></div>
+</div>
+<p>もし終了して再起動が必要になった場合、未処理のリクエストはファイルに依然として表示され、新しいアシスタントインスタンスによって読み取られます。</p>
+<p>各キャッシュは「cache_parse」メソッドを定義すべきで、これはユーザースペースから書かれたメッセージを処理します。エラーを返す（これは write システムコールに逆流します）か 0 を返す必要があります。</p>
+<p>各キャッシュはまた「cache_request」メソッドも定義すべきで、これはキャッシュアイテムを提供されたバッファにエンコードします。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>チャンネルにアクティブなリーダーがいない場合、かつ60秒以上アクティブなリーダーがいない場合、さらに多くのリクエストはチャンネルに追加されず、有効なエントリが見つからない検索は失敗します。これは一部の後方互換性のためです：以前のnfsエクスポートテーブルが優先されるとされており、失敗した検索は明確な「no（否定）」を意味しました。</p>
+</div>
+</section>
+<section id="request-response-format">
+<h3>リクエスト/レスポンス形式<a class="headerlink" href="#request-response-format" title="この見出しへのパーマリンク">¶</a></h3>
+<p>各キャッシュはチャンネルを介したリクエストとレスポンスの形式を自由に選択できますが、以下の形式が推奨され、サポート用ルーチンが提供されています：各リクエストまたはレスポンスレコードは印刷可能なASCII文字で構成され、末尾に正確に1つの改行文字を含める必要があります。レコード内のフィールドはスペースで区切られ、通常は1つのスペースです。フィールド内にスペース、改行、またはヌル文字が必要な場合は、それらを引用符で囲む必要があります。2つのメカニズムが利用可能です：</p>
+<ul class="simple">
+<li><p>フィールドが「x」で始まる場合、そのフィールドには偶数の16進数の桁が含まれなければなりません。これらの桁のペアは、フィールド内のバイトを表します。</p></li>
+<li><p>それ以外の場合、フィールド内に「o」が含まれる場合は、その後ろに3桁の8進数が続く必要があります。これはバイトのコードを表します。他の文字は自身のまま扱われます。少なくともスペース、改行、ヌル、および引用符はこのように引用する必要があります。</p></li>
+</ul>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxカーネル内のファイルシステム</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../index.html#core-vfs-documentation">コアVFSドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../index.html#filesystem-support-layers">ファイルシステムサポートレイヤー</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="../index.html#filesystems">ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxカーネル内のファイルシステム</a><ul>
+<li><a href="index.html">NFS</a><ul>
+<li>前へ: <a href="pnfs.html" title="前章">pnfsにおける参照カウント</a></li>
+<li>次へ: <a href="rpc-server-gss.html" title="次章">カーネルRPCサーバー用rpcsec_gssサポート</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/filesystems/nfs/rpc-cache.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

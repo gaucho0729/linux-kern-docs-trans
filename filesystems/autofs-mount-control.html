@@ -1,0 +1,324 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>autofs カーネルモジュールの miscellaneous デバイス制御操作 — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="befs.html" rel="next" title="Linux用のBeOSファイルシステム"/>
+<link href="autofs.html" rel="prev" title="autofs - その動作方法"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="miscellaneous-device-control-operations-for-the-autofs-kernel-module">
+<h1>autofs カーネルモジュールの miscellaneous デバイス制御操作<a class="headerlink" href="#miscellaneous-device-control-operations-for-the-autofs-kernel-module" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="the-problem">
+<h2>問題<a class="headerlink" href="#the-problem" title="この見出しへのパーマリンク">¶</a></h2>
+<p>autofs のアクティブな再起動に問題があります（つまり、busyなマウントがある状態で autofs を再起動する場合）。</p>
+<p>通常の運用では、autofs は管理しているディレクトリにファイルディスクリプタを開いており、制御操作を実行できるようにしています。ファイルディスクリプタを使用することで、ioctl 操作はスーパーブロックに保存されている autofs 特有の情報をアクセスできます。操作例としては、autofs マウントを猫の状態に設定する、期限切れタイムアウトを設定する、期限切れチェックを要求するなどがあります。以下で説明するように、特定の autofs トリガーによるマウントは、autofs マウント自体を覆うことがあります。そのため、既にファイルディスクリプタを開いていない場合、open(2) を使ってこれらの操作用のファイルディスクリプタを取得できなくなります。</p>
+<p>現在、autofs は「umount -l」（ラズ_umount）を使用してアクティブなマウントを再起動時にクリアしています。ラズ_umount はほとんどのケースで動作しますが、マウントツリーを上位にたどってパスを構築する必要がある場合（例: getcwd(2) や /proc/&lt;pid&gt;/cwd）、パス構築の起点がマウントツリーから分離されてしまったため、動作しなくなります。</p>
+<p>autofs の本質的な問題は、既存のマウントに再接続できないことです。直感的には、autofs ファイルシステムのリマウント機能を追加すれば解決すると考えられますが、実際にはそれが不可能です。これは、autofs 直接マウントと「オンデマンドマウントと期限切れ」のネストマウントツリーの実装が、マウントトリガーディレクトリの dentry 上に直接マウントされるためです。</p>
+<p>自動マウントマップには、直接マウント（カーネルモジュールのソースコードでは「オフセット」と呼ばれる第三のタイプがあり、これは単なる直接マウントの隠し形です）と間接マウントの2種類があります。</p>
+<p>直接マウントと間接マウントのエントリを持つマスターマップの例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/-      /etc/auto.direct
+/test   /etc/auto.indirect
+</pre></div>
+</div>
+<p>対応するマップファイル:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/etc/auto.direct:
+
+/automount/dparse/g6  budgie:/autofs/export1
+/automount/dparse/g1  shark:/autofs/export1
+and so on.
+</pre></div>
+</div>
+<p>/etc/auto.indirect:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>g1    shark:/autofs/export1
+g6    budgie:/autofs/export1
+and so on.
+</pre></div>
+</div>
+<p>上記の間接マップでは、/test に autofs ファイルシステムがマウントされ、各サブディレクトリキーごとに inode ロックアップ操作によってマウントがトリガーされます。たとえば、shark:/autofs/export1 が /test/g1 にマウントされるなどします。</p>
+<p>直接マウントの処理方法は、各フルパス（例：/automount/dparse/g1）に対してautofsマウントを実行し、それをマウントトリガーとして使用することです。そのため、パスをたどる際にshark:/autofs/export1をこのマウントポイントの上にマウントします。これらのパスは常にディレクトリであるため、follow_link inode操作を使用してマウントをトリガーできます。</p>
+<p>ただし、直接マップと間接マップの各エントリはオフセットを持つ場合があり（これによりマルチマウントマップエントリになります）。</p>
+<p>例えば、間接マウントマップエントリは以下のようにもなり得ます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>g1  \
+/        shark:/autofs/export5/testing/test \
+/s1      shark:/autofs/export/testing/test/s1 \
+/s2      shark:/autofs/export5/testing/test/s2 \
+/s1/ss1  shark:/autofs/export1 \
+/s2/ss2  shark:/autofs/export2
+</pre></div>
+</div>
+<p>同様に、直接マウントマップエントリも以下のようにもなり得ます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/automount/dparse/g1 \
+    /       shark:/autofs/export5/testing/test \
+    /s1     shark:/autofs/export/testing/test/s1 \
+    /s2     shark:/autofs/export5/testing/test/s2 \
+    /s1/ss1 shark:/autofs/export2 \
+    /s2/ss2 shark:/autofs/export2
+</pre></div>
+</div>
+<p>autofsバージョン4の問題点は、オフセットが多数あるエントリをマウントする際、ネストが含まれる可能性があるにもかかわらず、すべてのオフセットを単位としてマウントし、アンマウントする必要がありました。これは本質的に問題ではありませんが、マップエントリに多数のオフセットを持つユーザーにとっては問題となりました。このメカニズムはよく知られた「hosts」マップで使用されており、2.4ではマウント数が枯渇する場合やプライベートポート数が枯渇するケースが確認されています。</p>
+<p>バージョン5では、オフセットのツリーを下るたびにマウントし、同様に期限切れを処理することで上述の問題を解決しました。実装にはより詳細な処理がありますが、問題説明のためには必要ありません。重要な点は、これらのオフセットが直接マウントと同じメカニズムで実装されているため、マウントポイントはマウントによって覆われることができるということです。</p>
+<p>現在のautofs実装では、マウントポイントでioctlファイルディスクリプタを開き、制御操作を行います。このディスクリプタの参照は、マウントが使用中のかどうかを判定するチェックでカウントされ、またマウントスーパーブロックに保持されているautofsファイルシステム情報にアクセスするために使用されます。そのため、ファイルハンドルの使用は維持する必要があります。</p>
+</section>
+<section id="the-solution">
+<h2>解決策<a class="headerlink" href="#the-solution" title="この見出しへのパーマリンク">¶</a></h2>
+<p>既存の直接、間接、オフセットマウントを維持しながらautofsを再開できるようにするには、これらの潜在的に覆われているautofsマウントポイントにファイルハンドルを取得できる必要があります。単なる孤立した操作を実装するのではなく、既存のioctlインターフェースを再実装し、新しい操作を追加してこの機能を提供することに決定しました。</p>
+<p>さらに、ビジーなマウントを持つマウントツリーを再構築できるようにするため、マウントをトリガーした最後のユーザーのuidとgidが必要です。これらはautofsマップでマクロ置換変数として使用できるため、マウントリクエスト時に記録され、取得するための操作が追加されました。</p>
+<p>制御インターフェースを再実装する際、既存インターフェースのいくつかの問題も修正されました。まず、マウントまたは期限切れ操作が完了した際、ステータスは「send ready」または「send fail」操作を通じてカーネルに返されます。ioctlインターフェースの「send fail」操作は常にENOENTのみを送信可能だったため、再実装によりユーザー空間から実際のステータスを送信できるようになりました。また、非常に大きなマップを使用しているユーザーにとって、マウントが存在するかを確認する操作はコストが高くなります。通常これは/proc/mountsをスキャンする形となり、頻繁に行われるためマウントテーブルに多くのエントリがある場合、大きなオーバーヘッドを引き起こします。マウントポイントのdentry（カバー済みまたは未カバー）のマウントステータスを照会する操作も追加されました。</p>
+<p>現在のカーネル開発ポリシーはioctlメカニズムの使用を避けることを推奨しており、Netlinkなどのシステムを優先します。このシステムを用いた実装は評価のために試みられましたが、このケースでは不十分でした。代替としてジェネリックNetlinkシステムが使用されました。raw Netlinkは複雑さを大幅に増加させるためです。ジェネリックNetlinkシステムは一般的なケースのioctl機能には優れた解決策ですが、完全な代替にはならない可能性があります。その主な目的はメッセージバスの実装であり、特定のioctl置き換えとしての用途ではないからです。この制限を回避することは可能ですが、ある懸念によりこの選択肢は採用されませんでした。それは、autofsの期限切れ処理がデーモン内で極めて複雑になったためです。umount候補が列挙されるのは、ほぼ他の理由なく「期限切れioctlを呼び出す回数をカウント」するためです。これはマウントテーブルのスキャンを伴うため、大規模なマップを持つユーザーにとって大きなオーバーヘッドとなっています。この問題を改善するには、以前のように期限切れリクエストがマウント（ファイルハンドル）に発行された際、デーモンに連続して呼び出しを行い、もうマウントをumountできなくなった時点で適切なステータスをデーモンに返すのが最善です。現在は1つのマウントごとに期限切れ処理を行っています。ジェネリックNetlinkの実装は、メッセージバスアーキテクチャの要件により、今後の開発でこの可能性を排除してしまうためです。</p>
+</section>
+<section id="autofs-miscellaneous-device-mount-control-interface">
+<h2>autofs その他のデバイス マウント制御インターフェース<a class="headerlink" href="#autofs-miscellaneous-device-mount-control-interface" title="この見出しへのパーマリンク">¶</a></h2>
+<p>制御インターフェースは通常 /dev/autofs のデバイスノードを開きます。</p>
+<p>すべてのioctlは、必要なパラメータ情報を渡すための共通の構造体を使用し、操作結果を返します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct autofs_dev_ioctl {
+        __u32 ver_major;
+        __u32 ver_minor;
+        __u32 size;             /* total size of data passed in
+                                * including this struct */
+        __s32 ioctlfd;          /* automount command fd */
+
+        /* Command parameters */
+        union {
+                struct args_protover                protover;
+                struct args_protosubver             protosubver;
+                struct args_openmount               openmount;
+                struct args_ready           ready;
+                struct args_fail            fail;
+                struct args_setpipefd               setpipefd;
+                struct args_timeout         timeout;
+                struct args_requester               requester;
+                struct args_expire          expire;
+                struct args_askumount               askumount;
+                struct args_ismountpoint    ismountpoint;
+        };
+
+        char path[0];
+};
+</pre></div>
+</div>
+<p>ioctlfdフィールドは、autofsマウントポイントのマウントポイントファイル記述子です。openコールによって返され、すべてのコール（指定されたパスがマウントポイントであるかどうかのチェックを除く）で使用されます。このフィールドは、指定されたマウントポイントファイル記述子に対応する特定のマウントをチェックする場合や、autofsファイルシステム内のディレクトリにおける最後に成功したマウントのuidとgidを要求する場合にオプションで使用されます。</p>
+<p>以下の説明で述べたコールのパラメータおよび結果を通信するために、ユニオンが使用されます。</p>
+<p>pathフィールドは必要な場合にパスを渡すために使用され、sizeフィールドはユーザー空間から送信された構造体の長さが増加した際の補正に使用されます。</p>
+<p>この構造体は、特定のフィールドを設定する前に、void関数呼び出しinit_autofs_dev_ioctl()を使用して初期化できます。<code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">autofs_dev_ioctl</span> <span class="pre">*</span></code>).</p>
+<p>すべてのioctlは、ユーザー空間からカーネル空間へこの構造体をコピーし、サイズパラメータが構造体のサイズよりも小さければ-EINVALを返します。カーネルメモリの割当が失敗した場合は-ENOMEMを、コピー自体が失敗した場合は-EFAULTを返します。その他のチェックには、ユーザー空間でコンパイルされたバージョンとモジュールバージョンの比較があり、不一致の場合は-EINVALを返します。サイズフィールドが構造体のサイズより大きい場合、パスが存在すると仮定され、それが「/」で始まりNULL終端されているかを確認します。それ以外の場合は-EINVALを返します。これらのチェックの後、AUTOFS_DEV_IOCTL_VERSION_CMD、AUTOFS_DEV_MINOR_CMD、AUTOFS_DEV_IOCTL_CLOSEMOUNT_CMDを除くすべてのioctlコマンドでは、ioctlfdが検証され、有効な記述子でないか、またはautofsマウントポイントに該当しない場合、-EBADF、-ENOTTY、または-EINVAL（autofs記述子でない）のエラーが返されます。</p>
+</section>
+<section id="the-ioctls">
+<h2>ioctl<a class="headerlink" href="#the-ioctls" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このインターフェースを使用した実装例は、autofsバージョン5.0.4以降、kernel.orgの/pub/linux/daemons/autofs/v5ディレクトリにある配布用tarballのlib/dev-ioctl-lib.cファイルにあります。</p>
+<p>このインターフェースで実装されたデバイスノードioctl操作は:</p>
+<section id="autofs-dev-ioctl-version">
+<h3>AUTOFS_DEV_IOCTL_VERSION<a class="headerlink" href="#autofs-dev-ioctl-version" title="この見出しへのパーマリンク">¶</a></h3>
+<p>autofsデバイスioctlカーネルモジュールのメジャーバージョンとマイナーバージョンを取得します。これは初期化されたstruct autofs_dev_ioctlを入力パラメータとして必要とし、渡された構造体にバージョン情報を設定します。成功時は0を、バージョン不一致が検出された場合は-EINVALを返します。</p>
+</section>
+<section id="autofs-dev-ioctl-protover-cmd-and-autofs-dev-ioctl-protosubver-cmd">
+<h3>AUTOFS_DEV_IOCTL_PROTOVER_CMD and AUTOFS_DEV_IOCTL_PROTOSUBVER_CMD<a class="headerlink" href="#autofs-dev-ioctl-protover-cmd-and-autofs-dev-ioctl-protosubver-cmd" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ロードされたモジュールが理解するautofsプロトコルバージョンのメジャーバージョンとマイナーバージョンを取得します。このコールは、ioctlfdフィールドに有効なautofsマウントポイント記述子が設定された初期化済みのstruct autofs_dev_ioctlを使用し、struct args_protoverのversionフィールドまたはstruct args_protosubverのsub_versionフィールドにリクエストされたバージョン番号を設定します。これらのコマンドは成功時に0を返し、検証失敗時に負のエラーコードのいずれかを返します。</p>
+</section>
+<section id="autofs-dev-ioctl-openmount-and-autofs-dev-ioctl-closemount">
+<h3>AUTOFS_DEV_IOCTL_OPENMOUNT and AUTOFS_DEV_IOCTL_CLOSEMOUNT<a class="headerlink" href="#autofs-dev-ioctl-openmount-and-autofs-dev-ioctl-closemount" title="この見出しへのパーマリンク">¶</a></h3>
+<p>autofs管理のマウントポイントパスのファイル記述子を取得および解放します。openコールでは、pathフィールドが設定され、sizeフィールドが適切に調整された初期化済みstruct autofs_dev_ioctlが必要です。また、struct args_openmountのdevidフィールドには、autofsマウントのデバイス番号を設定します。このデバイス番号は/proc/mountsに表示されるマウントオプションから取得できます。closeコールでは、openコールから取得した記述子が設定されたioctlfdフィールドを持つ初期化済みstruct autofs_dev_ioctlが必要です。ファイル記述子の解放はclose(2)でも行え、プロセス終了時にすべてのオープンされた記述子も自動的に閉じられます。closeコールは主に完全性を確保し、ユーザー空間実装の一貫性を提供するため、実装された操作に含まれています。</p>
+</section>
+<section id="autofs-dev-ioctl-ready-cmd-and-autofs-dev-ioctl-fail-cmd">
+<h3>AUTOFS_DEV_IOCTL_READY_CMD and AUTOFS_DEV_IOCTL_FAIL_CMD<a class="headerlink" href="#autofs-dev-ioctl-ready-cmd-and-autofs-dev-ioctl-fail-cmd" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ユーザー空間からカーネルにマウントおよび期限切れの結果ステータスを返します。これらのコールでは、openコールから取得した記述子が設定されたioctlfdフィールドを持つ初期化済みstruct aut,dev_ioctlが必要です。struct args_readyまたはstruct args_failのtokenフィールドには、前記のマウントまたは期限切れリクエストでユーザー空間が受け取った待機キューのトークン番号を設定します。struct args_failのstatusフィールドには操作のerrnoが設定され、成功時は0になります。</p>
+</section>
+<section id="autofs-dev-ioctl-setpipefd-cmd">
+<h3>AUTOFS_DEV_IOCTL_SETPIPEFD_CMD<a class="headerlink" href="#autofs-dev-ioctl-setpipefd-cmd" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルとデーモン間の通信に使用するパイプファイル記述子を設定します。通常はマウント時にオプションで設定しますが、既存のマウントに再接続する際には、このコマンドを使用してautofsマウントに新しいカーネルパイプ記述子を通知します。マウントが誤ってパイプ記述子を設定されることを防ぐため、autofsマウントがcatatonic状態（次のコールを参照）である必要があります。</p>
+<p>呼び出しには、ioctlfdフィールドがopen呼び出しで取得したディスクリプタに設定され、struct args_setpipefdのpipefdフィールドがパイプのディスクリプタに設定された初期化済みのstruct autofs_dev_ioctlが必要です。成功した場合、呼び出し元のプロセスグループID（制御プロセスを識別するためのもの、例えば所有するautomount(8)デーモン）を設定します。</p>
+</section>
+<section id="autofs-dev-ioctl-catatonic-cmd">
+<h3>AUTOFS_DEV_IOCTL_CATATONIC_CMD<a class="headerlink" href="#autofs-dev-ioctl-catatonic-cmd" title="この見出しへのパーマリンク">¶</a></h3>
+<p>autofsマウントポイントを猫の目状態（catatonic）にします。これにより、autofsマウントはもはやマウント要求を発行しなくなり、カーネル通信パイプディスクリプタが解放され、キュー内の残りの待機が解放されます。</p>
+<p>呼び出しには、ioctlfdフィールドがopen呼び出しで取得したディスクリプタに設定された初期化済みのstruct autofs_dev_ioctlが必要です。</p>
+</section>
+<section id="autofs-dev-ioctl-timeout-cmd">
+<h3>AUTOFS_DEV_IOCTL_TIMEOUT_CMD<a class="headerlink" href="#autofs-dev-ioctl-timeout-cmd" title="この見出しへのパーマリンク">¶</a></h3>
+<p>autofsマウントポイント内のマウントの期限切れタイムアウトを設定します。</p>
+<p>呼び出しには、ioctlfdフィールドがopen呼び出しで取得したディスクリプタに設定された初期化済みのstruct autofs_dev_ioctlが必要です。</p>
+</section>
+<section id="autofs-dev-ioctl-requester-cmd">
+<h3>AUTOFS_DEV_IOCTL_REQUESTER_CMD<a class="headerlink" href="#autofs-dev-ioctl-requester-cmd" title="この見出しへのパーマリンク">¶</a></h3>
+<p>指定されたパスのdentryで最後に成功したマウントをトリガーしたプロセスのUIDとGIDを返します。</p>
+<p>呼び出しには、pathフィールドが対象のマウントポイントに設定され、sizeフィールドが適切に調整された初期化済みのstruct autofs_dev_ioctlが必要です。返却時にstruct args_requesterのuidフィールドにはUIDとgidフィールドのGIDが含まれます。</p>
+<p>アクティブなマウントを持つautofsマウントツリーを再構築する際、元のプロセスUIDとGID（またはそれらの文字列変異）を使用してマウント検索を行ったマップエントリに接続する必要があります。この呼び出しは、ユーザー空間でマウントマップ検索に使用するUIDとGIDを取得する機能を提供します。</p>
+</section>
+<section id="autofs-dev-ioctl-expire-cmd">
+<h3>AUTOFS_DEV_IOCTL_EXPIRE_CMD<a class="headerlink" href="#autofs-dev-ioctl-expire-cmd" title="この見出しへのパーマリンク">¶</a></h3>
+<p>指定されたautofsマウントに対してカーネルに期限切れ要求を発行します。通常、このioctlはさらに期限切れ候補が見つかるまで呼び出されます。</p>
+<p>呼び出しには、ioctlfdフィールドがopen呼び出しで取得したディスクリプタに設定された初期化済みのstruct autofs_dev_ioctlが必要です。さらに、struct args_expireのhowフィールドをAUTOFS_EXP_IMMEDIATEまたはAUTOFS_EXP_FORCEDに設定することで、マウントタイムアウトとは無関係な即時期限切れや、マウントがビジーかどうかとは無関係な強制期限切れを要求できます。期限切れ候補が見つからない場合、ioctlは-1を返し、errnoがEAGAINに設定されます。</p>
+<p>この呼び出しは、指定されたioctlfdに対応するマウントをチェックし、期限切れ可能なマウントを検出後、デーモンに期限切れ要求を再送し、完了を待機します。</p>
+</section>
+<section id="autofs-dev-ioctl-askumount-cmd">
+<h3>AUTOFS_DEV_IOCTL_ASKUMOUNT_CMD<a class="headerlink" href="#autofs-dev-ioctl-askumount-cmd" title="この見出しへのパーマリンク">¶</a></h3>
+<p>autofsマウントポイントが使用中かどうかを確認します。</p>
+<p>この呼び出しは、ioctlfdフィールドがopen呼び出しで取得したディスクリプタに設定されている初期化されたstruct autofs_dev_ioctlを必要とし、結果はstruct args_askumountのmay_umountフィールドで返します。1はビジー状態、0はそれ以外を表します。</p>
+</section>
+<section id="autofs-dev-ioctl-ismountpoint-cmd">
+<h3>AUTOFS_DEV_IOCTL_ISMOUNTPOINT_CMD<a class="headerlink" href="#autofs-dev-ioctl-ismountpoint-cmd" title="この見出しへのパーマリンク">¶</a></h3>
+<p>指定されたパスがマウントポイントであるかどうかを確認します。</p>
+<p>この呼び出しは初期化されたstruct autofs_dev_ioctlを必要とします。2つの変異があります。どちらもpathフィールドをチェックするマウントポイントのパスに設定し、sizeフィールドを適切に調整します。一方ではioctlfdフィールドで特定のマウントポイントを指定し、もう一方ではstruct args_ismountpointのpathフィールドと、オプションでin.typeフィールドをautofsマウントタイプに設定します。この呼び出しは、マウントポイントである場合1を返し、out.devidフィールドにマウントのデバイス番号を、out.magicフィールドに関連するスーパーブロックマジックナンバー（以下に記載）を設定します。それ以外の場合は0を返します。どちらの場合も、new_encode_dev()で返されるデバイス番号がout.devidフィールドに返されます。</p>
+<p>ファイルディスクリプタが提供された場合、特定のマウントを検索しており、マウントスタックの上部に必ずしも存在する必要はありません。この場合、ディスクリプタが対応するパスがマウントポイントであるか、またはマウントを含んでいる（ルートマウントがないマルチマウントなど）場合、マウントポイントとみなされます。この場合、ディスクリプタがマウントポイントに対応する場合1を返し、カバーするマウントのスーパーマジックが存在する場合はそれを返します。それ以外の場合は0を返します。</p>
+<p>パスが提供された場合（ioctlfdフィールドが-1に設定されている）、パスが検索され、それがマウントのルートであるかどうかが確認されます。タイプも提供された場合、特定のautofsマウントを検索し、マッチが見つからない場合は失敗を返します。検索されたパスがマウントのルートである場合、1を返し、マウントのスーパーマジックを含めます。それ以外の場合は0を返します。</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxカーネル内のファイルシステム</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#core-vfs-documentation">コアVFSドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#filesystem-support-layers">ファイルシステムサポートレイヤー</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#filesystems">ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxカーネル内のファイルシステム</a><ul>
+<li>前へ: <a href="autofs.html" title="前章">autofs - その動作方法</a></li>
+<li>次へ: <a href="befs.html" title="次章">Linux用のBeOSファイルシステム</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/filesystems/autofs-mount-control.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

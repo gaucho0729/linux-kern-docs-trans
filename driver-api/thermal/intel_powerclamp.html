@@ -1,0 +1,419 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Intel Powerclamp Driver — The Linux Kernel documentation</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="nouveau_thermal.html" rel="next" title="カーネル ドライバ nouveau"/>
+<link href="exynos_thermal_emulation.html" rel="prev" title="エクシノス エミュレーション モード"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="intel-powerclamp-driver">
+<h1>インテル パワーカラムドライバ<a class="headerlink" href="#intel-powerclamp-driver" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="simple">
+<dt>作成者:</dt><dd><ul class="simple">
+<li><p>Arjan van de Ven &lt;<a class="reference external" href="mailto:arjan%40linux.intel.com">arjan<span>@</span>linux<span>.</span>intel<span>.</span>com</a>&gt;</p></li>
+<li><p>Jacob Pan &lt;<a class="reference external" href="mailto:jacob.jun.pan%40linux.intel.com">jacob<span>.</span>jun<span>.</span>pan<span>@</span>linux<span>.</span>intel<span>.</span>com</a>&gt;</p></li>
+</ul>
+</dd>
+</dl>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>システムの消費電力が実行時において電力予算、熱制約、または騒音レベルの制限により減少する必要がある状況を想定します。この場合、アクティブな冷却は好ましくありません。ハードウェアが設計された災害的シナリオを防ぐために、ソフトウェア管理による被動的な電力削減が実施される必要があります。</p>
+<p>現在、P-states（電力状態）、T-states（クロック modulation）、およびCPUオフライン化がCPUのスロットリングに使用されています。</p>
+<p>Intel CPUでは、C-states（電力状態）が有効な電力削減手段ですが、これまでワークロードに応じて機械的に使用されていました。intel_powerclampドライバーの開発により、すべてのオンラインCPUスレッド間でアイドル時間の注入を同期する方法が導入されました。目標は、強制的で制御可能なC状態の滞在時間を達成することです。</p>
+<p>電力、パフォーマンス、スケーラビリティ、ユーザー体験の分野でテスト/分析が行われました。多くの場合、CPUをオフライン化するか、CPUクロックを変調するよりも明確な利点が示されています。</p>
+</section>
+<section id="theory-of-operation">
+<h2>動作原理<a class="headerlink" href="#theory-of-operation" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="idle-injection">
+<h3>アイドル時間の注入<a class="headerlink" href="#idle-injection" title="この見出しへのパーマリンク">¶</a></h3>
+<p>現代のIntelプロセッサ（Nehalem以降）では、パッケージレベルのC状態滞在時間はMSRs（マシンスペシャルレジスタ）で利用可能であり、これもカーネルに提供されています。</p>
+<p>これらのMSRsは以下の通りです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#define MSR_PKG_C2_RESIDENCY      0x60D
+#define MSR_PKG_C3_RESIDENCY      0x3F8
+#define MSR_PKG_C6_RESIDENCY      0x3F9
+#define MSR_PKG_C7_RESIDENCY      0x3FA
+</pre></div>
+</div>
+<p>カーネルがシステムにアイドル時間を注入できる場合、パッケージレベルのC状態を管理する閉ループ制御システムを構築できます。intel_powerclampドライバーはこのような制御システムとして設計されており、目標設定値はユーザーが選択したアイドル比率（電力削減に基づく）であり、誤差は実際のパッケージレベルC状態滞在時間比率と目標アイドル比率の差です。</p>
+<p>注入は高優先度のカーネルスレッドによって制御され、オンラインCPUごとに生成されます。</p>
+<p>SCHED_FIFOクラスのこれらのカーネルスレッドは、制御されたディューティー比と時間の制限を行うためのクランプアクションを実行します。各CPUごとのスレッドは、ジッファーズの丸めに基づいてアイドル時間と時間の同期を取るため、累積エラーを防ぎ、ジャッジ効果を回避します。スレッドはCPUにバインドされており、CPUがオフライン化されるまで移動できません。この場合、オフライン化されたCPUに属するスレッドは即座に終了されます。</p>
+<p>SCHED_FIFOで実行され、相対的に高い優先度を持つことで、このスキームはプリエンプト可能および非プリエンプト可能なカーネルの両方に適用可能です。jiffies周辺のアイドル時間の整列は、HZ値に対するスケーラビリティを確保します。この効果はPerf timechartを使用してより明確に視覚化できます。以下のダイアグラムは、kernel thread kidle_inject/cpuの挙動を示しています。アイドルインジェクション中に、指定された「duration」の期間、monitor/mwaitアイドル状態で実行し、その後他のタスクにCPUを譲渡します。次の時間間隔までこのプロセスを繰り返します。</p>
+<p>アイドル時間中にNOHZスケジュールティックは無効化されますが、割り込みはマスクされません。テストでは、スケジュールティックからの追加ウェイクアップが、大規模システムにおけるpowerclampドライバの効果に劇的な影響を与えることが確認されています（80プロセッサ搭載のWestmereシステム）。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>CPU0
+                  ____________          ____________
+kidle_inject/0   |   sleep    |  mwait |  sleep     |
+        _________|            |________|            |_______
+                               duration
+CPU1
+                  ____________          ____________
+kidle_inject/1   |   sleep    |  mwait |  sleep     |
+        _________|            |________|            |_______
+                              ^
+                              |
+                              |
+                              roundup(jiffies, interval)
+</pre></div>
+</div>
+<p>統計を収集し、グローバルな制御パラメータを更新できるのは1つのCPUのみです。このCPUは本ドキュメントでは「制御CPU」と呼ばれます。制御CPUは実行時において、BSPを優先するポリシーに基づいて選出され、CPUホットプラグの可能性を考慮します。</p>
+<p>アイドル制御システムの動的特性において、パッケージレベルのアイドル時間は主に非因果系とみなされ、その挙動は過去または現在の入力に基づくことはできません。そのため、intel_powerclampドライバは、入力された目標アイドル比（target idle ratio）に基づき、即座に所望のアイドル時間を強制します。インジェクション後、powerclampは指定された時間窓内で実際のアイドル時間を監視し、次のインジェクションを調整して過剰または不足修正を避れます。</p>
+<p>因果性制御システム（例：温度制御）で使用される場合、このドライバのユーザーは、過去のサンプルと出力がフィードバックに含まれるアルゴリズムを実装する必要があります。例えば、PIDベースの熱制御器は、過去のサンプルの積分および微分ゲインに基づき、powerclampドライバを使用して所望の目標温度を維持できます。</p>
+</section>
+<section id="calibration">
+<h3>校正<a class="headerlink" href="#calibration" title="この見出しへのパーマリンク">¶</a></h3>
+<p>スケーラビリティテスト中に、CPUの数が増えるにつれてCPU間の同期動作が困難になることが観察されています。これはパッケージレベルのC状態へのシステムの移行能力にも当てはまります。</p>
+<p>intel_powerclampドライバがスケーラブルであることを確認するため、オンライン校正が実装されています。このような校正を行う目的は以下の通りです：</p>
+<ol class="loweralpha simple">
+<li><p>アイドルインジェクション比率の有効な範囲を特定する</p></li>
+<li><p>各目標比率における補正量を特定する</p></li>
+</ol>
+<p>各目標比率に対する補正には2つの部分があります：</p>
+<blockquote>
+<div><p>a) ステディステートエラー補償 この機能は、システムが追加のウェイクアップ（外部割込みなど）なしにアイドル状態に入る際のエラーを補正するために用いられます。</p>
+<p>b) ディナミックエラー補償 アイドル状態中にウェイクアップが過剰に発生した場合、割込みを静かにするために追加のアイドル比率を設定し、CPUの活動を抑えることで、割込みを抑制します。</p>
+</div></blockquote>
+<p>ユーザーが補償の進捗や結果を確認できるように、debugfsファイルが提供されています。例えば、Westmereシステムでは以下のように表示されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>[jacob@nex01 ~]$ cat
+/sys/kernel/debug/intel_powerclamp/powerclamp_calib
+controlling cpu: 0
+pct confidence steady dynamic (compensation)
+0       0       0       0
+1       1       0       0
+2       1       1       0
+3       3       1       0
+4       3       1       0
+5       3       1       0
+6       3       1       0
+7       3       1       0
+8       3       1       0
+...
+30      3       2       0
+31      3       2       0
+32      3       1       0
+33      3       2       0
+34      3       1       0
+35      3       2       0
+36      3       1       0
+37      3       2       0
+38      3       1       0
+39      3       2       0
+40      3       3       0
+41      3       1       0
+42      3       2       0
+43      3       1       0
+44      3       1       0
+45      3       2       0
+46      3       3       0
+47      3       0       0
+48      3       2       0
+49      3       3       0
+</pre></div>
+</div>
+<p>補償は実行時に行われます。オフラインでの処理は利用できません。ステディステート補償は、隣接する比率の信頼レベルが満足できるレベルに達した場合にのみ使用されます。信頼レベルは、実行時に収集されたクリーンデータに基づいて累積されます。追加の割込みが発生していない期間に収集されたデータはクリーンデータとみなされます。</p>
+<p>アイドル状態中に過剰なウェイクアップが発生した場合、その状態を検知した際に追加のアイドル時間を注入します。現在は、注入比率を2倍にするシンプルなアルゴリズムを採用しています。改善策として、該当するIRQを制限する方法（レベルトリガー割込みのEOIを遅延させるなど）が考えられますが、スケジューラーやIRQコアコードへの影響を最小限に抑えるのは課題です。</p>
+</section>
+<section id="cpu-online-offline">
+<h3>CPU オンライン/オフライン<a class="headerlink" href="#cpu-online-offline" title="この見出しへのパーマリンク">¶</a></h3>
+<p>CPUホットプラグ活動の通知を受けるたびに、パーセルCPUのカーネルスレッドが起動または停止します。intel_powerclampドライバーは、CPUオフラインイベント後にスレッドが他のCPUに移動しても、クラッピングカーネルスレッドの状態を追跡します。</p>
+</section>
+</section>
+<section id="performance-analysis">
+<h2>パフォーマンス分析<a class="headerlink" href="#performance-analysis" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このセクションでは、Westmere（80P）やIvy Bridge（4P、8P）などの複数のシステムで収集された一般的なパフォーマンスデータについて説明します。</p>
+<section id="effectiveness-and-limitations">
+<h3>有効性と制限事項<a class="headerlink" href="#effectiveness-and-limitations" title="この見出しへのパーマリンク">¶</a></h3>
+<p>アイドルインジェクションの最大許容範囲は50％に制限されています。前述の通り、強制アイドル時間中に割込みが許可されるため、過剰な割込みが発生すると補償効果が低下します。極端な例として、ping -f コマンドでネットワーク割込みを洪水状態にし、CPUの応答がほとんどない状況を挙げると、アイドルインジェクションスレッドからほとんど対処できません。しかし、通常のケースでは、大容量ファイルのscpなど、アプリケーションはpowerclampドライバーによって制限されます。CPUの速度を落とすことでネットワークプロトコル処理も遅くなり、結果的に割込みが減少します。</p>
+<p>制御パラメータが実行時において制御CPUによって変更される場合、他のCPUが変更に追いつくまでに追加の時間がかかる可能性があります。この時間帯ではアイドルインジェクションが同期していないため、予想される比率でパッケージC状態に入ることができません。しかし、この影響は小さいです。ほとんどの場合、ターゲット比率の変更はアイドルインジェクションの周波数よりもはるかに頻繁に更新されないためです。</p>
+</section>
+<section id="scalability">
+<h3>スケーラビリティ<a class="headerlink" href="#scalability" title="この見出しへのパーマリンク">¶</a></h3>
+<p>テストでは、4P/8P Ivy Bridgeシステムと80P Westmereサーバーの間で、50%のアイドル比率においても、わずかですが測定可能な差が確認されました。Westmereでは同じターゲットアイドル比率に対してより多くの補正が必要です。補正はアイドル比率が大きくなるにつれて増加します。上記の理由により、校正コードの必要性が生じます。</p>
+<p>IVB 8Pシステムでは、オフラインCPUと比較して、パワーカラムは1ワットあたりの性能で最大40%向上を達成できます。（スピンカウンターを各CPUのカウントスレッドで合計して測定）</p>
+</section>
+</section>
+<section id="usage-and-interfaces">
+<h2>使用方法とインターフェース<a class="headerlink" href="#usage-and-interfaces" title="この見出しへのパーマリンク">¶</a></h2>
+<p>パワーカラムドライバーは一般的な熱層にクーリングデバイスとして登録されています。現在はどの熱ゾーンとも関連付けられていません：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>jacob@chromoly:/sys/class/thermal/cooling_device14$ grep . *
+cur_state:0
+max_state:50
+type:intel_powerclamp
+</pre></div>
+</div>
+<p>cur_stateはユーザーが望むアイドルパーセンテージを設定するためのものです。cur_stateに0を書き込むとアイドルインジェクションが停止します。1〜max_stateの値を書き込むとアイドルインジェクションが開始します。cur_stateを読み込むと現在の実際のアイドルパーセンテージが返されます。これはユーザーが設定した値とは異なる場合があります。現在のアイドルパーセンテージはワークロードに依存し、自然なアイドルを含みます。アイドルインジェクションが無効になっている場合、cur_stateは0ではなく-1を返します。これは100%のビジー状態と無効状態を混同しないようにするためです。</p>
+<p>使用例：- 25%のアイドル時間をインジェクションする場合：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ sudo sh -c "echo 25 &gt; /sys/class/thermal/cooling_device80/cur_state
+</pre></div>
+</div>
+<p>システムがビジーでなく、すでに25%以上のアイドル時間がすでに存在する場合、パワーカラムドライバーはアイドルインジェクションを開始しません。Topを使用してもアイドルインジェクションのカーネルスレッドは表示されません。</p>
+<p>システムがビジー（スピンテストの下記）で、自然なアイドル時間が25%未満の場合、パワーカラムカーネルスレッドはアイドルインジェクションを行います。強制アイドル時間は通常のアイドルとしてカウントされ、アイドルタスクの一般的なコードパスが使用されます。</p>
+<p>この例では24.1%のアイドルが表示されています。これはパワーカラムドライバーが動作しているときにシステムの遅延の原因を特定するためのシステム管理者またはユーザーに役立ちます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Tasks: 197 total,   1 running, 196 sleeping,   0 stopped,   0 zombie
+Cpu(s): 71.2%us,  4.7%sy,  0.0%ni, 24.1%id,  0.0%wa,  0.0%hi,  0.0%si,  0.0%st
+Mem:   3943228k total,  1689632k used,  2253596k free,    74960k buffers
+Swap:  4087804k total,        0k used,  4087804k free,   945336k cached
+
+  PID USER      PR  NI  VIRT  RES  SHR S %CPU %MEM    TIME+  COMMAND
+ 3352 jacob     20   0  262m  644  428 S  286  0.0   0:17.16 spin
+ 3341 root     -51   0     0    0    0 D   25  0.0   0:01.62 kidle_inject/0
+ 3344 root     -51   0     0    0    0 D   25  0.0   0:01.60 kidle_inject/3
+ 3342 root     -51   0     0    0    0 D   25  0.0   0:01.61 kidle_inject/1
+ 3343 root     -51   0     0    0    0 D   25  0.0   0:01.60 kidle_inject/2
+ 2935 jacob     20   0  696m 125m  35m S    5  3.3   0:31.11 firefox
+ 1546 root      20   0  158m  20m 6640 S    3  0.5   0:26.97 Xorg
+ 2100 jacob     20   0 1223m  88m  30m S    3  2.3   0:23.68 compiz
+</pre></div>
+</div>
+<p>テストにより、パワークラムドライバーを冷却装置として使用することで、PIDベースのユーザー空間サーマルコントローラーが、他の熱的影響が加わらない状態でCPU温度を効果的に制御できることが確認されています。たとえば、UltraBookユーザーは、特定の温度条件下（ほとんどのアクティブなトリップポイントを下回る温度）でカーネルをコンパイルすることが可能です。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../driver-model/index.html">ドライバモデル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../basics.html">ドライバの基礎</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infrastructure.html">デバイスドライバのインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ioctl.html">ioctlベースのインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../early-userspace/index.html">初期ユーザースペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pm/index.html">CPUおよびデバイスの電源管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../clk.html">共通のCLKフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device-io.html">バスを問わないデバイスアクセス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dma-buf.html">バッファ共有と同期</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device_link.html">デバイスリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../component.html">複合ドライバ用コンポーネントヘルパ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../message-based.html">メッセージベースのデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infiniband.html">InfiniBandおよびリモートDMA（RDMA）インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../frame-buffer.html">フレームバッファライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../regulator.html">電圧および電流レギュレータAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../input.html">入力サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../usb/index.html">Linux USB API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firewire.html">Firewire（IEEE 1394）ドライバインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pci/index.html">Linux PCIドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../spi.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i2c.html">I<sup>2</sup>CおよびSMBusサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmb.html">衛星MC用IPMBドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmi.html">Linux IPMIドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i3c/index.html">I3Cサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../interconnect.html">汎用システムインターコネクトサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../devfreq.html">デバイス周波数スケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hsi.html">高速同期シリアルインターフェース (HSI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../edac.html">エラー検出と訂正 (EDAC) デバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../scsi.html">SCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../libata.html">libATA開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../target.html">ターゲットおよびiSCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mailbox.html">共通メールボックスフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mtdnand.html">MTD NANDドライバプログラミングインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html">パラレルポートデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#x50-uart-driver">16x50 UARTドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#pulse-width-modulation-pwm">パルス幅変調 (PWM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mei/index.html">インテル(R) マネジメントエンジニアリングインターフェース (インテル(R) MEI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mtd/index.html">メモリ技術デバイス (MTD)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mmc/index.html">MMC/SD/SDIOカードサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nvdimm/index.html">非揮発性メモリデバイス (NVDIMM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../w1.html">W1: ダラスの1ワイヤーバス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rapidio/index.html">Linux RapidIO サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../s390-drivers.html">s390チャネルデバイスドライバの作成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vme.html">VMEデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../80211/index.html">Linux 802.11ドライバ開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../uio-howto.html">ユーザースペースI/O HOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firmware/index.html">LinuxファームウェアAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pinctl.html">PINCTRL (PIN CONTROL)サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../gpio/index.html">汎用入出力 (GPIO)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../md/index.html">RAID</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../media/index.html">メディアサブシステム カーネル内部API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../misc_devices.html">その他のデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nfc/index.html">近距離通信 (NFC)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dmaengine/index.html">DMAエンジンドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../slimbus.html">LinuxカーネルSLIMbusサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../soundwire/index.html">SoundWireドキュメント</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">熱管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../fpga/index.html">FPGAサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../acpi/index.html">ACPI サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../backlight/lp855x-driver.html">カーネルドライバlp855x</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../connector.html">カーネルコンネクタ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../console.html">コンソールドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dcdbas.html">Dellシステム管理ベースドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../eisa.html">EISAバスサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isa.html">ISAドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isapnp.html">ISA Plug &amp; Playサポート (Jaroslav Kysela &lt;perex@suse.cz&gt;)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io-mapping.html">io_mapping関数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io_ordering.html">メモリマップアドレスへのI/O書き込みの順序付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../generic-counter.html">汎用カウンタインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lightnvm-pblk.html">pblk: 物理ブロックデバイスターゲット</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../memory-devices/index.html">メモリコントローラー ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../men-chameleon-bus.html">MEN Chameleon Bus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ntb.html">NTB ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nvmem.html">NVMEM サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../parport-lowlevel.html">PARPORT インターフェース ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pps.html">PPS - パルス毎秒 (Pulse Per Second)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ptp.html">Linux用PTP ハードウェアクロック インフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../phy/index.html">ジェネリック PHY フレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pti_intel_mid.html">インテル MID PTI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pwm.html">パルス幅変調 (PWM) インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html">PLDM ファームウェア フラッシュアップデート ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html#overview-of-the-pldmfw-library">概要: <code class="docutils literal notranslate"><span class="pre">pldmfw</span></code> ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rfkill.html">rfkill - RFキルスイッチサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../serial/index.html">シリアルデバイスのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sm501.html">SM501 ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../switchtec.html">Linux Switchtec サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sync_file.html">シンクファイル API ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio-mediated-device.html">VFIO メディエイテッドデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio.html">VFIO - 「仮想ファンクション I/O」 </a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xilinx/index.html">Xilinx FPGA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xillybus.html">ジェネリックFPGAインターフェース用Xillybusドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../zorro.html">Zorroデバイス用のデバイスドライバの作成</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul>
+<li><a href="index.html">熱管理</a><ul>
+<li>前へ: <a href="exynos_thermal_emulation.html" title="前章">エクシノス エミュレーション モード</a></li>
+<li>次へ: <a href="nouveau_thermal.html" title="次章">カーネル ドライバ nouveau</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/driver-api/thermal/intel_powerclamp.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

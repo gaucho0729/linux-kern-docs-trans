@@ -1,0 +1,873 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>ジャーナル (jbd2) — Linuxカーネルのドキュメンテーション</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="journal-jbd2">
+<h1>ジャーナル (jbd2)<a class="headerlink" href="#journal-jbd2" title="この見出しへのパーマリンク">¶</a></h1>
+<p>ext3で導入されたジャーナル機能は、システムクラッシュ時のファイルシステム破損を防ぐためにext4ファイルシステムで採用されています。ディスクの小さな連続領域（デフォルト128MiB）がファイルシステム内に確保され、重要なデータのディスクへの即時書き込みが行われます。重要なデータトランザクションがディスクに完全に書き込まれてディスクの書き込みキャッシュからフラッシュされた後、そのデータのコミット記録がジャーナルに書き込まれます。その後、ジャーナルコードがディスク上の最終的な場所にトランザクションを書き込み（これは多くのシークや小さな読み書き消去を伴う可能性があります）、コミット記録を削除します。システムが2段階目の遅い書き込み中にクラッシュした場合、ジャーナルは最新のコミット記録まで再現され、ジャーナルを通じてディスクに書き込まれたデータのアトミック性が保証されます。これにより、メタデータ更新の途中でファイルシステムが詰まることを防ぎます。</p>
+<p>パフォーマンスの観点から、ext4はデフォルトでファイルシステムメタデータのみジャーナル経由で書き込まれます。これにより、クラッシュ後はファイルデータブロックが一貫した状態に保証されない可能性があります。このデフォルトの保証レベル（<code class="docutils literal notranslate"><span class="pre">data=ordered</span></code>)が満足できない場合は、マウントオプションでジャーナル動作を制御できます。もし <code class="docutils literal notranslate"><span class="pre">data=journal</span></code>モードを指定すれば、すべてのデータとメタデータがジャーナル経由でディスクに書き込まれます。これは遅いですが最も安全です。もし <code class="docutils literal notranslate"><span class="pre">data=writeback</span></code>モードを指定すれば、メタデータがジャーナル経由でディスクに書き込まれる前に汚染されたデータブロックがディスクにフラッシュされません。</p>
+<p>高速コミットがサポートされる <code class="docutils literal notranslate"><span class="pre">data=ordered</span></code> モードでは、ext4がコミット遅延を大幅に削減する高速コミット機能をサポートします。デフォルトの <code class="docutils literal notranslate"><span class="pre">data=ordered</span></code>
+モードではメタデータブロックをジャーナルにログします。高速コミットモードでは、ext4はJBD2と共有される高速コミット領域に、影響を受けたメタデータを再構築するために必要な最小限の差分のみを保存します。高速コミット領域が満杯になったり、高速コミットが不可能になったり、JBD2のコミットタイマが鳴った場合、ext4は従来のフルコミットを行います。フルコミットは以前のすべての高速コミットを無効化し、高速コミット領域を空にします。この機能はmkfsの時刻に有効化する必要があります。</p>
+<p>ジャーナル inode は通常 inode 8 です。ジャーナル inode の最初の 68 バイトは ext4 スーパーブロックに複製されます。ジャーナル自体は通常の（ただし隠しファイルとして扱われる）ファイルです。このファイルは通常、ブロックグループ全体を占めますが、mke2fs はディスクの中央に配置しようとします。</p>
+<p>jbd2 のすべてのフィールドはディスクにビッグエンディアン順で書き込まれます。これは ext4 とは逆の順序です。</p>
+<p>注意: ext4 と ocfs2 はどちらも jbd2 を使用します。</p>
+<p>ext4 ファイルシステムに埋め込まれたジャーナルの最大サイズは 2^32 ブロックです。jbd2 自体はこの点には関心を示さなさそうです。</p>
+<section id="layout">
+<h2>レイアウト<a class="headerlink" href="#layout" title="この見出しへのパーマリンク">¶</a></h2>
+<p>一般的に、ジャーナルは次の形式を持ちます:</p>
+<table class="colwidths-given docutils align-default">
+<colgroup>
+<col style="width: 20%"/>
+<col style="width: 60%"/>
+<col style="width: 20%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>スーパーブロック</p></th>
+<th class="head"><p>descriptor_block (data_blocks または revocation_block) [さらにデータまたは回収情報] commit_block</p></th>
+<th class="head"><p>[さらにトランザクション…]</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td></td>
+<td><p>1 つのトランザクション</p></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>トランザクションは、descriptor といくつかのデータ、またはブロック回収リストで始まります。完了したトランザクションは常に commit で終わります。commit レコードが存在しない（またはチェックサムが一致しない）場合、再構築の際にはトランザクションが破棄されます。</p>
+</section>
+<section id="external-journal">
+<h2>外部ジャーナル<a class="headerlink" href="#external-journal" title="この見出しへのパーマリンク">¶</a></h2>
+<p>オプションで、ext4 ファイルシステムは外部ジャーナルデバイスで作成できます（内部ジャーナルとは異なり、予約された inode を使用します）。この場合、ファイルシステムデバイスでは、 <code class="docutils literal notranslate"><span class="pre">s_journal_inum</span></code> がゼロで、 <code class="docutils literal notranslate"><span class="pre">s_journal_uuid</span></code> が設定されます。ジャーナルデバイスには通常の場所に ext4 スーパーブロックがあり、一致する UUID を持ちます。ジャーナルスーパーブロックはスーパーブロックの次の完全なブロックに配置されます。</p>
+<table class="colwidths-given docutils align-default">
+<colgroup>
+<col style="width: 15%"/>
+<col style="width: 15%"/>
+<col style="width: 15%"/>
+<col style="width: 40%"/>
+<col style="width: 15%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>1024 バイトのパディング</p></th>
+<th class="head"><p>ext4 スーパーブロック</p></th>
+<th class="head"><p>ジャーナル スーパーブロック</p></th>
+<th class="head"><p>descriptor_block (data_blocks または revocation_block) [さらにデータまたは回収情報] commit_block</p></th>
+<th class="head"><p>[さらにトランザクション…]</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td></td>
+<td></td>
+<td></td>
+<td><p>1 つのトランザクション</p></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="block-header">
+<h2>ブロックヘッダー<a class="headerlink" href="#block-header" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ジャーナル内のすべてのブロックは共通の 12 バイトヘッダーで始まります
+<code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">journal_header_s</span></code>:</p>
+<table class="colwidths-given docutils align-default">
+<colgroup>
+<col style="width: 10%"/>
+<col style="width: 10%"/>
+<col style="width: 30%"/>
+<col style="width: 50%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>オフセット</p></th>
+<th class="head"><p>タイプ</p></th>
+<th class="head"><p>名前</p></th>
+<th class="head"><p>説明</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>0x0</p></td>
+<td><p>__be32</p></td>
+<td><p>h_magic</p></td>
+<td><p>jbd2 マジックナンバー、0xC03B3998。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x4</p></td>
+<td><p>__be32</p></td>
+<td><p>h_blocktype</p></td>
+<td><p>このブロックが含むデータの説明。詳しくは <a class="reference internal" href="#jbd2-blocktype">jbd2_blocktype</a> 下記の表。</p></td>
+</tr>
+<tr class="row-even"><td><p>0x8</p></td>
+<td><p>__be32</p></td>
+<td><p>h_sequence</p></td>
+<td><p>このブロックに関連するトランザクション ID。</p></td>
+</tr>
+</tbody>
+</table>
+<p id="jbd2-blocktype">ジャーナル ブロックタイプは次のいずれかです:</p>
+<table class="colwidths-given docutils align-default">
+<colgroup>
+<col style="width: 20%"/>
+<col style="width: 80%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>値</p></th>
+<th class="head"><p>説明</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>1</p></td>
+<td><p>ディスクリプタ。これはトランザクション中にジャーナルを通じて書き込まれたデータブロックの系列を表します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>2</p></td>
+<td><p>ブロック コミットレコード。これはトランザクション完了を示します。</p></td>
+</tr>
+<tr class="row-even"><td><p>3</p></td>
+<td><p>ジャーナル スーパーブロック、バージョン 1。</p></td>
+</tr>
+<tr class="row-odd"><td><p>4</p></td>
+<td><p>ジャーナル スーパーブロック、バージョン 2。</p></td>
+</tr>
+<tr class="row-even"><td><p>5</p></td>
+<td><p>ブロック回収レコード。これにより、ジャーナルが後に上書きされたブロックをスキップして復元を高速化できます。</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="super-block">
+<h2>スーパーブロック<a class="headerlink" href="#super-block" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ジャーナルのスーパーブロックは ext4 に比べてはるかにシンプルです。保持される主なデータはジャーナルのサイズとトランザクションログの開始位置です。</p>
+<p>ジャーナルスーパーブロックは <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">journal_superblock_s</span></code>として記録され、これは 1024 バイトの長さです:</p>
+<table class="colwidths-given docutils align-default">
+<colgroup>
+<col style="width: 10%"/>
+<col style="width: 10%"/>
+<col style="width: 30%"/>
+<col style="width: 50%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>オフセット</p></th>
+<th class="head"><p>タイプ</p></th>
+<th class="head"><p>名前</p></th>
+<th class="head"><p>説明</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td></td>
+<td></td>
+<td></td>
+<td><p>ジャーナルの静的な情報。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x0</p></td>
+<td><p>journal_header_t (12 バイト)</p></td>
+<td><p>s_header</p></td>
+<td><p>このブロックがスーパーブロックであることを示す共通ヘッダー。</p></td>
+</tr>
+<tr class="row-even"><td><p>0xC</p></td>
+<td><p>__be32</p></td>
+<td><p>s_blocksize</p></td>
+<td><p>ジャーナルデバイスのブロックサイズ。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x10</p></td>
+<td><p>__be32</p></td>
+<td><p>s_maxlen</p></td>
+<td><p>このジャーナルのブロック数の合計。</p></td>
+</tr>
+<tr class="row-even"><td><p>0x14</p></td>
+<td><p>__be32</p></td>
+<td><p>s_first</p></td>
+<td><p>ログ情報の最初のブロック。</p></td>
+</tr>
+<tr class="row-odd"><td></td>
+<td></td>
+<td></td>
+<td><p>ログの現在の状態を記述する動的情報。</p></td>
+</tr>
+<tr class="row-even"><td><p>0x18</p></td>
+<td><p>__be32</p></td>
+<td><p>s_sequence</p></td>
+<td><p>ログに期待される最初のコミットID。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x1C</p></td>
+<td><p>__be32</p></td>
+<td><p>s_start</p></td>
+<td><p>ログの開始ブロック番号。コメントとは異なり、このフィールドがゼロであることはジャーナルがクリーンであることを意味しません！</p></td>
+</tr>
+<tr class="row-even"><td><p>0x20</p></td>
+<td><p>__be32</p></td>
+<td><p>s_errno</p></td>
+<td><p>設定されたエラー値、 <a class="reference internal" href="../journalling.html#c.jbd2_journal_abort" title="jbd2_journal_abort (ジャーナル中止)"><code class="xref c c-func docutils literal notranslate"><span class="pre">jbd2_journal_abort()</span></code></a>.</p></td>
+</tr>
+<tr class="row-odd"><td></td>
+<td></td>
+<td></td>
+<td><p>残りのフィールドはv2スーパーブロックでのみ有効です。</p></td>
+</tr>
+<tr class="row-even"><td><p>0x24</p></td>
+<td><p>__be32</p></td>
+<td><p>s_feature_compat;</p></td>
+<td><p>互換性のある機能セット。表を参照してください <a class="reference internal" href="#jbd2-compat">jbd2_compat</a> も参照してください。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x28</p></td>
+<td><p>__be32</p></td>
+<td><p>s_feature_incompat</p></td>
+<td><p>非互換性のある機能セット。表を参照してください <a class="reference internal" href="#jbd2-incompat">jbd2_incompat</a> も参照してください。</p></td>
+</tr>
+<tr class="row-even"><td><p>0x2C</p></td>
+<td><p>__be32</p></td>
+<td><p>s_feature_ro_compat</p></td>
+<td><p>読み取り専用の互換性のある機能セット。現在はこれらはありません。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x30</p></td>
+<td><p>__u8</p></td>
+<td><p>s_uuid[16]</p></td>
+<td><p>ジャーナル用の128ビットUUID。これはマウント時にext4スーパーブロック内のコピーと比較されます。</p></td>
+</tr>
+<tr class="row-even"><td><p>0x40</p></td>
+<td><p>__be32</p></td>
+<td><p>s_nr_users</p></td>
+<td><p>このジャーナルを共有しているファイルシステムの数。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x44</p></td>
+<td><p>__be32</p></td>
+<td><p>s_dynsuper</p></td>
+<td><p>動的スーパーブロックコピーの位置。(使用されていない？)</p></td>
+</tr>
+<tr class="row-even"><td><p>0x48</p></td>
+<td><p>__be32</p></td>
+<td><p>s_max_transaction</p></td>
+<td><p>トランザクションあたりのジャーナルブロックの制限。(使用されていない？)</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x4C</p></td>
+<td><p>__be32</p></td>
+<td><p>s_max_trans_data</p></td>
+<td><p>トランザクションあたりのデータブロックの制限。(使用されていない？)</p></td>
+</tr>
+<tr class="row-even"><td><p>0x50</p></td>
+<td><p>__u8</p></td>
+<td><p>s_checksum_type</p></td>
+<td><p>ジャーナルに使用されるチェックサムアルゴリズム。参照： <a class="reference internal" href="#jbd2-checksum-type">jbd2_checksum_type</a> を参照してください。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x51</p></td>
+<td><p>__u8[3]</p></td>
+<td><p>s_padding2</p></td>
+<td></td>
+</tr>
+<tr class="row-even"><td><p>0x54</p></td>
+<td><p>__be32</p></td>
+<td><p>s_num_fc_blocks</p></td>
+<td><p>ジャーナル内の高速コミットブロックの数。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x58</p></td>
+<td><p>__u32</p></td>
+<td><p>s_padding[42]</p></td>
+<td></td>
+</tr>
+<tr class="row-even"><td><p>0xFC</p></td>
+<td><p>__be32</p></td>
+<td><p>s_checksum</p></td>
+<td><p>このフィールドがゼロに設定されている全体スーパーブロックのチェックサム。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x100</p></td>
+<td><p>__u8</p></td>
+<td><p>s_users[16*48]</p></td>
+<td><p>ログを共有しているすべてのファイルシステムのID。e2fsprogs/Linuxでは共有された外部ジャーナルは許可されていませんが、jbd2コードを使用するLustre（またはocfs2？）などは可能かもしれません。</p></td>
+</tr>
+</tbody>
+</table>
+<p id="jbd2-compat">ジャーナルの互換性機能は以下のいずれかの組み合わせです：</p>
+<table class="colwidths-given docutils align-default">
+<colgroup>
+<col style="width: 20%"/>
+<col style="width: 80%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>値</p></th>
+<th class="head"><p>説明</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>0x1</p></td>
+<td><p>ジャーナルはデータブロックにチェックサムを保持します。(JBD2_FEATURE_COMPAT_CHECKSUM)</p></td>
+</tr>
+</tbody>
+</table>
+<p id="jbd2-incompat">ジャーナルの非互換性機能は以下のいずれかの組み合わせです：</p>
+<table class="colwidths-given docutils align-default">
+<colgroup>
+<col style="width: 20%"/>
+<col style="width: 80%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>値</p></th>
+<th class="head"><p>説明</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>0x1</p></td>
+<td><p>ジャーナルにはブロック回収レコードがあります。(JBD2_FEATURE_INCOMPAT_REVOKE)</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x2</p></td>
+<td><p>ジャーナルは64ビットブロック番号を処理できます。(JBD2_FEATURE_INCOMPAT_64BIT)</p></td>
+</tr>
+<tr class="row-even"><td><p>0x4</p></td>
+<td><p>ジャーナルは非同期でコミットされます。(JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT)</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x8</p></td>
+<td><p>このジャーナルはディスク上のチェックサム形式のv2を使用しています。各ジャーナルメタデータブロックには独自のチェックサムが割り当てられ、ディスクリプターテーブル内のブロックタグにはジャーナル内のデータブロックそれぞれのチェックサムが含まれます。(JBD2_FEATURE_INCOMPAT_CSUM_V2)</p></td>
+</tr>
+<tr class="row-even"><td><p>0x10</p></td>
+<td><p>このジャーナルはディスク上のチェックサム形式のv3を使用しています。これはv2と同じですが、ジャーナルブロックタグのサイズはブロック番号のサイズに関係なく固定されています。(JBD2_FEATURE_INCOMPAT_CSUM_V3)</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x20</p></td>
+<td><p>ジャーナルにフェスティバルコミットブロックがあります。(JBD2_FEATURE_INCOMPAT_FAST_COMMIT)</p></td>
+</tr>
+</tbody>
+</table>
+<p id="jbd2-checksum-type">ジャーナルチェックサムタイプコードは次のいずれかです。crc32またはcrc32cが最も可能性が高い選択肢です。</p>
+<table class="colwidths-given docutils align-default">
+<colgroup>
+<col style="width: 20%"/>
+<col style="width: 80%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>値</p></th>
+<th class="head"><p>説明</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>1</p></td>
+<td><p>CRC32</p></td>
+</tr>
+<tr class="row-odd"><td><p>2</p></td>
+<td><p>MD5</p></td>
+</tr>
+<tr class="row-even"><td><p>3</p></td>
+<td><p>SHA1</p></td>
+</tr>
+<tr class="row-odd"><td><p>4</p></td>
+<td><p>CRC32C</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="descriptor-block">
+<h2>ディスクリプターブロック<a class="headerlink" href="#descriptor-block" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ディスクリプターブロックには、ジャーナルに続くデータブロックの最終的な位置を記述するジャーナルブロックタグの配列が含まれています。ディスクリプターブロックはデータ構造で完全に記述されるのではなく、オープンコードで記述されていますが、ここではブロック構造を示します。ディスクリプターブロックは少なくとも36バイトを消費しますが、完全なブロックを使用します：</p>
+<table class="colwidths-given docutils align-default">
+<colgroup>
+<col style="width: 10%"/>
+<col style="width: 10%"/>
+<col style="width: 30%"/>
+<col style="width: 50%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>オフセット</p></th>
+<th class="head"><p>タイプ</p></th>
+<th class="head"><p>名前</p></th>
+<th class="head"><p>ディスクリプター</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>0x0</p></td>
+<td><p>journal_header_t</p></td>
+<td><p>(オープンコード)</p></td>
+<td><p>共通ブロックヘッダー。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0xC</p></td>
+<td><p>struct journal_block_tag_s</p></td>
+<td><p>オープンコード配列[]</p></td>
+<td><p>ブロックまたはこのディスクリプターブロックの後に続くすべてのデータブロックを記述するタグが十分あります。</p></td>
+</tr>
+</tbody>
+</table>
+<p>ジャーナルブロックタグは、ジャーナル機能とブロックタグフラグが設定されていることにより、以下のいずれかの形式を持ちます。</p>
+<p>JBD2_FEATURE_INCOMPAT_CSUM_V3が設定されている場合、ジャーナルブロックタグは次のようになります <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">journal_block_tag3_s</span></code>、これは以下のようになります。サイズは16または32バイトです。</p>
+<table class="colwidths-given docutils align-default">
+<colgroup>
+<col style="width: 10%"/>
+<col style="width: 10%"/>
+<col style="width: 30%"/>
+<col style="width: 50%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>オフセット</p></th>
+<th class="head"><p>タイプ</p></th>
+<th class="head"><p>名前</p></th>
+<th class="head"><p>ディスクリプター</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>0x0</p></td>
+<td><p>__be32</p></td>
+<td><p>t_blocknr</p></td>
+<td><p>対応するデータブロックがディスク上に配置されるべき場所の下位32ビット。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x4</p></td>
+<td><p>__be32</p></td>
+<td><p>t_flags</p></td>
+<td><p>ディスクリプターに付随するフラグ。表を参照してください <a class="reference internal" href="#jbd2-tag-flags">jbd2_tag_flags</a> を参照してください。</p></td>
+</tr>
+<tr class="row-even"><td><p>0x8</p></td>
+<td><p>__be32</p></td>
+<td><p>t_blocknr_high</p></td>
+<td><p>対応するデータブロックがディスク上に配置されるべき場所の上位32ビット。JBD2_FEATURE_INCOMPAT_64BITが有効でない場合、この値はゼロです。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0xC</p></td>
+<td><p>__be32</p></td>
+<td><p>t_checksum</p></td>
+<td><p>ジャーナルUUID、シーケンス番号、およびデータブロックのチェックサム。</p></td>
+</tr>
+<tr class="row-even"><td></td>
+<td></td>
+<td></td>
+<td><p>このフィールドはオープンコードのようですが、常にタグの最後に出現し、t_checksumの後にきます。『同じUUID』フラグが設定されている場合、このフィールドは存在しません。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x8または0xC</p></td>
+<td><p>char</p></td>
+<td><p>uuid[16]</p></td>
+<td><p>このタグに付随するUUID。このフィールドは
+<code class="docutils literal notranslate"><span class="pre">j_uuid</span></code> フィールドのコピーと思われますが、のみがこのフィールドを変更します。 <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">journal_s</span></code>ファイルシステムの設定</p></td>
+</tr>
+</tbody>
+</table>
+<p id="jbd2-tag-flags">ジャーナルタグフラグは次のいずれかの組み合わせです：</p>
+<table class="colwidths-given docutils align-default">
+<colgroup>
+<col style="width: 20%"/>
+<col style="width: 80%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>値</p></th>
+<th class="head"><p>説明</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>0x1</p></td>
+<td><p>ディスク上のブロックがエスケープされています。データブロックの最初の4バイトがjbd2マジックナンバーと一致したためです。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x2</p></td>
+<td><p>このブロックは前のブロックと同じUUIDを持つため、UUIDフィールドは省略されています。</p></td>
+</tr>
+<tr class="row-even"><td><p>0x4</p></td>
+<td><p>データブロックはトランザクションによって削除されました。(使用されていない？)</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x8</p></td>
+<td><p>これはこのディスクリプタブロックの最後のタグです。</p></td>
+</tr>
+</tbody>
+</table>
+<p>JBD2_FEATURE_INCOMPAT_CSUM_V3が設定されていない場合、ジャーナルブロックタグは次のようになります <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">journal_block_tag_s</span></code>、これは以下のようになります。サイズは8、12、24、または28バイトです:</p>
+<table class="colwidths-given docutils align-default">
+<colgroup>
+<col style="width: 10%"/>
+<col style="width: 10%"/>
+<col style="width: 30%"/>
+<col style="width: 50%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>オフセット</p></th>
+<th class="head"><p>タイプ</p></th>
+<th class="head"><p>名前</p></th>
+<th class="head"><p>ディスクリプター</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>0x0</p></td>
+<td><p>__be32</p></td>
+<td><p>t_blocknr</p></td>
+<td><p>対応するデータブロックがディスク上に配置されるべき場所の下位32ビット。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x4</p></td>
+<td><p>__be16</p></td>
+<td><p>t_checksum</p></td>
+<td><p>ジャーナルUUID、シーケンス番号、およびデータブロックのチェックサム。注意として、下位16ビットのみが保存されます。</p></td>
+</tr>
+<tr class="row-even"><td><p>0x6</p></td>
+<td><p>__be16</p></td>
+<td><p>t_flags</p></td>
+<td><p>ディスクリプターに付随するフラグ。表を参照してください <a class="reference internal" href="#jbd2-tag-flags">jbd2_tag_flags</a> を参照してください。</p></td>
+</tr>
+<tr class="row-odd"><td></td>
+<td></td>
+<td></td>
+<td><p>次のフィールドは、スーパーブロックが64ビットブロック番号のサポートを示している場合にのみ存在します。</p></td>
+</tr>
+<tr class="row-even"><td><p>0x8</p></td>
+<td><p>__be32</p></td>
+<td><p>t_blocknr_high</p></td>
+<td><p>データブロックがディスク上に配置されるべき場所の上位32ビット。</p></td>
+</tr>
+<tr class="row-odd"><td></td>
+<td></td>
+<td></td>
+<td><p>このフィールドはオープンコードされているように見えます。常にタグの最後に出現し、t_flagsやt_blocknr_highの後にきます。'同じUUID'フラグが設定されている場合、このフィールドは存在しません。</p></td>
+</tr>
+<tr class="row-even"><td><p>0x8または0xC</p></td>
+<td><p>char</p></td>
+<td><p>uuid[16]</p></td>
+<td><p>このタグに付随するUUID。このフィールドは
+<code class="docutils literal notranslate"><span class="pre">j_uuid</span></code> フィールドのコピーと思われますが、のみがこのフィールドを変更します。 <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">journal_s</span></code>ファイルシステムの設定</p></td>
+</tr>
+</tbody>
+</table>
+<p>JBD2_FEATURE_INCOMPAT_CSUM_V2またはJBD2_FEATURE_INCOMPAT_CSUM_V3が設定されている場合、ブロックの終わりは次のようになります
+<code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">jbd2_journal_block_tail</span></code>、これは以下のようになります:</p>
+<table class="colwidths-given docutils align-default">
+<colgroup>
+<col style="width: 10%"/>
+<col style="width: 10%"/>
+<col style="width: 30%"/>
+<col style="width: 50%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>オフセット</p></th>
+<th class="head"><p>タイプ</p></th>
+<th class="head"><p>名前</p></th>
+<th class="head"><p>ディスクリプター</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>0x0</p></td>
+<td><p>__be32</p></td>
+<td><p>t_checksum</p></td>
+<td><p>ジャーナルUUIDとディスクリプタブロックのチェックサム。このフィールドはゼロに設定されます。</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="data-block">
+<h2>データブロック<a class="headerlink" href="#data-block" title="この見出しへのパーマリンク">¶</a></h2>
+<p>一般的に、ジャーナルを通じてディスクに書き込まれるデータブロックは、ディスクリプタブロックの後にそのままジャーナルファイルに書き込まれます。ただし、ブロックの最初の4バイトがjbd2マジックナンバーと一致する場合、その4バイトはゼロに置き換えられ、ディスクリプタブロックタグに'エスケープ'フラグが設定されます。</p>
+</section>
+<section id="revocation-block">
+<h2>回収ブロック<a class="headerlink" href="#revocation-block" title="この見出しへのパーマリンク">¶</a></h2>
+<p>回収ブロックは、以前のトランザクションでのブロックの再実行を防ぐために使用されます。これは、一度ジャーナルに記録されたが現在はジャーナルされていないブロックをマークするために使用されます。通常は、メタデータブロックが解放され、ファイルデータブロックとして再割り当てされる場合に発生します。この場合、ファイルブロックがディスクに書き込まれた後にジャーナルの再実行を行うと、破損が発生します。</p>
+<p><strong>注意</strong>: このメカニズムは、'このジャーナルブロックはこの他のジャーナルブロックによって上書きされる'という意味ではありません。著者（djwong）が誤って考えたものです。トランザクションに追加される任意のブロックは、そのブロックのすべての既存の回収記録を削除します。</p>
+<p>回収ブロックは
+<code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">jbd2_journal_revoke_header_s</span></code>、少なくとも16バイトの長さですが、完全なブロックを使用します:</p>
+<table class="colwidths-given docutils align-default">
+<colgroup>
+<col style="width: 10%"/>
+<col style="width: 10%"/>
+<col style="width: 30%"/>
+<col style="width: 50%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>オフセット</p></th>
+<th class="head"><p>タイプ</p></th>
+<th class="head"><p>名前</p></th>
+<th class="head"><p>説明</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>0x0</p></td>
+<td><p>journal_header_t</p></td>
+<td><p>r_header</p></td>
+<td><p>共通ブロックヘッダー。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0xC</p></td>
+<td><p>__be32</p></td>
+<td><p>r_count</p></td>
+<td><p>このブロックで使用されるバイト数。</p></td>
+</tr>
+<tr class="row-even"><td><p>0x10</p></td>
+<td><p>__be32または__be64</p></td>
+<td><p>blocks[0]</p></td>
+<td><p>回収するブロック。</p></td>
+</tr>
+</tbody>
+</table>
+<p>r_countの後に、このトランザクションによって有効にされたブロック番号の線形配列があります。スーパーブロックが64ビットブロック番号のサポートを宣伝している場合、各ブロック番号のサイズは8バイトですが、それ以外の場合は4バイトです。</p>
+<p>JBD2_FEATURE_INCOMPAT_CSUM_V2またはJBD2_FEATURE_INCOMPAT_CSUM_V3が設定されている場合、回収ブロックの終わりは次のようになります <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">jbd2_journal_revoke_tail</span></code>、これは以下の形式を持ちます:</p>
+<table class="colwidths-given docutils align-default">
+<colgroup>
+<col style="width: 10%"/>
+<col style="width: 10%"/>
+<col style="width: 30%"/>
+<col style="width: 50%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>オフセット</p></th>
+<th class="head"><p>タイプ</p></th>
+<th class="head"><p>名前</p></th>
+<th class="head"><p>説明</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>0x0</p></td>
+<td><p>__be32</p></td>
+<td><p>r_checksum</p></td>
+<td><p>ジャーナルUUIDと回収ブロックのチェックサム。</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="commit-block">
+<h2>コミットブロック<a class="headerlink" href="#commit-block" title="この見出しへのパーマリンク">¶</a></h2>
+<p>コミットブロックは、トランザクションがジャーナルに完全に書き込まれたことを示す監視者です。このコミットブロックがジャーナルに到達すると、このトランザクションで保存されたデータはディスク上の最終的な場所に書き込まれることができます。</p>
+<p>コミットブロックは、 <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">commit_header</span></code>という構造で記述され、これは32バイト長（ただし完全なブロックを使用します）:</p>
+<table class="colwidths-given docutils align-default">
+<colgroup>
+<col style="width: 10%"/>
+<col style="width: 10%"/>
+<col style="width: 30%"/>
+<col style="width: 50%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>オフセット</p></th>
+<th class="head"><p>タイプ</p></th>
+<th class="head"><p>名前</p></th>
+<th class="head"><p>ディスクリプター</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>0x0</p></td>
+<td><p>journal_header_s</p></td>
+<td><p>(オープンコード)</p></td>
+<td><p>共通ブロックヘッダー。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0xC</p></td>
+<td><p>unsigned char</p></td>
+<td><p>h_chksum_type</p></td>
+<td><p>トランザクション内のデータブロックの整合性を検証するために使用するチェックサムのタイプ。詳しくは <a class="reference internal" href="#jbd2-checksum-type">jbd2_checksum_type</a> を参照してください。</p></td>
+</tr>
+<tr class="row-even"><td><p>0xD</p></td>
+<td><p>unsigned char</p></td>
+<td><p>h_chksum_size</p></td>
+<td><p>チェックサムが使用するバイト数。おそらく4バイトです。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0xE</p></td>
+<td><p>unsigned char</p></td>
+<td><p>h_padding[2]</p></td>
+<td></td>
+</tr>
+<tr class="row-even"><td><p>0x10</p></td>
+<td><p>__be32</p></td>
+<td><p>h_chksum[JBD2_CHECKSUM_BYTES]</p></td>
+<td><p>チェックサムを保存する32バイトの領域です。JBD2_FEATURE_INCOMPAT_CSUM_V2またはJBD2_FEATURE_INCOMPAT_CSUM_V3が設定されている場合、最初の <code class="docutils literal notranslate"><span class="pre">__be32</span></code> はジャーナルUUIDと全体のコミットブロックのチェックサムであり、このフィールドはゼロに設定されます。JBD2_FEATURE_COMPAT_CHECKSUMが設定されている場合、最初の <code class="docutils literal notranslate"><span class="pre">__be32</span></code> はすでにトランザクションに書き込まれたすべてのブロックのcrc32です。</p></td>
+</tr>
+<tr class="row-odd"><td><p>0x30</p></td>
+<td><p>__be64</p></td>
+<td><p>h_commit_sec</p></td>
+<td><p>トランザクションがコミットされた時刻（エポックからの秒数）。</p></td>
+</tr>
+<tr class="row-even"><td><p>0x38</p></td>
+<td><p>__be32</p></td>
+<td><p>h_commit_nsec</p></td>
+<td><p>上記のタイムスタンプのナノ秒成分。</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="fast-commits">
+<h2>高速コミット<a class="headerlink" href="#fast-commits" title="この見出しへのパーマリンク">¶</a></h2>
+<p>高速コミット領域は、タグ長値のログとして構成されています。各TLVは、タグとフィールド全体の長さを格納する <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">ext4_fc_tl</span></code> で始まり、その後に可変長のタグ固有の値が続きます。サポートされているタグとその意味の一覧は以下の通りです:</p>
+<table class="colwidths-given docutils align-default">
+<colgroup>
+<col style="width: 10%"/>
+<col style="width: 25%"/>
+<col style="width: 25%"/>
+<col style="width: 40%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>タグ</p></th>
+<th class="head"><p>意味</p></th>
+<th class="head"><p>値構造体</p></th>
+<th class="head"><p>説明</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>EXT4_FC_TAG_HEAD</p></td>
+<td><p>高速コミット領域ヘッダ</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">ext4_fc_head</span></code></p></td>
+<td><p>これらの高速コミットが適用されるべきトランザクションのTIDを格納します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>EXT4_FC_TAG_ADD_RANGE</p></td>
+<td><p>インノードへのエクステントの追加</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">ext4_fc_add_range</span></code></p></td>
+<td><p>このインノードで追加するインノード番号とエクステントを格納します。</p></td>
+</tr>
+<tr class="row-even"><td><p>EXT4_FC_TAG_DEL_RANGE</p></td>
+<td><p>インノードへの論理オフセットの削除</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">ext4_fc_del_range</span></code></p></td>
+<td><p>削除が必要なインノード番号と論理オフセット範囲を格納します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>EXT4_FC_TAG_CREAT</p></td>
+<td><p>新たに作成されたファイルのディレクトリエントリの作成</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">ext4_fc_dentry_info</span></code></p></td>
+<td><p>親インノード番号、インノード番号、および新たに作成されたファイルのディレクトリエントリを格納します。</p></td>
+</tr>
+<tr class="row-even"><td><p>EXT4_FC_TAG_LINK</p></td>
+<td><p>ディレクトリエントリをインノードにリンク</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">ext4_fc_dentry_info</span></code></p></td>
+<td><p>親インノード番号、インノード番号、およびディレクトリエントリを格納します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>EXT4_FC_TAG_UNLINK</p></td>
+<td><p>インODEのディレクトリエントリをアンリンクする</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">ext4_fc_dentry_info</span></code></p></td>
+<td><p>親インノード番号、インノード番号、およびディレクトリエントリを格納します。</p></td>
+</tr>
+<tr class="row-even"><td><p>EXT4_FC_TAG_PAD (パディング)</p></td>
+<td><p>パディング（未使用領域）</p></td>
+<td><p>なし</p></td>
+<td><p>フェスティバル コミット領域の未使用バイト</p></td>
+</tr>
+<tr class="row-odd"><td><p>EXT4_FC_TAG_TAIL (テール)</p></td>
+<td><p>フェスティバル コミットの終端をマークする</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">ext4_fc_tail</span></code></p></td>
+<td><p>このタグが表すフェスティバル コミットの終端を表すコミットのTIDとCRCを保存する</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/filesystems/ext4/journal.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

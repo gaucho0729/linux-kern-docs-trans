@@ -1,0 +1,1087 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Flash-Friendly File System (F2FS) とは？ — Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="gfs2.html" rel="next" title="Global File System"/>
+<link href="ext3.html" rel="prev" title="Ext3 ファイルシステム"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="what-is-flash-friendly-file-system-f2fs">
+<h1>フラッシュフレンドリーなファイルシステム（F2FS）とは何ですか？<a class="headerlink" href="#what-is-flash-friendly-file-system-f2fs" title="この見出しへのパーマリンク">¶</a></h1>
+<p>SSD、eMMC、SDカードなどのNANDフラッシュメモリベースのストレージデバイスは、モバイルからサーバーまでの幅広いシステムに搭載されています。これらは回転ディスクとは異なる特徴を持つため、ストレージデバイスの上位レイヤーであるファイルシステムは設計段階で変化に適応する必要があります。</p>
+<p>F2FSはNANDフラッシュメモリベースのストレージデバイスを活用したファイルシステムで、ログ構造ファイルシステム（LFS）に基づいています。設計ではLFSの基本的な課題である「迷走する木の雪だるま式効果」と「高いクリーンオーバーヘッド」に焦点を当てています。</p>
+<p>NANDフラッシュメモリベースのストレージデバイスは内部幾何学やフラッシュメモリ管理方式（FTL）によって異なる特性を示すため、F2FSおよびそのツールは、ディスクレイアウトの構成だけでなく、割当およびクリーンアルゴリズムの選択にもさまざまなパラメータをサポートしています。</p>
+<p>以下のgitツリーには、ファイルシステムのフォーマットツール（mkfs.f2fs）、整合性チェックツール（fsck.f2fs）、デバッグツール（dump.f2fs）が含まれています。</p>
+<ul class="simple">
+<li><p>git://git.kernel.org/pub/scm/linux/kernel/git/jaegeuk/f2fs-tools.git</p></li>
+</ul>
+<p>バグの報告やパッチの送信には、以下のメールリストをご利用ください：</p>
+<ul class="simple">
+<li><p><a class="reference external" href="mailto:linux-f2fs-devel%40lists.sourceforge.net">linux-f2fs-devel<span>@</span>lists<span>.</span>sourceforge<span>.</span>net</a></p></li>
+</ul>
+<section id="background-and-design-issues">
+<h2>背景と設計上の課題<a class="headerlink" href="#background-and-design-issues" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="log-structured-file-system-lfs">
+<h3>ログ構造ファイルシステム（LFS）<a class="headerlink" href="#log-structured-file-system-lfs" title="この見出しへのパーマリンク">¶</a></h3>
+<p>「ログ構造ファイルシステムは、すべての変更をディスクに順次書き込むログ形式の構造を使用し、ファイルの書き込みとクラッシュ回復を高速化します。ログはディスク上の唯一の構造であり、ファイルの効率的な読み戻しに必要なインデックス情報を含みます。ディスク上の大きな空き領域を維持するため、ログをセグメントに分割し、セグメントクリーナーを使用して重複したセグメントから有効な情報を圧縮します。」（Rosenblum, M. and Ousterhout, J. K., 1992, 「ログ構造ファイルシステムの設計と実装」, ACM Trans. Computer Systems 10, 1, 26–52）</p>
+</section>
+<section id="wandering-tree-problem">
+<h3>迷走する木の問題<a class="headerlink" href="#wandering-tree-problem" title="この見出しへのパーマリンク">¶</a></h3>
+<p>LFSでは、ファイルデータが更新されログの末尾に書き込まれるとき、その直接ポインタブロックが変更された位置に応じて更新されます。その後、直接ポインタブロックの更新により間接ポインタブロックも更新されます。このような形で、inode、inodeマップ、チェックポイントブロックなどの上位インデックス構造も再帰的に更新されます。この問題は「wandering tree problem（彷徨う木問題）」と呼ばれており、パフォーマンス向上のためには更新伝播をできるだけ減らすか消す必要があります。</p>
+<p>[1] Bityutskiy, A. 2005. JFFS3 design issues. <a class="reference external" href="http://www.linux-mtd.infradead.org/">http://www.linux-mtd.infradead.org/</a></p>
+</section>
+<section id="cleaning-overhead">
+<h3>クリーニングオーバーヘッド<a class="headerlink" href="#cleaning-overhead" title="この見出しへのパーマリンク">¶</a></h3>
+<p>LFSはアウトオブプレース書き込みを基盤としているため、ストレージ全体にわたって多数の廃棄ブロックが散らばります。新しい空きログ領域を提供するためには、ユーザーに対してこれらの廃棄ブロックをスムーズに回収する必要があります。この作業を「クリーニングプロセス」と呼びます。</p>
+<p>このプロセスは以下の3つの操作から構成されます。</p>
+<ol class="arabic simple">
+<li><p>victimセグメントはセグメント使用状況テーブルを参照して選択されます。</p></li>
+<li><p>victimセグメントを特定するセグメントサマリブロックのデータの親インデックス構造をすべて読み込みます。</p></li>
+<li><p>データとその親インデックス構造間のクロスリファレンスを確認します。</p></li>
+<li><p>有効なデータを選択的に移動します。</p></li>
+</ol>
+<p>このクリーニング作業は予期せぬ長時間の遅延を引き起こす可能性があるため、ユーザーに対して遅延を隠すことが最も重要な目標です。また、有効なデータの移動量を減らし、迅速に移動させる必要があります。</p>
+</section>
+</section>
+<section id="key-features">
+<h2>主要な機能<a class="headerlink" href="#key-features" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="flash-awareness">
+<h3>フラッシュアウェアネス<a class="headerlink" href="#flash-awareness" title="この見出しへのパーマリンク">¶</a></h3>
+<ul class="simple">
+<li><p>パフォーマンス向上のためにランダムな書き込み領域を拡大するが、高い空間ローカリティを提供する</p></li>
+<li><p>FTLの操作単位にデータ構造を合わせるよう最大限に努力する</p></li>
+</ul>
+</section>
+<section id="id1">
+<h3>迷走する木の問題<a class="headerlink" href="#id1" title="この見出しへのパーマリンク">¶</a></h3>
+<ul class="simple">
+<li><p>inodeおよび各種ポインタブロックを表す「ノード」という用語を使用する</p></li>
+<li><p>すべての「ノード」ブロックの位置を含むノードアドレステーブル（NAT）を導入し、これにより更新伝播を遮断する</p></li>
+</ul>
+</section>
+<section id="id2">
+<h3>クリーニングオーバーヘッド<a class="headerlink" href="#id2" title="この見出しへのパーマリンク">¶</a></h3>
+<ul class="simple">
+<li><p>バックグラウンドクリーニングプロセスをサポートする</p></li>
+<li><p>victim選択ポリシーにおける貪欲法およびコストベネフィットアルゴリズムをサポートする</p></li>
+<li><p>静的/動的ホットデータとクールデータの分離に向けたマルチヘッドログをサポートする</p></li>
+<li><p>効率的なブロック割当を実現する適応ログを導入する</p></li>
+</ul>
+</section>
+</section>
+<section id="mount-options">
+<h2>マウントオプション<a class="headerlink" href="#mount-options" title="この見出しへのパーマリンク">¶</a></h2>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 27%"/>
+<col style="width: 73%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>background_gc=%s</p></td>
+<td><p>クリーニング作業（ゴミ収集）をバックグラウンドで実行するかどうかを有効/無効にする。background_gc=onの場合はゴミ収集を有効にし、background_gc=offの場合は無効にします。background_gc=syncの場合はバックグラウンドで同期実行されるゴミ収集を有効にします。このオプションのデフォルト値はonであり、デフォルトではゴミ収集が有効になっています。</p></td>
+</tr>
+<tr class="row-even"><td><p>gc_merge</p></td>
+<td><p>background_gcが有効な場合、このオプションを有効にすると、バックグラウンドGCスレッドがフォアグラウンドGCリクエストを処理します。これにより、I/OとCPUリソースが制限されたプロセスからGCがトリガーされた際の、遅延したフォアグラウンドGC操作によるスロウな挙動を解消できます。</p></td>
+</tr>
+<tr class="row-odd"><td><p>nogc_merge</p></td>
+<td><p>GCマージ機能を無効化します。</p></td>
+</tr>
+<tr class="row-even"><td><p>disable_roll_forward</p></td>
+<td><p>ロールフォワード回復ルーチンを無効化します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>norecovery</p></td>
+<td><p>ロールフォワード回復ルーチンを無効化し、読み取り専用でマウントします（つまり、-o ro,disable_roll_forward）。</p></td>
+</tr>
+<tr class="row-even"><td><p>discard/nodiscard</p></td>
+<td><p>f2fsにおけるリアルタイムdiscardを有効/無効にします。discardが有効な場合、セグメントがクリーンになったときにdiscard/TRIMコマンドを発行します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>no_heap</p></td>
+<td><p>ヒープスタイルのセグメント割当を無効化します。これはデータ用の空きセグメントをメインエリアの先頭から、ノード用はメインエリアの末尾から検索する方式です。</p></td>
+</tr>
+<tr class="row-even"><td><p>nouser_xattr</p></td>
+<td><p>拡張ユーザー属性を無効化します。注意：CONFIG_F2FS_FS_XATTRが選択されている場合、xattrはデフォルトで有効になります。</p></td>
+</tr>
+<tr class="row-odd"><td><p>noacl</p></td>
+<td><p>POSIXアクセス制御リストを無効化します。注意：CONFIG_F2FS_FS_POSIX_ACLが選択されている場合、aclはデフォルトで有効になります。</p></td>
+</tr>
+<tr class="row-even"><td><p>active_logs=%u</p></td>
+<td><p>アクティブなログ数を設定可能にします。現在の設計ではf2fsは2、4、6のログのみをサポートしています。デフォルト値は6です。</p></td>
+</tr>
+<tr class="row-odd"><td><p>disable_ext_identify</p></td>
+<td><p>mkfsで設定された拡張リストを無効化します。これにより、f2fsはメディアファイルなどの冷蔵ファイルを認識しなくなります。</p></td>
+</tr>
+<tr class="row-even"><td><p>inline_xattr</p></td>
+<td><p>インラインxattrs機能を有効にします。</p></td>
+</tr>
+<tr class="row-odd"><td><p>noinline_xattr</p></td>
+<td><p>インラインxattrs機能を無効化します。</p></td>
+</tr>
+<tr class="row-even"><td><p>inline_xattr_size=%u</p></td>
+<td><p>インラインxattrサイズを設定可能にします。これは柔軟なインラインxattr機能に依存します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>inline_data</p></td>
+<td><p>インラインデータ機能を有効にします：新たに作成された小さな（〜3.4KB未満）ファイルはinodeブロックに書き込まれます。</p></td>
+</tr>
+<tr class="row-even"><td><p>inline_dentry</p></td>
+<td><p>インラインディレクトリ機能を有効にします：新たに作成されたディレクトリエントリのデータはinodeブロックに書き込まれます。インラインdentryを保存するinodeブロックのスペースは〜3.4KBに制限されます。</p></td>
+</tr>
+<tr class="row-odd"><td><p>noinline_dentry</p></td>
+<td><p>インラインdentry機能を無効化します。</p></td>
+</tr>
+<tr class="row-even"><td><p>flush_merge</p></td>
+<td><p>同時に行われるキャッシュフラッシュコマンドをできるだけ統合し、冗長なコマンドの問題を解消します。基盤となるデバイスがキャッシュフラッシュコマンドを相対的に遅く処理する場合、このオプションを有効にすることを推奨します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>nobarrier</p></td>
+<td><p>基盤となるストレージがキャッシュデータを非揮発領域に書き込むことを保証している場合、このオプションを使用できます。このオプションが設定されている場合、キャッシュフラッシュコマンドは発行されませんが、f2fsはすべてのデータ書き込みの書き込み順序を保証します。</p></td>
+</tr>
+<tr class="row-even"><td><p>fastboot</p></td>
+<td><p>システムがマウント時間をできるだけ短縮するために、通常のパフォーマンスを犠牲にしても良い場合にこのオプションを使用します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>extent_cache</p></td>
+<td><p>rbツリーを基にしたエクステントキャッシュを有効化します。これは、inodeごとに連続した論理アドレスと物理アドレスをマッピングするエクステントをキャッシュできるため、キャッシュヒット率が向上します。デフォルトで有効です。</p></td>
+</tr>
+<tr class="row-even"><td><p>noextent_cache</p></td>
+<td><p>rbツリーを基にしたエクステントキャッシュを明示的に無効化します。上記のextent_cacheマウントオプションを参照してください。</p></td>
+</tr>
+<tr class="row-odd"><td><p>noinline_data</p></td>
+<td><p>インラインデータ機能を無効化します。インラインデータ機能はデフォルトで有効です。</p></td>
+</tr>
+<tr class="row-even"><td><p>data_flush</p></td>
+<td><p>チェックポイント前にデータフラッシュを有効化し、通常ファイルとシンボリックリンクのデータを永続化します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>reserve_root=%d</p></td>
+<td><p>指定されたuidまたはgidを持つ特権ユーザーからの割当に使用される予約領域を設定できます。単位: 4KB、デフォルトの制限はユーザーブロックの0.2%です。</p></td>
+</tr>
+<tr class="row-even"><td><p>resuid=%d</p></td>
+<td><p>予約ブロックを使用できるユーザーID。</p></td>
+</tr>
+<tr class="row-odd"><td><p>resgid=%d</p></td>
+<td><p>予約ブロックを使用できるグループID。</p></td>
+</tr>
+<tr class="row-even"><td><p>fault_injection=%d</p></td>
+<td><p>指定された注入率ですべてのサポートされているタイプのフェールトインジェクションを有効化します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>fault_type=%d</p></td>
+<td><p>フェールトインジェクションタイプを設定できます。fault_injectionオプションとともに有効化してください。フェールトタイプの値は下記に示されており、単一または複合タイプのいずれかをサポートしています。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 63%"/>
+<col style="width: 37%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Type_Name</p></th>
+<th class="head"><p>Type_Value</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>FAULT_KMALLOC</p></td>
+<td><p>0x000000001</p></td>
+</tr>
+<tr class="row-odd"><td><p>FAULT_KVMALLOC</p></td>
+<td><p>0x000000002</p></td>
+</tr>
+<tr class="row-even"><td><p>FAULT_PAGE_ALLOC</p></td>
+<td><p>0x000000004</p></td>
+</tr>
+<tr class="row-odd"><td><p>FAULT_PAGE_GET</p></td>
+<td><p>0x000000008</p></td>
+</tr>
+<tr class="row-even"><td><p>FAULT_ALLOC_NID</p></td>
+<td><p>0x000000020</p></td>
+</tr>
+<tr class="row-odd"><td><p>FAULT_ORPHAN</p></td>
+<td><p>0x000000040</p></td>
+</tr>
+<tr class="row-even"><td><p>FAULT_BLOCK</p></td>
+<td><p>0x000000080</p></td>
+</tr>
+<tr class="row-odd"><td><p>FAULT_DIR_DEPTH</p></td>
+<td><p>0x000000100</p></td>
+</tr>
+<tr class="row-even"><td><p>FAULT_EVICT_INODE</p></td>
+<td><p>0x000000200</p></td>
+</tr>
+<tr class="row-odd"><td><p>FAULT_TRUNCATE</p></td>
+<td><p>0x000000400</p></td>
+</tr>
+<tr class="row-even"><td><p>FAULT_READ_IO</p></td>
+<td><p>0x000000800</p></td>
+</tr>
+<tr class="row-odd"><td><p>FAULT_CHECKPOINT</p></td>
+<td><p>0x000001000</p></td>
+</tr>
+<tr class="row-even"><td><p>FAULT_DISCARD</p></td>
+<td><p>0x000002000</p></td>
+</tr>
+<tr class="row-odd"><td><p>FAULT_WRITE_IO</p></td>
+<td><p>0x000004000</p></td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+<tr class="row-even"><td><p>mode=%s</p></td>
+<td><p>ブロック割当モードを制御します。サポートされるモードは「adaptive」と「lfs」です。「lfs」モードでは、メイン領域へのランダムな書き込みは行われません。</p></td>
+</tr>
+<tr class="row-odd"><td><p>io_bits=%u</p></td>
+<td><p>書き込みIOリクエストのビットサイズを設定します。「mode=lfs」で設定してください。</p></td>
+</tr>
+<tr class="row-even"><td><p>usrquota</p></td>
+<td><p>シンプルなユーザーディスククォータの会計を有効化します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>grpquota</p></td>
+<td><p>シンプルなグループディスククォータの会計を有効化します。</p></td>
+</tr>
+<tr class="row-even"><td><p>prjquota</p></td>
+<td><p>シンプルなプロジェクトクォータの会計を有効化します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>usrjquota=&lt;ファイル&gt;</p></td>
+<td><p>マウント時に指定したファイルとタイプを指定し、クォータ情報が復旧フロー中に正しく更新できるようにします</p></td>
+</tr>
+<tr class="row-even"><td><p>grpjquota=&lt;ファイル&gt;</p></td>
+<td><p>復旧フロー中に情報が正しく更新できるようにします</p></td>
+</tr>
+<tr class="row-odd"><td><p>prjjquota=&lt;ファイル&gt;</p></td>
+<td><p>&lt;クォータファイル&gt;: ルートディレクトリに必須です;</p></td>
+</tr>
+<tr class="row-even"><td><p>jqfmt=&lt;クォータタイプ&gt;</p></td>
+<td><p>&lt;クォータタイプ&gt;: [vfsold,vfsv0,vfsv1].</p></td>
+</tr>
+<tr class="row-odd"><td><p>offusrjquota</p></td>
+<td><p>ユーザーのジャーナル化クォータをオフにします</p></td>
+</tr>
+<tr class="row-even"><td><p>offgrpjquota</p></td>
+<td><p>グループのジャーナル化クォータをオフにします</p></td>
+</tr>
+<tr class="row-odd"><td><p>offprjjquota</p></td>
+<td><p>プロジェクトのジャーナル化クォータをオフにします</p></td>
+</tr>
+<tr class="row-even"><td><p>クォータ</p></td>
+<td><p>シンプルなユーザーディスククォータの会計を有効化します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>noquota</p></td>
+<td><p>すべての通常のディスククォータオプションを無効にします</p></td>
+</tr>
+<tr class="row-even"><td><p>whint_mode=%s</p></td>
+<td><p>ブロックレイヤーに渡す書き込みヒントの制御。"off"、"user-based"、"fs-based"の3種類をサポートしています。"off"モード（デフォルト）ではf2fsがヒントを渡しません。"user-based"モードではユーザーが指定したヒントを渡します。"fs-based"モードではf2fsのポリシーに基づいてヒントを渡します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>alloc_mode=%s</p></td>
+<td><p>ブロック割当ポリシーを調整します。"reuse"と"default"をサポートしています。</p></td>
+</tr>
+<tr class="row-even"><td><p>fsync_mode=%s</p></td>
+<td><p>fsyncのポリシーを制御します。現在"posix"、"strict"、"nobarrier"をサポートしています。"posix"モード（デフォルト）ではPOSIX準拠で軽量な操作を行い、ファイルシステムのパフォーマンスを向上させます。"strict"モードでは重い操作となり、xfs、ext4、btrfsと同様の挙動をします（xfstest generic/342は通過しますがパフォーマンスが低下します）。
+"nobarrier"は"posix"に基づいていますが、非原子的なファイルにはフラッシュコマンドを発行しません（"nobarrier"マウントオプションと同様です）。</p></td>
+</tr>
+<tr class="row-odd"><td><p>test_dummy_encryption</p></td>
+<td></td>
+</tr>
+<tr class="row-even"><td><p>test_dummy_encryption=%s</p></td>
+<td><p>ダミー暗号化を有効にします。これは仮想のfscryptコンテキストを提供します。この仮想fscryptコンテキストはxfstestsで使用されます。引数は"v1"または"v2"のいずれかを指定して、対応するfscryptポリシーバージョンを選択します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>checkpoint=%s[:%u[%]]</p></td>
+<td><p>「disable」に設定するとチェックポイント機能をオフにします。「enable」に設定するとチェックポイント機能を再び有効にします。デフォルトでは有効になっています。無効な状態では、アンマウントや予期せぬシャットダウンにより、ファイルシステムの内容がマウント時にそのオプションでマウントされた時の状態に戻ることがあります。チェックポイント=disabledでマウントする際には、ファイルシステムがすべての利用可能な領域を使用できるようにガベージコレクションを実行する必要があります。この処理に時間がかかる場合、マウントがEAGAINを返す可能性があります。必要に応じて、一時的にどの程度のディスク容量を放棄するかを示す値を追加できます。これはブロック数またはパーセントで指定可能です。例えば、チェックポイント=disable:100%でマウントすると常に成功しますが、すべての残りの空き領域を隠す可能性があります。実際の利用不可領域は/sys/fs/f2fs/&lt;disk&gt;/unusableで確認できます。この領域はチェックポイント=enableで再取得されます。</p></td>
+</tr>
+<tr class="row-even"><td><p>checkpoint_merge</p></td>
+<td><p>チェックポイントが有効な場合、この機能を使用してカーネルデーモンを作成し、複数のチェックポイント要求を統合して冗長なチェックポイント問題を解消できます。さらに、cgroup内の低I/O予算とCPUシェアを持つプロセスコンテキストでチェックポイント処理が行われる場合の遅延問題も解消します。この機能をより効果的に実行するため、カーネルデーモンのデフォルトI/O優先度を「3」に設定し、他のカーネルスレッドよりも高い優先度を付与します。これはext4ファイルシステムのjbd2ジャーナリングスレッドにI/O優先度を付与する方法と同じです。</p></td>
+</tr>
+<tr class="row-odd"><td><p>nocheckpoint_merge</p></td>
+<td><p>チェックポイントマージ機能を無効にします。</p></td>
+</tr>
+<tr class="row-even"><td><p>compress_algorithm=%s</p></td>
+<td><p>圧縮アルゴリズムを制御します。現在f2fsは「lzo」、「lz4」、「zstd」および「lzo-rle」アルゴリズムをサポートしています。</p></td>
+</tr>
+<tr class="row-odd"><td><p>compress_algorithm=%s:%d</p></td>
+<td><p>圧縮アルゴリズムとその圧縮レベルを制御します。現在は「lz4」と「zstd」のみ圧縮レベルの設定が可能です。アルゴリズムレベル範囲 lz4 3 - 16 zstd 1 - 22</p></td>
+</tr>
+<tr class="row-even"><td><p>compress_log_size=%u</p></td>
+<td><p>圧縮クラスタサイズを設定可能にします。サイズは4KB * (1 &lt;&lt; %u)となり、16KBが最小サイズでデフォルト値もこのサイズです。</p></td>
+</tr>
+<tr class="row-odd"><td><p>compress_extension=%s</p></td>
+<td><p>指定された拡張子に対応するファイルに圧縮を有効化できるようにします。たとえば、すべての'.ext'拡張子のファイルが高圧縮率を有する場合、'.ext'を圧縮拡張子リストに設定し、これらのファイルにデフォルトで圧縮を有効化できるようにします。ioctl経由で個別に有効化する必要はなくなります。他のファイルについては、依然としてioctl経由で圧縮を有効化できます。注意点として、'*'という特別な予約拡張子があり、これを設定することですべてのファイルに圧縮を有効化できます。</p></td>
+</tr>
+<tr class="row-even"><td><p>compress_chksum</p></td>
+<td><p>圧縮されたクラスタ内のrawデータのチェックサムを検証します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>compress_mode=%s</p></td>
+<td><p>ファイル圧縮モードを制御します。「fs」モードと「user」モードをサポートしています。「fs」モード（デフォルト）では、圧縮が有効なファイルに対してf2fsが自動的に圧縮を行います。「user」モードでは、f2fsが自動圧縮を無効化し、ユーザーが対象ファイルやタイミングを選択できるようにします。ユーザーはioctl経由で圧縮/復元を手動で行うことができます。</p></td>
+</tr>
+<tr class="row-even"><td><p>compress_cache</p></td>
+<td><p>ファイルシステム管理inodeのアドレス空間を用いて圧縮ブロックをキャッシュし、ランダム読み取りのキャッシュヒット率を向上させます。</p></td>
+</tr>
+<tr class="row-odd"><td><p>inlinecrypt</p></td>
+<td><p>暗号化ファイルのコンテンツをblk-cryptoフレームワークを使用して暗号化/復号するようにします（ファイルシステムレイヤーの暗号化ではなく）。これによりインライン暗号化ハードウェアの使用が可能になります。ディスク上の形式は影響を受けません。詳細については
+<a class="reference internal" href="../block/inline-encryption.html"><span class="doc">インライン暗号化</span></a>.</p></td>
+</tr>
+<tr class="row-even"><td><p>atgc</p></td>
+<td><p>年齢閾値に基づくガベージコレクションを有効化します。これはバックグラウンドGCにおいて高い効果と効率を提供します。</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="debugfs-entries">
+<h2>Debugfsエントリ<a class="headerlink" href="#debugfs-entries" title="この見出しへのパーマリンク">¶</a></h2>
+<p>/sys/kernel/debug/f2fs/には、f2fsとしてマウントされたすべてのパーティションに関する情報が含まれています。各ファイルはf2fs全体の情報を示します。</p>
+<p>/sys/kernel/debug/f2fs/statusには含まれます:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>現在f2fsが管理している主要なファイルシステム情報</p></li>
+<li><p>すべてのセグメントに関する平均SIT情報</p></li>
+<li><p>現在f2fsが消費しているメモリの使用量</p></li>
+</ul>
+</div></blockquote>
+</section>
+<section id="sysfs-entries">
+<h2>Sysfsエントリ<a class="headerlink" href="#sysfs-entries" title="この見出しへのパーマリンク">¶</a></h2>
+<p>マウントされたf2fsファイルシステムに関する情報は、/sys/fs/f2fs/にあります。各マウントされたファイルシステムは、デバイス名に基づいて/sys/fs/f2fs/配下にディレクトリが作成され、そのディレクトリ内のファイルは以下の表に示します。</p>
+<p>/sys/fs/f2fs/&lt;devname&gt;内のファイル（関連するドキュメント: Documentation/ABI/testing/sysfs-fs-f2fs を参照）</p>
+</section>
+<section id="usage">
+<h2>使い方<a class="headerlink" href="#usage" title="この見出しへのパーマリンク">¶</a></h2>
+<ol class="arabic">
+<li><p>ユーザーランドツールをダウンロードし、コンパイルします。</p></li>
+<li><p>f2fsがカーネル内に静的コンパイルされている場合はスキップします。それ以外の場合は、f2fs.koモジュールを挿入します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># insmod f2fs.ko
+</pre></div>
+</div>
+</li>
+<li><p>マウント時に使用するディレクトリを作成します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># mkdir /mnt/f2fs
+</pre></div>
+</div>
+</li>
+<li><p>ブロックデバイスをフォーマットし、f2fsとしてマウントします:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># mkfs.f2fs -l label /dev/block_device
+# mount -t f2fs /dev/block_device /mnt/f2fs
+</pre></div>
+</div>
+</li>
+</ol>
+<section id="mkfs-f2fs">
+<h3>mkfs.f2fs<a class="headerlink" href="#mkfs-f2fs" title="この見出しへのパーマリンク">¶</a></h3>
+<p>mkfs.f2fsは、パーティションをf2fsファイルシステムとしてフォーマットするために使用され、基本的なディスク上のレイアウトを構築します。</p>
+<p>クイックオプションは以下の通りです:</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 20%"/>
+<col style="width: 80%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">-l</span> <span class="pre">[label]</span></code></p></td>
+<td><p>ボリュームラベルを指定します。最大512文字のユニコード名を指定できます。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">-a</span> <span class="pre">[0</span> <span class="pre">or</span> <span class="pre">1]</span></code></p></td>
+<td><p>ヒープベースの割当の開始位置を分割します。</p>
+<p>デフォルトでは1が設定され、この動作を行います。</p>
+</td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">-o</span> <span class="pre">[int]</span></code></p></td>
+<td><p>ボリュームサイズに対するオーバープロビジョニング比率（パーセント）を設定します。</p>
+<p>デフォルトでは5が設定されています。</p>
+</td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">-s</span> <span class="pre">[int]</span></code></p></td>
+<td><p>セクション内のセグメント数を設定します。</p>
+<p>1はデフォルトで設定されています。</p>
+</td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">-z</span> <span class="pre">[int]</span></code></p></td>
+<td><p>ゾーンごとのセクション数を設定します。</p>
+<p>1はデフォルトで設定されています。</p>
+</td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">-e</span> <span class="pre">[str]</span></code></p></td>
+<td><p>基本的な拡張子リストを設定します。例: 「mp3,gif,mov」</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">-t</span> <span class="pre">[0</span> <span class="pre">or</span> <span class="pre">1]</span></code></p></td>
+<td><p>discardコマンドを無効にするか、有効にするかを設定します。</p>
+<p>1はデフォルトで設定されており、discardを実行します。</p>
+</td>
+</tr>
+</tbody>
+</table>
+<p>注意: 完全なオプション一覧を取得するには、mkfs.f2fs(8)のmanページを参照してください。</p>
+</section>
+<section id="fsck-f2fs">
+<h3>fsck.f2fs<a class="headerlink" href="#fsck-f2fs" title="この見出しへのパーマリンク">¶</a></h3>
+<p>fsck.f2fsは、f2fs形式のパーティションの整合性を確認するためのツールです。ファイルシステムメタデータとユーザーが作成したデータが正しくクロス参照されているかを検証します。注意として、初期バージョンのツールは不整合を修正しません。</p>
+<p>クイックオプションは以下の通りです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>-d debug level [default:0]
+</pre></div>
+</div>
+<p>注意: 完全なオプション一覧を取得するには、fsck.f2fs(8)のmanページを参照してください。</p>
+</section>
+<section id="dump-f2fs">
+<h3>dump.f2fs<a class="headerlink" href="#dump-f2fs" title="この見出しへのパーマリンク">¶</a></h3>
+<p>dump.f2fsは特定のinodeの情報を表示し、SSAとSITをファイルにダンプします。それぞれのファイルはdump_ssaとdump_sitです。</p>
+<p>dump.f2fsはf2fsファイルシステムのディスク上のデータ構造をデバッグするためのツールです。指定されたinode番号で認識されるディスク上のinode情報を表示し、すべてのSSAおよびSITエントリを予定されたファイル、./dump_ssaと./dump_sitにダンプできます。</p>
+<p>オプションは以下の通りです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>-d debug level [default:0]
+-i inode no (hex)
+-s [SIT dump segno from #1~#2 (decimal), for all 0~-1]
+-a [SSA dump segno from #1~#2 (decimal), for all 0~-1]
+</pre></div>
+</div>
+<p>例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># dump.f2fs -i [ino] /dev/sdx
+# dump.f2fs -s 0~-1 /dev/sdx (SIT dump)
+# dump.f2fs -a 0~-1 /dev/sdx (SSA dump)
+</pre></div>
+</div>
+<p>注意: 完全なオプション一覧を取得するには、dump.f2fs(8)のmanページを参照してください。</p>
+</section>
+<section id="sload-f2fs">
+<h3>sload.f2fs<a class="headerlink" href="#sload-f2fs" title="この見出しへのパーマリンク">¶</a></h3>
+<p>sload.f2fsは、既存のディスクイメージにファイルとディレクトリを挿入する方法を提供します。これは、コンパイル済みファイルをもとにf2fsイメージを構築する際にはじめて有用です。</p>
+<p>注意: 完全なオプション一覧を取得するには、sload.f2fs(8)のmanページを参照してください。</p>
+</section>
+<section id="resize-f2fs">
+<h3>resize.f2fs<a class="headerlink" href="#resize-f2fs" title="この見出しへのパーマリンク">¶</a></h3>
+<p>resize.f2fsは、f2fs形式のディスクイメージのサイズを変更し、イメージ内のすべてのファイルとディレクトリを保持します。</p>
+<p>注意: 完全なオプション一覧を取得するには、resize.f2fs(8)のmanページを参照してください。</p>
+</section>
+<section id="defrag-f2fs">
+<h3>defrag.f2fs<a class="headerlink" href="#defrag-f2fs" title="この見出しへのパーマリンク">¶</a></h3>
+<p>defrag.f2fsは、ディスク上の散在した書き込みデータおよびファイルシステムメタデータを統合します。これにより、より多くの連続した空き領域を提供して書き込み速度を向上させることができます。</p>
+<p>注意: 完全なオプション一覧を取得するには、defrag.f2fs(8)のmanページを参照してください。</p>
+</section>
+<section id="f2fs-io">
+<h3>f2fs_io<a class="headerlink" href="#f2fs-io" title="この見出しへのパーマリンク">¶</a></h3>
+<p>f2fs_ioは、さまざまなファイルシステムAPIおよびf2fs固有のAPIを実行するためのシンプルなツールです。これはQAテストにおいて非常に有用です。</p>
+<p>注意: 完全なオプション一覧を取得するには、f2fs_io(8)のmanページを参照してください。</p>
+</section>
+</section>
+<section id="design">
+<h2>設計<a class="headerlink" href="#design" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="on-disk-layout">
+<h3>ディスク上のレイアウト<a class="headerlink" href="#on-disk-layout" title="この見出しへのパーマリンク">¶</a></h3>
+<p>F2FSは、全体のボリュームを複数のセグメントに分割します。各セグメントは2MBのサイズに固定されています。セクションは連続するセグメントからなり、ゾーンはセクションのセットで構成されます。デフォルトでは、セクションとゾーンのサイズは1セグメントサイズに設定されていますが、ユーザーはmkfsを使用してサイズを簡単に変更できます。</p>
+<p>F2FSは、全体のボリュームを6つのエリアに分割し、スーパーブロックを除くすべてのエリアは以下の通り複数のセグメントで構成されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>                                        align with the zone size &lt;-|
+             |-&gt; align with the segment size
+ _________________________________________________________________________
+|            |            |   Segment   |    Node     |   Segment  |      |
+| Superblock | Checkpoint |    Info.    |   Address   |   Summary  | Main |
+|    (SB)    |   (CP)     | Table (SIT) | Table (NAT) | Area (SSA) |      |
+|____________|_____2______|______N______|______N______|______N_____|__N___|
+                                                                   .      .
+                                                         .                .
+                                             .                            .
+                                ._________________________________________.
+                                |_Segment_|_..._|_Segment_|_..._|_Segment_|
+                                .           .
+                                ._________._________
+                                |_section_|__...__|_
+                                .            .
+                                .________.
+                                |__zone__|
+</pre></div>
+</div>
+<ul class="simple">
+<li><dl class="simple">
+<dt>スーパーブロック (SB)</dt><dd><p>パーティションの開始位置に配置されており、ファイルシステムのクラッシュを防ぐために2つのコピーが存在します。基本的なパーティション情報と、f2fsのいくつかのデフォルトパラメータを含みます。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>チェックポイント (CP)</dt><dd><p>ファイルシステム情報、有効なNAT/SITセットのビットマップ、孤立 inode リスト、および現在アクティブなセグメントのサマリエントリを含みます。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>セグメント情報テーブル (SIT)</dt><dd><p>有効ブロック数や、すべてのブロックの有効性を示すビットマップなどのセグメント情報が含まれます。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>ノードアドレステーブル (NAT)</dt><dd><p>メインエリアに格納されているすべてのノードブロックのブロックアドレステーブルで構成されています。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>セグメントサマリーエリア (SSA)</dt><dd><p>メインエリアに格納されているすべてのデータおよびノードブロックの所有者情報を含むサマリエントリを含みます。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>メインエリア</dt><dd><p>ファイルおよびディレクトリデータとそのインデックスを含みます。</p>
+</dd>
+</dl>
+</li>
+</ul>
+<p>ファイルシステムとフラッシュベースストレージのずれを防ぐため、F2FSはCPの開始ブロックアドレスをセグメントサイズと一致させます。また、SSAエリアで一部のセグメントを確保して、メインエリアの開始ブロックアドレスをゾーンサイズと一致させます。</p>
+<p>追加の技術的詳細については、以下の調査を参照してください。
+<a class="reference external" href="https://wiki.linaro.org/WorkingGroups/Kernel/Projects/FlashCardSurvey">https://wiki.linaro.org/WorkingGroups/Kernel/Projects/FlashCardSurvey</a></p>
+</section>
+<section id="file-system-metadata-structure">
+<h3>ファイルシステムメタデータ構造<a class="headerlink" href="#file-system-metadata-structure" title="この見出しへのパーマリンク">¶</a></h3>
+<p>F2FSはチェックポイント方式を採用してファイルシステムの一貫性を維持します。マウント時にF2FSはまずCPエリアをスキャンして最後の有効なチェックポイントデータを検索します。スキャン時間を短縮するため、F2FSはCPのコピーを2つだけ使用します。そのうちの1つは常に最後の有効データを示し、これはシャドウコピー機構と呼ばれます。CPに加えて、NATおよびSITもシャドウコピー機構を採用しています。</p>
+<p>ファイルシステムの一貫性を確保するため、各CPは有効なNATおよびSITのコピーを指しています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+--------+----------+---------+
+|   CP   |    SIT   |   NAT   |
++--------+----------+---------+
+.         .          .          .
+.            .              .              .
+.               .                 .                 .
++-------+-------+--------+--------+--------+--------+
+| CP #0 | CP #1 | SIT #0 | SIT #1 | NAT #0 | NAT #1 |
++-------+-------+--------+--------+--------+--------+
+   |             ^                          ^
+   |             |                          |
+   `----------------------------------------'
+</pre></div>
+</div>
+</section>
+<section id="index-structure">
+<h3>インデックス構造<a class="headerlink" href="#index-structure" title="この見出しへのパーマリンク">¶</a></h3>
+<p>データの位置を管理する主要なデータ構造は「ノード」です。伝統的なファイル構造と同様に、F2FSにはinode、直接ノード、間接ノードの3種類のノードがあります。F2FSはinodeブロックに4KBを割り当て、そのブロックには923データブロックインデックス、2つの直接ノードポインタ、2つの間接ノードポインタ、および1つの二重間接ノードポインタを含みます。1つの直接ノードブロックには1018データブロックが含まれ、1つの間接ノードブロックにも1018ノードブロックが含まれます。したがって、1つのinodeブロック（つまりファイル）は以下の通りカバーします。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>4KB * (923 + 2 * 1018 + 2 * 1018 * 1018 + 1018 * 1018 * 1018) := 3.94TB.
+
+ Inode block (4KB)
+   |- data (923)
+   |- direct node (2)
+   |          `- data (1018)
+   |- indirect node (2)
+   |            `- direct node (1018)
+   |                       `- data (1018)
+   `- double indirect node (1)
+                       `- indirect node (1018)
+                                    `- direct node (1018)
+                                               `- data (1018)
+</pre></div>
+</div>
+<p>すべてのノードブロックはNATによってマッピングされるため、各ノードの位置はNATテーブルによって変換されます。葉データの更新によって引き起こされるノード更新の伝播を防ぐため、F2FSはわandering tree問題を考慮して、その伝播を切断できます。</p>
+</section>
+<section id="directory-structure">
+<h3>ディレクトリ構造<a class="headerlink" href="#directory-structure" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ディレクトリエントリは11バイトを占め、以下の属性から構成されます。</p>
+<ul class="simple">
+<li><p>ファイル名のハッシュ値</p></li>
+<li><p>ino イノデ番号</p></li>
+<li><p>len ファイル名の長さ</p></li>
+<li><p>type ファイルタイプ（ディレクトリ、シンリンクなど）</p></li>
+</ul>
+<p>dentryブロックは214つのdentryスロットとファイル名を含みます。その中では、各dentryが有効かどうかを表すビットマップが使用されます。dentryブロックは以下の構成で4KBを占めます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Dentry Block(4 K) = bitmap (27 bytes) + reserved (3 bytes) +
+                    dentries(11 * 214 bytes) + file name (8 * 214 bytes)
+
+                       [Bucket]
+           +--------------------------------+
+           |dentry block 1 | dentry block 2 |
+           +--------------------------------+
+           .               .
+     .                             .
+.       [Dentry Block Structure: 4KB]       .
++--------+----------+----------+------------+
+| bitmap | reserved | dentries | file names |
++--------+----------+----------+------------+
+[Dentry Block: 4KB] .   .
+               .               .
+          .                          .
+          +------+------+-----+------+
+          | hash | ino  | len | type |
+          +------+------+-----+------+
+          [Dentry Structure: 11 bytes]
+</pre></div>
+</div>
+<p>F2FSはディレクトリ構造に多段階ハッシュテーブルを実装しています。各レベルには、以下の図に示すように専用のハッシュバケット数を持つハッシュテーブルがあります。"A(2B)"はバケットが2データブロックを含むことを意味します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>----------------------
+A : bucket
+B : block
+N : MAX_DIR_HASH_DEPTH
+----------------------
+
+level #0   | A(2B)
+        |
+level #1   | A(2B) - A(2B)
+        |
+level #2   | A(2B) - A(2B) - A(2B) - A(2B)
+    .     |   .       .       .       .
+level #N/2 | A(2B) - A(2B) - A(2B) - A(2B) - A(2B) - ... - A(2B)
+    .     |   .       .       .       .
+level #N   | A(4B) - A(4B) - A(4B) - A(4B) - A(4B) - ... - A(4B)
+</pre></div>
+</div>
+<p>ブロック数とバケット数は次の式に基づいて決定されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>                          ,- 2, if n &lt; MAX_DIR_HASH_DEPTH / 2,
+# of blocks in level #n = |
+                          `- 4, Otherwise
+
+                           ,- 2^(n + dir_level),
+                           |        if n + dir_level &lt; MAX_DIR_HASH_DEPTH / 2,
+# of buckets in level #n = |
+                           `- 2^((MAX_DIR_HASH_DEPTH / 2) - 1),
+                                    Otherwise
+</pre></div>
+</div>
+<p>F2FSがディレクトリ内からファイル名を検索する際には、まずファイル名のハッシュ値を計算します。その後、レベル#0のハッシュテーブルをスキャンし、ファイル名とそのイノデ番号を含むdentryを探します。見つからない場合は、レベル#1の次のハッシュテーブルをスキャンします。このようにして、レベル1からNまで順にハッシュテーブルをスキャンします。各レベルでF2FSは以下の式で決定される1つのバケットのみをスキャンするため、計算量はO(log(ファイル数))となります。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>bucket number to scan in level #n = (hash value) % (# of buckets in level #n)
+</pre></div>
+</div>
+<p>ファイル作成の際には、F2FSはファイル名をカバーする空き連続スロットを検索します。検索操作と同様に、レベル1からNまでのすべてのハッシュテーブルで空きスロットを検索します。</p>
+<p>次の図は、子を持つ2つのケースの例を示しています:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>    --------------&gt; Dir &lt;--------------
+    |                                 |
+ child                             child
+
+ child - child                     [hole] - child
+
+ child - child - child             [hole] - [hole] - child
+
+Case 1:                           Case 2:
+Number of children = 6,           Number of children = 3,
+File size = 7                     File size = 7
+</pre></div>
+</div>
+</section>
+<section id="default-block-allocation">
+<h3>デフォルトのブロック割り当て<a class="headerlink" href="#default-block-allocation" title="この見出しへのパーマリンク">¶</a></h3>
+<p>実行時、F2FSは「Main」領域内で6つのアクティブなログ（ホット/ウォーム/コールド ノードとホット/ウォーム/コールド データ）を管理します。</p>
+<ul class="simple">
+<li><p>ホットノードはディレクトリの直接ノードブロックを含みます。</p></li>
+<li><p>ウォームノードはホットノードブロックを除く直接ノードブロックを含みます。</p></li>
+<li><p>コールドノードは間接ノードブロックを含みます。</p></li>
+<li><p>ホットデータはdentryブロックを含みます。</p></li>
+<li><p>ウォームデータはホットデータおよびコールドデータブロックを除くデータブロックを含みます。</p></li>
+<li><p>コールドデータはマルチメディアデータまたは移動されたデータブロックを含みます。</p></li>
+</ul>
+<p>LFSはフリースペース管理に2つのスキームを採用しています：スレッドロギングとコピー＆コンパクション。コピー＆コンパクションスキーム（クリーニングと呼ばれる）は、連続的な書き込み性能が非常に高いデバイスに適しており、常に新しいデータの書き込みにフリーセグメントが提供されます。しかし、高利用率下ではクリーニングオーバーヘッドに悩まされます。一方、スレッドロギングスキームはランダムな書き込みに悩まされるものの、クリーニングプロセスは不要です。F2FSはコピー＆コンパクションスキームをデフォルトで採用していますが、ファイルシステムの状態に応じて動的にスレッドロギングスキームに切り替えるハイブリッドスキームを採用しています。</p>
+<p>F2FSはフラッシュベースのストレージと整合性を保つため、セクション単位でセグメントを割り当てます。F2FSはセクションサイズがFTLのガベージコレクションのユニットサイズと一致することを期待しています。さらに、FTLのマッピング粒度に応じて、アクティブログの各セグメントを可能な限り異なるゾーンから割り当てます。FTLはマッピング粒度に応じてアクティブログ内のデータを1つの割り当て単位に書き込むことが可能です。</p>
+</section>
+<section id="cleaning-process">
+<h3>クリーニングプロセス<a class="headerlink" href="#cleaning-process" title="この見出しへのパーマリンク">¶</a></h3>
+<p>F2FSはオンデマンドでなくバックグラウンドでもクリーニングを行います。オンデマンドクリーニングはVFSコールに十分な空きセグメントがなくなったときにトリガーされます。バックグラウンドクリーナーはカーネルスレッドによって実行され、システムがアイドル状態になったときにクリーニングジョブをトリガーします。</p>
+<p>F2FSは2つの被害セグメント選択ポリシーをサポートしています：貪欲アルゴリズムとコストベネフィットアルゴリズム。貪欲アルゴリズムでは、有効ブロック数が最も少ないセグメントを被害セグメントとして選択します。コストベネフィットアルゴリズムでは、セグメントの年齢と有効ブロック数を考慮して被害セグメントを選択し、貪欲アルゴリズムにおけるログブロックスラッシング問題を解決します。F2FSはオンデマンドクリーナーに貪欲アルゴリズムを採用し、バックグラウンドクリーナーにはコストベネフィットアルゴリズムを採用しています。</p>
+<p>被害セグメント内のデータが有効かどうかを識別するため、F2FSはビットマップを管理しています。各ビットはブロックの有効性を表し、ビットマップはメインエリア内のすべてのブロックをカバーするビットストリームで構成されています。</p>
+</section>
+<section id="write-hint-policy">
+<h3>ライトヒントポリシー<a class="headerlink" href="#write-hint-policy" title="この見出しへのパーマリンク">¶</a></h3>
+<ol class="arabic simple">
+<li><p>whint_mode=off。F2FSはWRITE_LIFE_NOT_SETのみを下位に伝達します。</p></li>
+</ol>
+<p>2) whint_mode=user-based。F2FSはユーザーが提供したヒントを下位に伝達しようとします。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 33%"/>
+<col style="width: 38%"/>
+<col style="width: 30%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>User</p></th>
+<th class="head"><p>F2FS</p></th>
+<th class="head"><p>ブロック</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>N/A</p></td>
+<td><p>META</p></td>
+<td><p>WRITE_LIFE_NOT_SET</p></td>
+</tr>
+<tr class="row-odd"><td><p>N/A</p></td>
+<td><p>HOT_NODE</p></td>
+<td><p>“</p></td>
+</tr>
+<tr class="row-even"><td><p>N/A</p></td>
+<td><p>WARM_NODE</p></td>
+<td><p>“</p></td>
+</tr>
+<tr class="row-odd"><td><p>N/A</p></td>
+<td><p>COLD_NODE</p></td>
+<td><p>“</p></td>
+</tr>
+<tr class="row-even"><td><p>ioctl(COLD)</p></td>
+<td><p>COLD_DATA</p></td>
+<td><p>WRITE_LIFE_EXTREME</p></td>
+</tr>
+<tr class="row-odd"><td><p>拡張リスト</p></td>
+<td><p>“</p></td>
+<td><p>“</p></td>
+</tr>
+<tr class="row-even"><td><p>– バッファードIO</p></td>
+<td></td>
+<td></td>
+</tr>
+<tr class="row-odd"><td><p>WRITE_LIFE_EXTREME</p></td>
+<td><p>COLD_DATA</p></td>
+<td><p>WRITE_LIFE_EXTREME</p></td>
+</tr>
+<tr class="row-even"><td><p>WRITE_LIFE_SHORT</p></td>
+<td><p>HOT_DATA</p></td>
+<td><p>WRITE_LIFE_SHORT</p></td>
+</tr>
+<tr class="row-odd"><td><p>WRITE_LIFE_NOT_SET</p></td>
+<td><p>WARM_DATA</p></td>
+<td><p>WRITE_LIFE_NOT_SET</p></td>
+</tr>
+<tr class="row-even"><td><p>WRITE_LIFE_NONE</p></td>
+<td><p>“</p></td>
+<td><p>“</p></td>
+</tr>
+<tr class="row-odd"><td><p>WRITE_LIFE_MEDIUM</p></td>
+<td><p>“</p></td>
+<td><p>“</p></td>
+</tr>
+<tr class="row-even"><td><p>WRITE_LIFE_LONG</p></td>
+<td><p>“</p></td>
+<td><p>“</p></td>
+</tr>
+<tr class="row-odd"><td><p>– ディレクトIO</p></td>
+<td></td>
+<td></td>
+</tr>
+<tr class="row-even"><td><p>WRITE_LIFE_EXTREME</p></td>
+<td><p>COLD_DATA</p></td>
+<td><p>WRITE_LIFE_EXTREME</p></td>
+</tr>
+<tr class="row-odd"><td><p>WRITE_LIFE_SHORT</p></td>
+<td><p>HOT_DATA</p></td>
+<td><p>WRITE_LIFE_SHORT</p></td>
+</tr>
+<tr class="row-even"><td><p>WRITE_LIFE_NOT_SET</p></td>
+<td><p>WARM_DATA</p></td>
+<td><p>WRITE_LIFE_NOT_SET</p></td>
+</tr>
+<tr class="row-odd"><td><p>WRITE_LIFE_NONE</p></td>
+<td><p>“</p></td>
+<td><p>WRITE_LIFE_NONE</p></td>
+</tr>
+<tr class="row-even"><td><p>WRITE_LIFE_MEDIUM</p></td>
+<td><p>“</p></td>
+<td><p>WRITE_LIFE_MEDIUM</p></td>
+</tr>
+<tr class="row-odd"><td><p>WRITE_LIFE_LONG</p></td>
+<td><p>“</p></td>
+<td><p>WRITE_LIFE_LONG</p></td>
+</tr>
+</tbody>
+</table>
+<ol class="arabic simple" start="3">
+<li><p>whint_mode=fs-based。F2FSは自身のポリシーに基づいてヒントを下位に伝達します。</p></li>
+</ol>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 33%"/>
+<col style="width: 38%"/>
+<col style="width: 30%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>User</p></th>
+<th class="head"><p>F2FS</p></th>
+<th class="head"><p>ブロック</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>N/A</p></td>
+<td><p>META</p></td>
+<td><p>WRITE_LIFE_MEDIUM;</p></td>
+</tr>
+<tr class="row-odd"><td><p>N/A</p></td>
+<td><p>HOT_NODE</p></td>
+<td><p>WRITE_LIFE_NOT_SET</p></td>
+</tr>
+<tr class="row-even"><td><p>N/A</p></td>
+<td><p>WARM_NODE</p></td>
+<td><p>“</p></td>
+</tr>
+<tr class="row-odd"><td><p>N/A</p></td>
+<td><p>COLD_NODE</p></td>
+<td><p>WRITE_LIFE_NONE</p></td>
+</tr>
+<tr class="row-even"><td><p>ioctl(COLD)</p></td>
+<td><p>COLD_DATA</p></td>
+<td><p>WRITE_LIFE_EXTREME</p></td>
+</tr>
+<tr class="row-odd"><td><p>拡張リスト</p></td>
+<td><p>“</p></td>
+<td><p>“</p></td>
+</tr>
+<tr class="row-even"><td><p>– バッファードIO</p></td>
+<td></td>
+<td></td>
+</tr>
+<tr class="row-odd"><td><p>WRITE_LIFE_EXTREME</p></td>
+<td><p>COLD_DATA</p></td>
+<td><p>WRITE_LIFE_EXTREME</p></td>
+</tr>
+<tr class="row-even"><td><p>WRITE_LIFE_SHORT</p></td>
+<td><p>HOT_DATA</p></td>
+<td><p>WRITE_LIFE_SHORT</p></td>
+</tr>
+<tr class="row-odd"><td><p>WRITE_LIFE_NOT_SET</p></td>
+<td><p>WARM_DATA</p></td>
+<td><p>WRITE_LIFE_LONG</p></td>
+</tr>
+<tr class="row-even"><td><p>WRITE_LIFE_NONE</p></td>
+<td><p>“</p></td>
+<td><p>“</p></td>
+</tr>
+<tr class="row-odd"><td><p>WRITE_LIFE_MEDIUM</p></td>
+<td><p>“</p></td>
+<td><p>“</p></td>
+</tr>
+<tr class="row-even"><td><p>WRITE_LIFE_LONG</p></td>
+<td><p>“</p></td>
+<td><p>“</p></td>
+</tr>
+<tr class="row-odd"><td><p>– ディレクトIO</p></td>
+<td></td>
+<td></td>
+</tr>
+<tr class="row-even"><td><p>WRITE_LIFE_EXTREME</p></td>
+<td><p>COLD_DATA</p></td>
+<td><p>WRITE_LIFE_EXTREME</p></td>
+</tr>
+<tr class="row-odd"><td><p>WRITE_LIFE_SHORT</p></td>
+<td><p>HOT_DATA</p></td>
+<td><p>WRITE_LIFE_SHORT</p></td>
+</tr>
+<tr class="row-even"><td><p>WRITE_LIFE_NOT_SET</p></td>
+<td><p>WARM_DATA</p></td>
+<td><p>WRITE_LIFE_NOT_SET</p></td>
+</tr>
+<tr class="row-odd"><td><p>WRITE_LIFE_NONE</p></td>
+<td><p>“</p></td>
+<td><p>WRITE_LIFE_NONE</p></td>
+</tr>
+<tr class="row-even"><td><p>WRITE_LIFE_MEDIUM</p></td>
+<td><p>“</p></td>
+<td><p>WRITE_LIFE_MEDIUM</p></td>
+</tr>
+<tr class="row-odd"><td><p>WRITE_LIFE_LONG</p></td>
+<td><p>“</p></td>
+<td><p>WRITE_LIFE_LONG</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="fallocate-2-policy">
+<h3>Fallocate(2)ポリシー<a class="headerlink" href="#fallocate-2-policy" title="この見出しへのパーマリンク">¶</a></h3>
+<p>デフォルトポリシーは以下のPOSIX規則に従います。</p>
+<dl class="simple">
+<dt>ディスク領域の割り当て</dt><dd><p>fallocate()のデフォルト操作（つまりモードがゼロの場合）は、オフセットとlenで指定された範囲内でディスク領域を割り当てます。オフセット+lenがファイルサイズより大きい場合、ファイルサイズ（stat(2)で報告されるもの）が変更されます。オフセットとlenで指定された範囲内の任意のサブ領域が呼び出し前にはデータを含んでいなかった場合、その領域はゼロに初期化されます。このデフォルト動作はposix_fallocate(3)ライブラリ関数の動作に近いものであり、その関数を最適に実装するための方法として意図されています。</p>
+</dd>
+</dl>
+<p>ただし、F2FSがfallocate(fd, DEFAULT_MODE)よりも前に行われるioctl(fd, F2FS_IOC_SET_PIN_FILE)を受信した場合、ゼロまたはランダムデータを持つディスク上のブロックアドレスを割り当てることで、以下のシナリオに有用です:</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>create(fd)</p></li>
+<li><p>ioctl(fd, F2FS_IOC_SET_PIN_FILE)</p></li>
+<li><p>fallocate(fd, 0, 0, size)</p></li>
+<li><p>address = fibmap(fd, offset)</p></li>
+<li><p>open(blkdev)</p></li>
+<li><p>write(blkdev, address)</p></li>
+</ol>
+</div></blockquote>
+</section>
+<section id="compression-implementation">
+<h3>圧縮実装<a class="headerlink" href="#compression-implementation" title="この見出しへのパーマリンク">¶</a></h3>
+<ul class="simple">
+<li><p>新しい用語"cluster"が圧縮の基本単位として定義され、ファイルは論理的に複数のclusterに分割可能です。1つのclusterは4 &lt;&lt; n (n &gt;= 0)の論理ページを含み、圧縮サイズもclusterサイズとします。各clusterは圧縮可能または非圧縮のいずれかです。</p></li>
+<li><p>clusterメタデータレイアウトでは、clusterが圧縮されたものか通常のものかを示す特別なブロックアドレスが使用されます。圧縮clusterの場合、以下のメタデータがclusterを[1, 4 &lt;&lt; n - 1]の物理ブロックにマッピングし、f2fsは圧縮ヘッダと圧縮データを含むデータを格納します。</p></li>
+<li><p>上書き時の書き込み拡大を防ぐため、F2FSは一度書き込んだファイルにのみ圧縮をサポートします。cluster内のすべての論理ブロックに有効データが含まれており、clusterデータの圧縮率が指定されたしきい値未満の場合にのみ圧縮が可能です。</p></li>
+<li><p>通常のinodeに圧縮を有効にする方法は以下の3通りあります:</p>
+<ul>
+<li><p>chattr +c file</p></li>
+<li><p>chattr +c dir; touch dir/file</p></li>
+<li><p>mount w/ -o compress_extension=ext; touch file.ext</p></li>
+<li><p>mount w/ -o compress_extension=*; touch any_file</p></li>
+</ul>
+</li>
+<li><p>この時点では、圧縮機能はユーザーに圧縮された領域を直接公開しません。これは後続のデータ更新を保証するためです。代わりに、主な目的はフラッシュディスクへのデータ書き込みを可能な限り減らし、ディスク寿命を延長し、IOの混雑を緩和することです。代替案として、immutableビットを設定した後、ioctlインターフェースを介して圧縮領域を回収し、ユーザーに表示する機能を追加しました。</p></li>
+</ul>
+<p>圧縮メタデータレイアウト:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>                            [Dnode Structure]
+            +-----------------------------------------------+
+            | cluster 1 | cluster 2 | ......... | cluster N |
+            +-----------------------------------------------+
+            .           .                       .           .
+    .                       .                .                      .
+.         Compressed Cluster       .        .        Normal Cluster            .
++----------+---------+---------+---------+  +---------+---------+---------+---------+
+|compr flag| block 1 | block 2 | block 3 |  | block 1 | block 2 | block 3 | block 4 |
++----------+---------+---------+---------+  +---------+---------+---------+---------+
+        .                             .
+        .                                           .
+    .                                                           .
+    +-------------+-------------+----------+----------------------------+
+    | data length | data chksum | reserved |      compressed data       |
+    +-------------+-------------+----------+----------------------------+
+</pre></div>
+</div>
+</section>
+<section id="compression-mode">
+<h3>圧縮モード<a class="headerlink" href="#compression-mode" title="この見出しへのパーマリンク">¶</a></h3>
+<p>f2fsは"fs"および"user"の2つの圧縮モードを"compression_mode"マウントオプションでサポートします。このオプションにより、圧縮を有効にしたファイルの圧縮方法を選択できます（通常のinodeに圧縮を有効にする方法については"圧縮実装"セクションを参照してください）。</p>
+<p>1) compress_mode=fs これはデフォルトオプションです。f2fsは圧縮を有効にしたファイルのwriteback時に自動的に圧縮を行います。</p>
+<p>2) compress_mode=user この設定は自動圧縮を無効にし、ユーザーがターゲットファイルやタイミングを選択できるようにします。ユーザーはF2FS_IOC_DECOMPRESS_FILEおよびF2FS_IOC_COMPRESS_FILEというioctlコマンドを使用して、圧縮が有効なファイルに対して手動で圧縮/解圧を行うことができます（以下のように）。</p>
+<p>ファイルを解凍するには、</p>
+<p>fd = open(filename, O_WRONLY, 0); ret = ioctl(fd, F2FS_IOC_DECOMPRESS_FILE);</p>
+<p>ファイルを圧縮するには、</p>
+<p>fd = open(filename, O_WRONLY, 0); ret = ioctl(fd, F2FS_IOC_COMPRESS_FILE);</p>
+</section>
+<section id="nvme-zoned-namespace-devices">
+<h3>NVMe Zoned Namespaceデバイス<a class="headerlink" href="#nvme-zoned-namespace-devices" title="この見出しへのパーマリンク">¶</a></h3>
+<ul class="simple">
+<li><p>ZNSは、ゾーンごとの容量を定義し、これはゾーンサイズと等しいか、それ以下であることができます。ゾーン容量はゾーン内の利用可能なブロック数を示します。F2FSは、ゾーン容量がゾーンサイズより小さい場合、初期マウント時にゾーン容量を超えるセグメントはフリーセグメントビットマップで「非利用」とマークします。これらのセグメントは永久的に使用済みとみなされ、書き込み対象から除外されるため、ゴミコレクションの対象とはなりません。ゾーン容量がデフォルトのセグメントサイズ（2MB）に整っていない場合、セグメントはゾーン容量の前半から開始し、ゾーン容量境界を跨ぐことがあります。このような跨るセグメントも利用可能なセグメントとみなされます。これらのセグメント内でゾーン容量を超えるブロックはすべて利用不可能とみなされます。</p></li>
+</ul>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxカーネル内のファイルシステム</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#core-vfs-documentation">コアVFSドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#filesystem-support-layers">ファイルシステムサポートレイヤー</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#filesystems">ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxカーネル内のファイルシステム</a><ul>
+<li>前へ: <a href="ext3.html" title="前章">Ext3 ファイルシステム</a></li>
+<li>次へ: <a href="gfs2.html" title="次章">Global File System</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/filesystems/f2fs.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

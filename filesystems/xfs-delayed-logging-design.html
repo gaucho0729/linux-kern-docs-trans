@@ -1,0 +1,459 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>XFS Delayed Logging Design — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="xfs-self-describing-metadata.html" rel="next" title="XFS 自己記述メタデータ"/>
+<link href="vfat.html" rel="prev" title="VFAT"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="xfs-delayed-logging-design">
+<h1>XFS遅延ログ記録設計<a class="headerlink" href="#xfs-delayed-logging-design" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="introduction-to-re-logging-in-xfs">
+<h2>XFSにおける再ログ記録の紹介<a class="headerlink" href="#introduction-to-re-logging-in-xfs" title="この見出しへのパーマリンク">¶</a></h2>
+<p>XFSのロギングは論理的および物理的なロギングの組み合わせです。インODEやdquotなどの一部のオブジェクトは論理的な形式でロギングされ、ロギングされる詳細はメモリ内の構造体の変更内容から構成されます。他のオブジェクト（通常はバッファ）は物理的な変更がロギングされます。このような違いの理由は、頻繁にロギングされるオブジェクトのロギング領域を削減するためです。インODEの一部は他の部分よりも頻繁にロギングされ、インODEは他のオブジェクト（スーパーブロックバッファを除く）よりも頻繁にロギングされるため、メタデータのロギング量を最小限に抑えることが重要です。</p>
+<p>このような懸念の理由は、XFSが単一のオブジェクトに対して複数の変更を同時にロギング可能だからです。これにより、ロギングは各変更をディスクにフラッシュするのではなく、新しい変更を記録する前にディスクにフラッシュする必要がありません。XFSは「re-logging（再ロギング）」と呼ばれる方法でこれを実現します。概念的には非常に単純で、オブジェクトの新しい変更を記録するには、 <em>新しいコピー</em> を新しいトランザクションに含めることで実現されます。</p>
+<p>つまり、変更AからFまでの連続した変更があり、オブジェクトが変更D後にディスクに書き出された場合、ロギングには以下のトランザクションの系列が表示されます。それぞれのトランザクションの内容とトランザクションのロギングシーケンス番号（LSN）が含まれます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Transaction             Contents        LSN
+   A                       A               X
+   B                      A+B             X+n
+   C                     A+B+C           X+n+m
+   D                    A+B+C+D         X+n+m+o
+    &lt;object written to disk&gt;
+   E                       E               Y (&gt; X+n+m+o)
+   F                      E+F             Y+p
+</pre></div>
+</div>
+<p>言い換えれば、オブジェクトが再ロギングされるたびに、新しいトランザクションは現在ロギングにのみ保存されているすべての前の変更をまとめたものです。</p>
+<p>この再ロギング技術は、ロギングされているオブジェクトがロギングの先頭を妨げることなく、ロギングの先頭を進めることが可能にします。これは上記の表で、各次のトランザクションのLSN（増加する）が変化していることから確認できます。LSNは、トランザクションのロギング内の位置を直接的に符号化したものです。</p>
+<p>この再ログ記録は、長時間にわたる複数コミットのトランザクションを実装するためにも使用されます。このようなトランザクションは「ロールイングトランザクション」と呼ばれ、特別なログ予約である「永続的なトランザクション予約」を必要とします。ロールイングトランザクションの典型的な例は、inodeからエクステントを削除する操作で、これは予約サイズの制限により1トランザクションあたり2エクステントしか処理できないためです。したがって、ロールイングエクステント削除トランザクションは、各削除操作でinodeとbtreeバッファが変更されるたびに再ログ記録を行い、操作が進むにつれてログ内で前へ進むようにします。これにより、ログが巻き戻る場合でも、現在の操作が自身でブロックされることを防ぎます。</p>
+<p>このようにして、再ログ記録操作がXFSジャーナリングサブシステムの正しく動作する上で基本的な役割を果たしていることがわかります。上述の説明から、なぜXFSメタデータ操作がログに大量に書き込まれるのか理解できるでしょう。同じオブジェクトに対して繰り返し操作を行うと、同じ変更が繰り返しログに記録されるためです。さらに深刻なのは、オブジェクトが再ログ記録されるたびに汚れる傾向があるため、次のトランザクションで記録されるメタデータがより多くなります。</p>
+<p>XFSトランザクションサブシステムのもう一つの特徴は、ほとんどのトランザクションが非同期であることです。つまり、ログバッファが満杯になるまで、または同期操作がログバッファ内のトランザクションをディスクに書き出すまで、ディスクへのコミットが行われません。これは、XFSがメモリ内でトランザクションを集約（バッチ処理）して、ログIOがトランザクション処理のパフォーマンスに与える影響を最小限に抑える仕組みです。</p>
+<p>非同期トランザクション処理の制限は、ログマネージャーが提供するログバッファの数とサイズに依存します。デフォルトでは8つのログバッファがあり、各バッファのサイズは32KBです。マウントオプションを使用することで、最大で256KBまでサイズを拡張できます。</p>
+<p>これにより、ファイルシステムに対して同時に実行可能なメタデータ変更の最大数が設定されます。もしすべてのログバッファが満杯でIO処理中であれば、現在のバッチ処理が完了するまで新たなトランザクションのコミットはできません。現在では、単一のCPUコアが十分なトランザクションを生成して、ログバッファを常に満杯にし続けることが一般的です。したがって、XFSジャーナリングサブシステムはIO制限の影響を受けるとされています。</p>
+</section>
+<section id="delayed-logging-concepts">
+<h2>遅延ログ記録: 概念<a class="headerlink" href="#delayed-logging-concepts" title="この見出しへのパーマリンク">¶</a></h2>
+<p>XFSが使用する再ロギング技術と非同期ロギングを組み合わせた際の重要な点は、変更されたオブジェクトがログバッファにディスクにコミットされる直前までに複数回再ロギングされる可能性があることです。前の再ロギング例に戻ると、トランザクションAからDが同じログバッファにディスクにコミットされる可能性があります。</p>
+<p>つまり、単一のログバッファには同じオブジェクトの複数のコピーが含まれるかもしれませんが、そのうちの1つのコピーだけが必要です。最後の「D」のコピーが、以前の変更からのすべての変更を含んでいるためです。言い換えれば、ログバッファには必要なコピーが1つ、そして3つの無効なコピー（スペースを無駄にしている）が存在します。同じオブジェクトの繰り返し操作を行う場合、これらの「無効なオブジェクト」はログバッファで使用されるスペースの90%以上を占めることがあります。ログに書き込まれるメタデータ量を大幅に削減できるため、無効なオブジェクトの数を減らすことが、遅延ロギングの基本的な目標です。</p>
+<p>概念的な観点から見ると、XFSはすでにメモリ内で再ロギングを行っています（メモリ＝ログバッファ）。ただし、非常に効率的ではありません。論理的な変更を物理的なフォーマットに変換する過程で再ロギングを行っているためです。これは、トランザクションの変更をログバッファに物理的にフォーマットする前に、メモリ内で論理的な変更を追跡するインフラストラクチャが存在しないからです。そのため、ログバッファに無効なオブジェクトが蓄積するのを避けることはできません。</p>
+<p>遅延ロギングは、ログバッファインフラストラクチャの外でオブジェクトのトランザクション変更を保持し、追跡するための名前です。XFSのジャーナリングサブシステムに再ロギングという基本的な概念があるため、これは実際には比較的簡単に実行できます。すべてのログされた項目の変更はすでに現在のインフラストラクチャで追跡されています。大きな問題は、これらの変更を一貫性があり、復元可能な方法でログに集約し、書き出すことです。このドキュメントでは、問題の説明とその解決策に焦点を当てています。</p>
+<p>遅延ロギングがジャーナリングサブシステムの動作に与える重要な変更の一つは、未確定のメタデータ変更の量が利用可能なログバッファのサイズや数とは関係なくなることです。つまり、以前はいつでも最大2MBのトランザクション変更がログに書き込まれていない可能性があったが、現在はメモリ内でより多くの変更が蓄積される可能性があります。したがって、クラッシュ時のメタデータの喪失の可能性は、既存のロギングメカニズムよりも大幅に高くなっています。</p>
+<p>ログの回復によって一貫性のあるファイルシステムが得られるという保証は変わりませんが、注意すべき点は、回復されたファイルシステムに対しては、クラッシュの結果として多くの数千のトランザクションが実行されていない可能性があるということです。これは、データを気にするアプリケーションが、データ整合性を維持する必要がある場所でfsync()を使用することがさらに重要になる理由です。</p>
+<p>遅延ログは、新しい概念であり、その正しさを厳密に証明する必要があるというわけではありません。メモリに変更を蓄積してからログに書き出す方法は、ext3やext4などの多くのファイルシステムで効果的に使用されており、このドキュメントではその概念が信頼できるものであることを説得する時間を費やしません。代わりに、これは「解決済みの問題」として扱われ、XFSで実装するのは単なるソフトウェア工学の練習に過ぎません。</p>
+<p>XFSにおける遅延ログの基本的な要件は以下の通りです：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>ログに書き込まれるメタデータ量を少なくとも1桁以上減らす。</p></li>
+<li><p>要件#1を検証するための十分な統計情報を提供する。</p></li>
+<li><p>新しいコードの問題をデバッグするための十分な新しいトレーシングインフラストラクチャを提供する。</p></li>
+<li><p>ディスク上のフォーマット変更（メタデータまたはログフォーマット）を行わない。</p></li>
+<li><p>マウントオプションで有効化および無効化可能にする。</p></li>
+<li><p>同期トランザクションワークロードにおいてパフォーマンスの後退がない。</p></li>
+</ol>
+</div></blockquote>
+</section>
+<section id="delayed-logging-design">
+<h2>遅延ログ記録: 設計<a class="headerlink" href="#delayed-logging-design" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="storing-changes">
+<h3>変更の保存<a class="headerlink" href="#storing-changes" title="この見出しへのパーマリンク">¶</a></h3>
+<p>論理レベルで変更を蓄積する（つまり、既存のログ項目の汚れた領域トラッキングのみを使用）問題は、変更をログバッファに書き込む際、フォーマットしているオブジェクトが変更されないことを保証する必要があります。これにはオブジェクトのロックが必要となり、同時に変更が行われないようにします。したがって、論理的な変更をログにフラッシュするには、すべてのオブジェクトをロックし、フォーマットしてから再びロックを解除する必要があります。</p>
+<p>これにより、既に実行中のトランザクションとのデッドロックの可能性が大幅に高まります。例えば、トランザクションがオブジェクトAをロックして変更しており、遅延ログのトラッキングロックを取得してトランザクションをコミットする必要がありますが、フラッシャースレッドがすでに遅延ログのトラッキングロックを保持しており、オブジェクトAのロックを取得しようとしている状態です。これは解決不可能なデッドロック状態に見え、これが遅延ログの実装を長期間阻んでいた問題でした。</p>
+<p>解決策は比較的簡単です - ただ、その認識に時間がかかっただけです。要するに、現在のログ記録コードは、各項目の変更内容をベクター配列にフォーマットし、項目内の変更領域を指すようにしています。ログ記録コードは、トランザクションコミット時に項目がトランザクションでロックされている間、これらのベクターが指すメモリをログバッファにコピーします。フォーマットコードの出力先としてログバッファを使用する代わりに、フォーマットされたベクターを収容できる十分なサイズのメモリバッファを使用すればよいのです。</p>
+<p>このメモリバッファにベクターをコピーし、ベクターがオブジェクト自体ではなくメモリバッファを指すように再構成すれば、ログバッファ記録コードと互換性のある変更内容のコピーが得られます。これにより、オブジェクトにロックをかけずにアクセスできるようになります。このフォーマットと再構成作業は、トランザクションコミット中にオブジェクトがロックされている間に行うことができ、トランザクション的に整合性のあるベクターが得られ、所有するオブジェクトのロックを必要とせずにアクセス可能になります。</p>
+<p>したがって、未処理の非同期トランザクションをログにフラッシュする際のオブジェクトのロックを避けることができます。既存のフォーマット方法と遅延ログ記録フォーマットの違いは、下記の図に示されています。</p>
+<p>現在の形式ログベクター:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Object    +---------------------------------------------+
+Vector 1      +----+
+Vector 2                    +----+
+Vector 3                                   +----------+
+</pre></div>
+</div>
+<p>フォーマット後:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Log Buffer    +-V1-+-V2-+----V3----+
+</pre></div>
+</div>
+<p>遅延ログ記録ベクター:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Object    +---------------------------------------------+
+Vector 1      +----+
+Vector 2                    +----+
+Vector 3                                   +----------+
+</pre></div>
+</div>
+<p>フォーマット後:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Memory Buffer +-V1-+-V2-+----V3----+
+Vector 1      +----+
+Vector 2           +----+
+Vector 3                +----------+
+</pre></div>
+</div>
+<p>メモリバッファと関連するベクターは単一のオブジェクトとして渡す必要がありますが、親オブジェクトと関連付けられる必要があります。オブジェクトが再ログ記録される場合、現在のメモリバッファを最新の変更を含む新しいメモリバッファに置き換える必要があります。</p>
+<p>メモリバッファをフォーマットした後でもベクターを保持する理由は、ログバッファ境界を越えたベクターの分割を正しくサポートするためです。ベクターを保持しないと、項目内の領域境界の位置が分からないため、ログバッファ記録時に領域の新しいエンカプスレーション方法が必要になります（つまり、二重エンカプスレーション）。これはディスク上の形式変更を意味し、望ましくありません。また、ログ領域ヘッダーをフォーマット段階で記録する必要があり、これは領域ごとの状態をヘッダーに配置する必要があるため、問題です。</p>
+<p>したがって、ベクターを保持する必要がありますが、メモリバッファをベクターにアタッチし、ベクターのアドレスをメモリバッファを指すように再定義することで、ログバッファ書き込みコードに渡して既存のログベクターと同じように処理される、自己記述的なオブジェクトを作成できます。これにより、メモリ内で再ログされた項目を処理するために新しいディスク上の形式を必要としなくなるのです。</p>
+</section>
+<section id="tracking-changes">
+<h3>変更の追跡<a class="headerlink" href="#tracking-changes" title="この見出しへのパーマリンク">¶</a></h3>
+<p>メモリ内で制限なく使用可能な形でトランザクション変更を記録できるようになった現在、これらの変更を追跡し蓄積できる必要があります。これにより、後述のタイミングでログに書き出すことが可能になります。ログ項目はこのベクターとバッファを保存するための自然な場所であり、またトランザクションに含められたオブジェクトが常に存在するため、コミットされたオブジェクトを追跡するためのオブジェクトとしても適切です。</p>
+<p>ログ項目は、ログに書き込まれたがディスクにまだ書き込まれていないログ項目を追跡するためにすでに使用されています。このようなログ項目は「アクティブ」とみなされ、Active Item List (AIL) という LSN 順の二重連結リストに格納されます。ログバッファの I/O 完了時に項目がこのリストに挿入され、その後アンピンされディスクに書き出すことが可能になります。AIL に含まれるオブジエクトは再ログ化され、そのトランザクションのログバッファ I/O 完了時にオブジェクトが再ピンされ、AIL 内で前方に移動します。</p>
+<p>このように、AIL に含まれる項目は依然として変更および再ログ化される可能性があるため、追跡は AIL インフラストラクチャとは別途行う必要があります。したがって、コミットされた項目の追跡には AIL リストポインタを再利用することはできませんし、AIL ロックで保護されるフィールドに状態を保存することもできません。そのため、ログ項目内にコミットされた項目の追跡に専用のロック、リスト、状態フィールドが必要です。</p>
+<p>AIL と同様に、コミットされた項目の追跡は新しいリストである Committed Item List (CIL) を通じて行われます。このリストはコミットされ、メモリバッファがアタッチされているログ項目を追跡します。トランザクションコミット順でオブジェクトを追跡するため、オブジェクトが再ログ化されるとリスト内の位置から削除され、リスト末尾に再挿入されます。これはデバッグの容易さのために完全に任意に行われ、リスト末尾の項目が最も最近に変更されたものです。CIL の順序はトランザクションの整合性には必要ありません（次のセクションで説明します）ので、開発者の利便性/理解のためのものとして順序が設定されています。</p>
+</section>
+<section id="delayed-logging-checkpoints">
+<h3>遅延ログ: チェックポイント<a class="headerlink" href="#delayed-logging-checkpoints" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ログ同期イベント（一般的には「ログフォース」と呼ばれる）が発生すると、CIL（Commit Information Log）内のすべての項目がログバッファを通じてログに書き込まれる必要があります。これらの項目はCIL内の順序を維持しながら、原子的なトランザクションとして書き込まれなければなりません。すべてのオブジェクトが原子的なトランザクションとして書き込まれる必要がある理由は、再ログイン（relogging）とログ再生（log replay）の要件に起因します。特定のトランザクション内のすべての変更は、ログ回復中に完全に再生されるべきであり、それ以外の場合は再生されないべきです。もしトランザクションがログに完全に記録されていないため再生されなかった場合、その後のトランザクションも再生されないべきです。</p>
+<p>この要件を満たすためには、CIL全体を単一のログトランザクションとして書き込む必要があります。幸いなことに、XFSのログコードにはトランザクションのサイズに固定された制限はなく、ログ再生コードにも同様です。唯一の根本的な制限は、トランザクションがログのサイズの半分未満である必要があります。この制限の理由は、ログのヘッドとテールを特定するためには、常に少なくとも1つの完全なトランザクションがログに存在している必要があります。もしトランザクションがログの半分以上になる場合、そのトランザクションを書き込む過程でクラッシュが発生すると、ログ内の唯一の完全な前のトランザクションが部分的に上書きされる可能性があります。これにより回復失敗と不一致なファイルシステムが発生するため、チェックポイントの最大サイズはログの半分未満に制限する必要があります。</p>
+<p>このサイズ要件以外では、チェックポイントトランザクションは他のトランザクションと何も違いません。トランザクションヘッダー、フォーマットされたログ項目の系列、そしてテールにあるコミットレコードを含みます。回復の観点からもチェックポイントトランザクションは他のトランザクションと変わりません。ただ、サイズが大きく、含まれる項目数も多いだけです。これにより最悪の場合、回復トランザクションオブジェクトハッシュサイズのチューニングが必要になる可能性があります。</p>
+<p>チェックポイントは単なるトランザクションであり、すべてのログ項目の変更がログベクターとして保存されているため、既存のログバッファ書き込みコードを用いて変更をログに書き込むことができます。効率的にこれを実行するには、CIL（Current Item List）をロックしている時間は最小限に抑える必要があります。現在のログ書き込みコードは、トランザクション内容（ログベクター）の書き込みとトランザクションコミットレコードの書き込みを分離する仕組みにより簡単にこれを実現可能ですが、この追跡には各チェックポイントごとのコンテキストをログ書き込みプロセスを通してチェックポイント完了まで追跡する必要があります。</p>
+<p>したがって、チェックポイントにはチェックポイントの開始から完了までの状態を追跡するコンテキストが存在します。チェックポイントトランザクションが開始される同時刻に新しいコンテキストが開始されます。つまり、チェックポイント操作中にCILから現在の項目をすべて削除する際、すべての変更内容を現在のチェックポイントコンテキストに移動し、その後新しいコンテキストを初期化してCILにアタッチし、新しいトランザクションの集約を開始します。</p>
+<p>これにより、すべてのコミット項目の移動後すぐにCILをアンロックでき、ログにチェックポイントをフォーマットしている間でも新しいトランザクションを発行できるようになります。また、ログフォースの重いワークロードの場合、既存のトランザクションコミットコードが行うように、同時に複数のチェックポイントをログバッファに書き込むことが可能になります。ただし、これにはログ内のコミットレコードを厳密に順序付けし、ログ再再生中にチェックポイントの順序を維持する必要があります。</p>
+<p>ログ項目をチェックポイントトランザクションに書き込む同時、他のトランザクションが項目を変更し、新しいCILにログ項目を挿入する場合、チェックポイントトランザクションのコミットコードはログ項目を用いて書き込むべきログベクターのリストを保存することはできません。したがって、ログベクターはログ項目から分離できるようにチェーン状態に結合する必要があります。つまり、CILがフラッシュされる際、メモリバッファから解放され、各ログ項目にアタッチされたログベクターをチェックポイントコンテキストにアタッチし、ログ項目を解放する必要があります。図式的には、フラッシュ前のCILは以下のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>CIL Head
+   |
+   V
+Log Item &lt;-&gt; log vector 1       -&gt; memory buffer
+   |                            -&gt; vector array
+   V
+Log Item &lt;-&gt; log vector 2       -&gt; memory buffer
+   |                            -&gt; vector array
+   V
+......
+   |
+   V
+Log Item &lt;-&gt; log vector N-1     -&gt; memory buffer
+   |                            -&gt; vector array
+   V
+Log Item &lt;-&gt; log vector N       -&gt; memory buffer
+                                -&gt; vector array
+</pre></div>
+</div>
+<p>フラッシュ後はCILヘッドが空となり、チェックポイントコンテキストのログベクター一覧は以下のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Checkpoint Context
+   |
+   V
+log vector 1    -&gt; memory buffer
+   |            -&gt; vector array
+   |            -&gt; Log Item
+   V
+log vector 2    -&gt; memory buffer
+   |            -&gt; vector array
+   |            -&gt; Log Item
+   V
+......
+   |
+   V
+log vector N-1  -&gt; memory buffer
+   |            -&gt; vector array
+   |            -&gt; Log Item
+   V
+log vector N    -&gt; memory buffer
+                -&gt; vector array
+                -&gt; Log Item
+</pre></div>
+</div>
+<p>この転送が完了すると、CILがアンロックされ新しいトランザクションが開始できるようになり、チェックポイントフラッシュコードはログベクターチェーンを処理してチェックポイントをコミットします。</p>
+<p>チェックポイントがログバッファに書き込まれると、コミットレコードが書き込まれたログバッファにチェックポイントコンテキストがアタッチされ、完了コールバックが一緒に追加されます。ログIOの完了はこのコールバックを呼び出し、その後ログベクターチェーン内のログ項目（つまりAILへの挿入およびアンピン）のトランザクションコミット処理を実行し、ログベクターチェーンとチェックポイントコンテキストを解放します。</p>
+<p>議論ポイント：ログ項目をベクターを追跡する最も効率的な方法かどうかは不明です。ただし、自然な方法のように思えます。CILでログ項目を歩くことによってログベクターをチェーン化し、ログ項目とログベクターのリンクを切断しているため、ログ項目リストの変更にキャッシュラインヒットが発生し、さらにログベクターチェーンの処理で別のキャッシュラインヒットが発生します。ログベクターで追跡する場合、ログ項目とログベクターのリンクを切断するだけで済むため、ログ項目キャッシュラインのみを汚染する必要があります。通常は1対2のキャッシュライン汚染の違いには気にしませんが、1つのチェックポイントトランザクションに80,000以上のログベクターが含まれる可能性があるため、この点は「測定と比較」の状況で、実装がdevツリーに導入された後で検証する必要があります。</p>
+</section>
+<section id="delayed-logging-checkpoint-sequencing">
+<h3>遅延ログ: チェックポイントシーケンシング<a class="headerlink" href="#delayed-logging-checkpoint-sequencing" title="この見出しへのパーマリンク">¶</a></h3>
+<p>XFSトランザクションサブシステムの重要な特徴の一つは、コミットされたトランザクションにそのトランザクションコミットのログシーケンス番号（LSN）を付与することです。これにより、トランザクションを非同期に発行でき、今後の操作がそのトランザクションがログに完全にコミットされるまで完了できない場合でも、トランザクションを発行できます。例外的に依存操作が発生した場合（例：解放されたメタデータエクステントをデータエクステントとして再利用）、特別な最適化されたログフォースを発行して、依存トランザクションをディスクに即座に強制的に書き込むことができます。</p>
+<p>これを行うには、トランザクションがコミットレコードのLSNを記録する必要があります。このLSNはトランザクションが書き込まれたログバッファから直接取得されます。これにより現在のトランザクションメカニズムは問題ありませんが、遅延ログではトランザクションが直接ログバッファに書き込まれないため、別のトランザクションシーケンシング方法が必要です。</p>
+<p>チェックポイントセクションで議論したように、遅延ログはチェックポイントごとのコンテキストを使用し、そのため各チェックポイントにシーケンス番号を割り当てる操作は簡単です。チェックポイントコンテキストの切り替えはアトミックに行う必要がありますが、外部のアトミックカウンターを使用することなく、各新しいコンテキストに単調に増加するシーケンス番号を割り当てることも簡単です。新しいコンテキストには、現在のコンテキストのシーケント番号に1を加えたものを割り当てることができます。</p>
+<p>次に、コミット時にトランザクションコミットLSNにログバッファLSNを割り当てるのではなく、現在のチェックポイントシーケンス番号を割り当てることができます。これにより、完了していないトランザクションを追跡する操作が、続行前にコミットする必要があるチェックポイントシーケンス番号を把握できます。結果として、ログを特定のLSNに強制するコードは、特定のチェックポイントにログを強制する必要があることを保証しなければなりません。</p>
+<p>この操作を行うために、現在コミット中のすべてのチェックポイントコンテキストを追跡する必要があります。チェックポイントをフラッシュする際、コンテキストは「コミット中」リストに追加され、検索可能です。チェックポイントコミットが完了すると、このリストから削除されます。チェックポイントコンテキストはチェックポイントのコミットレコードのLSNを記録しているため、コミットレコードを含むログバッファを待機することもでき、既存のログフォースメカニズムを使用して同期フォースを実行できます。</p>
+<p>注意すべきは、同期フォースが既存のログバッファコードに似た緩和アルゴリズムで拡張される可能性があることです。これにより、すでに同期中のトランザクションがフラッシュされている場合でも、複数の同期トランザクションをまとめることができます。ただし、ここでの設計のパフォーマンス検証を行う必要があります。</p>
+<p>ログフォースの主な懸念は、待機するチェックポイントよりも前のすべてのチェックポイントがディスクにコミットされていることを保証することです。そのため、待機するチェックポイントの前にコミット中のリスト内のすべての前のコンテキストが完了していることを確認する必要があります。この同期処理はログフォースコード内で行い、他の場所で待機する必要はありません。シリアル化が必要なのはログフォースを実行するときです。</p>
+<p>残る唯一の複雑さは、ログフォースが現在のコンテキストと一致するフォースシーケンス番号のケースを処理する必要があることです。つまり、CILをフラッシュし、完了を待つ必要があるのです。これは、既存のログフォースコードにシーケンス番号を確認し、必要に応じてプッシュするという単純な追加です。実際、現在のシーケンスチェックポイントフラッシュをログフォースコードに組み込むことで、同期トランザクションを発行する現在のメカニズムは変更されません（つまり、非同期トランザクションをコミットし、そのトランザクションのLSNでログをフォースする）。したがって、遅延ログが使用されているかどうかに関わらず、上位コードの挙動は変わりません。</p>
+</section>
+<section id="delayed-logging-checkpoint-log-space-accounting">
+<h3>遅延ログ記録：チェックポイントログスペースの計算<a class="headerlink" href="#delayed-logging-checkpoint-log-space-accounting" title="この見出しへのパーマリンク">¶</a></h3>
+<p>チェックポイントトランザクションの大問題は、トランザクションのログスペースの予約です。チェックポイントトランザクションのサイズは事前に分からないため、必要なログスペースの量や、ログバッファに必要な数、また使用される分割ログベクターリージョンの数も予測できません。コミットアイテムリストにアイテムを追加するにつれて必要なログスペースの量を追跡することはできますが、チェックポイント用のログスペースを予約する必要があります。</p>
+<p>通常のトランザクションは、トランザクションの最大のログスペース使用量を考慮してログスペースを予約します。この予約には、ログレコードヘッダー、トランザクションおよびリージョンヘッダー、分割リージョンのヘッダー、バッファテールパディング、なども含まれます。また、トランザクション内で変更されたメタデータの実際のスペースも含まれます。一部は固定オーバーヘッドですが、多くの部分はトランザクションのサイズやログされるリージョンの数（トランザクション内のログベクターベクター数）に依存します。</p>
+<p>違いの例として、ディレクトリ変更のログとインノード変更のログを挙げることができます。多くのインノードコアを変更する場合（例: <code class="docutils literal notranslate"><span class="pre">chmod</span> <span class="pre">-R</span> <span class="pre">g+w</span> <span class="pre">*</span></code>この場合、 inode コアと inode ログ形式構造体のみを含むトランザクションが多数存在します。つまり、2つのベクターで約150バイトのサイズになります。10,000個の inode を変更する場合、20,000のベクターで約1.5MBのメタデータを書き込むことになります。各ベクターは12バイトなので、ログに記録すべき総量は約1.75MBです。一方、フルなディレクトリバッファをログする場合、各バッファは通常4KBで、1.5MBのディレクトリバッファを扱うと約400のバッファと各バッファごとのバッファ形式構造体が必要になり、約800のベクターまたは1.51MBの総スペースになります。このようにして、静的なログスペース予約が柔軟でなく、すべてのワークロードで「最適な値」を選ぶのが困難であることが明らかになります。</p>
+<p>さらに、静的な予約を使用する場合、予約全体のどの部分をカバーするのかという問題があります。トランザクション予約で使用されるスペースを計算するには、CIL（Change In-Log）に現在のオブジェクトの使用スペースを追跡し、オブジェクトが再ログされる際の使用スペースの増減を算出することで、チェックポイント予約はログバッファメタデータ（例: ログヘッダーレコードなど）のみを考慮する必要があるのです。</p>
+<p>しかし、ログメタデータに限って静的な予約を使用するだけでも問題があります。通常、ログレコードヘッダは1MBのログスペースに対して少なくとも16KBのログスペースを使用し（32KBあたり512バイト）、予約はランダムなサイズのチェックポイントトランザクションを処理できるだけの大きさにする必要があります。この予約はチェックポイント開始前に設定する必要があり、また待機せずにスペースを確保する必要があります。8MBのチェックポイントでは約150KBの予約が必要で、これは非自明な量のスペースです。</p>
+<p>静的な予約はロググラントカウンターを操作する必要があります。スペースに永続的な予約を取ることは可能ですが、チェックポイントトランザクションの完了ごとに書き込み予約（トランザクションが実際に使用できるスペース）を更新する必要があります。問題は、必要なスペースが不足している場合、regrantコードが待機してスペースを待つことになることです。</p>
+<p>この問題のせいで、チェックポイントをコミットしてログスペースを解放する必要がある場合、デッドロックが発生する可能性があります（ロールバックトランザクションの説明を参照してください）。したがって、 <em>grace periodsを尊重しなければなりませんし、</em> 静的な予約を使用する場合、常にログにスペースが確保されている必要があります。これは非常に困難で複雑な作業であり、実現は可能です。ただし、より簡単な方法があります。</p>
+<p>この作業をより簡単に行う方法は、CIL内の項目が使用するログスペース全体を追跡し、これをもとにログメタデータが使用するログスペースの量を動的に計算することです。このログメタデータのスペースがトランザクションのコミットによって新しいメモリバッファがCILに挿入されることで変化した場合、その変化を引き起こしたトランザクションから必要なスペースの差分が削除されます。このようなレベルのトランザクションは、すでに必要な最大のログメタデータスペースを予約済みであるため、この作業に十分なスペースが予約されています。 <em>always</em> このようなデルタ予約は常に最大予約量以下であり、予約された最大量をすでに超えることはありません。</p>
+<p>したがって、CILに項目が追加されるたびにチェックポイントトランザクションの予約量を動的に拡張できるため、事前にログスペースを予約し再許可する必要がありません。これによりデッドロックを回避し、チェックポイントフラッシュコードのブロッキングポイントを除去できます。</p>
+<p>以前に述べたように、トランザクションはログのサイズの半分以上にはなりません。したがって、予約の拡張に伴う処理として、予約サイズと最大許容トランザクションサイズを比較する必要があります。最大閾値に達した場合、CILをログにプッシュする必要があります。これは「バックグラウンドフラッシュ」として実行され、必要に応じて実行されます。これはログフォースによってトリガーされるCILプッシュと同様ですが、チェックポイントコミットの完了を待つ必要はありません。このバックグラウンドプッシュはトランザクションコミットコードによってチェックされ実行されます。</p>
+<p>トランザクションサブシステムがアイドル状態になった場合、CILにまだ項目が残っている場合は、xfssyncdが定期的に発行するログフォースによってフラッシュされます。このログフォースはCILをディスクにプッシュし、トランザクションサブシステムがアイドル状態を維持する場合、既存のログ記録方法と同様にアイドルログがカバーされる（有効にされた状態としてマークされる）ようにします。議論すべきポイントは、現在の30秒ごとの頻度よりもこのログフォースをより頻繁に実行する必要があるかどうかです。</p>
+</section>
+<section id="delayed-logging-log-item-pinning">
+<h3>遅延ログ記録：ログ項目ピンニング<a class="headerlink" href="#delayed-logging-log-item-pinning" title="この見出しへのパーマリンク">¶</a></h3>
+<p>現在、トランザクションのコミット中に項目がロックされている間、ログ項目はピンされています。これは項目がフォーマットされた直後に発生しますが、ロックが解除される前であればいつでも実行可能です。このメカニズムの結果として、項目はログバッファにコミットされたすべてのトランザクションごとにピンされます。したがって、ログバッファで再ログインされる項目は、それらが汚染されたトランザクションごとにピンカウントを持つことになります。これらのトランザクションがそれぞれ完了するたびに、項目は1回ずつアンピンされます。その結果、項目はすべてのトランザクションが完了し、未処理のトランザクションがなくなった時点でアンピンされます。したがって、ログ項目のピンとアンピンはトランザクションコミットとログ項目完了との1対1の関係により対称的です。</p>
+<p>遅延ログインの場合、トランザクションコミットと完了との関係は非対称になります。オブジェクトがCILに再ログインされるたびに、コミットプロセスは実行されますが、対応する完了登録は行われません。つまり、トランザクションコミットとログ項目完了との間には多対一の関係が生じます。その結果、トランザクションコミットとログ項目完了の「ピンしてコミット、アンピンして完了」モデルを維持すると、ログ項目のピンとアンピンがアンバランスになります。</p>
+<p>ピン/アンピンの対称性を維持するためには、アルゴリズムを「CILへの挿入時にピン、チェックポイント完了時にアンピン」と変更する必要があります。つまり、ピンとアンピンはチェックポイントコンテキストを中心に対称になります。オブジェクトがCILに初めて挿入されたときにピンしますが、トランザクションコミット中にすでにCILに存在している場合は再度ピンしません。複数の未処理チェックポイントコンテキストがあるため、ピンカウントが一時的に高くなる可能性がありますが、各チェックポイントが完了するたびに、コンテキストに応じた正しいピンカウントが保持されます。</p>
+<p>状況をさらに複雑にするが、ピン数のコンテキストにおけるチェックポイントレベルの制御は、アイテムのピン操作がCILコミット/フラッシュロックの下で行われる必要がある。このロック外でオブジェクトをピンすると、ピン数がどのコンテキストに関連しているかを保証できない。これは、アイテムのピン操作が現在のCILにアイテムが存在するかどうかに依存するためである。CILを最初にピンしないでオブジェクトをチェックしてピンしようとすると、チェックとピンの間にCILがフラッシュされる競合状態が生じる（ピンしない場合も含む）。したがって、CILフラッシュ/コミットロックを保持して、アイテムを正しくピンする必要がある。</p>
+</section>
+<section id="delayed-logging-concurrent-scalability">
+<h3>遅延ログ: 並行スケーラビリティ<a class="headerlink" href="#delayed-logging-concurrent-scalability" title="この見出しへのパーマリンク">¶</a></h3>
+<p>CILの基本的な要件は、トランザクションコミットを通じたアクセスが多数の並行コミットにスケーラブルであるということである。現在のトランザクションコミットコードは、2048台のプロセッサから同時にトランザクションが到達しても崩壊しない。現在のトランザクションコードは、1つのCPUのみで使用する場合と同様の速度で動作するが、遅延することはない。</p>
+<p>その結果、遅延ログトランザクションコミットコードは、基盤から並行性を考慮した設計が必要である。設計には明確にシリアル化ポイントが存在しており、重要な3つは以下の通り:</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>CILのフラッシュ中に新しいトランザクションコミットをブロックする</p></li>
+<li><p>CILにアイテムを追加し、アイテムスペースの会計を更新する</p></li>
+<li><p>チェックポイントコミットの順序</p></li>
+</ol>
+</div></blockquote>
+<p>トランザクションコミットとCILフラッシュの相互作用を確認すると、ここでは多くのトランザクションが同時にコミットしようとするが、その数にはログ内の予約スペースの可用性が制限となる。実際の制限は、128MBのログに対して数百の並行トランザクション程度であり、これは機械内のCPUごとに1つずつという一般的な状態を意味する。</p>
+<p>トランザクションコミットがフラッシュを保持する時間は相対的に長い。ログアイテムのピンニングはCILフラッシュを保持している間に行う必要があり、現在の状態ではオブジェクトがメモリバッファにフォーマットされる間（つまり、 <a class="reference internal" href="../core-api/kernel-api.html#c.memcpy" title="memcpy"><code class="xref c c-func docutils literal notranslate"><span class="pre">memcpy()</span></code></a>sが進行中）に保持される。最終的には、フォーマットとオブジェクトのピンニングを分離して行う二段階アルゴリズムを採用することで、トランザクションコミット側の保持時間を短縮できる。</p>
+<p>潜在的なトランザクションコミット側の保持者が多いことから、ロックは本当にスリープロックであるべきです。CILフラッシュがロックを取得する場合、マシン内の他のすべてのCPUがCILロックでスピンするのを防いたいです。CILのフラッシュには、何万というログ項目のリストをたどる必要があり、それによりロックが相当長時間保持されることになります。そのため、スピン競合は大きな懸念です。多くのCPUが無駄にスピンするのを防ぐため、スリープロックを選択しています。ただし、トランザクションコミットやCILフラッシュ側のどちらにもロックを保持しながらスリープする処理は含まれていません。</p>
+<p>CILフラッシュは、非同期トランザクションワークロードにおいてトランザクションコミットに比べて相対的にレアな操作であることも留意しておくべきです。時間とともに、読み書きセマフォを使用した排他制御がトランザクションコミットの並行性を制限する可能性があるかどうかは明らかになるでしょう。特に、ロックの読み込み側でのキャッシュラインのバウンスが原因で、パフォーマンス低下が発生する可能性があります。</p>
+<p>2番目のシリアル化ポイントは、トランザクションコミット側で、アイテムがCILに挿入される処理です。トランザクションがこのコードを並行して実行する可能性があるため、CILは上記のコミット/フラッシュ排他制御とは別に保護する必要があります。また、排他ロックが必要ですが、保持時間は非常に短いため、スピンロックが適切です。このロックが競合ポイントになる可能性はあるものの、トランザクションごとに一度だけ保持するため、競合の可能性は低いと考えられます。</p>
+<p>最終的なシリアル化ポイントは、チェックポイントコミットレコードの順序を制御するコードで、チェックポイントコミットとログフォースシーケンシングの一部として実行されます。CILフラッシュをトリガーするコードパス（つまり、ログフォースをトリガーする処理）は、ログベクターをログバッファにすべて書き込んだ後、コミットレコードを書き込む前に、順序ループに入ります。このループでは、コミット中のチェックポイントリストをたどり、チェックポイントがコミットレコードの書き込みを完了するのを待つ必要があります。その結果、ロックと待機変数が必要になります。ログフォースシーケンシングも同様のロック、リストのたどり、ブロッキングメカニズムを必要とし、チェックポイントの完了を保証します。</p>
+<p>これらの2つのシーケンシング操作は、待っているイベントが異なる場合でもメカニズムを使用できます。チェックポイント コミットレコードのシーケンシングは、チェックポイント コンテキストがコミット LSN（コミットレコードの書き込み完了を通じて取得）を含むまで待機する必要があります。ログフォースシーケンシングは、前のチェックポイント コンテキストがコミットリストから削除されるまで（つまり、完了した状態になるまで）待機する必要があります。これらの2つのシリアル化キューは、単純なウェイト変数とブロードキャストウェイクアップ（thundering herds）を使用して実装されています。これらはCILと同じロックも使用しています。CILロックでの競合が過剰になったり、ブロードキャストウェイクアップによるプロセスのスイッチが多すぎる場合、これらの操作は新しいスピンロックに移され、別個のウェイトリストを持つことでロック競合を減らし、誤ったイベントによるプロセスの起動数を減らすことができます。</p>
+</section>
+<section id="lifecycle-changes">
+<h3>ライフサイクルの変更<a class="headerlink" href="#lifecycle-changes" title="この見出しへのパーマリンク">¶</a></h3>
+<p>現在のログ項目ライフサイクルは以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1. Transaction allocate
+2. Transaction reserve
+3. Lock item
+4. Join item to transaction
+        If not already attached,
+                Allocate log item
+                Attach log item to owner item
+        Attach log item to transaction
+5. Modify item
+        Record modifications in log item
+6. Transaction commit
+        Pin item in memory
+        Format item into log buffer
+        Write commit LSN into transaction
+        Unlock item
+        Attach transaction to log buffer
+
+&lt;log buffer IO dispatched&gt;
+&lt;log buffer IO completes&gt;
+
+7. Transaction completion
+        Mark log item committed
+        Insert log item into AIL
+                Write commit LSN into log item
+        Unpin log item
+8. AIL traversal
+        Lock item
+        Mark log item clean
+        Flush item to disk
+
+&lt;item IO completion&gt;
+
+9. Log item removed from AIL
+        Moves log tail
+        Item unlocked
+</pre></div>
+</div>
+<p>基本的に、ステップ1-6はステップ7とは独立しており、ステップ8-9とも独立しています。アイテムはステップ7が進行している間でも、ステップ1-6またはステップ8-9で同時にロックされることがあります。ただし、ステップ1-6またはステップ8-9のどちらか一方のみが同時に発生します。ログ項目がAIL（Active Index Log）内にあるか、ステップ6と7の間にある場合、ステップ1-6が再入力される場合、その項目は再ログされます。ステップ8-9が実行され完了した場合のみ、オブジェクトがクリーンとみなされます。</p>
+<p>遅延ログにより、ライフサイクルに新しいステップが挿入されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1. Transaction allocate
+2. Transaction reserve
+3. Lock item
+4. Join item to transaction
+        If not already attached,
+                Allocate log item
+                Attach log item to owner item
+        Attach log item to transaction
+5. Modify item
+        Record modifications in log item
+6. Transaction commit
+        Pin item in memory if not pinned in CIL
+        Format item into log vector + buffer
+        Attach log vector and buffer to log item
+        Insert log item into CIL
+        Write CIL context sequence into transaction
+        Unlock item
+
+&lt;next log force&gt;
+
+7. CIL push
+        lock CIL flush
+        Chain log vectors and buffers together
+        Remove items from CIL
+        unlock CIL flush
+        write log vectors into log
+        sequence commit records
+        attach checkpoint context to log buffer
+
+&lt;log buffer IO dispatched&gt;
+&lt;log buffer IO completes&gt;
+
+8. Checkpoint completion
+        Mark log item committed
+        Insert item into AIL
+                Write commit LSN into log item
+        Unpin log item
+9. AIL traversal
+        Lock item
+        Mark log item clean
+        Flush item to disk
+&lt;item IO completion&gt;
+10. Log item removed from AIL
+        Moves log tail
+        Item unlocked
+</pre></div>
+</div>
+<p>これにより、2つのログ方法間のライフサイクルの違いは、ライフサイクルの途中にのみ存在します。それらは依然として同じ開始点と終点、および実行制約を持っています。違いは、ログ項目をログ自体にコミットする処理と完了処理に限定されます。したがって、遅延ログは既存の制約や割当、解放に新たな制限を導入することはありません。</p>
+<p>このゼロインパクトの「挿入」により遅延ログインフラストラクチャと、ディスク形式の変更を避けるための内部構造の設計により、マウントオプションを通じて遅延ログと既存メカニズムの切り替えが可能です。根本的に、ログマネージャーが負荷特性に応じて自動的に透明にメソッドを切り替える理由はありませんが、遅延ログが設計通り動作すれば、このような切り替えは必要ありません。</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxカーネル内のファイルシステム</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#core-vfs-documentation">コアVFSドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#filesystem-support-layers">ファイルシステムサポートレイヤー</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#filesystems">ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxカーネル内のファイルシステム</a><ul>
+<li>前へ: <a href="vfat.html" title="前章">VFAT</a></li>
+<li>次へ: <a href="xfs-self-describing-metadata.html" title="次章">XFS 自己記述メタデータ</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/filesystems/xfs-delayed-logging-design.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

@@ -1,0 +1,874 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>ファイルシステムマウントAPI — Linux Kernelドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="quota.html" rel="next" title="クォータサブシステム"/>
+<link href="mandatory-locking.html" rel="prev" title="Linuxオペレーティングシステムにおける必須ファイルロック"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="filesystem-mount-api">
+<h1>ファイルシステムマウントAPI<a class="headerlink" href="#filesystem-mount-api" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="overview">
+<h2>概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>新しいマウントの作成は、マルチステッププロセスとして行われます:</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>ファイルシステムコンテキストを作成します。</p></li>
+<li><p>パラメータをパースし、コンテキストにアタッチします。パラメータはユーザー空間から個別に渡されることが想定されていますが、レガシーバイナリパラメータも処理可能です。</p></li>
+<li><p>有効化し、事前処理を行います。</p></li>
+<li><p>スーパーブロックとマウント可能なルートを取得または作成します。</p></li>
+<li><p>マウントを実行します。</p></li>
+<li><p>エラーメッセージをコンテキストに添付して返します。</p></li>
+<li><p>コンテキストを破棄します。</p></li>
+</ol>
+</div></blockquote>
+<p>これをサポートするために、file_system_type構造体が2つの新しいフィールドを獲得します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int (*init_fs_context)(struct fs_context *fc);
+const struct fs_parameter_description *parameters;
+</pre></div>
+</div>
+<p>最初のフィールドは、ファイルシステム固有の部分を設定するために呼び出され、追加のスペースを含み、2番目のフィールドは登録時に検証用のパラメータ記述にポイントします。今後のシステムコールによる照会にも使用されます。</p>
+<p>セキュリティ初期化が行われていますので注意してください。 <em>RCU保護データ構造からデータ要素を削除した後、</em> ファイルシステムが呼ばれるようにして、ネームスペースの調整が最初に行われます。</p>
+</section>
+<section id="the-filesystem-context">
+<h2>ファイルシステムコンテキスト<a class="headerlink" href="#the-filesystem-context" title="この見出しへのパーマリンク">¶</a></h2>
+<p>スーパーブロックの作成と再構成はファイルシステムコンテキストによって制御されます。これはfs_context構造体で表されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fs_context {
+        const struct fs_context_operations *ops;
+        struct file_system_type *fs_type;
+        void                    *fs_private;
+        struct dentry           *root;
+        struct user_namespace   *user_ns;
+        struct net              *net_ns;
+        const struct cred       *cred;
+        char                    *source;
+        char                    *subtype;
+        void                    *security;
+        void                    *s_fs_info;
+        unsigned int            sb_flags;
+        unsigned int            sb_flags_mask;
+        unsigned int            s_iflags;
+        unsigned int            lsm_flags;
+        enum fs_context_purpose purpose:8;
+        ...
+};
+</pre></div>
+</div>
+<p>fs_contextのフィールドは以下の通りです:</p>
+<blockquote>
+<div><ul>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>const struct fs_context_operations *ops
+</pre></div>
+</div>
+<p>これらはファイルシステムコンテキスト上で実行できる操作です（以下を参照）。これは-&gt;init_fs_context() file_system_type操作によって設定する必要があります。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct file_system_type *fs_type
+</pre></div>
+</div>
+<p>構築または再構成されているファイルシステムのfile_system_typeへのポインタ。これはタイプオーナーへの参照を保持します。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void *fs_private
+</pre></div>
+</div>
+<p>ファイルシステムのプライベートデータへのポインタ。これはファイルシステムがパースしたオプションを保存する場所です。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct dentry *root
+</pre></div>
+</div>
+<p>マウント可能なツリーのルート（間接的に、そのスーパーブロック）へのポインタ。これは-&gt;get_tree()操作によって埋められます。このフィールドが設定されている場合、root-&gt;d_sbへのアクティブな参照も保持する必要があります。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct user_namespace *user_ns
+struct net *net_ns
+</pre></div>
+</div>
+<p>呼び出しプロセスが使用しているネームスペースのサブセットがあります。これらは各ネームスペースへの参照を保持します。ファイルシステムは、自動マウントの親マウントスーパーブロックなどの他のソースを反映するために、サブスクライブされたネームスペースを置き換えることができます。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>const struct cred *cred
+</pre></div>
+</div>
+<p>マウントャーの資格情報。これは資格情報への参照を保持します。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>char *source
+</pre></div>
+</div>
+<p>これはソースを指定します。ブロックデバイス（例: /dev/sda1）であるか、NFSが望むような「host:/path」などのより複雑なものかもしれません。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>char *subtype
+</pre></div>
+</div>
+<p>/proc/mountsに表示されるタイプに追加される文字列で、それを識別します（FUSEで使用されます）。ファイルシステムが望む場合は設定可能です。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void *security
+</pre></div>
+</div>
+<p>LSMがスーパーブロックのセキュリティデータを保持するための場所。関連するセキュリティ操作は以下に記載されています。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void *s_fs_info
+</pre></div>
+</div>
+<p>新しいスーパーブロックの提案されたs_fs_info、スーパーブロックで設定されます。
+<a class="reference internal" href="api-summary.html#c.sget_fc" title="sget_fc"><code class="xref c c-func docutils literal notranslate"><span class="pre">sget_fc()</span></code></a>これはsuperblockを区別するために使用できます。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>unsigned int sb_flags
+unsigned int sb_flags_mask
+</pre></div>
+</div>
+<p>super_block::s_flagsに設定/クリアするSB_*フラグのビットはどれか。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>unsigned int s_iflags
+</pre></div>
+</div>
+<p>superblockが作成されるときに、これらはs-&gt;s_iflagsとビットごとのOR演算されます。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>enum fs_context_purpose
+</pre></div>
+</div>
+<p>コンテキストの目的を示します。利用可能な値は次のとおりです：</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 41%"/>
+<col style="width: 59%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>FS_CONTEXT_FOR_MOUNT,</p></td>
+<td><p>明示的なマウント用の新しいsuperblock</p></td>
+</tr>
+<tr class="row-even"><td><p>FS_CONTEXT_FOR_SUBMOUNT</p></td>
+<td><p>既存のマウントの自動サブマウント</p></td>
+</tr>
+<tr class="row-odd"><td><p>FS_CONTEXT_FOR_RECONFIGURE</p></td>
+<td><p>既存のマウントの変更</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+</li>
+</ul>
+</div></blockquote>
+<p>マウントコンテキストはvfs_new_fs_context()またはvfs_dup_fs_context()を呼び出すことで作成され、put_fs_context()で破棄されます。構造体は参照カウントされていません。</p>
+<p>VFS、セキュリティ、ファイルシステムのマウントオプションはそれぞれvfs_parse_mount_option()で設定されます。古いmount(2)システムコールで提供されたページ単位のデータはgeneric_parse_monolithic()で解析できます。</p>
+<p>マウント時に、ファイルシステムは任意のポインタからデータを取得してsuperblock（またはそれ以外のオブジェクト）にアタッチできるようにします。ただし、マウントコンテキスト内のポインタをクリアする必要があります。</p>
+<p>ファイルシステムはマウントコンテキストを使ってリソースを割り当て、それらをピン留めすることもできます。たとえばNFSは適切なプロトコルバージョンモジュールをピン留めできます。</p>
+</section>
+<section id="the-filesystem-context-operations">
+<h2>ファイルシステムコンテキスト操作<a class="headerlink" href="#the-filesystem-context-operations" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ファイルシステムコンテキストは操作テーブルを指しています：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fs_context_operations {
+        void (*free)(struct fs_context *fc);
+        int (*dup)(struct fs_context *fc, struct fs_context *src_fc);
+        int (*parse_param)(struct fs_context *fc,
+                           struct fs_parameter *param);
+        int (*parse_monolithic)(struct fs_context *fc, void *data);
+        int (*get_tree)(struct fs_context *fc);
+        int (*reconfigure)(struct fs_context *fc);
+};
+</pre></div>
+</div>
+<p>これらの操作はマウント手順のさまざまな段階で呼び出され、ファイルシステムコンテキストを管理します。以下がその操作です：</p>
+<blockquote>
+<div><ul>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void (*free)(struct fs_context *fc);
+</pre></div>
+</div>
+<p>コンテキストが破棄されるときに、ファイルシステム固有の部分をクリーンアップするために呼び出されます。一部のコンテキストが-&gt;get_tree()によって削除・NULL化されている可能性があるため、その点を認識しておく必要があります。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int (*dup)(struct fs_context *fc, struct fs_context *src_fc);
+</pre></div>
+</div>
+<p>ファイルシステムコンテキストが複製されるときに、ファイルシステム固有データを複製するために呼び出されます。エラーを返すことで複製失敗を示せます。</p>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p>注意: この操作が失敗しても、すぐにput_fs_context()が呼び出されるため、-&gt;dup() <em>grace periodsを尊重しなければなりませんし、</em> は-&gt;free()でファイルシステム固有データを安全にします。</p>
+</div>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int (*parse_param)(struct fs_context *fc,
+                   struct fs_parameter *param);
+</pre></div>
+</div>
+<p>パラメータがファイルシステムコンテキストに追加されるときに呼び出されます。paramはキー名と値オブジェクトを指します。VFS固有のオプションはすでに除外され、fc-&gt;sb_flagsがコンテキスト内で更新されています。セキュリティオプションも除外され、fc-&gt;securityが更新されています。</p>
+<p>パラメータはfs_parse()とfs_lookup_param()で解析できます。注意点として、ソース（複数可能）は「source」という名前のパラメータとして提示されます。</p>
+<p>成功時は0を返すか、負のエラーコードを返します。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int (*parse_monolithic)(struct fs_context *fc, void *data);
+</pre></div>
+</div>
+<p>mount(2)システムコールが呼び出され、データページを一度にすべて渡す場合に呼ばれます。この場合、コンマで区切られた「key[=val]」項目のリストであると予想される場合は、NULLに設定できます。</p>
+<p>戻り値は-&gt;parse_param()の戻り値と同じです。</p>
+<p>ファイルシステム（例：NFS）がデータを最初に確認し、標準のkey-valリストであると判断した場合、generic_parse_monolithic()に処理を委譲できます。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int (*get_tree)(struct fs_context *fc);
+</pre></div>
+</div>
+<p>ファイルシステムコンテキストに保存された情報を使ってマウント可能なルートとスーパーブロックを取得または作成するため呼び出されます（再構成は別のベクター経由で行われます）。ファイルシステムコンテキストから必要なリソースを分離してスーパーブロックに転送できます。</p>
+<p>成功時はfc-&gt;rootにマウント可能なルートを設定し0を返す必要があります。エラーの場合は負のエラーコードを返します。</p>
+<p>ユーザースペース駆動のコンテキストでは、特定のコンテキストに対してこの関数が一度しか呼び出せないように設定されます。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int (*reconfigure)(struct fs_context *fc);
+</pre></div>
+</div>
+<p>ファイルシステムコンテキストに保存された情報を使ってスーパーブロックを再構成するため呼び出されます。ファイルシステムコンテキストから必要なリソースを分離してスーパーブロックに転送できます。スーパーブロックはfc-&gt;root-&gt;d_sbから取得できます。</p>
+<p>成功時は0を返す必要があります。エラーの場合は負のエラーコードを返します。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>reconfigureはremount_fsの代替として意図されています。</p>
+</div>
+</li>
+</ul>
+</div></blockquote>
+</section>
+<section id="filesystem-context-security">
+<h2>ファイルシステムコンテキストセキュリティ<a class="headerlink" href="#filesystem-context-security" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ファイルシステムコンテキストには、LSMsがマウントされるスーパーブロックのセキュリティコンテキストを構築するために使用できるセキュリティポインタが含まれています。新しいマウントコードがこの目的で使用する操作は以下の通りです：</p>
+<blockquote>
+<div><ul>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int security_fs_context_alloc(struct fs_context *fc,
+                              struct dentry *reference);
+</pre></div>
+</div>
+<p>fc-&gt;security（初期値はNULL）を初期化し、必要なリソースを確保します。成功時は0を、失敗時は負のエラーコードを返します。</p>
+<p>コンテキストがスーパーブロック再構成（FS_CONTEXT_FOR_RECONFIGURE）のために作成されている場合、root dentryを示します。サブマウント（FS_CONTEXT_FOR_SUBMOUNT）の場合も同様に、自動マウントポイントを示します。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int security_fs_context_dup(struct fs_context *fc,
+                            struct fs_context *src_fc);
+</pre></div>
+</div>
+<p>fc-&gt;security（初期値はNULL）を初期化し、必要なリソースを確保します。src_fcは元のファイルシステムコンテキストを指し、参照として使用できます。成功時は0を、失敗時は負のエラーコードを返します。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void security_fs_context_free(struct fs_context *fc);
+</pre></div>
+</div>
+<p>fc-&gt;securityにアタッチされたものをクリーンアップします。注意点として、内容がスーパーブロックに転送され、get_tree中にポインタがクリアされる可能性があります。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int security_fs_context_parse_param(struct fs_context *fc,
+                                    struct fs_parameter *param);
+</pre></div>
+</div>
+<p>各マウントパラメータに対して呼び出されます。引数は-&gt;parse_param()メソッドと同じです。パラメータをファイルシステムに渡す場合は0を、無視する場合は1を、拒否する場合はエラーを返す必要があります。</p>
+<p>paramが指す値は、文字列の場合は変更可能ですが、取得（値ポインタがNULLに設定される）場合もあります。取得された場合は1を返す必要があります。ファイルシステムに渡されないようにするためです。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int security_fs_context_validate(struct fs_context *fc);
+</pre></div>
+</div>
+<p>すべてのオプションが解析された後呼び出され、全体としてのパラメータを検証し、必要な割当を行います。これによりsecurity_sb_get_tree()とsecurity_sb_reconfigure()が失敗しにくくなります。0を返すか、負のエラーコードを返します。</p>
+<p>再構成の場合は、ターゲットスーパーブロックはfc-&gt;rootを通じてアクセス可能です。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int security_sb_get_tree(struct fs_context *fc);
+</pre></div>
+</div>
+<p>マウントプロセス中に呼び出され、指定されたスーパーブロックがマウント可能か確認し、セキュリティデータを転送します。0を返すか、負のエラーコードを返します。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void security_sb_reconfigure(struct fs_context *fc);
+</pre></div>
+</div>
+<p>LSMのコンテキストに再構成を適用するために呼び出されます。失敗してはなりません。エラーチェックやリソース割当は、パラメータ解析と検証のハンドラで事前に実行する必要があります。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int security_sb_mountpoint(struct fs_context *fc,
+                           struct path *mountpoint,
+                           unsigned int mnt_flags);
+</pre></div>
+</div>
+<p>マウントプロセス中に呼び出され、コンテキストに接続されたルートdentryが指定されたマウントポイントに接続可能か確認します。成功時は0を、失敗時は負のエラーコードを返します。</p>
+</li>
+</ul>
+</div></blockquote>
+</section>
+<section id="vfs-filesystem-context-api">
+<h2>VFSファイルシステムコンテキストAPI<a class="headerlink" href="#vfs-filesystem-context-api" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ファイルシステムコンテキストを作成する操作は4つあり、コンテキストの破壊は1つです。</p>
+<blockquote>
+<div><ul>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fs_context *fs_context_for_mount(struct file_system_type *fs_type,
+                                        unsigned int sb_flags);
+</pre></div>
+</div>
+<p>新しいマウントの設定に必要なファイルシステムコンテキストを割り当てます。これは新しいスーパーブロックか既存のスーパーブロックを共有するかに関わらず、スーパーブロックフラグを設定し、セキュリティを初期化し、fs_type-&gt;init_fs_context()を呼び出してファイルシステム固有データを初期化します。</p>
+<p>fs_typeはコンテキストを管理するファイルシステムタイプを指定し、sb_flagsはそのスーパーブロックに保存されるフラグを初期化します。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fs_context *fs_context_for_reconfigure(
+         struct dentry *dentry,
+         unsigned int sb_flags,
+         unsigned int sb_flags_mask);
+</pre></div>
+</div>
+<p>既存のスーパーブロックを再構成するためにファイルシステムコンテキストを割り当てます。dentryは構成するスーパーブロックへの参照を提供し、sb_flagsとsb_flags_maskは変更すべきスーパーブロックフラグと変更後の値を示します。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fs_context *fs_context_for_submount(
+         struct file_system_type *fs_type,
+         struct dentry *reference);
+</pre></div>
+</div>
+<p>自動マウントポイントやその他の派生スーパーブロック用に新しいマウントを作成するためにファイルシステムコンテキストを割り当てます。fs_typeはコンテキストを管理するファイルシステムタイプを指定し、参照dentryはパラメータを提供します。名前空間は参照dentryのスーパーブロックから継承されます。</p>
+<p>参照するdentryがfs_typeと同じファイルシステムタイプである必要はないことに注意してください。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fs_context *vfs_dup_fs_context(struct fs_context *src_fc);
+</pre></div>
+</div>
+<p>ファイルシステムコンテキストを複製し、記録されたオプションをコピーし、保持するリソースを複製または追加で参照します。これは、ファイルシステムがネストされたマウント内でマウントを取得する必要がある場合（例：NFS4がターゲットサーバーのルートを内部的にマウントし、その後ターゲットディレクトリへのプライベートなパスウォークを実行する場合）に使用可能です。</p>
+<p>新しいコンテキストでの目的は古いコンテキストから継承されます。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void put_fs_context(struct fs_context *fc);
+</pre></div>
+</div>
+<p>ファイルシステムコンテキストを破壊し、保持するリソースを解放します。これは-&gt;free()操作を呼び出します。これはファイルシステムコンテキストを作成したすべてのユーザーが呼び出すことを意図しています。</p>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p>ファイルシステムコンテキストは参照カウントされないため、これは条件に関係なく破壊を引き起こします。</p>
+</div>
+</li>
+</ul>
+</div></blockquote>
+<p>上記のすべての操作では、put操作を除き、返り値はマウントコンテキストポインタまたは負のエラーコードです。</p>
+<p>残りの操作では、エラーが発生した場合、負のエラーコードが返されます。</p>
+<blockquote>
+<div><ul>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int vfs_parse_fs_param(struct fs_context *fc,
+                       struct fs_parameter *param);
+</pre></div>
+</div>
+<p>ファイルシステムコンテキストに単一のマウントパラメータを提供します。これは「source」パラメータとして指定されるソース/デバイスの指定を含み、ファイルシステムがこれをサポートする場合、複数回指定可能です。</p>
+<p>paramはパラメータのキー名と値を指定します。パラメータはまず標準的なマウントフラグ（SB_xxxフラグを設定して消費）またはセキュリティオプション（LSMが消費）に該当するかを確認し、その後ファイルシステムに渡されます。</p>
+<p>パラメータ値は型があり、次のいずれかです：</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 41%"/>
+<col style="width: 59%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>fs_value_is_flag</p></td>
+<td><p>パラメータに値が指定されていない</p></td>
+</tr>
+<tr class="row-even"><td><p>fs_value_is_string</p></td>
+<td><p>値は文字列</p></td>
+</tr>
+<tr class="row-odd"><td><p>fs_value_is_blob</p></td>
+<td><p>値はバイナリブロブ</p></td>
+</tr>
+<tr class="row-even"><td><p>fs_value_is_filename</p></td>
+<td><p>値はファイル名* + dirfd</p></td>
+</tr>
+<tr class="row-odd"><td><p>fs_value_is_file</p></td>
+<td><p>値はオープンされたファイル（file*）</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>値がある場合、その値はparam-&gt;{string,blob,name,file}の構造体内のユニオンに保存されます。注意点として、関数はポインタを奪ってクリアする可能性があり、その後はそのオブジェクトの処分を責任をもって行います。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int vfs_parse_fs_string(struct fs_context *fc, const char *key,
+                        const char *value, size_t v_size);
+</pre></div>
+</div>
+<p>vfs_parse_fs_param()をラップし、渡された値文字列をコピーします。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int generic_parse_monolithic(struct fs_context *fc, void *data);
+</pre></div>
+</div>
+<p>sys_mount()データページを解析し、テキストリストとしての形式を想定します。これはkey[=val]オプションがコンマで区切られた形式で、リストの各項目をvfs_mount_option()に渡します。これは-&gt;parse_monolithic()メソッドがNULLの場合のデフォルトです。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int vfs_get_tree(struct fs_context *fc);
+</pre></div>
+</div>
+<p>マウント可能なルートとスーパーブロックを取得または作成し、ファイルシステムコンテキスト内のパラメータを使用してスーパーブロックを選択/構成します。これにより-&gt;get_tree()メソッドが呼び出されます。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct vfsmount *vfs_create_mount(struct fs_context *fc);
+</pre></div>
+</div>
+<p>指定されたファイルシステムコンテキストのパラメータを使用してマウントを作成します。注意: この操作はマウントを何かに接続しません。</p>
+</li>
+</ul>
+</div></blockquote>
+</section>
+<section id="superblock-creation-helpers">
+<h2>スーパーブロック作成ヘルパー<a class="headerlink" href="#superblock-creation-helpers" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ファイルシステムがスーパーブロックの作成または検索に使用できるVFSのヘルパがいくつか用意されています。</p>
+<blockquote>
+<div><ul>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct super_block *
+sget_fc(struct fs_context *fc,
+        int (*test)(struct super_block *sb, struct fs_context *fc),
+        int (*set)(struct super_block *sb, struct fs_context *fc));
+</pre></div>
+</div>
+<p>これはコアルーチンです。testがNULLでない場合、fs_contextに保持されている基準に一致する既存のスーパーブロックをtest関数を使用して検索します。一致が見つからない場合、新しいスーパーブロックが作成され、set関数が呼ばれて設定されます。</p>
+<p>set関数が呼ばれる前に、fc-&gt;s_fs_infoはsb-&gt;s_fs_infoに転送され、set関数が成功した場合（つまり0を返した場合）、fc-&gt;s_fs_infoはクリアされます。</p>
+</li>
+</ul>
+</div></blockquote>
+<p>以下のすべてのヘルパは <a class="reference internal" href="api-summary.html#c.sget_fc" title="sget_fc"><code class="xref c c-func docutils literal notranslate"><span class="pre">sget_fc()</span></code></a>:</p>
+<blockquote>
+<div><ul>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int vfs_get_super(struct fs_context *fc,
+                  enum vfs_get_super_keying keying,
+                  int (*fill_super)(struct super_block *sb,
+                                    struct fs_context *fc))
+</pre></div>
+</div>
+<p>デバイスレスのスーパーブロックを作成/検索します。キーリングはこのタイプのスーパーブロックがいくつ存在可能で、どのように共有されるかを示します:</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>vfs_get_single_super</p>
+<p>システム内にはこのようなスーパーブロックは1つしか存在できません。さらに新しいスーパーブロックを取得する試みはこの1つを取得し（パラメータの違いは無視されます）</p>
+</li>
+<li><p>vfs_get_keyed_super</p>
+<p>このタイプのスーパーブロックは複数存在可能で、s_fs_infoポインタでキー付けされます（例: これはネームスペースを指しているかもしれません）。</p>
+</li>
+<li><p>vfs_get_independent_super</p>
+<p>このタイプの独立スーパーブロックは複数存在可能です。この関数は既存のものをマッチせず、常に新しいものを生成します。</p>
+</li>
+</ol>
+</div></blockquote>
+</li>
+</ul>
+</div></blockquote>
+</section>
+<section id="parameter-description">
+<h2>パラメータ説明<a class="headerlink" href="#parameter-description" title="この見出しへのパーマリンク">¶</a></h2>
+<p>パラメータはlinux/fs_parser.hで定義された構造体を使用して説明されます。コアの説明構造体があり、すべてを結びつけています:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fs_parameter_description {
+        const struct fs_parameter_spec *specs;
+        const struct fs_parameter_enum *enums;
+};
+</pre></div>
+</div>
+<p>例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>enum {
+        Opt_autocell,
+        Opt_bar,
+        Opt_dyn,
+        Opt_foo,
+        Opt_source,
+};
+
+static const struct fs_parameter_description afs_fs_parameters = {
+        .specs          = afs_param_specs,
+        .enums          = afs_param_enums,
+};
+</pre></div>
+</div>
+<p>メンバは以下の通りです:</p>
+<blockquote>
+<div><ol class="arabic">
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>const struct fs_parameter_specification *specs;
+</pre></div>
+</div>
+<p>パラメータ仕様のテーブルで、nullエントリで終了します。エントリの型は:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fs_parameter_spec {
+        const char              *name;
+        u8                      opt;
+        enum fs_parameter_type  type:8;
+        unsigned short          flags;
+};
+</pre></div>
+</div>
+<p>「name」フィールドはパラメータキーに完全一致する文字列で、ワイルドカードやパターン、ケース無視はなしです。「opt」はfs_parser()関数が成功した場合に返す値です。</p>
+<p>「type」フィールドは望ましい値の型を示し、次のいずれかでなければなりません:</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 34%"/>
+<col style="width: 34%"/>
+<col style="width: 31%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>TYPE NAME</p></th>
+<th class="head"><p>EXPECTED VALUE</p></th>
+<th class="head"><p>RESULT IN</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>fs_param_is_flag</p></td>
+<td><p>値なし</p></td>
+<td><p>n/a</p></td>
+</tr>
+<tr class="row-odd"><td><p>fs_param_is_bool</p></td>
+<td><p>ブール値</p></td>
+<td><p>result-&gt;boolean</p></td>
+</tr>
+<tr class="row-even"><td><p>fs_param_is_u32</p></td>
+<td><p>32ビット符号なし整数</p></td>
+<td><p>result-&gt;uint_32</p></td>
+</tr>
+<tr class="row-odd"><td><p>fs_param_is_u32_octal</p></td>
+<td><p>32ビットオクタリ整数</p></td>
+<td><p>result-&gt;uint_32</p></td>
+</tr>
+<tr class="row-even"><td><p>fs_param_is_u32_hex</p></td>
+<td><p>32ビットヘキサデシマル整数</p></td>
+<td><p>result-&gt;uint_32</p></td>
+</tr>
+<tr class="row-odd"><td><p>fs_param_is_s32</p></td>
+<td><p>32ビット符号付き整数</p></td>
+<td><p>result-&gt;int_32</p></td>
+</tr>
+<tr class="row-even"><td><p>fs_param_is_u64</p></td>
+<td><p>64ビット符号なし整数</p></td>
+<td><p>result-&gt;uint_64</p></td>
+</tr>
+<tr class="row-odd"><td><p>fs_param_is_enum</p></td>
+<td><p>エナム値名</p></td>
+<td><p>result-&gt;uint_32</p></td>
+</tr>
+<tr class="row-even"><td><p>fs_param_is_string</p></td>
+<td><p>任意の文字列</p></td>
+<td><p>param-&gt;string</p></td>
+</tr>
+<tr class="row-odd"><td><p>fs_param_is_blob</p></td>
+<td><p>バイナリ・ブロブ</p></td>
+<td><p>param-&gt;blob</p></td>
+</tr>
+<tr class="row-even"><td><p>fs_param_is_blockdev</p></td>
+<td><p>ブロックデバイスのパス</p></td>
+<td><ul class="simple">
+<li><p>検索が必要</p></li>
+</ul>
+</td>
+</tr>
+<tr class="row-odd"><td><p>fs_param_is_path</p></td>
+<td><p>パス</p></td>
+<td><ul class="simple">
+<li><p>検索が必要</p></li>
+</ul>
+</td>
+</tr>
+<tr class="row-even"><td><p>fs_param_is_fd</p></td>
+<td><p>ファイル記述子</p></td>
+<td><p>result-&gt;int_32</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>値が fs_param_is_bool 型の場合、fs_parse() は "0"、"1"、"no"、"yes"、"false"、"true" といった文字列とマッチを試みます。</p>
+<p>各パラメータは 'flags' で修飾することもできます:</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 32%"/>
+<col style="width: 68%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>fs_param_v_optional</p></td>
+<td><p>値はオプションです</p></td>
+</tr>
+<tr class="row-even"><td><p>fs_param_neg_with_no</p></td>
+<td><p>キーパラメータが "no" でプレフィックスされている場合、result-&gt;negated が設定されます</p></td>
+</tr>
+<tr class="row-odd"><td><p>fs_param_neg_with_empty</p></td>
+<td><p>値が "" の場合、result-&gt;negated が設定されます</p></td>
+</tr>
+<tr class="row-even"><td><p>fs_param_deprecated</p></td>
+<td><p>このパラメータは非推奨です。</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>これらはいくつかの便利なラッパーでラップされています:</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 33%"/>
+<col style="width: 67%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>MACRO</p></th>
+<th class="head"><p>SPECIFIES</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>fsparam_flag()</p></td>
+<td><p>fs_param_is_flag</p></td>
+</tr>
+<tr class="row-odd"><td><p>fsparam_flag_no()</p></td>
+<td><p>fs_param_is_flag, fs_param_neg_with_no</p></td>
+</tr>
+<tr class="row-even"><td><p>fsparam_bool()</p></td>
+<td><p>fs_param_is_bool</p></td>
+</tr>
+<tr class="row-odd"><td><p>fsparam_u32()</p></td>
+<td><p>fs_param_is_u32</p></td>
+</tr>
+<tr class="row-even"><td><p>fsparam_u32oct()</p></td>
+<td><p>fs_param_is_u32_octal</p></td>
+</tr>
+<tr class="row-odd"><td><p>fsparam_u32hex()</p></td>
+<td><p>fs_param_is_u32_hex</p></td>
+</tr>
+<tr class="row-even"><td><p>fsparam_s32()</p></td>
+<td><p>fs_param_is_s32</p></td>
+</tr>
+<tr class="row-odd"><td><p>fsparam_u64()</p></td>
+<td><p>fs_param_is_u64</p></td>
+</tr>
+<tr class="row-even"><td><p>fsparam_enum()</p></td>
+<td><p>fs_param_is_enum</p></td>
+</tr>
+<tr class="row-odd"><td><p>fsparam_string()</p></td>
+<td><p>fs_param_is_string</p></td>
+</tr>
+<tr class="row-even"><td><p>fsparam_blob()</p></td>
+<td><p>fs_param_is_blob</p></td>
+</tr>
+<tr class="row-odd"><td><p>fsparam_bdev()</p></td>
+<td><p>fs_param_is_blockdev</p></td>
+</tr>
+<tr class="row-even"><td><p>fsparam_path()</p></td>
+<td><p>fs_param_is_path</p></td>
+</tr>
+<tr class="row-odd"><td><p>fsparam_fd()</p></td>
+<td><p>fs_param_is_fd</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>すべての引数は名前を表す文字列とオプション番号の2つを取る。たとえば：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static const struct fs_parameter_spec afs_param_specs[] = {
+        fsparam_flag    ("autocell",    Opt_autocell),
+        fsparam_flag    ("dyn",         Opt_dyn),
+        fsparam_string  ("source",      Opt_source),
+        fsparam_flag_no ("foo",         Opt_foo),
+        {}
+};
+</pre></div>
+</div>
+<p>上記のマクロに該当しないもののタイプとフラグを指定するための追加マクロ __fsparam() が提供される。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>const struct fs_parameter_enum *enums;
+</pre></div>
+</div>
+<p>enum 値名のテーブルから整数へのマッピング表で、null エントリで終了する。これは次の型を持つ：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fs_parameter_enum {
+        u8              opt;
+        char            name[14];
+        u8              value;
+};
+</pre></div>
+</div>
+<p>配列は { パラメータ ID, 名前 } でキー付けされた要素の無秩序なリストで、マッピングする値を示す。たとえば：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static const struct fs_parameter_enum afs_param_enums[] = {
+        { Opt_bar,   "x",      1},
+        { Opt_bar,   "y",      23},
+        { Opt_bar,   "z",      42},
+};
+</pre></div>
+</div>
+<p>fs_param_is_enum 型のパラメータが見つかった場合、fs_parse() はその値を enum 表で検索し、結果をパース結果に保存する。</p>
+</li>
+</ol>
+</div></blockquote>
+<p>パーサーのポインタは file_system_type struct のパーサーポインタに指され、これは登録時に検証（CONFIG_VALIDATE_FS_PARSER=y の場合）を提供し、fsinfo() システムコールを介してユーザー空間から説明を照会できるようにする。</p>
+</section>
+<section id="parameter-helper-functions">
+<h2>パラメータ補助関数<a class="headerlink" href="#parameter-helper-functions" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ファイルシステムや LSM が与えられたパラメータを処理するのに役立つ複数のユーティリティ関数が提供される。</p>
+<blockquote>
+<div><ul>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int lookup_constant(const struct constant_table tbl[],
+                    const char *name, int not_found);
+</pre></div>
+</div>
+<p>名前から整数へのマッピング表で、名前によって定数を検索する。この表は次の型を持つ要素の配列である：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct constant_table {
+        const char      *name;
+        int             value;
+};
+</pre></div>
+</div>
+<p>マッチが見つかった場合、対応する値が返される。マッチが見つからない場合は、not_found 値が返される。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>bool validate_constant_table(const struct constant_table *tbl,
+                             size_t tbl_size,
+                             int low, int high, int special);
+</pre></div>
+</div>
+<p>定数テーブルを検証する。すべての要素が適切に並んでおり、重複がなく、値が low と high の範囲内であることを確認する。ただし、範囲外の1つの特別な値を許容する。特別な値が不要な場合は、special を low-to-high の範囲内に設定するだけである。</p>
+<p>すべてが問題なければ true を返す。テーブルが無効な場合、エラーが dmesg にログされ、false を返す。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>bool fs_validate_description(const struct fs_parameter_description *desc);
+</pre></div>
+</div>
+<p>これはパラメータ記述にいくつかの検証チェックを行います。記述が正しい場合は true を返し、そうでない場合は false を返します。検証が失敗した場合、エラーを dmesg にログします。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int fs_parse(struct fs_context *fc,
+             const struct fs_parameter_description *desc,
+             struct fs_parameter *param,
+             struct fs_parse_result *result);
+</pre></div>
+</div>
+<p>これはパラメータの主な解釈器です。パラメータ記述を使用して、キー名でパラメータを検索し、それをオプション番号に変換して返します。</p>
+<p>成功した場合、パラメータのタイプがブール値、整数、または列挙型タイプを示す場合、この関数が値を変換し、結果を result-&gt;{boolean,int_32,uint_32,uint_64} に保存します。</p>
+<p>初期のマッチングに失敗した場合、キーは「no」プレフィックスが付加され、値が存在しない状態で検索が試行されます。このキーからプレフィックスを除去した状態で再検索が行われ、パラメータの型が fs_param_neg_with_no フラグを設定している場合、マッチングが成功し result-&gt;negated が true に設定されます。</p>
+<p>パラメータにマッチしなかった場合は -ENOPARAM を返します。パラメータにマッチしたが値が誤っている場合は -EINVAL を返します。それ以外の場合はパラメータのオプション番号を返します。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int fs_lookup_param(struct fs_context *fc,
+                    struct fs_parameter *value,
+                    bool want_bdev,
+                    struct path *_path);
+</pre></div>
+</div>
+<p>文字列またはファイル名タイプを保持するパラメータを受け取り、パス検索を試行します。パラメータがブロックデバイスを期待する場合、インノデが実際にブロックデバイスを表しているかを確認します。</p>
+<p>成功した場合は 0 を返し、 <code class="docutils literal notranslate"><span class="pre">*_path</span></code> 失敗した場合は負のエラーコードを返します。</p>
+</li>
+</ul>
+</div></blockquote>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxカーネル内のファイルシステム</a><ul class="current">
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#core-vfs-documentation">コアVFSドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#filesystem-support-layers">ファイルシステムサポートレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#filesystems">ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxカーネル内のファイルシステム</a><ul>
+<li>前へ: <a href="mandatory-locking.html" title="前章">Linuxオペレーティングシステムにおける必須ファイルロック</a></li>
+<li>次へ: <a href="quota.html" title="次章">クォータサブシステム</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/filesystems/mount_api.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

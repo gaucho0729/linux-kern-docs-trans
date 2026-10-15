@@ -1,0 +1,494 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>ACPIベースのデバイス列挙 — Linux Kernelドキュメンテーション</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="osi.html" rel="next" title="ACPI _OSI および _REV メソッド"/>
+<link href="dsd/leds.html" rel="prev" title="ACPIにおけるLEDの記述と参照"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="acpi-based-device-enumeration">
+<h1>ACPIベースのデバイス列挙<a class="headerlink" href="#acpi-based-device-enumeration" title="この見出しへのパーマリンク">¶</a></h1>
+<p>ACPI 5は、シリアルバス制御機器の背後にあるスレーブデバイスを列挙するために使用できる新しいリソース（UartTSerialBus、I2cSerialBus、SpiSerialBus、GpioIoおよびGpioInt）を導入しました。</p>
+<p>さらに、SoC/チップセットに統合された周辺機器がACPI名前空間にのみ出現するケースも増えてきています。これらは通常、メモリマップレジスタを通じてアクセスされるデバイスです。</p>
+<p>このサポートを実現し、既存ドライバーをできるだけ再利用するため、以下の取り組みを行いました：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>バスコネクタリソースを持たないデバイスはプラットフォームデバイスとして表現されます。</p></li>
+<li><p>実際のバス背後に存在するデバイスで、コネクタリソースがある場合は、 <a class="reference internal" href="../../driver-api/spi.html#c.spi_device" title="spi_device"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">spi_device</span></code></a> struct i2c_device（標準UARTはバスではないため、struct uart_deviceは存在しません）として表現されます。</p></li>
+</ul>
+</div></blockquote>
+<p>ACPIとDevice Treeはどちらもデバイス（およびリソース）の木構造を表現するため、この実装はDevice Treeの方法をできるだけ採用しています。</p>
+<p>ACPIの実装は、バス（プラットフォーム、SPI、I2C）背後のデバイスを列挙し、物理デバイスを作成して、ACPI名前空間内のACPIハンドルにバインドします。</p>
+<p>これは、ACPI_HANDLE(dev)がNULLでない場合、デバイスがACPI名前空間から列挙されたことを意味します。このハンドルは、他のデバイス固有の設定情報を抽出するために使用できます。以下にその例を示します。</p>
+<section id="platform-bus-support">
+<h2>プラットフォームバスサポート<a class="headerlink" href="#platform-bus-support" title="この見出しへのパーマリンク">¶</a></h2>
+<p>プラットフォームデバイスでデバイスを表現するため、デバイスにプラットフォームドライバーを実装し、サポートするACPI IDを追加するだけで十分です。同じIPブロックが他の非ACPIプラットフォームで使用される場合、ドライバーはオフボードで動作するか、最小限の変更で動作する可能性があります。</p>
+<p>既存ドライバーにACPIサポートを追加するのは比較的簡単です。以下に最もシンプルな例を示します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#ifdef CONFIG_ACPI
+static const struct acpi_device_id mydrv_acpi_match[] = {
+        /* ACPI IDs here */
+        { }
+};
+MODULE_DEVICE_TABLE(acpi, mydrv_acpi_match);
+#endif
+
+static struct platform_driver my_driver = {
+        ...
+        .driver = {
+                .acpi_match_table = ACPI_PTR(mydrv_acpi_match),
+        },
+};
+</pre></div>
+</div>
+<p>ドライバーがGPIOの取得や設定など複雑な初期化を行う必要がある場合、ACPIハンドルを取得して、ACPIテーブルからこの情報を抽出できます。</p>
+</section>
+<section id="dma-support">
+<h2>DMAサポート<a class="headerlink" href="#dma-support" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ACPI経由で列挙されたDMAコントローラーは、システムに登録してリソースへの汎用的なアクセスを提供する必要があります。たとえば、slaveデバイスに汎用API（dma_request_chan()）でアクセスしたいドライバーは、プローブ関数の最後に以下のように自身を登録する必要があります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>err = devm_acpi_dma_controller_register(dev, xlate_func, dw);
+/* Handle the error if it's not a case of !CONFIG_ACPI */
+</pre></div>
+</div>
+<p>必要に応じてカスタムのxlate関数（通常はacpi_dma_simple_xlate()で十分）を実装して、struct acpi_dma_specのFixedDMAリソースを対応するDMAチャネルに変換します。その場合のコード例は以下のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#ifdef CONFIG_ACPI
+struct filter_args {
+        /* Provide necessary information for the filter_func */
+        ...
+};
+
+static bool filter_func(struct dma_chan *chan, void *param)
+{
+        /* Choose the proper channel */
+        ...
+}
+
+static struct dma_chan *xlate_func(struct acpi_dma_spec *dma_spec,
+                struct acpi_dma *adma)
+{
+        dma_cap_mask_t cap;
+        struct filter_args args;
+
+        /* Prepare arguments for filter_func */
+        ...
+        return dma_request_channel(cap, filter_func, &amp;args);
+}
+#else
+static struct dma_chan *xlate_func(struct acpi_dma_spec *dma_spec,
+                struct acpi_dma *adma)
+{
+        return NULL;
+}
+#endif
+</pre></div>
+</div>
+<p>dma_request_chan()は、登録されたDMAコントローラーごとにxlate_func()を呼び出します。xlate関数では、struct acpi_dma_spec内の情報と、struct acpi_dmaで提供されるコントローラーのプロパティに基づいて適切なチャネルを選択する必要があります。</p>
+<p>クライアントは、特定のFixedDMAリソースに対応する文字列パラメータでdma_request_chan()を呼び出す必要があります。デフォルトでは、「tx」はFixedDMAリソース配列の最初のエントリ、「rx」は2番目のエントリを意味します。以下にレイアウトを示します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Device (I2C0)
+{
+        ...
+        Method (_CRS, 0, NotSerialized)
+        {
+                Name (DBUF, ResourceTemplate ()
+                {
+                        FixedDMA (0x0018, 0x0004, Width32bit, _Y48)
+                        FixedDMA (0x0019, 0x0005, Width32bit, )
+                })
+        ...
+        }
+}
+</pre></div>
+</div>
+<p>したがって、この例では、リクエストライン0x0018のFixedDMAは「tx」、次のリクエストラインは「rx」となります。</p>
+<p>信頼性の高いケースでは、クライアントは残念ながらacpi_dma_request_slave_chan_by_index()を直接呼び出し、特定のFixedDMAリソースをインデックスで選ぶ必要があります。</p>
+</section>
+<section id="spi-serial-bus-support">
+<h2>SPIシリアルバスサポート<a class="headerlink" href="#spi-serial-bus-support" title="この見出しへのパーマリンク">¶</a></h2>
+<p>SPIバスの背後にあるスレーブデバイスにはSpiSerialBusリソースがアタッチされています。これはSPIコアが自動的に抽出し、バスドライバがspi_register_master()を呼び出すことでスレーブデバイスが一括して列挙されます。</p>
+<p>SPIスレーブデバイスのACPI名前空間の例は以下のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Device (EEP0)
+{
+        Name (_ADR, 1)
+        Name (_CID, Package() {
+                "ATML0025",
+                "AT25",
+        })
+        ...
+        Method (_CRS, 0, NotSerialized)
+        {
+                SPISerialBus(1, PolarityLow, FourWireMode, 8,
+                        ControllerInitiated, 1000000, ClockPolarityLow,
+                        ClockPhaseFirst, "\\_SB.PCI0.SPI1",)
+        }
+        ...
+</pre></div>
+</div>
+<p>SPIデバイスドライバは、プラットフォームデバイスドライバと同様にACPI IDを追加するだけで十分です。以下は、at25 SPI EEPROMドライバにACPIサポートを追加する例（上記のACPIスニペットに対応）です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#ifdef CONFIG_ACPI
+static const struct acpi_device_id at25_acpi_match[] = {
+        { "AT25", 0 },
+        { },
+};
+MODULE_DEVICE_TABLE(acpi, at25_acpi_match);
+#endif
+
+static struct spi_driver at25_driver = {
+        .driver = {
+                ...
+                .acpi_match_table = ACPI_PTR(at25_acpi_match),
+        },
+};
+</pre></div>
+</div>
+<p>このドライバは、EEPROMのページサイズなどの情報が必要ですが、現在では標準的な方法がありません。一つのアイデアは、_DSMメソッドでこれらの情報を返すことです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Device (EEP0)
+{
+        ...
+        Method (_DSM, 4, NotSerialized)
+        {
+                Store (Package (6)
+                {
+                        "byte-len", 1024,
+                        "addr-mode", 2,
+                        "page-size, 32
+                }, Local0)
+
+                // Check UUIDs etc.
+
+                Return (Local0)
+        }
+</pre></div>
+</div>
+<p>その後、at25 SPIドライバは、ACPIハンドルに対して_DSMを呼び出してこの構成情報を取得できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct acpi_buffer output = { ACPI_ALLOCATE_BUFFER, NULL };
+struct acpi_object_list input;
+acpi_status status;
+
+/* Fill in the input buffer */
+
+status = acpi_evaluate_object(ACPI_HANDLE(&amp;spi-&gt;dev), "_DSM",
+                              &amp;input, &amp;output);
+if (ACPI_FAILURE(status))
+        /* Handle the error */
+
+/* Extract the data here */
+
+kfree(output.pointer);
+</pre></div>
+</div>
+</section>
+<section id="i2c-serial-bus-support">
+<h2>I2Cシリアルバスサポート<a class="headerlink" href="#i2c-serial-bus-support" title="この見出しへのパーマリンク">¶</a></h2>
+<p>I2Cバスコントローラーの背後にあるスレーブデバイスは、プラットフォームやSPIドライバと同様にACPI IDを追加するだけで十分です。I2Cコアは、アダプターが登録されたら自動的にコントローラー背後のスレーブデバイスを列挙します。</p>
+<p>既存のmpu3050入力ドライバにACPIサポートを追加する例は以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#ifdef CONFIG_ACPI
+static const struct acpi_device_id mpu3050_acpi_match[] = {
+        { "MPU3050", 0 },
+        { },
+};
+MODULE_DEVICE_TABLE(acpi, mpu3050_acpi_match);
+#endif
+
+static struct i2c_driver mpu3050_i2c_driver = {
+        .driver = {
+                .name   = "mpu3050",
+                .owner  = THIS_MODULE,
+                .pm     = &amp;mpu3050_pm,
+                .of_match_table = mpu3050_of_match,
+                .acpi_match_table = ACPI_PTR(mpu3050_acpi_match),
+        },
+        .probe          = mpu3050_probe,
+        .remove         = mpu3050_remove,
+        .id_table       = mpu3050_ids,
+};
+</pre></div>
+</div>
+</section>
+<section id="gpio-support">
+<h2>GPIOサポート<a class="headerlink" href="#gpio-support" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ACPI 5はGPIO接続を記述するための2つの新しいリソース、GpioIoとGpioIntを導入しました。これらのリソースは、デバイスが使用するGPIO番号をドライバに渡すために使用できます。ACPI 5.1では_DSD（デバイス固有データ）が追加され、GPIOの名前付けなどが可能になりました。</p>
+<p>例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Device (DEV)
+{
+        Method (_CRS, 0, NotSerialized)
+        {
+                Name (SBUF, ResourceTemplate()
+                {
+                        ...
+                        // Used to power on/off the device
+                        GpioIo (Exclusive, PullDefault, 0x0000, 0x0000,
+                                IoRestrictionOutputOnly, "\\_SB.PCI0.GPI0",
+                                0x00, ResourceConsumer,,)
+                        {
+                                // Pin List
+                                0x0055
+                        }
+
+                        // Interrupt for the device
+                        GpioInt (Edge, ActiveHigh, ExclusiveAndWake, PullNone,
+                                0x0000, "\\_SB.PCI0.GPI0", 0x00, ResourceConsumer,,)
+                        {
+                                // Pin list
+                                0x0058
+                        }
+
+                        ...
+
+                }
+
+                Return (SBUF)
+        }
+
+        // ACPI 5.1 _DSD used for naming the GPIOs
+        Name (_DSD, Package ()
+        {
+                ToUUID("daffd814-6eba-4d8c-8a91-bc9bbf4aa301"),
+                Package ()
+                {
+                        Package () {"power-gpios", Package() {^DEV, 0, 0, 0 }},
+                        Package () {"irq-gpios", Package() {^DEV, 1, 0, 0 }},
+                }
+        })
+        ...
+</pre></div>
+</div>
+<p>これらのGPIO番号はコントローラー相対であり、パス「\_SB.PCI0.GPI0」はコントローラーへのパスを指定します。LinuxでこれらのGPIOを使用するには、それらを対応するLinux GPIO記述子に変換する必要があります。</p>
+<p>これには標準的なGPIO APIがあり、Documentation/admin-guide/gpio/に詳しい説明があります。</p>
+<p>上記の例では、このようなコードを使用して、対応する2つのGPIOデスクリプタを取得できます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/gpio/consumer.h&gt;
+...
+
+struct gpio_desc *irq_desc, *power_desc;
+
+irq_desc = gpiod_get(dev, "irq");
+if (IS_ERR(irq_desc))
+        /* handle error */
+
+power_desc = gpiod_get(dev, "power");
+if (IS_ERR(power_desc))
+        /* handle error */
+
+/* Now we can use the GPIO descriptors */
+</pre></div>
+</div>
+<p>これらの関数には、デバイスが解放されるときにデスクリプタを解放するdevm_*バージョンのものもあります。</p>
+<p>参照 <a class="reference internal" href="gpio-properties.html"><span class="doc">_DSD デバイスプロパティ（GPIO関連）</span></a> GPIOに関連する_DSDバインディングについての詳細情報については、</p>
+</section>
+<section id="mfd-devices">
+<h2>MFDデバイス<a class="headerlink" href="#mfd-devices" title="この見出しへのパーマリンク">¶</a></h2>
+<p>MFDデバイスは、子デバイスをプラットフォームデバイスとして登録します。子デバイスには、ACPI名前空間内のそれらに関連する部分を参照するために使用できるACPIハンドルが必要です。LinuxのMFDサブシステムでは、2つの方法を提供しています:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>子デバイスは親のACPIハンドルを共有します。</p></li>
+<li><p>MFDセルは、デバイスのACPI IDを指定できます。</p></li>
+</ul>
+</div></blockquote>
+<p>最初のケースでは、MFDドライバは何も処理する必要がありません。結果として生成される子プラットフォームデバイスは、親デバイスを指すACPI_COMPANION()が設定されます。</p>
+<p>ACPI名前空間に、ACPI IDまたはACPI adrを使用してマッチできるデバイスがある場合、セルは以下のように設定する必要があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static struct mfd_cell_acpi_match my_subdevice_cell_acpi_match = {
+        .pnpid = "XYZ0001",
+        .adr = 0,
+};
+
+static struct mfd_cell my_subdevice_cell = {
+        .name = "my_subdevice",
+        /* set the resources relative to the parent */
+        .acpi_match = &amp;my_subdevice_cell_acpi_match,
+};
+</pre></div>
+</div>
+<p>ACPI ID「XYZ0001」は、MFDデバイス直下のACPIデバイスを直接検索し、見つかった場合、そのACPIコンパニオンデバイスが結果として生成される子プラットフォームデバイスにバインドされます。</p>
+</section>
+<section id="device-tree-namespace-link-device-id">
+<h2>デバイスツリー名前空間リンクデバイスID<a class="headerlink" href="#device-tree-namespace-link-device-id" title="この見出しへのパーマリンク">¶</a></h2>
+<p>デバイスツリープロトコルでは、ドライバやドライバコアが認識する文字列または文字列配列を値として持つ「compatible」プロパティを基にデバイスを識別します。これらの文字列の集合は、ACPI/PNPデバイスID名前空間に類似したデバイス識別名前空間とみなせます。したがって、デバイスツリー（DT）名前空間に既存の識別文字列を持つデバイスに対して、新たに（おそらく冗長な）ACPI/PNPデバイスIDを割り当てる必要は原則としてありません。特に、そのIDは他のデバイスとの互換性を示すためにのみ必要である場合です。</p>
+<p>ACPIでは、デバイスの互換性を示すための識別オブジェクトとして_CID（Compatible ID）が使用されますが、そのIDはACPI仕様で規定された名前空間のいずれかに属する必要があります（詳細はACPI 6.0の第6.1.2節を参照）。DT名前空間はその一つではありません。さらに、仕様では、すべてのACPIオブジェクトがデバイスを表す場合、_HIDまたは_ADR識別オブジェクトのいずれかが存在することを義務付けています（詳細はACPI 6.0の第6.1節を参照）。非列挙バスタイプの場合は、このオブジェクトは_HIDでなければならず、その値は仕様で規定された名前空間のいずれかからデバイスIDを取得しなければなりません。</p>
+<p>特別なDT名前空間リンクデバイスIDであるPRP0001は、ACPIにおいて既存のDT互換デバイス識別情報を使用し、ACPI仕様に基づく上記の要件を同時に満たす手段を提供します。つまり、_HIDがPRP0001を返す場合、ACPIサブシステムはデバイスオブジェクトの_DSD内の「compatible」プロパティを検索し、その値をもとに元のDTデバイス識別アルゴリズムと同様に該当デバイスを識別します。もし「compatible」プロパティが存在しないか、値が無効な場合、デバイスはACPIサブシステムによって列挙されません。それ以外の場合、デバイスは自動的にプラットフォームデバイスとして列挙されます（ただし、デバイスから親へのI2CまたはSPIリンクが存在する場合は、ACPIコアが親ドライバに列挙を委譲します）。また、_CIDでリストされたデバイスIDとともに、「compatible」プロパティ値から得られる識別文字列が使用され、デバイスに適したドライバが検索されます。</p>
+<p>同様に、_CIDで返されるデバイスIDリストにPRP0001が含まれる場合、_HIDと_CIDでリストされた他のデバイスIDと比較して、PRP0001の位置によって「compatible」プロパティ値でリストされた識別文字列の優先順位が決まります。具体的には、_CIDの返却パッケージ内でPRP0001の前に返されるデバイスIDが優先的に検査されます。この場合、デバイスが列挙されるバスタイプは、_HIDで返されるデバイスIDによって決まります。</p>
+<p>例えば、以下のACPIサンプルがlm75型I2C温度センサーを列挙し、Device Tree名前空間リンクを用いてドライバにマッチさせるために使用されることがあります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Device (TMP0)
+{
+        Name (_HID, "PRP0001")
+        Name (_DSD, Package() {
+                ToUUID("daffd814-6eba-4d8c-8a91-bc9bbf4aa301"),
+                Package () {
+                        Package (2) { "compatible", "ti,tmp75" },
+                }
+        })
+        Method (_CRS, 0, Serialized)
+        {
+                Name (SBUF, ResourceTemplate ()
+                {
+                        I2cSerialBusV2 (0x48, ControllerInitiated,
+                                400000, AddressingMode7Bit,
+                                "\\_SB.PCI0.I2C1", 0x00,
+                                ResourceConsumer, , Exclusive,)
+                })
+                Return (SBUF)
+        }
+}
+</pre></div>
+</div>
+<p>_HIDがPRP0001を返すとともに_DSDまたは_CIDに「compatible」プロパティが存在しないデバイスオブジェクトを定義しても、その祖先のいずれかが_DSDに有効な「compatible」プロパティを持つ_DSDを提供する限り有効です。このようなデバイスオブジェクトは、複合的な親デバイスのドライバに階層的な構成情報を提供する追加の「ブロック」として単純に扱われます。</p>
+<p>ただし、PRP0001は、デバイスオブジェクトの_HIDまたは_CIDからのみ返却可能であり、そのデバイスオブジェクト自身の_DSDまたはその上位階層の「composite device」のケースにおける_DSDから返却されるすべてのプロパティがACPI環境で使用可能である場合に限られます。そうでない場合、_DSD自体は無効とみなされ、「compatible」プロパティは意味を失います。</p>
+<p>「 <a class="reference internal" href="DSD-properties-rules.html"><span class="doc">DSDデバイスプロパティの使用規則</span></a> 詳しくは</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxカーネルファームウェアガイド</a><ul class="current">
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">ACPI サポート</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxカーネルファームウェアガイド</a><ul>
+<li><a href="index.html">ACPI サポート</a><ul>
+<li>前へ: <a href="dsd/leds.html" title="前章">ACPIにおけるLEDの記述と参照</a></li>
+<li>次へ: <a href="osi.html" title="次章">ACPI _OSI および _REV メソッド</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/firmware-guide/acpi/enumeration.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

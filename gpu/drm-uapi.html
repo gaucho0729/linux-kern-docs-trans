@@ -1,0 +1,1077 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>ユーザーランドインターフェース — The Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="drm-client.html" rel="next" title="カーネルクライアント"/>
+<link href="drm-kms-helpers.html" rel="prev" title="モード設定ヘルパ関数"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="userland-interfaces">
+<h1>ユーザランドインターフェース<a class="headerlink" href="#userland-interfaces" title="この見出しへのパーマリンク">¶</a></h1>
+<p>DRMコアはアプリケーションに対して複数のインターフェースをエクスポートしており、一般的には対応するlibdrmのラッパー関数を通じて使用されるように設計されています。さらに、ドライバはioctlとsysfsファイルを通じてユーザー空間のドライバおよびデバイスを意識したアプリケーションが使用できるデバイス固有のインターフェースをエクスポートします。</p>
+<p>外部インターフェースには、メモリマッピング、コンテキスト管理、DMA操作、AGP管理、vblank制御、フェンス管理、メモリ管理、出力管理が含まれます。</p>
+<p>ここでは汎用的なioctlとsysfsレイアウトについて説明します。manページが残りの詳細をカバーするため、高レベルの情報のみを記載します。</p>
+<section id="libdrm-device-lookup">
+<h2>libdrmデバイス検索<a class="headerlink" href="#libdrm-device-lookup" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ドラゴンに注意！ トラップドアに注意！</p>
+<p>他の誰かがこの状況を理解しようとしている場合に備えて、私がこの物語を要約します。まず最初に、名前の混乱を解消しましょう。なぜなら、カーネル内部、libdrm、およびioctlはすべて異なる名前で呼ばれるからです：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>GET_UNIQUE ioctl（drm_getuniqueで実装）はlibdrmのdrmGetBusid関数を通じてラップされています。</p></li>
+<li><p>libdrmのdrmSetBusid関数はSET_UNIQUE ioctlによってサポートされています。すべてのコードはカーネル内で <a class="reference internal" href="#c.drm_invalid_op" title="drm_invalid_op"><code class="xref c c-func docutils literal notranslate"><span class="pre">drm_invalid_op()</span></code></a>.</p></li>
+<li><p>内部のset_busidカーネル関数およびドライバコールバックは、SET_VERSION ioctlのみで使用されます。なぜなら、のみdrm 1.0（実装済み）がユーザー空間が上記のioctlを通じてバスIDを設定できるように許可したからです。</p></li>
+<li><p>他のioctlおよび関数は一貫して名前が付けられています。</p></li>
+</ul>
+</div></blockquote>
+<p>drm 1.1と1.4の違いについて気になる人もいるでしょう：ppcでのバスIDにおけるPCIドメインの正しく処理。この処理は2010年にlibdrmで初めて実装されたため、まだ実装済みとは言えません。drm 1.2と1.3には何か特別な点があるのか誰も知りません。</p>
+<p>ここからはdrmでのデバイス検索の恐ろしい物語です。大まかに言って、バスIDで検索する方法と、デバイスドライバ名で検索する方法の2つの方法があります。</p>
+<p>バスIDで開くのは比較的簡単です：</p>
+<ol class="arabic simple">
+<li><p>まずSET_VERSIONを呼び出してPCIドメインの処理を適切に行います。副作用として、マスターストラクチャ内のユニーク名が埋められます。</p></li>
+<li><p>次にGET_UNIQUEを呼び出して、マスターストラクチャ内のユニーク名を読み出します。これはステップ1によりバスIDと一致します。もし一致しない場合は、次のデバイスノードを試してみます。</p></li>
+</ol>
+<p>名前で開く場合はやや異なります：</p>
+<ol class="arabic simple">
+<li><p>VERSIONを直接呼び出してバージョンを取得し、そのioctlで返されるドライバ名と照合します。SET_VERSIONが呼ばれていないため、マスターノードが開かれた際に一意の名前が埋められていません。これは現在のdrmデバイスノードが常に1つのデバイスにバインドされており、ランタイムで割り当てられることがないためです（drm 1.0ではそのような機能がありました）。</p></li>
+<li><p>ドライバ名を照合します。一致しなければ次のデバイスノードに進みます。</p></li>
+<li><p>GET_UNIQUEを呼び出し、一意の名前の長さがゼロ（文字列の最初のバイトが0であることを確認）かどうかをチェックします。長さがゼロでなければlibdrmは次のデバイスノードに進みます。これはdrm 1.0時代のコピー＆ペーストコードの可能性が高いですが、これは単なる推測です。</p></li>
+</ol>
+<p>長くなる話ですが、オープンによる名前指定ロジックが動作するためには、SET_VERSIONが呼ばれる前にはGET_UNIQUEは一意な文字列を返してはいけません。それ以外にlibdrmが破綻します。この一意な文字列は変更されることもありませんし、実際のデバイスオープンとは関係ありません。なぜなら、ランタイムで割り当て可能なデバイスインスタンスはdrm 1.0でしかサポートされておらず、それ以降は廃止されているからです。しかしdrmOpenByNameのlibdrmコードはなぜか生き残っているため、このロジックは破壊できません。</p>
+</section>
+<section id="primary-nodes-drm-master-and-authentication">
+<span id="drm-primary-node"></span><h2>プライマリノード、DRMマスターアuthentication<a class="headerlink" href="#primary-nodes-drm-master-and-authentication" title="この見出しへのパーマリンク">¶</a></h2>
+<p><a class="reference internal" href="#c.drm_master" title="drm_master"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_master</span></code></a> オープンされたプライマリ/レガシデバイスノードを持つクライアントグループを追跡するために使用されます。すべての <a class="reference internal" href="drm-internals.html#c.drm_file" title="drm_file"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_file</span></code></a> が少なくとも1回、デバイスマスターベンチ（SET_MASTER IOCTL、またはプライマリデバイスノードを開いた際に他の誰もがマスターベンチでない場合）で成功した場合、1つの <a class="reference internal" href="#c.drm_master" title="drm_master"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_master</span></code></a>が存在します。これは <a class="reference internal" href="drm-internals.html#c.drm_file" title="drm_file"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_file.is_master</span></code></a>で記録されます。他のクライアントはただの <a class="reference internal" href="#c.drm_master" title="drm_master"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_master</span></code></a> へのポインタを持ちます。</p>
+<p>さらに、1つの <a class="reference internal" href="#c.drm_master" title="drm_master"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_master</span></code></a> が1つの <a class="reference internal" href="drm-internals.html#c.drm_device" title="drm_device"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_device</span></code></a>の現在のマスターベンチです。これはDROP_MASTERとSET_MASTER IOCTL、またはプライマリデバイスノードのクローズ/オープンによって切り替わります。参照：
+<a class="reference internal" href="#c.drm_is_current_master" title="drm_is_current_master"><code class="xref c c-func docutils literal notranslate"><span class="pre">drm_is_current_master()</span></code></a>.</p>
+<p>クライアントはGETMAGICとAUTHMAGIC IOCTLを使用して現在のマスターベンチ（自身と一致する場合）に認証できます。マスターベンチの交換と併せて、信頼できるクライアントグループ全体にデバイスへの制御されたアクセスを許可します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.drm_is_current_master">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_is_current_master</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="drm-internals.html#c.drm_file" title="drm_file"><span class="n"><span class="pre">drm_file</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">fpriv</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.drm_is_current_master" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>が現在のマスターベンチかどうかを確認します <strong>priv</strong> が現在のマスターベンチかどうか</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_file</span> <span class="pre">*fpriv</span></code></dt><dd><p>DRMファイルプライベート</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>確認します <strong>fpriv</strong> がそのデバイスの現在のマスターベンチかどうか。これによりクライアントがDRM_MASTER IOCTLを実行できるかどうかが決まります。</p>
+<p>現代の大多数のDRM_MASTERを必要とするIOCTLは、カーネルモード設定に関連しており、現在のマスターベンチが非共有ディスプレイハードウェアを所有していると仮定されます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.drm_master_get">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.drm_master" title="drm_master"><span class="n"><span class="pre">drm_master</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">drm_master_get</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.drm_master" title="drm_master"><span class="n"><span class="pre">drm_master</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">マスター</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.drm_master_get" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>マスターポインタを参照します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_master</span> <span class="pre">*master</span></code></dt><dd><p><a class="reference internal" href="#c.drm_master" title="drm_master"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_master</span></code></a></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>参照カウントをインクリメントします <strong>マスター</strong> および、ポインタを返します <strong>マスター</strong>.</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.drm_master_put">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_master_put</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.drm_master" title="drm_master"><span class="n"><span class="pre">drm_master</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">マスター</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.drm_master_put" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>参照を解除し、マスターポインタをクリアします</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_master</span> <span class="pre">**master</span></code></dt><dd><p>ポインタのポインタへの <a class="reference internal" href="#c.drm_master" title="drm_master"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_master</span></code></a></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>これは参照カウンタをデクリメントします <a class="reference internal" href="#c.drm_master" title="drm_master"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_master</span></code></a> 後ろの <strong>マスター</strong> をNULLに設定します</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.drm_master">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_master</span></span></span><a class="headerlink" href="#c.drm_master" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>drmマスターストラクチャ</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct drm_master {
+  struct kref refcount;
+  struct drm_device *dev;
+  char *unique;
+  int unique_len;
+  struct idr magic_map;
+  void *driver_priv;
+  struct drm_master *lessor;
+  int lessee_id;
+  struct list_head lessee_list;
+  struct list_head lessees;
+  struct idr leases;
+  struct idr lessee_idr;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">refcount</span></code></dt><dd><p>このマスターオブジェクトの参照カウンタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">dev</span></code></dt><dd><p>リンク先のDRMデバイス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unique</span></code></dt><dd><p>一意の識別子: 例. バスID。ロックで保護される
+<a class="reference internal" href="drm-internals.html#c.drm_device" title="drm_device"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_device.master_mutex</span></code></a>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unique_len</span></code></dt><dd><p>一意フィールドの長さ。ロックで保護される
+<a class="reference internal" href="drm-internals.html#c.drm_device" title="drm_device"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_device.master_mutex</span></code></a>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">magic_map</span></code></dt><dd><p>使用中の認証トークンのマップ。ロックで保護される
+<a class="reference internal" href="drm-internals.html#c.drm_device" title="drm_device"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_device.master_mutex</span></code></a>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">driver_priv</span></code></dt><dd><p>ドライバ専用情報へのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">lessor</span></code></dt><dd><p>リースホルダー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">lessee_id</span></code></dt><dd><p>リース先のID。オーナーは常にID 0を有します</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">lessee_list</span></code></dt><dd><p>同じマスターリース先の他者</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">lessees</span></code></dt><dd><p>このマスターリースしているdrm_masters</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">leases</span></code></dt><dd><p>このdrm_masterにリースされているオブジェクト</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">lessee_idr</span></code></dt><dd><p>このオーナーの下位リース先（リース先 == NULLのときのみ使用）</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>マスターストラクチャは legacy/primary デバイスノードにのみ関連するため、デバイスごとに1つずつ存在し、drm_minorごとに1つずつ存在しません</p>
+</section>
+<section id="open-source-userspace-requirements">
+<h2>オープンソースユーザースペース要件<a class="headerlink" href="#open-source-userspace-requirements" title="この見出しへのパーマリンク">¶</a></h2>
+<p>DRMサブシステムは、新しいuAPIがユーザースペース側でどのような形態を取るべきかについて、他のカーネルサブシステムよりも厳しい要件を持っています。このセクションでは、これらの要件がなぜ存在するのかを詳しく説明します</p>
+<p>要約すると、DRM uAPIの追加には対応するオープンソースユーザースペースのパッチが必須であり、それらのパッチはレビューされ、適切なアップストリームプロジェクトにマージされる必要があります</p>
+<p>GFXデバイス（ディスプレイおよびレンダリング/GPU側）は非常に複雑なハードウェアであり、ユーザースペースとカーネルは必然的に非常に密接に協働する必要があります。レンダリングおよびモード設定のインターフェースは極めて幅広く柔軟でなければならず、そのため、すべての可能性のあるコーナーケースを正確に定義することはほぼ不可能です。これにより、ユーザースペースが要求する動作と、 regressions を避けるために変更してはいけない動作、および現在の実装の副作用として生じた動作を区別するのが実用上困難になります</p>
+<p>ユーザースペースの全ソースコードにアクセスできない場合、実装詳細を変更することが不可能になります。なぜなら、ユーザースペースが現在の実装の副作用に依存している可能性があるからです。また、ソースコードにアクセスせずにこのような regressions をデバッグするのはほぼ不可能です。その結果として以下のことが導かれます</p>
+<ul class="simple">
+<li><p>Linuxカーネルの「リグレッションのない」ポリシーは、実際にはDRMサブシステムのオープンソースユーザースペースにのみ適用される。DRM開発者たちは、クローズドソースのblobドライバがユーザースペースでオープンドライバと同じuAPIを使用するのを問題視しないが、オープンドライバと完全に同じ方法で使用しなければならない。インターフェースの創造的な誤用は、過去に頻繁に起きており、破壊を引き起こすことがある。</p></li>
+<li><p>新しいユーザースペースインターフェースには、オープンソースの実装がデモンストレーション用の実装として必要である。</p></li>
+</ul>
+<p>オープンソースユーザースペースを必要とするもう一つの理由はuAPIのレビューである。 GFXスタックのカーネルとユーザースペースの部分は非常に密接に協働しなければならないため、コードレビューは新しいインターフェースが目標を達成しているかを評価するためには、両方の側面を確認しなければならない。インターフェースがユースケースを完全にカバーしていることを確認するためには、いくつか追加の要件が生じる:</p>
+<ul class="simple">
+<li><p>オープンソースユーザースペースはおもちゃやテストアプリケーションではなく、本格的な実装でなければならない。特に、すべての通常のエラーおよびエッジケースを処理する必要がある。これらは新しいuAPIが崩れることが多い場所であり、提案されたインターフェースの適切性を評価する上で不可欠である。</p></li>
+<li><p>ユーザースペース側はそのプロジェクトの基準に応じて完全にレビューされテストされなければならない。例えばmesaの場合、piglitテストケースとメーリングリストでのレビューが必要である。これは新しいインターフェースが実際に目的を果たすことを確保するためである。ユーザースペース側のレビュワーは、カーネルuAPIパッチにAcked-byを付けて、提案されたuAPIが十分にドキュメント化され、ユーザースペースで使用可能な状態にあると信じていることを示すべきである。</p></li>
+<li><p>ユーザースペースのパッチは、ベンダーのフォークではなく、公式なアップストリームに適用しなければならない。これは、レビューおよびテスト要件を回避するために迅速にフォークするのを防ぐためである。</p></li>
+<li><p>カーネルパッチは、上記のすべての要件が満たされた後でマージ可能であるが、 <strong>grace periodsを尊重しなければなりませんし、</strong> drm-nextまたはdrm-misc-nextにマージされる <strong>before</strong> ユーザースペースのパッチがランドするまで待つ必要がある。uAPIは常にカーネルから流れるため、逆の方向で行うとuAPIの定義およびヘッダーファイルの分離が生じるリスクがある。</p></li>
+</ul>
+<p>これはかなり厳しい要件ですが、過去数年の共有された痛みと経験から生まれたものです。uAPIは急いで追加され、ほぼ常にすぐに後悔されることが多くなっています。GFXデバイスは非常に速く変化するため、数年ごとにパラダイムシフトと完全に新しいuAPIインターフェースが必要になります。Linuxカーネルがユーザースペースを10年以上動作させる保証を提供しているため、DRMサブシステムにとってすでにかなり苦痛な状況です。同じ機能に対して複数の異なるuAPIが共存しており、毎年いくつかの完全な間違いを加えると、完全に管理不可能になるでしょう。</p>
+</section>
+<section id="render-nodes">
+<span id="drm-render-node"></span><h2>レンダーノード<a class="headerlink" href="#render-nodes" title="この見出しへのパーマリンク">¶</a></h2>
+<p>DRMコアはユーザースペースが使用できる複数のキャラクターデバイスを提供します。開かれるデバイスによって、ユーザースペースが実行できる操作（主にioctl）のセットが異なります。主なノードは常に作成され、card&lt;num&gt;と呼ばれます。また、現在使用されていない制御ノードであるcontrolD&lt;num&gt;も作成されます。主なノードはすべてのレガシーオペレーションを提供し、歴史的にユーザースペースが唯一使用していたインターフェースでした。KMS（Kernel Mode Setting）では制御ノードが導入されましたが、計画されたKMS制御インターフェースはまだ実装されておらず、現在も制御ノードは使用されていません。</p>
+<p>オフスクリーンレンダラーとGPGPUアプリケーションの利用が増加したため、クライアントはグラフィックサーバーを実行することなくGPUを活用できるようになりました。しかし、DRM APIでは権限のないクライアントがGPUアクセスを得る前にDRMマスターへの認証を必要としました。このステップを回避し、認証せずにクライアントにGPUアクセスを許可するため、レンダーノードが導入されました。レンダーノードはレンダーワークでしか使用されず、モード設定や権限のあるioctlはレンダーノードでは実行できません。許可されるのは非グローバルなレンダリングコマンドのみです。ドライバがレンダーノードをサポートする場合、DRIVER_RENDER DRMドライバキャパビリティを通じて広告する必要があります。サポートしない場合は、レンダーワーククライアントにはlegacy drmAuth認証手順とともに主なノードを使用する必要があります。</p>
+<p>ドライバがレンダリングノードのサポートをアドバタイズしている場合、DRMコアは別個のレンダリングノード（renderD&lt;num&gt;）を作成します。各デバイスごとに1つのレンダリングノードが存在します。このノードでは、PRIME関連のioctl以外のすべてのioctlが許可されません。特にGEM_OPENは明示的に禁止されます。レンダリングノードは、クライアントがレガシーアクセスインターフェースでのflink名やmmapオフセットを推測することで発生するバッファリークを防ぐために設計されています。この基本インターフェースに加えて、ドライバはドライバ依存のレンダリング専用ioctlをDRM_RENDER_ALLOWとしてマークする必要があります。これによりレンダリングクライアントがそれらを使用できるようになります。ドライバ開発者は、レンダリングノードで任意の特権ioctlを許可しないように注意する必要があります。</p>
+<p>レンダリングノードにより、ユーザー空間がレンダリングノードへのアクセスを基本ファイルシステムアクセスモードで制御できるようになりました。以前は特権プライマリ/レガシーノードでクライアントを認証する実行中のグラフィックスサーバーが必要でしたが、これによりその必要性が消えました。代わりにクライアントがレンダリングノードを開くだけでGPUへのアクセスが即座に許可されます。クライアント（またはサーバー）間の通信はPRIME経由で行われます。レンダリングノードからレガシーノードへのFLINKはサポートされません。新しいクライアントは不安全なFLINKインターフェースを使用してはなりません。</p>
+<p>モードセット/グローバルioctlをすべて削除するだけでなく、レンダリングノードはDRMマスターの概念も削除します。レンダリングクライアントはグラフィックスサーバーとは独立しているため、DRMマスターと関連付ける理由がありません。さらに、それらはどのマスターも動作しない状態で動作しなければならないため、ドライバはレンダリングノードをサポートする場合、マスターオブジェクトなしで動作できる必要があります。逆に、クライアント間でユーザー空間に可視かつオープンファイル境界を超えてアクセス可能な共有状態が必要なドライバは、レンダリングノードをサポートできません。</p>
+</section>
+<section id="device-hot-unplug">
+<h2>デバイスホットアンプラグ<a class="headerlink" href="#device-hot-unplug" title="この見出しへのパーマリンク">¶</a></h2>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>以下が計画です。実装はまだありません（2020年5月）。</p>
+</div>
+<p>グラフィックスデバイス（ディスプレイおよび/またはレンダリング）はUSB（例：ディスプレイアダプターやドッキングステーション）やThunderbolt（例：eGPU）で接続されることがあります。エンドユーザーはこれらのデバイスを使用中にホットアンプラグできるようになり、少なくともマシンがクラッシュしないことを期待しています。DRMデバイスのホットアンプラグによる被害はできるだけ制限し、ユーザー空間が処理したい場合はその機会を提供する必要があります。理想的には、DRMデバイスをアンプラグしてもデスクトップが継続して動作しますが、これはグラフィックススタック全体で明示的なサポートが必要です：カーネルとユーザー空間ドライバからディスプレイサーバー、ウィンドウシステムプロトコル、アプリケーションおよびライブラリに至るまで。</p>
+<p>同様の結果をもたらす他のシナリオとしては、回復不可能なGPUクラッシュ、PCIデバイスがバスから消失、またはドライバーが物理デバイスから強制的にアンバインドされるなどが挙げられます。</p>
+<p>言い換えれば、ユーザースペースの観点からすれば、デバイスが消失した後も、ユーザースペースが完全にその消失したDRMデバイスを使用しなくなったかぎり、動作はほぼ同じでなければなりません。ユーザースペースは、デバイス削除uevent、ioctlがENODEVを返す、またはドライバ固有のioctlがドライバ固有の結果を返す、あるいはopen()がENXIOを返すことで、デバイスの消失を認識します。</p>
+<p>ユーザースペースがすべての関連するDRMデバイスおよびdmabufファイルディスクリプタを閉じ、すべてのmmapを解除した後、DRMドライバーはもはや存在しないデバイス用のインスタンスを破棄できます。もし同じ物理デバイスがその間再び現れても、それは新しいDRMデバイスとみなされます。</p>
+<p>PIDと同様に、キャラクタデバイスのマイナーナンバーはすぐに再利用されません。新しいDRMデバイスは、以前に割り当てられたマイナーナンバーの次の空き番号を常に選択し、マイナーナンバーが枯渇した場合は巻き戻します。</p>
+<p>この目標は、カーネルおよびドライバーに少なくとも以下の要件をもたらします。</p>
+<section id="requirements-for-kms-uapi">
+<h3>KMS UAPIの要件<a class="headerlink" href="#requirements-for-kms-uapi" title="この見出しへのパーマリンク">¶</a></h3>
+<ul class="simple">
+<li><p>KMSコネクタは接続解除状態に変更する必要があります。</p></li>
+<li><p>レガシーのモードセットおよびページフラップ、およびアトミックコミット（実際のものとTEST_ONLYの両方）、および他のすべてのioctlはENODEVで失敗するか、擬似的な成功を返す必要があります。</p></li>
+<li><p>未完了の非ブロッキングKMS操作は、ユーザースペースが期待するDRMイベントを送信します。これは、擬似的な成功を返すioctlにも適用されます。</p></li>
+<li><p>消失した下位デバイスを持つデバイスノードに対してopen()を実行すると、ENXIOで失敗します。</p></li>
+<li><p>消失したDRMデバイスに対してDRMリースを作成しようとすると、ENODEVで失敗します。既存のDRMリースは上記の通り動作し続けます。</p></li>
+</ul>
+</section>
+<section id="requirements-for-render-and-cross-device-uapi">
+<h3>レンダリングおよびクロスデバイスUAPIの要件<a class="headerlink" href="#requirements-for-render-and-cross-device-uapi" title="この見出しへのパーマリンク">¶</a></h3>
+<ul class="simple">
+<li><p>動作できなくなったすべてのGPUジョブは、ユーザースペースにハングを引き起こさないよう、フェンスを強制的にシグナルを送る必要があります。関連するエラーコードはENODEVです。</p></li>
+<li><p>一部のユーザースペースAPIは、デバイスが消失した際の動作をすでに定義しています（OpenGL、GL ES: <a class="reference external" href="https://www.khronos.org/registry/OpenGL/extensions/KHR/KHR_robustness.txt">GL_KHR_robustness</a>; <a class="reference external" href="https://www.khronos.org/vulkan/">Vulkan</a>: VK_ERROR_DEVICE_LOST; など）。DRMドライバーは、ドライバ固有のioctlで失敗を返すか、ユーザースペースドライバーでそれらを処理するか、ueventに依存するなど、各自の方法でこの挙動を実装できます。</p></li>
+<li><p>消失したメモリにポインタを指すdmabufは、ENODEVでインポートに失敗するか、消失前の成功が可能だった場合に限り正常にインポートされます。既にインポートされたdmabufについては、下記のメモリマップに関する説明も参照してください。</p></li>
+<li><p>dmabufを消失したデバイスにインポートしようとすると、ENODEVで失敗するか、消失前の状態で成功した場合と同じように成功するかのいずれかです。</p></li>
+<li><p>消失した下位デバイスを持つデバイスノードに対してopen()を実行すると、ENXIOで失敗します。</p></li>
+</ul>
+</section>
+<section id="requirements-for-memory-maps">
+<h3>メモリマップの要件<a class="headerlink" href="#requirements-for-memory-maps" title="この見出しへのパーマリンク">¶</a></h3>
+<p>メモリマップには、既存のマップおよびデバイスが消失した後にも作成されるマップに適用される追加の要件があります。基盤となるメモリが消失した場合、マップは作成または変更され、読み取りと書き込みが依然として成功しますが、結果は未定義です。これはユーザー空間のmmap()でマップされたメモリおよびdmabufで指されるメモリ（他のデバイスにマップされるクロスデバイスdmabufインポートを含む）にも適用されます。</p>
+<p>SIGBUSのシグナルを上げることは現実的ではありません。ユーザー空間がこれを処理するのは困難です。シグナルハンドラはグローバルであり、ライブラリ（例：Mesaが生成するライブラリ）から正しく使用するのは極めて困難です。シグナルハンドラは組み合わせられず、GPU1とGPU2から異なるベンダーがそれぞれ異なるハンドラを持つことはできませんし、マップされた通常ファイルのハンドラも追加できません。スレッドによるシグナル処理も追加の問題を引き起こします。</p>
+</section>
+</section>
+<section id="ioctl-support-on-device-nodes">
+<span id="drm-driver-ioctl"></span><h2>デバイスノードにおけるIOCTLサポート<a class="headerlink" href="#ioctl-support-on-device-nodes" title="この見出しへのパーマリンク">¶</a></h2>
+<p>まず第一に、レンダリングをサポートするドライバー専用のIOCTLは必要です。カーネルモード設定はすべて標準化されており、プロパティを通じて拡張されています。一部の既存ドライバーでは、ディスプレイDRMマスター専用のIOCTLを定義している例外もありますが、これらはすべてプロパティより前から存在しています。</p>
+<p>レンダリングドライバーを持っている場合、常にドライバー専用プロパティを通じてサポートする必要があります。いくつかの手順が必要です。</p>
+<p>まず、ドライバー専用のUAPIヘッダーファイル内で、自分のIOCTL用の構造体を定義する必要があります。 <code class="docutils literal notranslate"><span class="pre">include/uapi/drm/my_driver_drm.h</span></code>:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct my_driver_operation {
+        u32 some_thing;
+        u32 another_thing;
+};
+</pre></div>
+</div>
+<p>すべてのベストプラクティスを遵守してください。
+<code class="docutils literal notranslate"><span class="pre">Documentation/process/botching-up-ioctls.rst</span></code>。注意： <a class="reference internal" href="#c.drm_ioctl" title="drm_ioctl"><code class="xref c c-func docutils literal notranslate"><span class="pre">drm_ioctl()</span></code></a>
+構造体は自動的にゼロ拡張されるため、末尾に追加可能なようにする必要があります。つまり、可変長配列は置かないでください。</p>
+<p>次に、DRM_IO()、DRM_IOR()、DRM_IOW()、またはDRM_IOWR()のいずれかを使用して、自分のIOCTL番号を定義する必要があります。これはDRM_IOCTL_という接頭辞で始める必要があります。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>##define DRM_IOCTL_MY_DRIVER_OPERATION  *         DRM_IOW(DRM_COMMAND_BASE, struct my_driver_operation)
+</pre></div>
+</div>
+<p>DRMドライバー専用IOCTLは、DRM_COMMAND_BASEからDRM_COMMAND_ENDまでの範囲内にいなければなりません。最後に、以下のような配列を用意する必要があります。 <a class="reference internal" href="#c.drm_ioctl_desc" title="drm_ioctl_desc"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_ioctl_desc</span></code></a> ハンドラを接続し、アクセス権を設定するために使用します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static const struct drm_ioctl_desc my_driver_ioctls[] = {
+    DRM_IOCTL_DEF_DRV(MY_DRIVER_OPERATION, my_driver_operation,
+            DRM_AUTH|DRM_RENDER_ALLOW),
+};
+</pre></div>
+</div>
+<p>次に、この配列をドライバー構造体の <a class="reference internal" href="drm-internals.html#c.drm_driver" title="drm_driver"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_driver.ioctls</span></code></a> フィールドに割り当てます。</p>
+<p>ドライバー固有のIOCTLの接続方法については、別章を参照してください。 <a class="reference internal" href="drm-internals.html#drm-driver-fops"><span class="std std-ref">ファイル操作</span></a> ドライバー固有のIOCTLがどのように接続されるかについて説明しています。</p>
+<section id="recommended-ioctl-return-values">
+<h3>推奨されるIOCTL戻り値<a class="headerlink" href="#recommended-ioctl-return-values" title="この見出しへのパーマリンク">¶</a></h3>
+<p>理論上は、ドライバーのIOCTLコールバックは非常に少ないエラーコードのみを返すことができますが、実際にはいくつかのエラーコードを返すのが良いです。このセクションでは、DRMサブシステム内で一般的な実践を記録しています。</p>
+<dl>
+<dt>ENOENT:</dt><dd><p>ファイルが存在しない場合にのみ使用すべきです（例：open() システムコールを呼び出すとき）。このエラーを再利用して、任意のオブジェクト検索失敗を信号としています（例：未知の GEM バッファオブジェクトハンドル、未知の KMS オブジェクトハンドルなど）。</p>
+</dd>
+<dt>ENOSPC:</dt><dd><p>一部のドライバでは、このエラーを「カーネルメモリ不足」を「VRAM不足」と区別するために使用します。また、レンダリングに使用される他の制限付きGPUリソース（例：特殊な制限付き圧縮バッファ）の不足にも適用されることがあります。コマンド送信IOCTLでのリソース割当/予約問題もこのEDEADLKを通じて信号として送出されることがあります。</p>
+<p>カーネル/システムメモリが完全に枯渇した場合はENOMEMを通じて信号として送出されます。</p>
+</dd>
+<dt>EPERM/EACCES:</dt><dd><p>操作が有効ですが、より高い特権が必要な場合に返されます。例として、root専用またはより一般的にDRMマスター専用操作は、非特権クライアントが呼び出したときにこのエラーを返します。EPERMとEACCESの明確な違いは存在しません。</p>
+</dd>
+<dt>ENODEV:</dt><dd><p>デバイスがもう存在しなくなったか、またはまだ完全に初期化されていません。</p>
+</dd>
+<dt>EOPNOTSUPP:</dt><dd><p>ドライバがサポートしていない機能（例：PRIME、モード設定、GEM）が原因です。</p>
+</dd>
+<dt>ENXIO:</dt><dd><p>リモートでの失敗、ハードウェアトランザクション（例：I2C）の場合もありますが、共有dma-bufやフェンスのエクスポートドライバが必要な機能をサポートしていない場合にも使用されます。</p>
+</dd>
+<dt>EINTR:</dt><dd><p>DRMドライバはユーザー空間がすべてのIOCTLを再開することを前提としています。どのDRM IOCTLもEINTRを返す可能性があり、その場合、IOCTLパラメータを変更せずに再開する必要があります。</p>
+</dd>
+<dt>EIO:</dt><dd><p>GPUが死んでリセットで復旧できず、モード設定ハードウェアの失敗は「リンクステータス」コネクタプロパティを通じて信号として送出されます。</p>
+</dd>
+<dt>EINVAL:</dt><dd><p>動作不可能な引数組み合わせを網羅するエラーコードです。</p>
+</dd>
+</dl>
+<p>IOCTLはETIME、EFAULT、EBUSY、ENOTTYなどの他のエラーコードも使用しますが、その使用方法は一般的な意味に従います。上記のリストはDRM固有のパターンを記載する目的です。注意点として、ENOTTYは「このIOCTLは存在しない」という少し直感的でない意味を持ち、DRMではまさにそのように使用されます。</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.drm_ioctl_t">
+<span class="sig-name descname"><span class="n"><span class="pre">drm_ioctl_t</span></span></span><a class="headerlink" href="#c.drm_ioctl_t" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p><strong>型定義</strong>: DRM ioctl関数タイプ。</p>
+</dd></dl>
+<p><strong>構文</strong></p>
+<blockquote>
+<div><p><code class="docutils literal notranslate"><span class="pre">typedef</span> <span class="pre">int</span> <span class="pre">drm_ioctl_t</span> <span class="pre">(struct</span> <span class="pre">drm_device</span> <span class="pre">*dev,</span> <span class="pre">void</span> <span class="pre">*data,</span> <span class="pre">struct</span> <span class="pre">drm_file</span> <span class="pre">*file_priv)</span></code></p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_device</span> <span class="pre">*dev</span></code></dt><dd><p>DRMデバイスinode</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*data</span></code></dt><dd><p>ioctl呼び出しのプライベートポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_file</span> <span class="pre">*file_priv</span></code></dt><dd><p>このioctlが実行されたDRMファイル</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>これはDRM ioctlのtypedefです。注意として、 <a class="reference internal" href="#c.drm_ioctl" title="drm_ioctl"><code class="xref c c-func docutils literal notranslate"><span class="pre">drm_ioctl()</span></code></a> すでにコピーされています <strong>data</strong>
+カーネル空間に、またioctlコマンドコードの読み書き設定に応じてその内容を戻すこともあります。</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.drm_ioctl_compat_t">
+<span class="sig-name descname"><span class="n"><span class="pre">drm_ioctl_compat_t</span></span></span><a class="headerlink" href="#c.drm_ioctl_compat_t" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p><strong>型定義</strong>: 互換性のあるDRM ioctl関数タイプ。</p>
+</dd></dl>
+<p><strong>構文</strong></p>
+<blockquote>
+<div><p><code class="docutils literal notranslate"><span class="pre">typedef</span> <span class="pre">int</span> <span class="pre">drm_ioctl_compat_t</span> <span class="pre">(struct</span> <span class="pre">file</span> <span class="pre">*filp,</span> <span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">cmd,</span> <span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">arg)</span></code></p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">file</span> <span class="pre">*filp</span></code></dt><dd><p>ファイルポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">cmd</span></code></dt><dd><p>ioctlコマンドコード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">arg</span></code></dt><dd><p>このioctlが実行されたDRMファイル</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>配列の互換性ハンドラを宣言するためのtypedefです。新しいドライバは自分のioctl構造体の構造レイアウトを破壊しない限り、この構造体は必要ありません。</p>
+<dl class="c enum">
+<dt class="sig sig-object c" id="c.drm_ioctl_flags">
+<span class="k"><span class="pre">enum</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_ioctl_flags</span></span></span><a class="headerlink" href="#c.drm_ioctl_flags" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>DRM ioctl フラグ</p>
+</dd></dl>
+<p><strong>定数</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">DRM_AUTH</span></code></dt><dd><p>これはレンダリング用のioctlであり、ファイル記述子がレンダリングノードであるか、または legacy/primary ノードである場合は認証が必要であることを示します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">DRM_MASTER</span></code></dt><dd><p>モード設定やディスプレイ状態を変更することができる任意のioctlには必ずこのフラグを設定する必要があります。ユーザースペースは、アクティブマスターファイル記述子であるときにのみprimaryノードを通じてioctlを呼び出す必要があります。</p>
+<p>読み取り専用のモード設定ioctlは、認証されていないクライアントや、現在アクティブなマスターよりも別のマスターが存在する場合でも呼び出すことができます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">DRM_ROOT_ONLY</span></code></dt><dd><p>マスターファイル記述子を操作する可能性のあるすべてのioctlにはこのフラグを設定する必要があります。現在はSETMASTERおよびDROPMASTER ioctlのみが該当し、例えばlogindが非協力的なマスター（ディスプレイコンポジタ）をコンプライアンスに従わせるために呼び出します。</p>
+<p>これはSYSADMIN能力を持つ呼び出し元と同等です。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">DRM_UNLOCKED</span></code></dt><dd><p>～かどうか <a class="reference internal" href="#c.drm_ioctl_desc" title="drm_ioctl_desc"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_ioctl_desc.func</span></code></a> DRM BKLを保持した状態で呼び出されるべきかを指定します。現代のドライバではデフォルトで強制されるため、このフラグを設定する必要は一切ありません。</p>
+<p>VBLANK_WAIT IOCTL以外の場所で使用しないでください。これは唯一のレガシーIOCTLであり、このフラグが必要なものです。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">DRM_RENDER_ALLOW</span></code></dt><dd><p>レンダリングノードをサポートするドライバ向けにレンダリングに必要なすべてのioctlに使用されます。これはすべての新しいレンダリングドライバに適用されるため、DRM_AUTHが設定されているすべてのioctlには常にこのフラグを設定する必要があります。ただし、読み取り専用のクエリioctlはこのフラグが設定されている場合でもDRM_AUTHが設定されていない場合があります。なぜなら、認証が不要だからです。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>設定可能なさまざまなフラグ <a class="reference internal" href="#c.drm_ioctl_desc" title="drm_ioctl_desc"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_ioctl_desc.flags</span></code></a> ユーザー空間が特定のioctlをどのように使用できるかを制御します。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.drm_ioctl_desc">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_ioctl_desc</span></span></span><a class="headerlink" href="#c.drm_ioctl_desc" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>DRMドライバioctlエントリ</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct drm_ioctl_desc {
+  unsigned int cmd;
+  enum drm_ioctl_flags flags;
+  drm_ioctl_t *func;
+  const char *name;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">cmd</span></code></dt><dd><p>ioctlコマンド番号（フラグを除く）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">flags</span></code></dt><dd><p>フラグのビットマスク <a class="reference internal" href="#c.drm_ioctl_flags" title="drm_ioctl_flags"><code class="xref c c-type docutils literal notranslate"><span class="pre">enum</span> <span class="pre">drm_ioctl_flags</span></code></a></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">func</span></code></dt><dd><p>このioctlのハンドラ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">name</span></code></dt><dd><p>デバッグ出力用のユーザー可読名</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>便利のため、これらは <a class="reference internal" href="#c.DRM_IOCTL_DEF_DRV" title="DRM_IOCTL_DEF_DRV"><code class="xref c c-func docutils literal notranslate"><span class="pre">DRM_IOCTL_DEF_DRV()</span></code></a>
+マクロ。</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.DRM_IOCTL_DEF_DRV">
+<span class="sig-name descname"><span class="n"><span class="pre">DRM_IOCTL_DEF_DRV</span></span></span><a class="headerlink" href="#c.DRM_IOCTL_DEF_DRV" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">DRM_IOCTL_DEF_DRV</span> <span class="pre">(ioctl,</span> <span class="pre">_func,</span> <span class="pre">_flags)</span></code></p>
+<blockquote>
+<div><p>ヘルパーマクロを使用して、 <a class="reference internal" href="#c.drm_ioctl_desc" title="drm_ioctl_desc"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_ioctl_desc</span></code></a></p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">ioctl</span></code></dt><dd><p>ioctlコマンドサフィックス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">_func</span></code></dt><dd><p>このioctlのハンドラ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">_flags</span></code></dt><dd><p>フラグのビットマスク <a class="reference internal" href="#c.drm_ioctl_flags" title="drm_ioctl_flags"><code class="xref c c-type docutils literal notranslate"><span class="pre">enum</span> <span class="pre">drm_ioctl_flags</span></code></a></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>エントリを生成するための小さなヘルパーマクロ <a class="reference internal" href="#c.drm_ioctl_desc" title="drm_ioctl_desc"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_ioctl_desc</span></code></a> ioctlコマンド番号は、 <code class="docutils literal notranslate"><span class="pre">DRM_IOCTL\_</span></code> をプレフィックスとして追加し、DRM_IOCTL_NR()に渡して構築します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.drm_noop">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_noop</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="drm-internals.html#c.drm_device" title="drm_device"><span class="n"><span class="pre">drm_device</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dev</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="drm-internals.html#c.drm_file" title="drm_file"><span class="n"><span class="pre">drm_file</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">に属するエントリで、ユーザー空間がファイルを閉じる前にイベントが届く前に正しく逆引きするためのものです</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.drm_noop" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>DRMノーアクションioctl実装</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_device</span> <span class="pre">*dev</span></code></dt><dd><p>このioctl用のDRMデバイス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*data</span></code></dt><dd><p>このioctl用のデータポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_file</span> <span class="pre">*file_priv</span></code></dt><dd><p>このioctl呼び出し用のDRMファイル</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>このdrm ioctlsのノーアクション実装は、失敗コードを返すことができない非推奨機能に対して役立ちます。既存のユーザースペースはioctlの結果を確認しますが、動作自体には関心がないためです。</p>
+<p>常に成功コード0を返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.drm_invalid_op">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_invalid_op</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="drm-internals.html#c.drm_device" title="drm_device"><span class="n"><span class="pre">drm_device</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dev</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">data</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="drm-internals.html#c.drm_file" title="drm_file"><span class="n"><span class="pre">drm_file</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">に属するエントリで、ユーザー空間がファイルを閉じる前にイベントが届く前に正しく逆引きするためのものです</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.drm_invalid_op" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>DRM無効ioctl実装</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_device</span> <span class="pre">*dev</span></code></dt><dd><p>このioctl用のDRMデバイス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*data</span></code></dt><dd><p>このioctl用のデータポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_file</span> <span class="pre">*file_priv</span></code></dt><dd><p>このioctl呼び出し用のDRMファイル</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>drm ioctls に関する無効な実装は、ユーザースペースがもはや ioctl を呼び出すことを許可したくない非推奨機能のためのものです。これは、徐々に kms に移行したドライバの古い ums インターフェースで、古いレガシーテーブルを保持していた場合に該当します。これは radeon および i915 kms ドライバにのみ適用され、他のドライバはこの関数を使用する必要がありません。</p>
+<p>常に -EINVAL の戻り値で失敗します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.drm_ioctl_permit">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_ioctl_permit</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">u32</span></span><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="drm-internals.html#c.drm_file" title="drm_file"><span class="n"><span class="pre">drm_file</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">に属するエントリで、ユーザー空間がファイルを閉じる前にイベントが届く前に正しく逆引きするためのものです</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.drm_ioctl_permit" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>呼び出し元に対して ioctl の権限を確認します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">u32</span> <span class="pre">flags</span></code></dt><dd><p>ioctl 権限フラグ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_file</span> <span class="pre">*file_priv</span></code></dt><dd><p>ポインタ先 <a class="reference internal" href="drm-internals.html#c.drm_file" title="drm_file"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_file</span></code></a> 呼び出し元の特定。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>呼び出し元が指定された権限で ioctl を実行できるかどうかを確認します。</p>
+<p><strong>戻り値</strong></p>
+<p>許可された場合はゼロ、それ以外は -EACCES。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.drm_ioctl">
+<span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_ioctl</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">ファイル</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">filp</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">cmd</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">arg</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.drm_ioctl" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>DRM ドライバ用の ioctl コールバック実装</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">file</span> <span class="pre">*filp</span></code></dt><dd><p>この ioctl が呼ばれるファイル</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">cmd</span></code></dt><dd><p>ioctl コマンド番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">arg</span></code></dt><dd><p>ユーザーアルゴリズム</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>DRM コアとドライバのディスパッチテーブルに ioctl 関数を検索します、そのテーブルは <a class="reference internal" href="drm-internals.html#c.drm_driver" title="drm_driver"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_driver.ioctls</span></code></a>。必要な権限を確認するために、
+<a class="reference internal" href="#c.drm_ioctl_permit" title="drm_ioctl_permit"><code class="xref c c-func docutils literal notranslate"><span class="pre">drm_ioctl_permit()</span></code></a>を呼び出し、対応する関数にディスパッチします。</p>
+<p><strong>戻り値</strong></p>
+<p>成功時はゼロ、失敗時は負のエラーコード。</p>
+<dl class="c function">
+<dt class="sig sig-object c">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_ioctl_flags</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nr</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">フラグ</span></span><span class="sig-paren">)</span><br/></dt>
+<dd><p>コア ioctl を確認し、ioctl 権限フラグを返します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">nr</span></code></dt><dd><p>ioctl 番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">*flags</span></code></dt><dd><p>ioctl 権限フラグを返す場所</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この ioctl は、drm コアが行うアクセスチェックを補完するために vmwgfx ドライバのみが使用しており、それほど深刻なレイヤー違反です。他のドライバは使用すべきではありません。</p>
+<p><strong>戻り値</strong></p>
+<p>が割り当てられている場合、真です <strong>nr</strong> DRM コアの ioctl 番号に対応する場合、true、それ以外は false。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.drm_compat_ioctl">
+<span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_compat_ioctl</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">ファイル</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">filp</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">cmd</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">arg</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.drm_compat_ioctl" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>32bit IOCTL 互換性ハンドラ（DRM ドライバ用）</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">file</span> <span class="pre">*filp</span></code></dt><dd><p>この ioctl が呼ばれるファイル</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">cmd</span></code></dt><dd><p>ioctl コマンド番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">arg</span></code></dt><dd><p>ユーザーアルゴリズム</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>64bit コアで実行される 32bit ユーザースペース用の互換性ハンドラ。すべての実際の IOCTL ハンドリングは <a class="reference internal" href="#c.drm_ioctl" title="drm_ioctl"><code class="xref c c-func docutils literal notranslate"><span class="pre">drm_ioctl()</span></code></a>適切に構造体をマーシャリングしながら転送されます。注意点として、このハンドラは DRM コアの IOCTL にのみ対応しており、ドライバが自身の IOCTL を破損させた場合、この関数をラッピングして処理する必要があります。</p>
+<p><strong>戻り値</strong></p>
+<p>成功時はゼロ、失敗時は負のエラーコード。</p>
+</section>
+</section>
+<section id="testing-and-validation">
+<h2>テストと検証<a class="headerlink" href="#testing-and-validation" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="testing-requirements-for-userspace-api">
+<h3>ユーザースペース API のテスト要件<a class="headerlink" href="#testing-requirements-for-userspace-api" title="この見出しへのパーマリンク">¶</a></h3>
+<p>新しいクロスドライバユーザースペースインターフェース拡張機能（新しい IOCTL、新しい KMS プロパティ、sysfs に新しいファイルなど、API 変更を構成するすべての要素）は、IGT でその機能にドライバに依存しないテストケースを備える必要があります。IGT を使用してターゲットハードウェアで合理的にテストが可能であればです。</p>
+</section>
+<section id="validating-changes-with-igt">
+<h3>IGT を使用した変更の検証<a class="headerlink" href="#validating-changes-with-igt" title="この見出しへのパーマリンク">¶</a></h3>
+<p>DRM ドライバのすべての機能をカバーし、DRM ドライバやコアの変更が既存の機能を逆進しないことを確認するために使用できるテストのコレクションがあります。このテストスイートは IGT と呼ばれ、そのコードとビルドおよび実行の手順は
+<a class="reference external" href="https://gitlab.freedesktop.org/drm/igt-gpu-tools/">https://gitlab.freedesktop.org/drm/igt-gpu-tools/</a>.</p>
+</section>
+<section id="using-vkms-to-test-drm-api">
+<h3>VKMS を使用した DRM API のテスト<a class="headerlink" href="#using-vkms-to-test-drm-api" title="この見出しへのパーマリンク">¶</a></h3>
+<p>VKMSは、テストやコンポジターの実行に役立つソフトウェアのみのKMSドライバモデルです。VKMSはハードウェアディスプレイ機能を必要とすることなく仮想ディスプレイを実現することを目的としており、これらの特徴によりDRMコアの動作検証に最適なツールとなり、コンポジター開発者にもサポートを提供します。VKMSはディスプレイなしで仮想マシンでDRM機能をテスト可能にし、一部のコア変更の検証を簡略化します。</p>
+<p>DRM APIの変更をVKMSで検証するには、まずカーネルの設定を開始してください：VKMSモジュールを有効にする必要があります。VKMSを有効にしてカーネルをコンパイルし、ターゲットマシンにインストールしてください。VKMSは仮想マシン（QEMU、virtmeなど）で実行可能です。KVMを使用することを推奨し、最小1GBのRAMと4コアを備えた環境が望ましいです。</p>
+<p>VM内でIGTテストを実行する方法は2通りあります：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>VM内でのIGTの使用</p></li>
+<li><p>ホストマシンからIGTを使用し、結果を共有ディレクトリに書き込みます。</p></li>
+</ol>
+</div></blockquote>
+<p>以下に、ホストマシンとVM間の共有ディレクトリを使用してigt-testsを実行する例を示します。例としてvirtmeを使用します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ virtme-run --rwdir /path/for/shared_dir --kdir=path/for/kernel/directory --mods=auto
+</pre></div>
+</div>
+<p>ゲストマシンでigt-testsを実行します。例として‘kms_flip’テストを実行します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ /path/for/igt-gpu-tools/scripts/run-tests.sh -p -s -t "kms_flip.*" -v
+</pre></div>
+</div>
+<p>この例ではigt_runnerのビルドではなく、Piglitを使用します（-pオプション）；テスト結果のHTMLサマリを作成し、‘igt-gpu-tools/results’フォルダに保存します。-tオプションで指定したigt-testsのみを実行します。</p>
+</section>
+<section id="display-crc-support">
+<h3>ディスプレイCRCサポート<a class="headerlink" href="#display-crc-support" title="この見出しへのパーマリンク">¶</a></h3>
+<p>DRMデバイスドライバーは、フレームが特定のハードウェアコンポーネント（CRCサンプリング「ソース」）に到達するたびにユーザー空間にそのフレームのCRC情報を提供できます。</p>
+<p>ユーザー空間は、debugfsのファイル「dri/0/crtc-N/crc/control」に書き込むことで、特定のCRTCでCRCの生成を制御できます。NはCRTCのインデックスで、受け入れ可能な値はドライバ固有のソース名および「auto」キーワードです。「auto」はドライバがこのCRTCのフレームCRCのデフォルトソースを選択するように指示します。</p>
+<p>フレームCRC生成が有効になると、ユーザー空間は「dri/0/crtc-N/crc/data」ファイルを読み込むことでCRCをキャプチャできます。このファイルの各行には、最初のフィールドにフレーム番号が表示され、その後に複数の符号なし整数フィールドが含まれます。フィールドは1つのスペースで区切られ、CRCフィールドの数はソース固有です。</p>
+<p>一部のケースでは、ユーザー空間から提供されたフレームコンテンツに基づいて指定された方法でCRCが計算される場合があります（例：eDP 1.3）。ただし、一般的にはフレームコンテンツがすでに不明確な方法で処理されており、ユーザー空間が提出したフレームコンテンツに一致するCRC値を生成できるとは限らないため、CRC計算は未定義の方法で行われます。このような一般的なケースでは、ユーザー空間が行える最大のことは、同じコンテンツを持つフレームの報告されたCRC値を比較することです。</p>
+<p>ドライバ側の実装労力は最小限です。ドライバは単に <a class="reference internal" href="drm-kms.html#c.drm_crtc_funcs" title="drm_crtc_funcs"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_crtc_funcs.set_crc_source</span></code></a> および <a class="reference internal" href="drm-kms.html#c.drm_crtc_funcs" title="drm_crtc_funcs"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_crtc_funcs.verify_crc_source</span></code></a>を実装するだけで十分です。vfuncsが設定されている場合、デバッグfsファイルは自動的に設定されます。CRCサンプルはドライバ内でこの関数を呼び出してキャプチャする必要があります。 <a class="reference internal" href="#c.drm_crtc_add_crc_entry" title="drm_crtc_add_crc_entry"><code class="xref c c-func docutils literal notranslate"><span class="pre">drm_crtc_add_crc_entry()</span></code></a>ドライバとハードウェアの要件に応じて、 <a class="reference internal" href="drm-kms.html#c.drm_crtc_funcs" title="drm_crtc_funcs"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_crtc_funcs.set_crc_source</span></code></a>
+はコミット（完全なモードセットを含む）を引き起こす可能性があります。</p>
+<p>非完全モードセットのアトミックコミットでもCRC結果が信頼できる必要があります。したがって、DRM_IOCTL_MODE_ATOMICによるコミットがCRC生成を無効化したり他の方法で干渉する場合、ドライバはそのコミットを完全モードセット（<a class="reference internal" href="drm-kms.html#c.drm_atomic_crtc_needs_modeset" title="drm_atomic_crtc_needs_modeset"><code class="xref c c-func docutils literal notranslate"><span class="pre">drm_atomic_crtc_needs_modeset()</span></code></a> がtrueを返す）としてマークする必要があります。結果として、一貫した結果を保証するため、汎用的なユーザー空間は、レガシーSETCRTCやDRM_MODE_ATOMIC_ALLOW_MODESETを持つアトミックコミット後にCRC生成を再設定する必要があります。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.drm_crtc_add_crc_entry">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_crtc_add_crc_entry</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="drm-kms.html#c.drm_crtc" title="drm_crtc"><span class="n"><span class="pre">drm_crtc</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">crtc</span></span>, <span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n"><span class="pre">has_frame</span></span>, <span class="n"><span class="pre">uint32_t</span></span><span class="w"> </span><span class="n"><span class="pre">フレーム</span></span>, <span class="n"><span class="pre">uint32_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">crcs</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.drm_crtc_add_crc_entry" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>フレームのCRC情報を持つエントリを追加</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_crtc</span> <span class="pre">*crtc</span></code></dt><dd><p>フレームに属するCRTC</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">has_frame</span></code></dt><dd><p>このエントリにフレーム番号が含まれるかどうか</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">uint32_t</span> <span class="pre">frame</span></code></dt><dd><p>これらのCRCが関連するフレーム番号</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">uint32_t</span> <span class="pre">*crcs</span></code></dt><dd><p>CRC値の配列、#drm_crtc_crc.values_cntの長さに一致</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>各フレームに対して、ドライバはCRCのソースから新しいデータを取得し、この関数を呼び出してユーザー空間が読み取るバッファに追加します。</p>
+</section>
+<section id="debugfs-support">
+<h3>デバッグfsサポート<a class="headerlink" href="#debugfs-support" title="この見出しへのパーマリンク">¶</a></h3>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.drm_info_list">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_info_list</span></span></span><a class="headerlink" href="#c.drm_info_list" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>デバッグfs情報リストエントリ</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct drm_info_list {
+  const char *name;
+  int (*show)(struct seq_file*, void*);
+  u32 driver_features;
+  void *data;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">name</span></code></dt><dd><p>ファイル名</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">show</span></code></dt><dd><p>表示コールバック。 <code class="xref c c-type docutils literal notranslate"><span class="pre">seq_file-&gt;private</span></code> はこの情報のインスタンスに対応する <a class="reference internal" href="#c.drm_info_node" title="drm_info_node"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span>
+<span class="pre">drm_info_node</span></code></a> のインスタンスが存在する
+<a class="reference internal" href="drm-internals.html#c.drm_minor" title="drm_minor"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_minor</span></code></a>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">driver_features</span></code></dt><dd><p>このエントリに必要なドライバ機能</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">data</span></code></dt><dd><p>ドライバ専用データ、デバイス固有でないもの</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この構造体は、drmコアによって作成されるデバッグfsファイルを表します。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.drm_info_node">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_info_node</span></span></span><a class="headerlink" href="#c.drm_info_node" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>マイノルごとのデバッグfsノード構造体</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct drm_info_node {
+  struct drm_minor *minor;
+  const struct drm_info_list *info_ent;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">minor</span></code></dt><dd><p><a class="reference internal" href="drm-internals.html#c.drm_minor" title="drm_minor"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_minor</span></code></a> このノードについて。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">info_ent</span></code></dt><dd><p>このノードのテンプレート。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この構造体は、 <a class="reference internal" href="#c.drm_info_list" title="drm_info_list"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span>
+<span class="pre">drm_info_list</span></code></a> のインスタンスとしてのデバッグfsファイルを表します。 <a class="reference internal" href="drm-internals.html#c.drm_minor" title="drm_minor"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_minor</span></code></a>.</p>
+<p>FIXME:</p>
+<p>これはレンダリングノードとプライマリノードのデバッグfsエントリを両方で複製していることが、あまり意味をなさないかもしれませんが、これはこのように自然に成長したものです。必要に応じて、互換性リンクを導入して修正すべきです。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.drm_debugfs_create_files">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_debugfs_create_files</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.drm_info_list" title="drm_info_list"><span class="n"><span class="pre">drm_info_list</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ファイル</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">コピーする文字数</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">dentry</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">root</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="drm-internals.html#c.drm_minor" title="drm_minor"><span class="n"><span class="pre">drm_minor</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">minor</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.drm_debugfs_create_files" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>DRMマイノル用の指定されたデバッグfsファイルを初期化</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">struct</span> <span class="pre">drm_info_list</span> <span class="pre">*files</span></code></dt><dd><p>作成するファイルの配列</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">count</span></code></dt><dd><p>提供されるファイルの数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dentry</span> <span class="pre">*root</span></code></dt><dd><p>DRIデバッグfsディレクトリエントリ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_minor</span> <span class="pre">*minor</span></code></dt><dd><p>デバイスマイノル番号</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>指定された配列で表されるデバッグfsファイルを、指定されたルートディレクトリに作成します。
+<a class="reference internal" href="#c.drm_info_list" title="drm_info_list"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_info_list</span></code></a> これらのファイルは、drm_debugfs_cleanup()が呼ばれたときに自動的に削除されます。</p>
+</section>
+</section>
+<section id="sysfs-support">
+<h2>sysfsサポート<a class="headerlink" href="#sysfs-support" title="この見出しへのパーマリンク">¶</a></h2>
+<p>DRMはsysfsとの相互作用にあたって、標準的な機能を除き、ドライバに対して追加のサポートをほとんど提供していません。追加のsysfsプロパティやプロパティグループを公開したいドライバは、以下のいずれかにアタッチできます。
+<a class="reference internal" href="drm-internals.html#c.drm_device" title="drm_device"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_device.dev</span></code></a> または <a class="reference internal" href="drm-kms.html#c.drm_connector" title="drm_connector"><code class="xref c c-type docutils literal notranslate"><span class="pre">drm_connector.kdev</span></code></a>.</p>
+<p>登録は、drm_sysfs_hotplug_eventを呼び出す際に自動的に処理されます。 <a class="reference internal" href="drm-internals.html#c.drm_dev_register" title="drm_dev_register"><code class="xref c c-func docutils literal notranslate"><span class="pre">drm_dev_register()</span></code></a>（sleepable RCU）が導入されました。
+<a class="reference internal" href="drm-kms.html#c.drm_connector_register" title="drm_connector_register"><code class="xref c c-func docutils literal notranslate"><span class="pre">drm_connector_register()</span></code></a> ホットプラグされたコネクタの場合は、アンレジスタも自動的にdrm_sysfs_hotplug_eventによって処理されます。 <a class="reference internal" href="drm-internals.html#c.drm_dev_unregister" title="drm_dev_unregister"><code class="xref c c-func docutils literal notranslate"><span class="pre">drm_dev_unregister()</span></code></a> および
+<a class="reference internal" href="drm-kms.html#c.drm_connector_unregister" title="drm_connector_unregister"><code class="xref c c-func docutils literal notranslate"><span class="pre">drm_connector_unregister()</span></code></a>.</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.drm_sysfs_hotplug_event">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_sysfs_hotplug_event</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="drm-internals.html#c.drm_device" title="drm_device"><span class="n"><span class="pre">drm_device</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dev</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.drm_sysfs_hotplug_event" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>DRM ueventを生成します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_device</span> <span class="pre">*dev</span></code></dt><dd><p>DRMデバイス</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>指定されたDRMデバイスに対してueventを送信します。 <strong>dev</strong>現在はuevent環境でHOTPLUG=1を設定していますが、これは他のタイプのイベントにも拡張可能です。</p>
+<p>新しいユーザースペースAPIは、コネクタステータス変更時のueventにdrm_sysfs_connector_status_eventを使用する必要があります。 <a class="reference internal" href="#c.drm_sysfs_connector_status_event" title="コネクタプロパティステータス変更時にDRM ueventを生成します。"><code class="xref c c-func docutils literal notranslate"><span class="pre">drm_sysfs_connector_status_event()</span></code></a>
+drm_sysfs_connector_status_event</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.drm_sysfs_connector_status_event">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">コネクタプロパティステータス変更時にDRM ueventを生成します。</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="drm-kms.html#c.drm_connector" title="drm_connector"><span class="n"><span class="pre">drm_connector</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">connector</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="drm-kms.html#c.drm_property" title="drm_property"><span class="n"><span class="pre">drm_property</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">プロパティ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.drm_sysfs_connector_status_event" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>プロパティステータスが変更されたコネクタ</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_connector</span> <span class="pre">*connector</span></code></dt><dd><p>ステータスが変更されたコネクタプロパティ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_property</span> <span class="pre">*property</span></code></dt><dd><p>現在はuevent環境でHOTPLUG=1とコネクタID、ステータス変更に関連するアタッチプロパティIDを設定しています。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>指定されたDRMデバイスに対してueventを送信します。 <strong>dev</strong>drm_class_device_register</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.drm_class_device_register">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">DRM sysfsクラスに新しいデバイスを登録します。</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="../driver-api/infrastructure.html#c.device" title="デバイス"><span class="n"><span class="pre">デバイス</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dev</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.drm_class_device_register" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>DRM sysfsクラス内に新しい</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">device</span> <span class="pre">*dev</span></code></dt><dd><p>登録するデバイス</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>を登録します。実際にはttmがグローバル設定の場所としてのみ使用され、ドライバはこれを呼び出すべきではありません。 <a class="reference internal" href="../driver-api/infrastructure.html#c.device" title="デバイス"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">device</span></code></a> drm_class_device_unregister</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.drm_class_device_unregister">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">DRM sysfsクラスからデバイスをアンレジスタします。</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="../driver-api/infrastructure.html#c.device" title="デバイス"><span class="n"><span class="pre">デバイス</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dev</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.drm_class_device_unregister" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>DRM sysfsクラスから</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">device</span> <span class="pre">*dev</span></code></dt><dd><p>登録解除するデバイス</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>をアンレジスタします。実際にはttmがグローバル設定の場所としてのみ使用され、ドライバはこれを呼び出すべきではありません。 <a class="reference internal" href="../driver-api/infrastructure.html#c.device" title="デバイス"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">device</span></code></a> VBlankイベント処理</p>
+</section>
+<section id="vblank-event-handling">
+<h2>DRMコアは垂直ブランクに関連する2つのioctlを提供します。<a class="headerlink" href="#vblank-event-handling" title="この見出しへのパーマリンク">¶</a></h2>
+<p>DRM_IOCTL_WAIT_VBLANK</p>
+<dl class="simple">
+<dt>このコマンドはstruct drm_wait_vblank構造体を引数として受け取り、指定されたVBlankイベントが発生したときにブロックするか、シグナルを要求するために使用されます。</dt><dd><p>DRM_IOCTL_MODESET_CTL</p>
+</dd>
+<dt>これは、ユーザーモードでモード設定変更を処理するドライバ向けに、カーネルがモード設定後にVBlank割込みを更新するために使用されていました。多くのデバイスでは、モード設定中に垂直ブランクカウンタが0にリセットされるためです。現代のドライバではこれを使用すべきではなく、カーネルモード設定では無効です。</dt><dd><p>ユーザースペースAPI構造体</p>
+</dd>
+</dl>
+</section>
+<section id="userspace-api-structures">
+<h2>DRMはユーザーアプリケーションと一貫した標準化されたインターフェースを提供するため、多くのUAPIと構造体定義を公開しています。ユーザースペースはこれらの構造体定義とUAPIフォーマットを参照してドライバと通信します。<a class="headerlink" href="#userspace-api-structures" title="この見出しへのパーマリンク">¶</a></h2>
+<p>hdr_metadata_infoframe</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.hdr_metadata_infoframe">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">HDRメタデータ情報フレームデータ。</span></span></span><a class="headerlink" href="#c.hdr_metadata_infoframe" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ストリームで使用される電気光学変換関数（EOTF）。</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct hdr_metadata_infoframe {
+  __u8 eotf;
+  __u8 metadata_type;
+  struct {
+    __u16 x, y;
+  } display_primaries[3];
+  struct {
+    __u16 x, y;
+  } white_point;
+  __u16 max_display_mastering_luminance;
+  __u16 min_display_mastering_luminance;
+  __u16 max_cll;
+  __u16 max_fall;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">eotf</span></code></dt><dd><p>Electro-Optical Transfer Function (EOTF) が使用されるストリーム。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">metadata_type</span></code></dt><dd><p>静的メタデータ記述子ID</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">display_primaries</span></code></dt><dd><p>データの色一次色。これらは符号なし16ビット値として、0.00002単位でコード化され、0x0000はゼロを、0xC350は1.0000を表します。
+<strong>display_primaries.x</strong>: 色一次色のX座標。
+<strong>display_primaries.y</strong>: 色一次色のY座標。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">white_point</span></code></dt><dd><p>色空間データの白点。これらは符号なし16ビット値として、0.00002単位でコード化され、0x0000はゼロを、0xC350は1.0000を表します。
+<strong>white_point.x</strong>: 色一次色の白点のX座標。
+<strong>white_point.y</strong>: 色一次色の白点のY座標。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">max_display_mastering_luminance</span></code></dt><dd><p>最大マスタリングディスプレイ輝度。この値は符号なし16ビット値として、1 cd/m²単位でコード化され、0x0001は1 cd/m²を、0xFFFFは65535 cd/m²を表します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">min_display_mastering_luminance</span></code></dt><dd><p>最小マスタリングディスプレイ輝度。この値は符号なし16ビット値として、0.0001 cd/m²単位でコード化され、0x0001は0.0001 cd/m²を、0xFFFFは6.5535 cd/m²を表します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">max_cll</span></code></dt><dd><p>最大コンテンツ光レベル。この値は符号なし16ビット値として、1 cd/m²単位でコード化され、0x0001は1 cd/m²を、0xFFFFは65535 cd/m²を表します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">max_fall</span></code></dt><dd><p>最大フレーム平均光レベル。この値は符号なし16ビット値として、1 cd/m²単位でコード化され、0x0001は1 cd/m²を、0xFFFFは65535 cd/m²を表します。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>CTA 861.G仕様に従うHDRメタデータインフォーフレーム。この値は仕様と完全に一致する必要があります。</p>
+<p>ユーザースペースは、この構造で説明した形式に従ってメタデータ情報を渡す必要があります。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.hdr_output_metadata">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">hdr_output_metadata</span></span></span><a class="headerlink" href="#c.hdr_output_metadata" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>HDR出力メタデータ</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct hdr_output_metadata {
+  __u32 metadata_type;
+  union {
+    struct hdr_metadata_infoframe hdmi_metadata_type1;
+  };
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">metadata_type</span></code></dt><dd><p>静的メタデータ記述子ID</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">{unnamed_union}</span></code></dt><dd><p>匿名</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">hdmi_metadata_type1</span></code></dt><dd><p>HDRメタデータ情報フレーム</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ユーザースペースから渡すメタデータ情報</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.drm_mode_create_blob">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_mode_create_blob</span></span></span><a class="headerlink" href="#c.drm_mode_create_blob" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>新しいブロックプロパティを作成</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct drm_mode_create_blob {
+  __u64 data;
+  __u32 length;
+  __u32 blob_id;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">data</span></code></dt><dd><p>コピーするデータへのポインタ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">length</span></code></dt><dd><p>コピーするデータの長さ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">blob_id</span></code></dt><dd><p>新しいプロパティID。lengthバイトをdataポインタからコピーし、新しいblob IDを返して新しい'blob'データプロパティを作成します。</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.drm_mode_destroy_blob">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_mode_destroy_blob</span></span></span><a class="headerlink" href="#c.drm_mode_destroy_blob" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ユーザーblobを破壊</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct drm_mode_destroy_blob {
+  __u32 blob_id;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">blob_id</span></code></dt><dd><p>破壊するblob_id。ユーザーが作成したblobプロパティを破壊します。</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.drm_mode_create_lease">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_mode_create_lease</span></span></span><a class="headerlink" href="#c.drm_mode_create_lease" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>リースを作成</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct drm_mode_create_lease {
+  __u64 object_ids;
+  __u32 object_count;
+  __u32 flags;
+  __u32 lessee_id;
+  __u32 fd;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">object_ids</span></code></dt><dd><p>オブジェクトIDの配列へのポインタ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">object_count</span></code></dt><dd><p>オブジェクトIDの数。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">flags</span></code></dt><dd><p>新しいFDのフラグ。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">lessee_id</span></code></dt><dd><p>リース受取人の一意の識別子。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">fd</span></code></dt><dd><p>新しいdrm_masterファイルのファイルディスクリプタ。リースモードリソースを生成し、別のdrm_masterを作成します。</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.drm_mode_list_lessees">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_mode_list_lessees</span></span></span><a class="headerlink" href="#c.drm_mode_list_lessees" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>リース受取者を一覧表示</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct drm_mode_list_lessees {
+  __u32 count_lessees;
+  __u32 pad;
+  __u64 lessees_ptr;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">count_lessees</span></code></dt><dd><p>リース受取者の数。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">pad</span></code></dt><dd><p>パディング。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">lessees_ptr</span></code></dt><dd><p>リース受取者のポインタ。drm_masterからリース受取者を一覧表示します。</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.drm_mode_get_lease">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_mode_get_lease</span></span></span><a class="headerlink" href="#c.drm_mode_get_lease" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>リースを取得</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct drm_mode_get_lease {
+  __u32 count_objects;
+  __u32 pad;
+  __u64 objects_ptr;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">count_objects</span></code></dt><dd><p>レンタルされたオブジェクトの数。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">pad</span></code></dt><dd><p>パディング。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">objects_ptr</span></code></dt><dd><p>オブジェクトへのポインタ。レンタルされたオブジェクトを取得</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.drm_mode_revoke_lease">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_mode_revoke_lease</span></span></span><a class="headerlink" href="#c.drm_mode_revoke_lease" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>レンタルを解除</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct drm_mode_revoke_lease {
+  __u32 lessee_id;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">lessee_id</span></code></dt><dd><p>レンタル先の一意ID。レンタルを解除</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.drm_mode_rect">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">drm_mode_rect</span></span></span><a class="headerlink" href="#c.drm_mode_rect" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>二次元の矩形。</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct drm_mode_rect {
+  __s32 x1;
+  __s32 y1;
+  __s32 x2;
+  __s32 y2;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">x1</span></code></dt><dd><p>水平方向の開始座標（含む）。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">y1</span></code></dt><dd><p>垂直方向の開始座標（含む）。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">x2</span></code></dt><dd><p>水平方向の終了座標（含まない）。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">y2</span></code></dt><dd><p>垂直方向の終了座標（含まない）。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>drmサブシステムを使用して <a class="reference internal" href="drm-kms-helpers.html#c.drm_rect" title="drm_rect"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">drm_rect</span></code></a> 矩形領域を管理するために、これをユーザー空間にエクスポートします。</p>
+<p>現在、drm_mode_atomicのblobプロパティFB_DAMAGE_CLIPSで使用されています。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linux GPUドライバ開発者ガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="introduction.html">はじめに</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-internals.html">DRM内部</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-mm.html">DRMメモリ管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-kms.html">カーネルモード設定 (KMS)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-kms-helpers.html">モード設定ヘルパ関数</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">ユーザランドインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-client.html">カーネルクライアント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drivers.html">GPUドライバドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="backlight.html">バックライトサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vga-switcheroo.html">VGAスイッチーロー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vgaarbiter.html">VGAアービトラー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="todo.html">TODOリスト</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linux GPUドライバ開発者ガイド</a><ul>
+<li>前へ: <a href="drm-kms-helpers.html" title="前章">モード設定ヘルパ関数</a></li>
+<li>次へ: <a href="drm-client.html" title="次章">カーネルクライアント</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/gpu/drm-uapi.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

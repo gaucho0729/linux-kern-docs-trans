@@ -1,0 +1,398 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>レレイインターフェース（以前はレレイファイルシステムとして知られていた）— Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="romfs.html" rel="next" title="ROMFS - ROMファイルシステム"/>
+<link href="ramfs-rootfs-initramfs.html" rel="prev" title="ディスクレスシステム（たとえばXターミナルやプリンターサーバーなど）を使用するには、ルートファイルシステムがディスク以外のデバイス上に存在する必要があります。これはinitramfs（参照：Ramfs, rootfs and initramfs）やramdisk（参照：Ramfs, rootfs and initramfs）やNFS経由でマウントされたファイルシステムを使用する場合です。以下のテキストではNFSをルートファイルシステムとして使用する方法について説明します。このテキストの後半では、「クライアント」とはディスクレスシステムを、「サーバー」とはNFSサーバーを指します。"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="relay-interface-formerly-relayfs">
+<h1>リレーアプリケーションインターフェース (以前はrelayfsと呼ばれていた)<a class="headerlink" href="#relay-interface-formerly-relayfs" title="この見出しへのパーマリンク">¶</a></h1>
+<p>レレイインターフェースは、カーネルアプリケーションがカーネルからユーザー空間へ大容量のデータを効率的にログとして記録し転送するためのメカニズムを提供します。このメカニズムはユーザー定義の「レレイチャネル」として実装されます。</p>
+<p>「レレイチャネル」は、CPUごとのカーネルバッファ（「チャネルバッファ」）として実装されたカーネル→ユーザー空間のデータ中継メカニズムです。各チャネルバッファはユーザー空間において通常のファイル（「レレイファイル」）として表現されます。カーネルクライアントは効率的な書き込み関数を使用してチャネルバッファにデータを書き込み、これらは自動的に現在のCPUのチャネルバッファにログとして記録されます。ユーザー空間アプリケーションはレレイファイルをmmap()またはread()で読み込み、データが利用可能になったときに取得します。レレイファイル自体はホストファイルシステム（例: debugfs）に作成され、以下に記述するAPIを使用してチャネルバッファと関連付けられます。</p>
+<p>チャネルバッファにログとして記録されるデータの形式は完全にカーネルクライアントの自由です。レレイインターフェースはカーネルクライアントがバッファデータに構造を課すためのハックを提供しますが、データフィルタリングの実装はカーネルクライアントに委譲されています。これにより、シンプルな設計を維持します。</p>
+<p>このドキュメントではレレイインターフェースAPIの概要を説明します。関数パラメータの詳細については、レレイインターフェースコード内の関数と併せて記述されています。詳細についてはそちらをご参照ください。</p>
+<section id="semantics">
+<h2>セマンティクス<a class="headerlink" href="#semantics" title="この見出しへのパーマリンク">¶</a></h2>
+<p>各レレイチャネルはCPUごとに1つのバッファを持ち、各バッファは1つまたは複数のサブバッファを含みます。メッセージは最初のサブバッファに書き込まれますが、新たなメッセージを含むには十分な容量がなくなった場合、次のサブバッファに書き込まれます（存在する場合）。メッセージはサブバッファをまたがって分割されることはありません。この時点でユーザー空間に通知が送られ、最初のサブバッファを空にしながら、カーネルは次のサブバッファに継続して書き込みます。</p>
+<p>サブバッファが満杯であることを通知された際、カーネルはそのサブバッファのうちどの部分がパディング（未使用領域）であるかを把握します。これは完全なメッセージがサブバッファに収まらなかったための空き領域です。ユーザー空間はこの情報を活用し、有効なデータのみをコピーできます。</p>
+<p>コピーを完了した後、ユーザー空間はサブバッファが消費されたことをカーネルに通知できます。</p>
+<p>レレイチャネルは、ユーザー空間がまだ収集していないデータを上書きするモードで動作できます。ユーザー空間がデータを消費するのを待つことなく、即座に上書きします。</p>
+<p>リレーチャンネル自体は、ユーザー空間とカーネル間でのこのようなデータの通信を提供していません。これにより、カーネル側はシンプルに保つことができ、ユーザー空間に対して単一のインターフェースを強制しません。ただし、以下に記載するように、例や別途のヘルパーツールを提供しています。</p>
+<p>read()インターフェースはパディングを削除し、内部的にreadサブバッファを消費するため、read(2)がチャネルバッファを空にするために使用される場合、カーネルとユーザー間の特別な通信は基本的な動作には必要ありません。</p>
+<p>リレーファイアウォールの主な目標の一つは、カーネルデータをユーザー空間に伝達するための低負荷メカニズムを提供することです。read()インターフェースは使いやすくはなりますが、mmap()アプローチほど効率的ではありません。例コードはこの二つのアプローチ間のトレードオフをできるだけ小さくするように試みています。</p>
+</section>
+<section id="klog-and-relay-apps-example-code">
+<h2>klogおよびrelay-appsの例コード<a class="headerlink" href="#klog-and-relay-apps-example-code" title="この見出しへのパーマリンク">¶</a></h2>
+<p>リレーファイアウォール自体はすぐに使用可能ですが、操作を簡単にするためにいくつかのシンプルなユーティリティ関数と例が提供されています。</p>
+<p>リレーアプリケーションの例を含むrelay-appsというtarballが、リレーフォーラムサイトで入手可能です。このtarballには、ユーザー空間とカーネル空間の両方の側にボイラープレートコードを含む.cファイルのペアからなる自立した例が含まれており、これらを組み合わせることで、日常的な管理作業を気にすることなくデータをディスクにストリーム送信するためのグルーブが提供されます。</p>
+<p>「klogデバッグ関数」パッチ（relay-apps tarball内のklog.patch）は、チャネルが存在するかどうかに関係なく、フォーマットされたテキストやrawデータをチャネルに書き込むための高レベルのロギング関数をカーネルに提供します。これらの関数は、カーネルやカーネルモジュールのどこにでも無条件の「トレース」ステートメントを挿入できます。ただし、データが実際にログ出力されるのは「klogハンドラ」が登録されている場合のみです（klogおよびkleakの例を参照してください）。</p>
+<p>リレーアプリケーションの例コードやklogを使用せずに、リレーアクセスインターフェースをからscratchで利用することも可能です。ただし、ユーザー空間とカーネル間の通信を実装する必要があります。これにより、バッファの状態（満杯、空、パディング量など）を双方が共有できるようになります。read()インターフェースはパディングを除去し、内部的に読み込みサブバッファを消費するため、read(2)がチャネルバッファを空にしている場合、基本的な動作にはカーネルとユーザー間の特別な通信は必要ありません。ただし、バッファ満杯などの状態は依然として何らかのチャネルを通じて通知する必要があります。</p>
+<p>klogおよびリレーアプリケーションの例は、relay-apps tarballに含まれています。 <a class="reference external" href="http://relayfs.sourceforge.net">http://relayfs.sourceforge.net</a></p>
+</section>
+<section id="the-relay-interface-user-space-api">
+<h2>リレーアプリケーションインターフェースユーザースペースAPI<a class="headerlink" href="#the-relay-interface-user-space-api" title="この見出しへのパーマリンク">¶</a></h2>
+<p>リレーアクセスインターフェースは、ユーザー空間がリレーチャネルバッファデータにアクセスするための基本的なファイル操作を実装しています。利用可能なファイル操作とその動作に関するコメントを以下に示します：</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 15%"/>
+<col style="width: 85%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>open()</p></td>
+<td><p>ユーザーが既存のチャネルバッファを開くことを可能にします。</p></td>
+</tr>
+<tr class="row-even"><td><p>mmap()</p></td>
+<td><p>呼び出し元のメモリ空間にチャネルバッファをマッピングします。注意点として、部分的なmmapは行えません。必ず全体をマッピングする必要があります。これはNRBUF * SUBBUFSIZEのサイズのファイルです。</p></td>
+</tr>
+<tr class="row-odd"><td><p>read()</p></td>
+<td><p>チャネルバッファの内容を読み込みます。読み込まれたバイトは読者によって消費されるため、その後の読み込みでは再利用できません。チャネルがno-overwriteモード（デフォルト）で使用されている場合、アクティブなカーネルライターが存在していてもいつでも読み込むことができます。チャネルがoverwriteモードで使用されており、アクティブなチャネルライターが存在する場合、結果が予測不能になる可能性があります。ユーザーは、チャネルへのログ出力をすべて終了した後にread()をoverwriteモードで使用する必要があります。サブバッファのパディングは自動的に除去されるため、読者には表示されません。</p></td>
+</tr>
+<tr class="row-even"><td><p>sendfile()</p></td>
+<td><p>チャネルバッファのデータを出力ファイル記述子に転送します。サブバッファのパディングは自動的に除去されるため、読者には表示されません。</p></td>
+</tr>
+<tr class="row-odd"><td><p>poll()</p></td>
+<td><p>POLLIN/POLLRDNORM/POLLERRがサポートされています。サブバッファ境界が跨がれたときにユーザー アプリケーションが通知されます。</p></td>
+</tr>
+<tr class="row-even"><td><p>close()</p></td>
+<td><p>チャネルバッファの参照カウントを減算します。参照カウントが0になると、つまりどのプロセスもカーネルクライアントもバッファを開いていない場合、チャネルバッファが解放されます。</p></td>
+</tr>
+</tbody>
+</table>
+<p>ユーザー アプリケーションがリレーファイルを使用するためには、ホストファイルシステムがマウントされている必要があります。例えば：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>mount -t debugfs debugfs /sys/kernel/debug
+</pre></div>
+</div>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>ホストファイルシステムは、カーネルクライアントがチャネルを作成または使用する際にはマウントする必要がありません。ユーザー スペース アプリケーションがバッファデータにアクセスする必要がある場合にのみマウントする必要があります。</p>
+</div>
+</section>
+<section id="the-relay-interface-kernel-api">
+<h2>リレーアプリケーションインターフェースカーネルAPI<a class="headerlink" href="#the-relay-interface-kernel-api" title="この見出しへのパーマリンク">¶</a></h2>
+<p>リレーアクセスインターフェースがインカーネルクライアントに提供するAPIのサマリーです：</p>
+<dl>
+<dt>TBD(curr. line MT:/API/)</dt><dd><p>チャネル管理機能:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>relay_open(base_filename, parent, subbuf_size, n_subbufs,
+           callbacks, private_data)
+relay_close(chan)
+relay_flush(chan)
+relay_reset(chan)
+</pre></div>
+</div>
+<p>ユーザー空間からの呼び出しが行われる場合に通常呼ばれるチャネル管理は、</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>relay_subbufs_consumed(chan, cpu, subbufs_consumed)
+</pre></div>
+</div>
+<p>書き込み関数:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>relay_write(chan, data, length)
+__relay_write(chan, data, length)
+relay_reserve(chan, length)
+</pre></div>
+</div>
+<p>コールバック:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>subbuf_start(buf, subbuf, prev_subbuf, prev_padding)
+buf_mapped(buf, filp)
+buf_unmapped(buf, filp)
+create_buf_file(filename, parent, mode, buf, is_global)
+remove_buf_file(dentry)
+</pre></div>
+</div>
+<p>補助関数:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>relay_buf_full(buf)
+subbuf_start_reserve(buf, length)
+</pre></div>
+</div>
+</dd>
+</dl>
+<section id="creating-a-channel">
+<h3>チャネルの作成<a class="headerlink" href="#creating-a-channel" title="この見出しへのパーマリンク">¶</a></h3>
+<p><a class="reference internal" href="../core-api/kernel-api.html#c.relay_open" title="relay_open"><code class="xref c c-func docutils literal notranslate"><span class="pre">relay_open()</span></code></a> チャネルと、それぞれのCPUごとのチャネルバッファを作成するための関数です。各チャネルバッファにはホストファイルシステムにファイルが作成され、ユーザー空間からマッピングや読み取りが可能です。ファイル名はbasename0…basenameN-1の形式で、NはオンラインCPUの数を表し、デフォルトではファイルシステムのルートに作成されます（親パラメータがNULLの場合）。リレーファイルを含むディレクトリ構造を作成したい場合は、ホストファイルシステムのディレクトリ作成関数を使用して作成し、親ディレクトリを <a class="reference internal" href="api-summary.html#c.debugfs_create_dir" title="debugfs_create_dir"><code class="xref c c-func docutils literal notranslate"><span class="pre">debugfs_create_dir()</span></code></a>に渡してください。
+<a class="reference internal" href="../core-api/kernel-api.html#c.relay_open" title="relay_open"><code class="xref c c-func docutils literal notranslate"><span class="pre">relay_open()</span></code></a>ユーザーはチャネルが閉じるときに作成したディレクトリ構造をクリーンアップする責任があります。その際は、再びホストファイルシステムのディレクトリ削除関数を使用してください。例えば、 <a class="reference internal" href="api-summary.html#c.debugfs_remove" title="debugfs_remove"><code class="xref c c-func docutils literal notranslate"><span class="pre">debugfs_remove()</span></code></a>.</p>
+<p>チャネルを作成し、ホストファイルシステムのチャネルバッファに関連するファイルを関連付けるには、ユーザーがcreate_buf_file()とremove_buf_file()の2つのコールバック関数を定義する必要があります。create_buf_file()は、それぞれのCPUごとのバッファから呼ばれる関数で、ユーザーがチャネルバッファを表すファイルを作成するためのものです。コールバックは、作成したファイルのdentryを返す必要があります。remove_buf_file()も定義する必要があります。これはcreate_buf_file()で作成したファイルを削除する責任があり、
+<a class="reference internal" href="../core-api/kernel-api.html#c.relay_open" title="relay_open"><code class="xref c c-func docutils literal notranslate"><span class="pre">relay_open()</span></code></a> の際に呼ばれます。
+<a class="reference internal" href="../core-api/kernel-api.html#c.relay_close" title="relay_close"><code class="xref c c-func docutils literal notranslate"><span class="pre">relay_close()</span></code></a>.</p>
+<p>これらのコールバックの典型的な定義例を以下に示します。この場合、debugfsを使用しています:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/*
+* create_buf_file() callback.  Creates relay file in debugfs.
+*/
+static struct dentry *create_buf_file_handler(const char *filename,
+                                            struct dentry *parent,
+                                            umode_t mode,
+                                            struct rchan_buf *buf,
+                                            int *is_global)
+{
+        return debugfs_create_file(filename, mode, parent, buf,
+                                &amp;relay_file_operations);
+}
+
+/*
+* remove_buf_file() callback.  Removes relay file from debugfs.
+*/
+static int remove_buf_file_handler(struct dentry *dentry)
+{
+        debugfs_remove(dentry);
+
+        return 0;
+}
+
+/*
+* relay interface callbacks
+*/
+static struct rchan_callbacks relay_callbacks =
+{
+        .create_buf_file = create_buf_file_handler,
+        .remove_buf_file = remove_buf_file_handler,
+};
+</pre></div>
+</div>
+<p>そして例 <a class="reference internal" href="../core-api/kernel-api.html#c.relay_open" title="relay_open"><code class="xref c c-func docutils literal notranslate"><span class="pre">relay_open()</span></code></a> それらを使用した呼び出し:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>chan = relay_open("cpu", NULL, SUBBUF_SIZE, N_SUBBUFS, &amp;relay_callbacks, NULL);
+</pre></div>
+</div>
+<p>create_buf_file()コールバックが失敗したり、定義されていない場合、チャネル作成が失敗し、 <a class="reference internal" href="../core-api/kernel-api.html#c.relay_open" title="relay_open"><code class="xref c c-func docutils literal notranslate"><span class="pre">relay_open()</span></code></a> 失敗します。</p>
+<p>各CPUごとのバッファの総サイズは、サブバッファ数をサブバッファサイズに掛けた値で計算されます。 <a class="reference internal" href="../core-api/kernel-api.html#c.relay_open" title="relay_open"><code class="xref c c-func docutils literal notranslate"><span class="pre">relay_open()</span></code></a>サブバッファのアイデアは、基本的にNバッファへのダブルバッファリングの拡張であり、アプリケーションがバッファ境界でのランダムアクセススキーマを簡単に実装できるようにするものです。これは、一部の高負荷アプリケーションにおいて重要です。サブバッファの数とサイズはアプリケーションに完全に依存しており、同じアプリケーションでも、状況によってこれらのパラメータの値が異なります。通常、適切な値は実験を通じて決定するのが良いですが、一般的には1つのサブバッファのみを持つことは悪いアイデアです。チャンネルモードによってはデータの上書きまたはイベントの喪失が確実に発生します。</p>
+<p>create_buf_file()の実装は、デフォルトのCPUごとのセットではなく、単一の「グローバル」バッファの作成を可能にするように定義することもできます。これは、システム全体のイベントの相対順序を確認するのに主に興味があるアプリケーションにとって有用です。このような場合、後処理ステップでのCPUごとのファイルのマージ/ソートに明示的なタイムスタンプを保存する必要がありません。</p>
+<p>To have <a class="reference internal" href="../core-api/kernel-api.html#c.relay_open" title="relay_open"><code class="xref c c-func docutils literal notranslate"><span class="pre">relay_open()</span></code></a> グローバルバッファを作成するには、create_buf_file()の実装では、単一バッファを表すファイルを作成するだけでなく、is_globalの出力パラメータをゼロ以外の値に設定する必要があります。グローバルバッファの場合、create_buf_file()とremove_buf,File()は一度だけ呼ばれます。通常のチャンネル書き込み関数（例：relay_write()）は引き続き使用可能です。どのCPUからの書き込みも透明にグローバルバッファに反映されますが、グローバルバッファであるため、呼び出し元はこのバッファに適切なロックをかける必要があります。これはスピンロックで書き込みをラップするか、relay.hから書き込み関数をコピーしてローカルバージョンを作成し、内部で適切なロックを実施する方法があります。</p>
+<p>private_dataが渡される <a class="reference internal" href="../core-api/kernel-api.html#c.relay_open" title="relay_open"><code class="xref c c-func docutils literal notranslate"><span class="pre">relay_open()</span></code></a> クライアントがチャンネルに関連付けるユーザー定義データを可能にし、create_buf_file()を含む即座に利用可能（chan-&gt;private_dataまたはbuf-&gt;chan-&gt;private_dataを通じて）です。</p>
+</section>
+<section id="buffer-only-channels">
+<h3>バッファのみのチャンネル<a class="headerlink" href="#buffer-only-channels" title="この見出しへのパーマリンク">¶</a></h3>
+<p>これらのチャンネルはファイルを関連付けず、relay_open(NULL, NULL, …)で作成できます。このようなチャンネルは、VFSが起動する前のカーネルでの初期トレースなど、特定のシナリオで有用です。このような場合、バッファのみのチャンネルを開き、その後、カーネルがファイルを処理できるようになるときに
+<a class="reference internal" href="../core-api/kernel-api.html#c.relay_late_setup_files" title="relay_late_setup_files"><code class="xref c c-func docutils literal notranslate"><span class="pre">relay_late_setup_files()</span></code></a> ユーザー空間にバッファデータを露出するための関数を呼び出します。</p>
+</section>
+<section id="channel-modes">
+<h3>チャンネル ‘モード’<a class="headerlink" href="#channel-modes" title="この見出しへのパーマリンク">¶</a></h3>
+<p>レレーアクセラは、「オーバーライド」モードか「オーバーライドしない」モードのいずれかで使用できます。モードは、以下の説明で示すように、subbuf_start()コールバックの実装によって完全に決定されます。subbuf_start()コールバックが定義されていない場合のデフォルトは「オーバーライドしない」モードです。デフォルトモードで十分で、チャネルデータを取得するためread()インターフェースを使用する予定であれば、このセクションの詳細は無視できます。このセクションの内容は主にmmap()実装に関連しています。</p>
+<p>「オーバーライド」モード（別名「フライトレコーダー」モード）では、書き込みはバッファを連続して循環し、失敗することはありませんが、古いデータを無条件で上書きします（実際に消費されていなくても）。一方、「オーバーライドしない」モードでは、未消費のサブバッファの数がチャネル内のサブバッファの総数に等しい場合、書き込みが失敗し、つまりデータが失われる可能性があります。消費者がいないか、消費者がサブバッファを十分に処理できない場合、どちらのモードでもデータが失われる可能性があります。違いは、データがバッファの先頭から失われるか、末尾から失われるかです。</p>
+<p>上記のように、レレーアクセラは、1つ以上のCPUごとのチャネルバッファから構成され、それぞれが円環バッファとして実装され、1つ以上のサブバッファに分割されています。メッセージは、以下の書き込み関数を通じて、チャネルの現在のCPUごとのバッファの現在のサブバッファに書き込まれます。メッセージが現在のサブバッファに収まらない場合（スペースが足りない場合）、クライアントはsubbuf_start()コールバックを通じて新しいサブバッファへの切り替えが行われる予定であることを通知されます。クライアントはこのコールバックを用いて、1) 適切な場合に次のサブバッファを初期化する、2) 適切な場合に前のサブバッファを終了する、3) 次のサブバッファへの切り替えを実際に実行するかどうかを示すブール値を返す、という3つの動作を行います。</p>
+<p>「オーバーライドしない」モードを実装するには、ユーザースペースクライアントがsubbuf_start()コールバックの実装を提供します。以下のような形で実装されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static int subbuf_start(struct rchan_buf *buf,
+                        void *subbuf,
+                        void *prev_subbuf,
+                        unsigned int prev_padding)
+{
+        if (prev_subbuf)
+                *((unsigned *)prev_subbuf) = prev_padding;
+
+        if (relay_buf_full(buf))
+                return 0;
+
+        subbuf_start_reserve(buf, sizeof(unsigned int));
+
+        return 1;
+}
+</pre></div>
+</div>
+<p>現在のバッファが満杯である場合、つまりすべてのサブバッファが未消費のままの場合、コールバックは0を返して、バッファの切り替えをまだ行わないことを示します。つまり、消費者が現在の準備ができたサブバッファを読み取る機会があるまで待機します。この関数が意味を持つためには、消費者がサブバッファが消費されたことを通じてレレーアクセラインターフェースに通知する責任があります。 <a class="reference internal" href="../core-api/kernel-api.html#c.relay_buf_full" title="relay_buf_full"><code class="xref c c-func docutils literal notranslate"><span class="pre">relay_buf_full()</span></code></a> via
+<a class="reference internal" href="../core-api/kernel-api.html#c.relay_subbufs_consumed" title="relay_subbufs_consumed"><code class="xref c c-func docutils literal notranslate"><span class="pre">relay_subbufs_consumed()</span></code></a>バッファに書き込む試みは、再度subbuf_start()コールバックが同じパラメータで呼び出されます。消費者が1つ以上の準備ができているサブバッファを消費した場合に限り、 <a class="reference internal" href="../core-api/kernel-api.html#c.relay_buf_full" title="relay_buf_full"><code class="xref c c-func docutils literal notranslate"><span class="pre">relay_buf_full()</span></code></a> 0を返します。その場合、バッファの切り替えが続きます。</p>
+<p>「上書き」モードにおけるsubbuf_start()コールバックの実装は非常に似ています：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static int subbuf_start(struct rchan_buf *buf,
+                        void *subbuf,
+                        void *prev_subbuf,
+                        size_t prev_padding)
+{
+        if (prev_subbuf)
+                *((unsigned *)prev_subbuf) = prev_padding;
+
+        subbuf_start_reserve(buf, sizeof(unsigned int));
+
+        return 1;
+}
+</pre></div>
+</div>
+<p>この場合、 <a class="reference internal" href="../core-api/kernel-api.html#c.relay_buf_full" title="relay_buf_full"><code class="xref c c-func docutils literal notranslate"><span class="pre">relay_buf_full()</span></code></a> チェックは意味がなく、コールバックは常に1を返します。これにより、バッファの切り替えは条件に関係なく行われます。このモードではクライアントがこの
+<a class="reference internal" href="../core-api/kernel-api.html#c.relay_subbufs_consumed" title="relay_subbufs_consumed"><code class="xref c c-func docutils literal notranslate"><span class="pre">relay_subbufs_consumed()</span></code></a> 関数を使用しても意味がありません。なぜなら、この関数は常に呼び出されないからです。</p>
+<p>クライアントがどのコールバックも定義していない場合、またはsubbuf_start()コールバックを定義していない場合に使用されるデフォルトのsubbuf_start()実装は、最もシンプルな「上書き不可」モードを実装します。つまり、何もせず0を返すだけです。</p>
+<p>サブバッファの先頭にヘッダー情報を予約するには、subbuf_start()コールバック内でsubbuf_start_reserve()ヘルパ関数を呼び出します。この予約領域はクライアントが望む情報を保存するために使用できます。上記の例では、各サブバッファにパディングカウントを保存するための領域が予約されています。これは、subbuf_start()実装内で前のサブバッファに値が設定されるため、前のサブバッファのパディング値はsubbuf_start()コールバックに渡されるとともに、前のサブバッファへのポインタも渡されます。なぜなら、パディング値はサブバッファが満たされるまで判明しないためです。チャンネルがオープンされる際には、最初のサブバッファにもsubbuf_start()コールバックが呼び出され、クライアントがそのサブバッファに領域を確保する機会を与えます。この場合、コールバックに渡される前のサブバッファポインタはNULLとなるため、クライアントは前のサブバッファに書き込む前にprev_subbufポインタの値を確認する必要があります。</p>
+</section>
+<section id="writing-to-a-channel">
+<h3>チャンネルへの書き込み<a class="headerlink" href="#writing-to-a-channel" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルクライアントは、relay_write()または__relay_write()を使用して、現在のCPUのチャンネルバッファにデータを書き込みます。relay_write()は主なログ記録関数であり、ローカルIRQセーブを用いてバッファを保護します。割り込みコンテキストからログを記録する可能性がある場合に使用すべきです。割り込みコンテキストから決してログを記録しないことが確実である場合、__relay_write()を使用できます。これはプリエンプションのみを無効化します。これらの関数は戻り値を返さないため、失敗したかどうかを判定することはできません。高速なログ記録パスでは戻り値をチェックする必要がないと想定されており、バッファが満杯で上書き不可モードが有効になっている場合を除けば常に成功するものとされています。この場合、subbuf_start()コールバックで失敗した書き込みを検出するために呼び出します。 <a class="reference internal" href="../core-api/kernel-api.html#c.relay_buf_full" title="relay_buf_full"><code class="xref c c-func docutils literal notranslate"><span class="pre">relay_buf_full()</span></code></a> さらに、</p>
+<p>relay_reserve()は、後で書き込むことができるチャンネルバッファ内のスロットを確保するために使用されます。これは、一時的なバッファにデータをステージングせずに直接チャンネルバッファに書き込む必要があるアプリケーションで通常使用されます。実際の書き込みがスロットを確保した後すぐに実行されない可能性があるため、relay_reserve()を使用するアプリケーションは、サブバッファ内に確保されたスペースや別個の配列として、実際に書き込まれたバイト数をカウントできます。relay-appsアーカイブの'reserve'例を参照してください。 <a class="reference external" href="http://relayfs.sourceforge.net">http://relayfs.sourceforge.net</a> 書き込み操作はクライアントの制御下で行われ、確保と分離されているため、relay_reserve()はバッファを一切保護しません。relay_reserve()を使用する際には、クライアントが適切な同期を提供する必要があります。</p>
+</section>
+<section id="closing-a-channel">
+<h3>チャンネルの閉じ方<a class="headerlink" href="#closing-a-channel" title="この見出しへのパーマリンク">¶</a></h3>
+<p>クライアントは、チャンネルを使用が終了した際に <a class="reference internal" href="../core-api/kernel-api.html#c.relay_close" title="relay_close"><code class="xref c c-func docutils literal notranslate"><span class="pre">relay_close()</span></code></a> を呼び出します。チャンネルとその関連するバッファは、チャンネルバッファへの参照がなくなったときに破壊されます。  <a class="reference internal" href="../core-api/kernel-api.html#c.relay_flush" title="relay_flush"><code class="xref c c-func docutils literal notranslate"><span class="pre">relay_flush()</span></code></a>
+すべてのチャンネルバッファでサブバッファの切り替えを強制し、チャンネルが閉じられる前に最後のサブバッファを確定および処理するために使用できます。</p>
+</section>
+<section id="misc">
+<h3>雑項<a class="headerlink" href="#misc" title="この見出しへのパーマリンク">¶</a></h3>
+<p>一部のアプリケーションでは、新しいチャンネルを開閉するたびにチャンネルを保持し再利用する方が望ましい場合があります。  <a class="reference internal" href="../core-api/kernel-api.html#c.relay_reset" title="relay_reset"><code class="xref c c-func docutils literal notranslate"><span class="pre">relay_reset()</span></code></a>
+この目的には使用できます。これは、チャンネルバッファメモリを再割当したり既存のマッピングを破棄することなくチャンネルを初期状態に戻します。ただし、チャンネルが現在書き込まれていない状態で安全に実行できる場合にのみ呼び出す必要があります。</p>
+<p>最後に、さまざまな目的で使用できるユーティリティコールバックがいくつかあります。buf_mapped()は、チャネルバッファがユーザー空間からmmappedされるたびに呼び出され、buf_unmapped()はそのバッファがunmappedされるときに呼び出されます。クライアントはこの通知を使用して、カーネルアプリケーション内でアクションをトリガーできます。たとえば、チャネルへのログ出力を有効/無効にしたりできます。</p>
+</section>
+</section>
+<section id="resources">
+<h2>リソース<a class="headerlink" href="#resources" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ニュース、例コード、メーリングリストなどについては、レレートインターフェースのホームページをご覧ください：</p>
+<blockquote>
+<div><p><a class="reference external" href="http://relayfs.sourceforge.net">http://relayfs.sourceforge.net</a></p>
+</div></blockquote>
+</section>
+<section id="credits">
+<h2>貢献者<a class="headerlink" href="#credits" title="この見出しへのパーマリンク">¶</a></h2>
+<p>レレートインターフェースのアイデアと仕様は、トレーシングに関する議論の結果として生まれました。以下の人物を含む：</p>
+<p>Michel Dagenais &lt;<a class="reference external" href="mailto:michel.dagenais%40polymtl.ca">michel<span>.</span>dagenais<span>@</span>polymtl<span>.</span>ca</a>&gt; Richard Moore &lt;<a class="reference external" href="mailto:richardj_moore%40uk.ibm.com">richardj_moore<span>@</span>uk<span>.</span>ibm<span>.</span>com</a>&gt; Bob Wisniewski &lt;<a class="reference external" href="mailto:bob%40watson.ibm.com">bob<span>@</span>watson<span>.</span>ibm<span>.</span>com</a>&gt; Karim Yaghmour &lt;<a class="reference external" href="mailto:karim%40opersys.com">karim<span>@</span>opersys<span>.</span>com</a>&gt; Tom Zanussi &lt;<a class="reference external" href="mailto:zanussi%40us.ibm.com">zanussi<span>@</span>us<span>.</span>ibm<span>.</span>com</a>&gt;</p>
+<p>Hubertus Franke氏への感謝を表します。多くの有用なアドバイスとバグレポートをありがとうございます。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxカーネル内のファイルシステム</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#core-vfs-documentation">コアVFSドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#filesystem-support-layers">ファイルシステムサポートレイヤー</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#filesystems">ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxカーネル内のファイルシステム</a><ul>
+<li>前へ: <a href="ramfs-rootfs-initramfs.html" title="前章">ディスクレスシステム（たとえばXターミナルやプリンターサーバーなど）を使用するには、ルートファイルシステムがディスク以外のデバイス上に存在する必要があります。これはinitramfs（参照：Ramfs, rootfs and initramfs）やramdisk（参照：Ramfs, rootfs and initramfs）やNFS経由でマウントされたファイルシステムを使用する場合です。以下のテキストではNFSをルートファイルシステムとして使用する方法について説明します。このテキストの後半では、「クライアント」とはディスクレスシステムを、「サーバー」とはNFSサーバーを指します。</a></li>
+<li>次へ: <a href="romfs.html" title="次章">ROMFS - ROMファイルシステム</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/filesystems/relay.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

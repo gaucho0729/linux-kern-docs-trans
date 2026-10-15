@@ -1,0 +1,344 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>In-Kernel Cache Object Representation and Management — The Linux Kernel documentation</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="backend-api.html" rel="next" title="FS-Cache キャッシュバックエンドAPI"/>
+<link href="fscache.html" rel="prev" title="汎用ファイルシステムキャッシング"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="in-kernel-cache-object-representation-and-management">
+<h1>カーネル内キャッシュオブジェクトの表現と管理<a class="headerlink" href="#in-kernel-cache-object-representation-and-management" title="この見出しへのパーマリンク">¶</a></h1>
+<p>By: David Howells &lt;<a class="reference external" href="mailto:dhowells%40redhat.com">dhowells<span>@</span>redhat<span>.</span>com</a>&gt;</p>
+<section id="representation">
+<h2>表現<a class="headerlink" href="#representation" title="この見出しへのパーマリンク">¶</a></h2>
+<p>FS-Cacheは、netfsが現在関心を持つ各オブジェクトのカーネル内での表現を維持しています。このようなオブジェクトはfscache_cookie構造体で表され、cookieと呼ばれます。</p>
+<p>FS-Cacheは、キャッシュバックエンドが現在積極的にキャッシュしているオブジェクトについても、別途カーネル内での表現を維持しています。このようなオブジェクトはfscache_object構造体で表され、オブジェクトと呼ばれます。キャッシュバックエンドは要求に応じてこれらのオブジェクトを割り当て、自身の表現に埋め込む必要があります。</p>
+<p>cookieとオブジェクトの間には1対Nの関係があります。cookieは複数のオブジェクトで表される可能性があります（インデックスが複数のキャッシュに存在する場合）あるいは、オブジェクトを持たない場合もあります（キャッシュされていない場合）。</p>
+<p>さらに、cookieとオブジェクトはどちらも階層構造を持っています。2つの階層構造は対応していますが、cookieの木は複数のキャッシュのオブジェクト木の合併を含む上位集合です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>    NETFS INDEX TREE               :      CACHE 1     :      CACHE 2
+                                   :                  :
+                                   :   +-----------+  :
+                          +-----------&gt;|  IObject  |  :
+      +-----------+       |        :   +-----------+  :
+      |  ICookie  |-------+        :         |        :
+      +-----------+       |        :         |        :   +-----------+
+            |             +------------------------------&gt;|  IObject  |
+            |                      :         |        :   +-----------+
+            |                      :         V        :         |
+            |                      :   +-----------+  :         |
+            V             +-----------&gt;|  IObject  |  :         |
+      +-----------+       |        :   +-----------+  :         |
+      |  ICookie  |-------+        :         |        :         V
+      +-----------+       |        :         |        :   +-----------+
+            |             +------------------------------&gt;|  IObject  |
+      +-----+-----+                :         |        :   +-----------+
+      |           |                :         |        :         |
+      V           |                :         V        :         |
++-----------+     |                :   +-----------+  :         |
+|  ICookie  |-------------------------&gt;|  IObject  |  :         |
++-----------+     |                :   +-----------+  :         |
+      |           V                :         |        :         V
+      |     +-----------+          :         |        :   +-----------+
+      |     |  ICookie  |--------------------------------&gt;|  IObject  |
+      |     +-----------+          :         |        :   +-----------+
+      V           |                :         V        :         |
++-----------+     |                :   +-----------+  :         |
+|  DCookie  |-------------------------&gt;|  DObject  |  :         |
++-----------+     |                :   +-----------+  :         |
+                  |                :                  :         |
+          +-------+-------+        :                  :         |
+          |               |        :                  :         |
+          V               V        :                  :         V
+    +-----------+   +-----------+  :                  :   +-----------+
+    |  DCookie  |   |  DCookie  |------------------------&gt;|  DObject  |
+    +-----------+   +-----------+  :                  :   +-----------+
+                                   :                  :
+</pre></div>
+</div>
+<p>上記の図では、ICookieとIObjectはインデックスを、DCookieとDObjectはデータストレージオブジェクトを表します。インデックスは複数のキャッシュに表現を持つ可能性がありますが、現在は非インデックスオブジェクトはそうできません。どのタイプのオブジェクトも完全に表現されていない可能性があります。</p>
+<p>netfs APIの観点では、netfsは実際にcookieへのポインタのみを確認できます。cookie自体やそれに付随するオブジェクトはnetfsに隠されています。</p>
+</section>
+<section id="object-management-state-machine">
+<h2>オブジェクト管理ステートマシン<a class="headerlink" href="#object-management-state-machine" title="この見出しへのパーマリンク">¶</a></h2>
+<p>FS-Cache内で、アクティブな各オブジェクトは個別の状態機械で管理されます。オブジェクトの状態はfscache_object構造体のobject-&gt;stateに保持されます。cookieは、異なる状態にあるオブジェクトのセットを指すことができます。</p>
+<p>各状態には、機械がその状態で起動した際に実行されるアクションが関連付けられています。4つの論理的な状態セットがあります：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>準備: 親オブジェクトが準備完了になるのを待つ状態。表現は階層構造を持ち、オブジェクトは親オブジェクトに対して作成またはアクセスされる必要があります。</p></li>
+<li><p>初期化: キャッシュ内の検索を行い、見つかった内容を検証し、必要に応じてディスクにメタデータを作成する状態。</p></li>
+<li><p>通常動作: netfs操作がオブジェクトに対して実行可能で、オブジェクトの状態を更新する状態。</p></li>
+<li><p>終了: オブジェクトをnetfs cookieから分離し、ディスクからオブジェクトを削除し、ディスクやシステムエラーを処理し、メモリ内のリソースを解放する状態。</p></li>
+</ol>
+</div></blockquote>
+<p>ほとんどの場合、状態間の移行は通知されたイベントに応じて行われます。状態が処理を終えたら、通常はその状態に関心のあるイベントのマスク（object-&gt;event_mask）を設定し、ワーカースレッドを解放します。その後、イベントが発生した場合（fscache_raise_event()を呼び出すことで発生）、そのイベントがマスクされていない場合、オブジェクトは処理のためにキューイングされます（fscache_enqueue_object()を呼び出すことで）。</p>
+<section id="provision-of-cpu-time">
+<h3>CPU時間の提供<a class="headerlink" href="#provision-of-cpu-time" title="この見出しへのパーマリンク">¶</a></h3>
+<p>さまざまな状態で行う作業は、スローワークファシリティのスレッドによってCPU時間として提供されました。これはワークキューのファシリティよりも優先的に使用された理由は以下の通りです：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>スレッドは特定の作業項目によって非常に長い時間完全に占拠されることがあります。これらの状態アクションは、検索、mkdir、create、setxattr、getxattr、truncate、unlink、rmdir、renameなどの同期的なジャーナル化されたディスクアクセスのシーケンスを実行している可能性があります。</p></li>
+<li><p>スレッドは実際の作業をあまり行わず、むしろI/Oに待機する時間が非常に長い場合があります。これは、単スレッドおよび1-per-CPUスレッドのワークキューが適切なスレッド数を保有しているとは限らないことを意味します。</p></li>
+</ol>
+</div></blockquote>
+</section>
+<section id="locking-simplification">
+<h3>ロックの簡略化<a class="headerlink" href="#locking-simplification" title="この見出しへのパーマリンク">¶</a></h3>
+<p>特定のオブジェクトの状態機関を同時に操作するスレッドは1つしか存在しないため、ロックの簡略化が可能になります。特に、ネットファイルシステム（netfs）のキャッシュオブジェクト（fscache_cookie）の表現をキャッシュバックエンドの表現（fscache_object）から分離する際のロックが簡略化されます。これはどちらの端からもリクエストされる可能性があります。</p>
+</section>
+</section>
+<section id="the-set-of-states">
+<h2>状態の集合<a class="headerlink" href="#the-set-of-states" title="この見出しへのパーマリンク">¶</a></h2>
+<p>オブジェクト状態機関には、オブジェクトが存在する状態がいくつかあります。オブジェクトが自身をセットアップし、親オブジェクトが子オブジェクトへのアクセスを許可する状態に移行するのを待機する準備状態があります：</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>State FSCACHE_OBJECT_INIT.</p>
+<p>オブジェクトを初期化し、親オブジェクトがアクティブになるのを待機します。キャッシュでは、親オブジェクトが自身を検索するまで、親オブジェクトからオブジェクトを検索することは不可能と期待されます。</p>
+</li>
+</ol>
+</div></blockquote>
+<p>オブジェクトが自身をセットアップし、オブジェクトメタデータをディスクからアクセスする初期化状態があります：</p>
+<blockquote>
+<div><ol class="arabic" start="2">
+<li><p>State FSCACHE_OBJECT_LOOKING_UP.</p>
+<p>親オブジェクトを起点にディスク上でオブジェクトを検索します。FS-Cacheはキャッシュバックエンドがキャッシュを調査し、このオブジェクトがキャッシュに存在するかどうかを確認し、存在する場合に有効かどうか（整合性管理）を検証することを期待しています。</p>
+<p>キャッシュは、何らかの理由で検索に失敗した場合、fscache_object_lookup_negative()を呼び出して検索失敗を示し、成功した場合、fscache_obtained_object()を呼び出して成功を示すべきです。</p>
+<p>検索が完了した後、FS-Cacheはネットファイルシステム（netfs）が読み取り操作を実行できるようにします。ファイルがキャッシュされていなくても、読み取り操作は即座にENODATAで拒否されます。最初のページがキャッシュ解除されるまで、そのファイルのキャッシュから読み取るデータは存在しないためです。</p>
+</li>
+<li><p>状態 FSCACHE_OBJECT_CREATING。</p>
+<p>ディスク上にオブジェクトを作成します。親オブジェクトを起点として作成を行います。これはオブジェクトが見つからない場合、またはオブジェクトの整合性データがディスク上の内容が古くなったと示している場合に発生します。この状態ではFS-Cacheはキャッシュがオブジェクトを作成することを期待しています。</p>
+<p>作成が成功した場合はキャッシュがfscache_obtained_object()を呼び、失敗した場合はfscache_object_lookup_negative()を呼びます。</p>
+<p>作成が完了した後、FS-Cacheはネットファイルシステムがキューに積んでいた書き込み操作を処理を開始します。作成が失敗した場合は、書き込み操作は透明に破棄され、キャッシュに記録されません。</p>
+</li>
+</ol>
+</div></blockquote>
+<p>オブジェクトはネットファイルシステムのリクエストを処理するためにいくつかの通常の動作状態を経過します。</p>
+<blockquote>
+<div><ol class="arabic" start="4">
+<li><p>状態 FSCACHE_OBJECT_AVAILABLE。</p>
+<p>一時的な状態で、待機中の操作が開始され、子オブジェクトがFSCACHE_OBJECT_INIT状態から進展可能となり、一時的な検索データが解放されます。</p>
+</li>
+<li><p>状態 FSCACHE_OBJECT_ACTIVE。</p>
+<p>通常の動作状態です。この状態ではネットファイルシステムが行うリクエストがキャッシュに渡されます。</p>
+</li>
+<li><p>状態 FSCACHE_OBJECT_INVALIDATING。</p>
+<p>オブジェクトが無効化処理中です。この状態に移行すると、すべての待機中の読み取り、書き込み、属性変更操作が破棄されます。キャッシュを完全にクリアし再初期化するためです。その後、FSCACHE_OBJECT_UPDATING状態に移行します。</p>
+</li>
+<li><p>状態 FSCACHE_OBJECT_UPDATING。</p>
+<p>キャッシュ内のオブジェクトをネットファイルシステムの記録に基づいて更新します。これは整合性を維持するために使用される補助データの更新を含みます。</p>
+</li>
+</ol>
+</div></blockquote>
+<p>また、オブジェクトが自身をクリーンアップし、メモリを解放し、ディスクからデータを削除する可能性のある終了状態もあります。</p>
+<blockquote>
+<div><ol class="arabic" start="8">
+<li><p>状態 FSCACHE_OBJECT_LC_DYING。</p>
+<p>検索または作成エラーにより終了する場合にこの状態に移行します。これはディスクエラーまたはシステムエラーなどの原因で発生します。一時的なデータがクリーンアップされ、親オブジェクトが解放されます。</p>
+</li>
+<li><p>状態 FSCACHE_OBJECT_DYING。</p>
+<p>ネットファイルシステムが親クッキーを解放した場合、またはキャッシュが引き上げられた場合にこの状態に移行します。</p>
+<p>このオブジェクトを待っている子オブジェクトにCPU時間があてられるため、それらも自身を破壊できるようになる。このオブジェクトはすべての子オブジェクトが消え去るまで待機し、次状態へ進む。</p>
+</li>
+</ol>
+</div></blockquote>
+<ol class="arabic" start="10">
+<li><p>State FSCACHE_OBJECT_ABORT_INIT.</p>
+<p>このオブジェクトはFSCACHE_OBJECT_INIT状態で親を待っていたが、親が死んだ場合にこの状態になる。オブジェクトは自身を破壊し、親がFSCACHE_OBJECT_DYING状態から進めるようにする。</p>
+</li>
+<li><p>State FSCACHE_OBJECT_RELEASING.</p></li>
+<li><p>State FSCACHE_OBJECT_RECYCLING.</p>
+<p>オブジェクトがすべての子オブジェクトを解放した後、netfsがクッキーを放棄したため死ぬ場合、この2つの状態のいずれかになる。最初の状態ではキャッシュデータが永続化されることが期待され、2番目の状態ではキャッシュデータが削除される。</p>
+</li>
+<li><p>State FSCACHE_OBJECT_WITHDRAWING.</p>
+<p>キャッシュがオブジェクトをサービスから外すことを希望した場合、この状態になる。これはスペース確保のためでもあり、エラーのためでも、あるいは全体のキャッシュが外されるためでもある。</p>
+</li>
+<li><p>State FSCACHE_OBJECT_DEAD.</p>
+<p>インメモリのオブジェクトレコードが削除準備になったときにこの状態になる。オブジェクトプロセッサはこの状態のオブジェクトを決して見ることはない。</p>
+</li>
+</ol>
+<section id="the-set-of-events">
+<h3>イベントのセット<a class="headerlink" href="#the-set-of-events" title="この見出しへのパーマリンク">¶</a></h3>
+<p>オブジェクトステートマシンに発生可能なイベントはいくつかある:</p>
+<blockquote>
+<div><dl>
+<dt>FSCACHE_OBJECT_EV_UPDATE</dt><dd><p>netfsがオブジェクトの更新を要求した場合。ステートマシンはキャッシュバックエンドにオブジェクトの更新を依頼し、キャッシュバックエンドはそのクッキー定義オプスを通じてnetfsに変更の詳細を尋ねる。</p>
+</dd>
+<dt>FSCACHE_OBJECT_EV_CLEARED</dt><dd><p>このイベントは以下の2つの状況で送信される:</p>
+<ol class="loweralpha simple">
+<li><p>オブジェクトの最後の子オブジェクトがドロップされたとき、</p></li>
+<li><p>オブジェクト上の最後の未完了操作が完了したとき。</p></li>
+</ol>
+<p>これは死んだ状態から進むためのイベントとして使用される。</p>
+</dd>
+<dt>FSCACHE_OBJECT_EV_ERROR</dt><dd><p>オブジェクトの処理中にI/Oエラーが発生した場合に送信される。</p>
+</dd>
+<dt>FSCACHE_OBJECT_EV_RELEASE, FSCACHE_OBJECT_EV_RETIRE</dt><dd><p>netfsが使用していたクッキーを放棄したときに送信されるイベント。netfsがバックイングオブジェクトを削除（retire）するか保持（retained）するかによって、選択されるイベントが異なる。</p>
+</dd>
+<dt>FSCACHE_OBJECT_EV_WITHDRAW</dt><dd><p>キャッシュバックエンドがオブジェクトを引き抜くことを希望したときに送信される。これはオブジェクトがnetfsのクッキーから分離される必要があることを意味する。</p>
+</dd>
+</dl>
+</div></blockquote>
+<p>引き抜き、解放、廃止などのイベントはすべてオブジェクトステートマシンで処理されるため、両端が同時に接続を切断しようとした場合でも衝突が発生しても問題ない。ステートマシンはどちらか一方を優先し、もう一方の効果を無視することで対応できる。</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxカーネル内のファイルシステム</a><ul class="current">
+<li class="toctree-l2 current"><a class="reference internal" href="../index.html#core-vfs-documentation">コアVFSドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../index.html#filesystem-support-layers">ファイルシステムサポートレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../index.html#filesystems">ファイルシステム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxカーネル内のファイルシステム</a><ul>
+<li><a href="index.html">Filesystem Caching</a><ul>
+<li>前へ: <a href="fscache.html" title="前章">汎用ファイルシステムキャッシング</a></li>
+<li>次へ: <a href="backend-api.html" title="次章">FS-Cache キャッシュバックエンドAPI</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/filesystems/caching/object.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

@@ -1,0 +1,583 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>USBの電源管理 — Linux Kernelドキュメント</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="hotplug.html" rel="next" title="USBホットプラグ"/>
+<link href="URB.html" rel="prev" title="USBリクエストブロック (URB)"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="power-management-for-usb">
+<span id="usb-power-management"></span><h1>USBの電源管理<a class="headerlink" href="#power-management-for-usb" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Alan Stern &lt;<a class="reference external" href="mailto:stern%40rowland.harvard.edu">stern<span>@</span>rowland<span>.</span>harvard<span>.</span>edu</a>&gt;</p>
+</dd>
+<dt class="field-even">日付</dt>
+<dd class="field-even"><p>最終更新日: 2014年2月</p>
+</dd>
+</dl>
+<section id="what-is-power-management">
+<h2>電源管理とは？<a class="headerlink" href="#what-is-power-management" title="この見出しへのパーマリンク">¶</a></h2>
+<p>電源管理（PM）とは、コンピュータシステムの一部を使用していないときに停止させてエネルギーを節約する技術です。コンポーネントが <code class="docutils literal notranslate"><span class="pre">suspended</span></code> 非機能的な低電力状態にあり、完全にオフになることもあります。停止中のコンポーネントは、
+<code class="docutils literal notranslate"><span class="pre">resumed</span></code> （カーネルが必要なときに機能するフル電力状態に戻すことができます）。（また、コンポーネントを停止状態からではなく、一部の機能を維持しながら使用可能な状態に置く形式のPMもあります。例えばCPUのクロック周波数を減らすなどです。このドキュメントではその他の形式については議論しません。）</p>
+<p>CPUとシステムの大部分を停止する場合、これを「システムスリープ」と呼びます。システム全体が稼働している間、特定のデバイスがオフになる場合、これを「ダイナミックスリープ」（または「ランタイムスリープ」「選択的スリープ」とも呼ばれます）と呼びます。このドキュメントは主にダイナミックPMがUSBサブシステムでどのように実装されるかに焦点を当てていますが、システムPMについてはある程度扱っています（ <code class="docutils literal notranslate"><span class="pre">Documentation/power/*.rst</span></code> を参照してください。システムPMについての詳細情報については、</p>
+<p>システムPMのサポートは、カーネルが
+<code class="docutils literal notranslate"><span class="pre">CONFIG_SUSPEND</span></code> または <code class="docutils literal notranslate"><span class="pre">CONFIG_HIBERNATION</span></code> が有効になっている場合にのみ存在します。USBのダイナミックPMサポート</p>
+<p>は、カーネルが <code class="docutils literal notranslate"><span class="pre">CONFIG_PM</span></code> 有効にされています。</p>
+<p>[歴史的に、USBのダイナミックPMサポートは、カーネルが <code class="docutils literal notranslate"><span class="pre">CONFIG_USB_SUSPEND</span></code> が有効になっている（これは
+<code class="docutils literal notranslate"><span class="pre">CONFIG_PM_RUNTIME</span></code>に依存していました）場合にのみ存在しました。3.10カーネルリリース以降、USBのダイナミックPMサポートは、カーネルが
+<code class="docutils literal notranslate"><span class="pre">CONFIG_PM_RUNTIME</span></code> が有効になっている場合にのみ存在します。 <code class="docutils literal notranslate"><span class="pre">CONFIG_USB_SUSPEND</span></code> オプションは廃止されました。]</p>
+</section>
+<section id="what-is-remote-wakeup">
+<h2>リモートウェイクアップとは？<a class="headerlink" href="#what-is-remote-wakeup" title="この見出しへのパーマリンク">¶</a></h2>
+<p>デバイスが停止している場合、通常はコンピュータが指示するまで再開しません。同様に、全体が停止しているコンピュータも、ユーザーが電源ボタンを押すなどして指示するまで再開しません。</p>
+<p>ただし、一部のデバイスは自動的に再開する能力や、カーネルに再開を依頼する能力、あるいは全体のコンピュータに再開を通知する能力を持っています。このような能力は「Wake On LAN」などと呼ばれることがありますが、ここでは一般的に「リモートウェイクアップ」と呼びます。リモートウェイクアップが有効なデバイスが停止している場合、外部イベントに応じて自動的に再開する（または再開を依頼する）ことができます。例えば、キーボードが停止している状態でキーが押されると再開する、またはUSBハブが停止している状態でデバイスが挿さると再開するなどです。</p>
+</section>
+<section id="when-is-a-usb-device-idle">
+<h2>USBデバイスがアイドル状態になるのはいつ？<a class="headerlink" href="#when-is-a-usb-device-idle" title="この見出しへのパーマリンク">¶</a></h2>
+<p>カーネルが重要な作業を行っていないと判断したデバイスは、アイドル状態にあるとみなされ、スリープ候補となる。正確な定義はデバイスのドライバに依存するが、ドライバは実際の通信が行われていない場合でもデバイスがアイドル状態でないことを宣言できる。例えば、ハブはそのハブに接続されたすべてのデバイスがすでにスリープしている場合に限りアイドル状態とみなされる。さらに、プログラムがusbfsファイルを開いている限り、デバイスはアイドル状態とみなされない。</p>
+<p>USBデバイスにドライバがなく、usbfsファイルが開いておらず、sysfs経由でアクセスされていない場合、デバイスは確実にアイドル状態にある。</p>
+</section>
+<section id="forms-of-dynamic-pm">
+<h2>動的PMの形式<a class="headerlink" href="#forms-of-dynamic-pm" title="この見出しへのパーマリンク">¶</a></h2>
+<p>カーネルがアイドル状態のデバイスをスリープさせる場合、これは <code class="docutils literal notranslate"><span class="pre">autosuspend</span></code> と呼ばれる。一般的に、デバイスが一定期間のアイドル状態を経た後でなければ、自動スリープ（autosuspend）されない。この期間を「アイドル遅延時間（idle-delay time）」と呼ぶ。</p>
+<p>もちろん、カーネルが自らの判断で行う操作は、コンピュータやそのデバイスの正常な動作を妨げてはならない。デバイスが自動スリープされ、プログラムがそれを使用しようとすると、カーネルが自動的にデバイスを再開する（autoresume）。同様の理由から、自動スリープ中のデバイスは、リモートウェイクアップをサポートしている場合、通常リモートウェイクアップが有効になっている。</p>
+<p>多くのUSBドライバが自動スリープをサポートしていない点を強調しておく。実際、この執筆時点（Linux 2.6.23）では、サポートしているドライバはハブドライバ、kaweth、asix、usblp、usblcd、usb-skeleton（これはカウントしない）のみである。サポートしていないドライバがデバイスにバインドされている場合、そのデバイスは自動スリープされない。実質的に、カーネルはそのデバイスが常にアイドル状態でないと仮定する。</p>
+<p>電源管理イベントは大きく分けて外部イベントと内部イベントの2つのクラスに分類できる。外部イベントはUSBスタックの外側からトリガーされるイベントで、システムのスリープ/再開（ユーザー空間からトリガー）、手動による動的再開（ユーザー空間からトリガー）、リモートウェイクアップ（デバイスからトリガー）が該当する。内部イベントはUSBスタック内でトリガーされるイベントで、自動スリープと自動再開が含まれる。注意点として、すべての動的スリープイベントは内部イベントであり、外部エージェントが動的スリープを発行することは許可されていない。</p>
+</section>
+<section id="the-user-interface-for-dynamic-pm">
+<h2>動的PMのユーザーインターフェース<a class="headerlink" href="#the-user-interface-for-dynamic-pm" title="この見出しへのパーマリンク">¶</a></h2>
+<p>動的電源管理（PM）を制御するユーザーインターフェースは、各USBデバイスのsysfsディレクトリの <code class="docutils literal notranslate"><span class="pre">power/</span></code>
+サブディレクトリに位置する。つまり、
+<code class="docutils literal notranslate"><span class="pre">/sys/bus/usb/devices/.../power/</span></code> の場所にある。ここで「…」はデバイスのIDを表す。関連する属性ファイルは：wakeup、control、および
+<code class="docutils literal notranslate"><span class="pre">autosuspend_delay_ms</span></code>。（また、ファイル名が <code class="docutils literal notranslate"><span class="pre">level</span></code>という名前のファイルも存在する可能性があるが、これは2.6.35カーネル以降で非推奨となり、
+<code class="docutils literal notranslate"><span class="pre">control</span></code> ファイルに置き換えられた。2.6.38では <code class="docutils literal notranslate"><span class="pre">autosuspend</span></code> ファイルは非推奨となり、 <code class="docutils literal notranslate"><span class="pre">autosuspend_delay_ms</span></code> ファイルに置き換えられます。違いは、新しいファイルがミリ秒単位で遅延を表し、古いファイルは秒単位で表している点です。混乱を招くかもしれませんが、2.6.37では両方のファイルが存在しますが、のみ <code class="docutils literal notranslate"><span class="pre">autosuspend</span></code> 動作します。)</p>
+<blockquote>
+<div><p><code class="docutils literal notranslate"><span class="pre">power/wakeup</span></code></p>
+<blockquote>
+<div><p>デバイスがリモートウェイクアップをサポートしない場合、このファイルは空です。サポートしている場合は、このファイルに「 <code class="docutils literal notranslate"><span class="pre">enabled</span></code> 」または「 <code class="docutils literal notranslate"><span class="pre">disabled</span></code>」という単語が含まれており、これらの単語をファイルに書き込むことができます。設定により、デバイスが次にスリープ状態になったときにリモートウェイクアップが有効になるかどうかが決まります。(デバイスがスリープ中で設定を変更しても、次のスリープ時に変更が反映されます。)</p>
+</div></blockquote>
+<p><code class="docutils literal notranslate"><span class="pre">power/control</span></code></p>
+<blockquote>
+<div><p>このファイルには2つの単語のうちの1つが含まれています： <code class="docutils literal notranslate"><span class="pre">on</span></code> または <code class="docutils literal notranslate"><span class="pre">auto</span></code>。この単語をファイルに書き込むことで、デバイスの設定を変更できます。</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">on</span></code> はデバイスが再開され、オートスリープが許可されないことを意味します。(もちろん、システムのスリープは依然として許可されます。)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">auto</span></code> は、カーネルがデバイスのオートスリープとオートリスローを許可する通常の状態です。</p></li>
+</ul>
+<p>(2.6.32までのカーネルでは、「
+<code class="docutils literal notranslate"><span class="pre">suspend</span></code>」を指定することもでき、これはデバイスがスリープ状態のままとなり、オートリスローが許可されないことを意味します。この設定はもはやサポートされていません。)</p>
+</div></blockquote>
+<p><code class="docutils literal notranslate"><span class="pre">power/autosuspend_delay_ms</span></code></p>
+<blockquote>
+<div><p>このファイルには、デバイスがオートスリープされるまでのアイドル時間（idle-delay時間）を表す整数値が含まれています。デフォルトは2000ミリ秒です。0はデバイスがアイドル状態になった直ちにオートスリープを開始し、負の値はオートスリープを決して行わないことを意味します。ファイルに数値を書き込むことで、オートスリープのアイドル時間（idle-delay時間）を変更できます。</p>
+</div></blockquote>
+</div></blockquote>
+<p>書き込み <code class="docutils literal notranslate"><span class="pre">-1</span></code> に（木の下から葉に向かって） <code class="docutils literal notranslate"><span class="pre">power/autosuspend_delay_ms</span></code> および「 <code class="docutils literal notranslate"><span class="pre">on</span></code> に（木の下から葉に向かって）
+<code class="docutils literal notranslate"><span class="pre">power/control</span></code> 」は基本的に同じ動作をします – どちらもデバイスがオートスリープされないようにします。はい、これはAPIの冗長性です。</p>
+<p>(2.6.21では「 <code class="docutils literal notranslate"><span class="pre">0</span></code> に（木の下から葉に向かって） <code class="docutils literal notranslate"><span class="pre">power/autosuspend</span></code> 」を書き込むことでデバイスがオートスリープされなくなりましたが、2.6.22で動作が変更されました。属性「
+<code class="docutils literal notranslate"><span class="pre">power/autosuspend</span></code> 」は2.6.21以前には存在せず、属性「
+<code class="docutils literal notranslate"><span class="pre">power/level</span></code> 」は2.6.22以前には存在しませんでした。  <code class="docutils literal notranslate"><span class="pre">power/control</span></code>
+は2.6.34で追加され、 <code class="docutils literal notranslate"><span class="pre">power/autosuspend_delay_ms</span></code> は2.6.37で追加されましたが、2.6.38になってから機能しました。)</p>
+</section>
+<section id="changing-the-default-idle-delay-time">
+<h2>デフォルトのアイドル遅延時間の変更<a class="headerlink" href="#changing-the-default-idle-delay-time" title="この見出しへのパーマリンク">¶</a></h2>
+<p>デフォルトのオートスリープアイドル時間（秒単位）は、usbcoreモジュールのパラメータで制御されます。usbcoreをロードする際に値を指定できます。たとえば、2秒から5秒に変更するには以下のようにします：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>modprobe usbcore autosuspend=5
+</pre></div>
+</div>
+<p>同様に、/etc/modprobe.dにある設定ファイルに以下のように追加することもできます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>options usbcore autosuspend=5
+</pre></div>
+</div>
+<p>一部のディストリビューションでは、ブートプロセスの初期段階でinitramfsイメージから実行されるスクリプトやプログラムを通じてusbcoreモジュールを非常に早くロードします。パラメータ値を変更するには、そのイメージを再構築する必要があります。</p>
+<p>usbcoreがカーネルに組み込まれている場合（ロード可能なモジュールとしてではなく）、以下のように追加できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>usbcore.autosuspend=5
+</pre></div>
+</div>
+<p>カーネルのブートコマンドラインに</p>
+<p>最後に、システムが起動している間でもパラメータ値を変更できます。以下のように行うと:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo 5 &gt;/sys/module/usbcore/parameters/autosuspend
+</pre></div>
+</div>
+<p>新しいUSBデバイスはすべて、自動スリープのアイドル遅延を5に初期化されます。(既に存在するデバイスのアイドル遅延値は影響を受けません。)</p>
+<p>初期デフォルトのアイドル遅延を-1に設定すると、すべてのUSBデバイスの自動スリープを防ぐことができます。これにより、選択したデバイスに対して自動スリープを有効にすることができます。</p>
+</section>
+<section id="warnings">
+<h2>警告<a class="headerlink" href="#warnings" title="この見出しへのパーマリンク">¶</a></h2>
+<p>USB仕様では、すべてのUSBデバイスが電源管理をサポートしなければならないと規定されています。しかし、残念なことに多くのデバイスがこれに十分対応していないのが現状です。これらを一時的にスリープさせることはできますが、再開しようとするとUSBバスから切断されたり、完全に動作しなくなることがあります。これは特にプリンタやスキャナに見られる傾向ですが、他の種類のデバイスにも同様の問題があります。</p>
+<p>このため、カーネルはデフォルトでは自動スリープを無効にします（
+<code class="docutils literal notranslate"><span class="pre">power/control</span></code> 属性が初期化されます <code class="docutils literal notranslate"><span class="pre">on</span></code>）。ホストは少なくともこの点では比較的適切に動作するようです。</p>
+<p>(2.6.21および2.6.22ではこのようにはなりませんでした。ほぼすべてのUSBデバイスで自動スリープがデフォルトで有効になっていました。その結果、多くの人が問題を経験しました。)</p>
+<p>これは、ホスト以外のデバイスが自動スリープされるのはユーザーまたはプログラムが明示的に有効にした場合に限られます。執筆時点ではこのような動作を行う汎用的なプログラムは存在せず、今後HALなどのデバイスマネージャーがこの責任を引き受けることを期待しています。その間は手動で操作を行うか、udevスクリプトに追加することで対応可能です。アイドル遅延時間も変更可能です。2秒はすべてのデバイスにとって最適な選択ではありません。</p>
+<p>ドライバーがそのデバイスが適切なスリープ/再開サポートを持っていることを知っている場合、自動スリープを自動的に有効にすることができます。たとえば、ノートPCのウェブカメラのビデオドライバーはこれを行うかもしれません（最近のカーネルではそうしています）。これらのデバイスはあまり使用されないため、通常は自動スリープされるべきです。</p>
+<p>場合によっては、デバイスがオートスリープ機能で正常に動作するにもかかわらず、依然として問題が発生することがあります。たとえば、キーボードやマウスを管理するusbhidドライバーはオートスリープをサポートしています。複数のキーボードをテストした結果、スリープ状態のキーボードで入力を行うと、キーボードがリモートウェイクアップを適切に行うものの、頻繁にキーストロークが失われる現象が確認されました。マウスのテストでは、一部のマウスはボタン押下時にリモートウェイクアップリクエストを送るが、動きに対しては送らない場合があり、一部はどちらにも反応しない場合もあります。</p>
+<p>カーネルは、オートスリープをサポートできないデバイスでも有効化を防ぐことはしません。理論上、適切なタイミングでスリープさせることでデバイスを破損させる可能性もあります。(非常にまれですが、あり得ます。) 注意が必要です。</p>
+</section>
+<section id="the-driver-interface-for-power-management">
+<h2>電源管理用ドライバインターフェース<a class="headerlink" href="#the-driver-interface-for-power-management" title="この見出しへのパーマリンク">¶</a></h2>
+<p>USBドライバーが外部電源管理をサポートするための要件は比較的控えめです。ドライバーは以下のメソッドを定義するだけで十分です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>.suspend
+.resume
+.reset_resume
+</pre></div>
+</div>
+<p>構造体の <a class="reference internal" href="usb.html#c.usb_driver" title="usb_driver"><code class="xref c c-type docutils literal notranslate"><span class="pre">usb_driver</span></code></a> メソッド、および <code class="docutils literal notranslate"><span class="pre">reset_resume</span></code> メソッドはオプションです。メソッドの役割は非常に単純です：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>以下の <code class="docutils literal notranslate"><span class="pre">suspend</span></code> メソッドは、ドライバにデバイスがスリープ状態になることを通知するため呼び出されます。ドライバが負のエラーコードを返すと、スリープ処理が中止されます。通常はドライバが0を返すため、その場合、ドライバはすべての未完了のURB（<a class="reference internal" href="usb.html#c.usb_kill_urb" title="usb_kill_urb"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_kill_urb()</span></code></a>）をキャンセルし、これ以上送信しない必要があります。</p></li>
+<li><p>以下の <code class="docutils literal notranslate"><span class="pre">resume</span></code> メソッドは、ドライバにデバイスが再開され、通常の動作に戻ったことを通知するため呼び出されます。これ以降、URBを再び送信できます。</p></li>
+<li><p>以下の <code class="docutils literal notranslate"><span class="pre">reset_resume</span></code> メソッドは、ドライバにデバイスが再開され、リセットされたことを通知するため呼び出されます。ドライバはデバイスが以前のスリープ前の状態をほぼ失っている可能性があるため、必要な初期化を再実行する必要があります（インターフェースは以前と同じaltsettingsを維持している可能性があります）。</p></li>
+</ul>
+</div></blockquote>
+<p>デバイスがスリープ状態のまま切断または電源を切られた場合、 <code class="docutils literal notranslate"><span class="pre">disconnect</span></code> メソッドが呼ばれる代わりに <code class="docutils literal notranslate"><span class="pre">resume</span></code> または
+<code class="docutils literal notranslate"><span class="pre">reset_resume</span></code> メソッドが呼ばれます。これは、ハibernationから目覚める際にも起こりやすいです。多くのシステムでは、ハibernation中にUSBホストコントローラーへのスリープ電流を維持しないからです。(USB Persist機能を使用することで、ハibernationによる強制切断の問題を回避できます。)</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">reset_resume</span></code> メソッドはUSB Persist機能（参照：
+<a class="reference internal" href="persist.html#usb-persist"><span class="std std-ref">システムスリープ時のUSBデバイスの永続性</span></a>）で使用され、また <code class="docutils literal notranslate"><span class="pre">CONFIG_USB_PERSIST</span></code> が有効でない特定の状況でも使用可能です。現在、デバイスが再開中にリセットされ、ドライバが
+<code class="docutils literal notranslate"><span class="pre">reset_resume</span></code> メソッドを持っていない場合、ドライバは再開に関する通知を受けることができません。後続のカーネルではドライバの <code class="docutils literal notranslate"><span class="pre">disconnect</span></code> メソッドを呼び出しますが、2.6.23ではこの処理は行われません。</p>
+<p>USBドライバーはインターフェースにバインドされるため、その <code class="docutils literal notranslate"><span class="pre">suspend</span></code> および <code class="docutils literal notranslate"><span class="pre">resume</span></code>
+インターフェースが一時停止または再開されるときに呼び出されるメソッドです。原則として、デバイスの一部のインターフェースを一時停止する（つまり、そのインターフェースのドライバがすべてのアクティビティを停止させる）一方で他のインターフェースを一時停止しないという状況を望むことはあります。しかし、USBコアはこのような動作を許可していません。デバイス自体が一時停止されるときにすべてのインターフェースが一時停止され、デバイスが再開されるときにすべてのインターフェースが再開されます。デバイスの一部のインターフェースだけを一時停止または再開することはできません。最も近い対応は、インターフェースのドライバをアンバインドするという方法です。</p>
+</section>
+<section id="the-driver-interface-for-autosuspend-and-autoresume">
+<h2>オートスリープとオートリザーブ用ドライバインターフェース<a class="headerlink" href="#the-driver-interface-for-autosuspend-and-autoresume" title="この見出しへのパーマリンク">¶</a></h2>
+<p>オートスリープとオートリザーブをサポートするためには、上記の3つのメソッドすべてを実装する必要があります。さらに、ドライバがオートスリープをサポートしていることを示すために、そのusb_driver構造体に <code class="docutils literal notranslate"><span class="pre">.supports_autosuspend</span></code> フラグを設定します。その後、ドライバは、自身のインターフェースがビジー（忙しい）状態またはアイドル（空闲）状態になったときにUSBコアに通知する責任があります。ドライバは、以下の6つの関数を呼び出すことでこれを実現します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int  usb_autopm_get_interface(struct usb_interface *intf);
+void usb_autopm_put_interface(struct usb_interface *intf);
+int  usb_autopm_get_interface_async(struct usb_interface *intf);
+void usb_autopm_put_interface_async(struct usb_interface *intf);
+void usb_autopm_get_interface_no_resume(struct usb_interface *intf);
+void usb_autopm_put_interface_no_suspend(struct usb_interface *intf);
+</pre></div>
+</div>
+<p>これらの関数は、usb_interfaceの埋め込まれたデバイス構造体に使用カウンタを保持することで動作します。使用カウンタが0より大きい場合、インターフェースはビジー状態とみなされ、カーネルはインターフェースのデバイスを自動的に一時停止しません。使用カウンタが0の場合、インターフェースはアイドル状態とみなされ、カーネルがデバイスを自動的に一時停止できるようになります。</p>
+<p>ドライバは、使用カウンタへの変更を全体的にバランスよく行う必要があります。ドライバがアンバインドされるときに、アンバランスな「get」操作が残ると、インターフェースが再度ドライバにバインドされた場合でもデバイスがランタイムスリープ状態に移行できなくなります。一方で、ドライバは、自身の <code class="docutils literal notranslate"><span class="pre">usb_autopm_*</span></code> ルーチンが戻った後でも、ワークキュー処理など内部で呼び出すことができます。ただし、インターフェースに有効な参照を保持している必要があります（経由して <code class="docutils literal notranslate"><span class="pre">disconnect</span></code> インターフェースへのアクティブな参照を保持しています）。 <code class="docutils literal notranslate"><span class="pre">usb_get_intf</span></code> および
+<code class="docutils literal notranslate"><span class="pre">usb_put_intf</span></code>).</p>
+<p>非同期ルーチンを使用するドライバは、自身で同期と相互排他を管理する責任があります。</p>
+<blockquote>
+<div><p><a class="reference internal" href="usb.html#c.usb_autopm_get_interface" title="usb_autopm_get_interface"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_autopm_get_interface()</span></code></a> 使用カウンタをインクリメントし、デバイスが一時停止されている場合に自動的に再開します。自動再開に失敗した場合は、カウンタを再び減算します。</p>
+<p><a class="reference internal" href="usb.html#c.usb_autopm_put_interface" title="usb_autopm_put_interface"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_autopm_put_interface()</span></code></a> 使用カウンタをデクリメントし、新しい値が0になった場合に自動的に一時停止を試みます。</p>
+<p><a class="reference internal" href="usb.html#c.usb_autopm_get_interface_async" title="usb_autopm_get_interface_async"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_autopm_get_interface_async()</span></code></a> および
+<a class="reference internal" href="usb.html#c.usb_autopm_put_interface_async" title="usb_autopm_put_interface_async"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_autopm_put_interface_async()</span></code></a> 非同期 counterparts とほぼ同じ動作を行います。大きな違いは、再開または一時停止の処理をワークキューを使用して行うことです。その結果、URBの完了ハンドラなどのアトミックコンテキストで呼び出すことができますが、戻るときにはデバイスがまだ望ましい状態にないことが一般的です。</p>
+<p><a class="reference internal" href="usb.html#c.usb_autopm_get_interface_no_resume" title="usb_autopm_get_interface_no_resume"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_autopm_get_interface_no_resume()</span></code></a> および
+<a class="reference internal" href="usb.html#c.usb_autopm_put_interface_no_suspend" title="usb_autopm_put_interface_no_suspend"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_autopm_put_interface_no_suspend()</span></code></a> 使用カウンターを単にインクリメントまたはデクリメントするだけであり、オートリザーブやオートスリープを実行しようとはしません。そのため、アトミックコンテキストで呼び出すことができます。</p>
+</div></blockquote>
+<p>最も簡単な使用パターンは、ドライバーが
+<a class="reference internal" href="usb.html#c.usb_autopm_get_interface" title="usb_autopm_get_interface"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_autopm_get_interface()</span></code></a> オープンルーチンおよび
+<a class="reference internal" href="usb.html#c.usb_autopm_put_interface" title="usb_autopm_put_interface"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_autopm_put_interface()</span></code></a> クローズまたはリリースルーチンで呼び出すことです。ただし、他のパターンも可能です。</p>
+<p>上記のオートスリープ試行は、多くの場合、何かしらの理由で失敗します。たとえば、 <code class="docutils literal notranslate"><span class="pre">power/control</span></code> 属性が <code class="docutils literal notranslate"><span class="pre">on</span></code>に設定されている可能性があります。または、同じデバイス内の他のインターフェースがアイドル状態でない可能性があります。これは完全に正常なことです。失敗の理由がデバイスが十分にアイドル状態でなかった場合、タイマーがオートスリープアイドル遅延が経過したときに自動的に操作を実行します。</p>
+<p>オートリザーブ試行も失敗することがあります。ただし、失敗はデバイスがもう存在しないか、正しく動作していないことを意味します。オートスリープとは異なり、オートリザーブにはアイドル遅延がありません。</p>
+</section>
+<section id="other-parts-of-the-driver-interface">
+<h2>ドライバインターフェースのその他の部分<a class="headerlink" href="#other-parts-of-the-driver-interface" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ドライバーは、デバイスのオートスリープを有効にするために次のルーチンを呼び出します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>usb_enable_autosuspend(struct usb_device *udev);
+</pre></div>
+</div>
+<p>彼らの <code class="xref c c-func docutils literal notranslate"><span class="pre">probe()</span></code> ルーチンを呼び出すことで、ドライバーがデバイスが正しくスリープおよび再開できることがわかっている場合です。これは、デバイスの <code class="docutils literal notranslate"><span class="pre">auto</span></code> 属性に値を書き込むことと完全に同等です。同様に、ドライバーは次のルーチンを呼び出すことでオートスリープを無効にできます： <code class="docutils literal notranslate"><span class="pre">power/control</span></code> これは、属性に値を書き込むことと完全に同等です。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>usb_disable_autosuspend(struct usb_device *udev);
+</pre></div>
+</div>
+<p>これは、属性に値を書き込むことと完全に同等です。 <code class="docutils literal notranslate"><span class="pre">on</span></code> から <code class="docutils literal notranslate"><span class="pre">power/control</span></code> 属性。</p>
+<p>ドライバーは、オートスリープ中にリモートウェイクアップが有効になっていることを確認する必要があります。たとえば、ユーザーがキーボードをタイプすることでリモートウェイクアップを引き起こすことができない場合、オートスリープする意味はありません。ドライバーが
+<code class="docutils literal notranslate"><span class="pre">intf-&gt;needs_remote_wakeup</span></code> に1を設定すると、リモートウェイクアップが利用できない場合、カーネルがデバイスをオートスリープさせません。(ただし、デバイスがすでにオートスリープしている場合、このフラグを設定してもカーネルがオートリザーブを実行するわけではありません。通常、ドライバーはこのフラグを自身の <code class="docutils literal notranslate"><span class="pre">probe</span></code>
+メソッドで設定します。その時点で、デバイスがオートスリープされていないことが保証されます。)</p>
+<p>ドライバーが割込みコンテキストでI/Oを非同期に実行する場合、 <a class="reference internal" href="usb.html#c.usb_autopm_get_interface_async" title="usb_autopm_get_interface_async"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_autopm_get_interface_async()</span></code></a> 出力開始前に呼び出さなければなりません。
+<a class="reference internal" href="usb.html#c.usb_autopm_put_interface_async" title="usb_autopm_put_interface_async"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_autopm_put_interface_async()</span></code></a> 出力キューが空になるときに呼び出さなければなりません。入力イベントを受信した場合、</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>usb_mark_last_busy(struct usb_device *udev);
+</pre></div>
+</div>
+<p>イベントハンドラ内で呼び出さなければなりません。これにより、PMコアにデバイスが先ほどまで忙しかったことを伝え、次のオートスリープアイドル遅延の期限を延期する必要があります。多くのusb_autopm_*ルーチンもこの呼び出しを行いますので、ドライバーは割込み駆動の入力が到達した場合のみ心配する必要があります。</p>
+<p>非同期操作は常に競合条件に巻き込まれます。たとえば、ドライバーが <a class="reference internal" href="usb.html#c.usb_autopm_get_interface_async" title="usb_autopm_get_interface_async"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_autopm_get_interface_async()</span></code></a> ルーチンを呼び出すタイミングが、コアがデバイスが十分にアイドル状態だったと判断したところですが、まだドライバーの <code class="docutils literal notranslate"><span class="pre">suspend</span></code>
+メソッドを呼び出しているところです。 <code class="docutils literal notranslate"><span class="pre">suspend</span></code> メソッドは、I/OリクエストルーチンとURB完了ハンドラとを同期させる責任があり、ドライバがデバイスを使用する必要がある場合、自動スリープを-EBUSYで失敗させるべきです。</p>
+<p>外部スリープ呼び出しは、このように失敗してはならない。自動スリープ呼び出しのみが例外です。ドライバは、メッセージ引数にマクロを適用することで、これらを区別できます。 <code class="xref c c-func docutils literal notranslate"><span class="pre">PMSG_IS_AUTO()</span></code> マクロをメッセージ引数に適用する <code class="docutils literal notranslate"><span class="pre">suspend</span></code>
+メソッドに適用します。これは内部PMイベント（自動スリープ）に対してTrueを、外部PMイベントに対してFalseを返します。</p>
+</section>
+<section id="mutual-exclusion">
+<h2>相互排他<a class="headerlink" href="#mutual-exclusion" title="この見出しへのパーマリンク">¶</a></h2>
+<p>外部イベントの場合、自動スリープまたは自動再開に関係なく、デバイスセマフォ（udev-&gt;dev.sem）が呼び出し時に保持されます。これは外部スリープ/再開イベントが、
+<code class="docutils literal notranslate"><span class="pre">suspend</span></code> または <code class="docutils literal notranslate"><span class="pre">resume</span></code> メソッド呼び出しと排他的であることを意味します。USBコアは、自動スリープ/自動再開イベントにも同様にこのことが保証されています。 <code class="docutils literal notranslate"><span class="pre">probe</span></code>,
+<code class="docutils literal notranslate"><span class="pre">disconnect</span></code>, <code class="docutils literal notranslate"><span class="pre">pre_reset</span></code>, and <code class="docutils literal notranslate"><span class="pre">post_reset</span></code>；USBコアは、自動スリープ/自動再開イベントにも同様にこのことが保証されています。</p>
+<p>ドライバがクリティカルセクション中にすべてのスリープ/再開呼び出しをブロックしたい場合、デバイスをロックし、
+<a class="reference internal" href="usb.html#c.usb_autopm_get_interface" title="usb_autopm_get_interface"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_autopm_get_interface()</span></code></a> を呼び出すのが最善です（クリティカルセクション終了時に逆の操作を行う）。デバイスセマフォを保持することで、すべての外部PM呼び出しをブロックし、 <a class="reference internal" href="usb.html#c.usb_autopm_get_interface" title="usb_autopm_get_interface"><code class="xref c c-func docutils literal notranslate"><span class="pre">usb_autopm_get_interface()</span></code></a> は、すら失敗しても内部PM呼び出しを防ぎます。（演習：なぜ？）</p>
+</section>
+<section id="interaction-between-dynamic-pm-and-system-pm">
+<h2>動的PMとシステムPMの相互作用<a class="headerlink" href="#interaction-between-dynamic-pm-and-system-pm" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ダイナミック電源管理とシステム電源管理は複数の方法で相互作用します。</p>
+<p>まず、システムスリープが発生する際、デバイスがすでに自動スリープしている可能性があります。システムスリープはなるべく透明であるべきですが、システム再開後にデバイスがスリープしたままになるべきです。しかし実際にはこの理論がうまく機能しない場合があります。2.6.37以降、システム再開時にすべてのデバイスを再開し、それ以降はデバイス自身がランタイムスリープを処理するというポリシーが採用されています。</p>
+<p>次に、システムスリープが進行中にダイナミック電源管理イベントが発生する可能性があります。この時間枠は短く、システムスリープは通常数秒程度しかかかりませんが、発生する場合があります。たとえば、スリープ中のデバイスがシステムスリープ中にリモートウェイクアップ信号を送信するかもしれません。リモートウェイクアップが成功すると、システムスリープが中止されます。リモートウェイクアップが失敗した場合でも、デバイスがアクティブなまま残っている可能性があり、システムスリープが完了した直後にシステムが再開されるかもしれません。リモートウェイクアップが失敗して信号が消失する場合もあります。どの結果が発生するかはタイミングやハードウェア、ファームウェアの設計に依存します。</p>
+</section>
+<section id="xhci-hardware-link-pm">
+<h2>xHCIハードウェアリンクPM<a class="headerlink" href="#xhci-hardware-link-pm" title="この見出しへのパーマリンク">¶</a></h2>
+<p>xHCIホストコントローラーは、USB2.0（xHCI 1.0の機能）およびリンクPMをサポートするUSB3.0デバイスにハードウェアリンク電源管理を提供します。ハードウェアLPMを有効にすると、ホストがデバイスを低電力状態（USB2.0デバイスではL1、USB3.0デバイスではU1/U2）に自動的に移行させることができ、この状態ではデバイスが非常に速く再起動できます。</p>
+<p>ハードウェアLPMを制御するユーザーインターフェースは
+<code class="docutils literal notranslate"><span class="pre">power/</span></code> サブディレクトリに位置する。つまり、
+<code class="docutils literal notranslate"><span class="pre">/sys/bus/usb/devices/.../power/</span></code> にあります。ここで「…」はデバイスのIDです。関連する属性ファイルは <code class="docutils literal notranslate"><span class="pre">usb2_hardware_lpm</span></code> および <code class="docutils literal notranslate"><span class="pre">usb3_hardware_lpm</span></code>.</p>
+<blockquote>
+<div><p><code class="docutils literal notranslate"><span class="pre">power/usb2_hardware_lpm</span></code></p>
+<blockquote>
+<div><p>USB2.0デバイスがLPMをサポートしており、xHCIホストルートハブがソフトウェアLPMをサポートしている場合、ホストはそのデバイスに対してソフトウェアLPMテストを実行します。デバイスがL1状態に移行し再起動に成功し、ホストがUSB2.0ハードウェアLPMをサポートしている場合、このファイルが表示され、ドライバーがデバイスにハードウェアLPMを有効にします。このファイルにy/Y/1またはn/N/0を書き込むことで、USB2.0ハードウェアLPMを手動で有効/無効にできます。これは主にテスト目的です。</p>
+</div></blockquote>
+<p><code class="docutils literal notranslate"><span class="pre">power/usb3_hardware_lpm_u1</span></code>
+<code class="docutils literal notranslate"><span class="pre">power/usb3_hardware_lpm_u2</span></code></p>
+<blockquote>
+<div><p>USB3.0 LPMをサポートするデバイスがxHCIホストに接続され、ホストがリンクPMをサポートしている場合、BOSディスクリプターにU1およびU2の待機遅延が設定されているかを確認します。確認が成功し、ホストがUSB3.0ハードウェアLPMをサポートしている場合、USB3.0ハードウェアLPMがデバイスに有効になり、これらのファイルが作成されます。これらのファイルは、USB3.0ハードウェアLPM U1またはU2がデバイスに有効かどうかを示す文字列値（enableまたはdisable）を保持しています。</p>
+</div></blockquote>
+</div></blockquote>
+</section>
+<section id="usb-port-power-control">
+<h2>USBポート電源制御<a class="headerlink" href="#usb-port-power-control" title="この見出しへのパーマリンク">¶</a></h2>
+<p>エンドポイントデバイスのスリープとハードウェア制御されたリンク電源管理の有効化に加え、USBサブシステムは特定の条件下でポートの電源を無効にする機能も持っています。電源制御は <code class="docutils literal notranslate"><span class="pre">Set/ClearPortFeature(PORT_POWER)</span></code> ホストのリクエストを通じてハブに行われます。ルートまたはプラットフォーム内部のハブの場合、ホストコントローラードライバーは <code class="docutils literal notranslate"><span class="pre">PORT_POWER</span></code> リクエストをプラットフォームファームウェア（ACPI）メソッド呼び出しに変換し、ポートの電源状態を設定します。詳細については、Linux Plumbers Conference 2012のスライド <a class="footnote-reference brackets" href="#f1" id="id1">1</a> および動画 <a class="footnote-reference brackets" href="#f2" id="id2">2</a>:</p>
+<p>を参照してください。リクエストを受信した <code class="docutils literal notranslate"><span class="pre">ClearPortFeature(PORT_POWER)</span></code> ポートは論理的にオフになり、ポートのVBUSの実際の喪失を引き起こす可能性があります。 <a class="footnote-reference brackets" href="#f3" id="id3">3</a>VBUSは、ハブが複数のポートを共有電源ウェルにグループ化し、すべてのポートがオフになるまで電源を維持する場合、または充電アプリケーションに設定されたハブポートによって維持される場合があります。いずれにしても、論理的にオフのポートはデバイスとの接続を失い、ホットプラグイベントやリモートウェイクアップイベントに応答しなくなります。</p>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p>ポートをオフにすると、デバイスをホットアドドすることができなくなる可能性があります。詳細については、「ポート電源制御のユーザーインターフェース」を参照してください。</p>
+</div>
+<p>デバイス自体への影響については、システムスリープ中にデバイスが経験するものと同様です。つまり、電源セッションが失われる状態になります。システムスリープ中にUSBデバイスやドライバーが不適切に動作する場合、ポート電源サイクルイベントによって同様に影響を受けることになります。このため、実装はハブのシステム再開処理と同様のデバイス回復処理（および同じクイック）を実行します。</p>
+<dl class="footnote brackets">
+<dt class="label" id="f1"><span class="brackets"><a class="fn-backref" href="#id1">1</a></span></dt>
+<dd><p><a class="reference external" href="http://dl.dropbox.com/u/96820575/sarah-sharp-lpt-port-power-off2-mini.pdf">http://dl.dropbox.com/u/96820575/sarah-sharp-lpt-port-power-off2-mini.pdf</a></p>
+</dd>
+<dt class="label" id="f2"><span class="brackets"><a class="fn-backref" href="#id2">2</a></span></dt>
+<dd><p><a class="reference external" href="http://linuxplumbers.ubicast.tv/videos/usb-port-power-off-kerneluserspace-api/">http://linuxplumbers.ubicast.tv/videos/usb-port-power-off-kerneluserspace-api/</a></p>
+</dd>
+<dt class="label" id="f3"><span class="brackets"><a class="fn-backref" href="#id3">3</a></span></dt>
+<dd><p>USB 3.1 第10.12節</p>
+<p>ウェイクアップに関する注意: デバイスがウェイクアップイベントを送信するように設定されている場合、ポート電源制御の実装はそのポートでの電源オフ試行をブロックします。</p>
+</dd>
+</dl>
+</section>
+<section id="user-interface-for-port-power-control">
+<h2>ポート電源制御用ユーザーインターフェース<a class="headerlink" href="#user-interface-for-port-power-control" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ポート電源制御メカニズムはPMランタイムシステムを使用します。電源を切る要求はポートデバイスの <code class="docutils literal notranslate"><span class="pre">power/pm_qos_no_power_off</span></code> フラグをクリアすることで行われます（デフォルトでは1）。ポートが切断されている場合、すぐに
+<code class="docutils literal notranslate"><span class="pre">ClearPortFeature(PORT_POWER)</span></code> リクエストが届きます。それ以外の場合は、PMランタイムルールに従い、接続されている子デバイスおよびそのすべての子孫をスリープ状態にします。このメカニズムは、ハブ記述子でポート電源スイッチングをアドバタイズしている（wHubCharacteristics論理電源スイッチングモードフィールド）ハブに依存します。</p>
+<p>注意: 一部のインターフェースデバイス/ドライバーはオートスリープをサポートしていません。ユーザー空間では、 <a class="reference internal" href="usb.html#c.usb_device" title="usb_device"><code class="xref c c-type docutils literal notranslate"><span class="pre">usb_device</span></code></a> スリープする前にインターフェースドライバーをアンバインドする必要があります。アンバインドされたインターフェースデバイスはデフォルトでスリープ状態になります。アンバインドする際は、親USBデバイスのドライバーではなく、インターフェースドライバーをアンバインドするように注意してください。また、ハブインターフェースドライバーはアンバインドしないでください。USBデバイス（インターフェースではない）のドライバーをアンバインドすると、カーネルがデバイスを再開できなくなります。ハブインターフェースドライバーをアンバインドすると、その子ポートの制御が失われ、すべての接続された子デバイスが切断します。良いルールとして、デバイスの「ドライバ/モジュールリンク」が
+<code class="docutils literal notranslate"><span class="pre">/sys/module/usbcore</span></code> を指している場合、そのデバイスをアンバインドするとポート電源制御に干渉します。</p>
+<p>ポート電源制御に関連するファイルの例。注意: この例では、これらのファイルはUSBハブデバイス（プレフィックス）に対して相対的に示しています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>prefix=/sys/devices/pci0000:00/0000:00:14.0/usb3/3-1
+
+                 attached child device +
+             hub port device +         |
+hub interface device +       |         |
+                     v       v         v
+             $prefix/3-1:1.0/3-1-port1/device
+
+$prefix/3-1:1.0/3-1-port1/power/pm_qos_no_power_off
+$prefix/3-1:1.0/3-1-port1/device/power/control
+$prefix/3-1:1.0/3-1-port1/device/3-1.1:&lt;intf0&gt;/driver/unbind
+$prefix/3-1:1.0/3-1-port1/device/3-1.1:&lt;intf1&gt;/driver/unbind
+...
+$prefix/3-1:1.0/3-1-port1/device/3-1.1:&lt;intfN&gt;/driver/unbind
+</pre></div>
+</div>
+<p>これらのファイルに加えて、一部のポートは別のハブのポートに接続する「ペアリンク」を持つ場合があります。期待されるのは、すべてのスーパースピードポートがハイスピードペアを持つことです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$prefix/3-1:1.0/3-1-port1/peer -&gt; ../../../../usb2/2-1/2-1:1.0/2-1-port1
+../../../../usb2/2-1/2-1:1.0/2-1-port1/peer -&gt; ../../../../usb3/3-1/3-1:1.0/3-1-port1
+</pre></div>
+</div>
+<p>「コンパニオンポート」や「EHC/XHCI共有スイッチオーバーポート」とは異なり、ペアポートは単一のUSB3コネクタに組み合わされたハイスピードおよびスーパースピードインターフェースピンです。ペアポートは同じ祖先XHCIデバイスを共有します。</p>
+<p>スーパースピードポートが電源を切られている間、デバイスが接続を下位互換性に変更し、ハイスピードピンに接続しようとする場合があります。この実装では、このような接続を防ぐための対策が講じられています:</p>
+<ol class="arabic simple">
+<li><p>ポートのスリープは順序を保って行われ、高速ポートがスーパースピードのペアが電源を切る許可を受ける前に電源を切ることを保証します。これは、スーパースピードポートの設定をゼロにしても、高速ポートのペアがランタイムスリープ状態になるまでポートが電源を切らない可能性があることを意味します。 <code class="docutils literal notranslate"><span class="pre">pm_qos_no_power_off</span></code> ユーザー空間がスーパースピードポートが電源を切るのを確実にするためには、スリープの順序を正しく管理する必要があります。</p></li>
+<li><p>ポートのリザーブは、スーパースピードポートが高速ポートよりも先に電源をオンにするように強制されます。</p></li>
+<li><p>ポートのリザーブは、接続された子デバイスをリザーブします。電源セッションが失われた後、デバイスが削除されているか、リセットが必要な場合があります。親ポートが電源を取り戻すときに子デバイスをリザーブすることで、これらの状態を解決し、子デバイスがスリープ（autosuspend-delay）およびリザーブ（reset-resume latency）できる速度で最大ポート電源サイクル周波数を制限します。</p></li>
+</ol>
+<p>ポート電源制御に関連するsysfsファイル:</p>
+<blockquote>
+<div><dl>
+<dt><code class="docutils literal notranslate"><span class="pre">&lt;hubdev-portX&gt;/power/pm_qos_no_power_off</span></code>:</dt><dd><p>この書き込みフラグは、アイドルポートの状態を制御します。すべての子孫デバイスがスリープした後、pm_qos_no_power_offが「0」の場合に限りポートがスリープ/電源を切ることができます。pm_qos_no_power_offが「1」の場合、ポートは子孫デバイスの状態に関係なくアクティブ/電源が入ったままです。デフォルトは1です。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">&lt;hubdev-portX&gt;/power/runtime_status</span></code>:</dt><dd><p>このファイルは、ポートが「アクティブ」（電源が入っている）か「スリープ」（論理的にオフ）かを反映します。VBUSがまだ供給されているかどうかについてはユーザー空間に情報がありません。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">&lt;hubdev-portX&gt;/connect_type</span></code>:</dt><dd><p>ユーザー空間にポートの場所と接続タイプを示すアドバイザリーリードオンリーフラグです。このフラグは「hotplug」、「hardwired」、「not used」、「unknown」の4つの値のいずれかを返します。すべての値（unknownを除く）はプラットフォームファームウェアによって設定されます。</p>
+<p><code class="docutils literal notranslate"><span class="pre">hotplug</span></code> プラットフォーム上に外部から接続可能/表示されるポートを示します。通常、ユーザー空間はこのようなポートを電源を維持して新しいデバイス接続イベントを処理するために選ぶでしょう。</p>
+<p><code class="docutils literal notranslate"><span class="pre">hardwired</span></code> 表示されないが接続可能なポートを指します。例はUSBブルートゥースの内部ポートで、外部スイッチやハードワイヤードUSBカメラを介して切断可能なポートです。pm_qos_no_power_offがスイッチで接続を制御するものと調整されている限り、これらのポートをスリープさせるのは安全です。ユーザー空間はポートが電源を切る前にデバイスが接続されているように、またはスイッチで接続を有効にする前にポートをオンにする必要があります。</p>
+<p><code class="docutils literal notranslate"><span class="pre">not</span> <span class="pre">used</span></code> 常にデバイスが接続されない内部ポートを指します。これらは空の内部ポートか、プラットフォーム上に物理的に露出していないポートかもしれません。常に電源を切っても安全とされています。</p>
+<p><code class="docutils literal notranslate"><span class="pre">unknown</span></code> このポートに関する情報がプラットフォームファームウェアで提供されていないことを意味します。これは、ポリシー決定において「ホットプラグ」として扱われるべき外部ハブポートを最もよく指します。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<ul class="simple">
+<li><p>BIOSにACPI情報の正確性を依存しているため、USBポートの説明が不足しているか誤っている可能性があります。</p></li>
+<li><p>クリアする際には注意が必要です <code class="docutils literal notranslate"><span class="pre">pm_qos_no_power_off</span></code>。電源がオフになると、このポートは新しい接続イベントに反応しなくなります。</p></li>
+</ul>
+</div>
+</dd>
+</dl>
+<p>子デバイスが接続された後、ポートを電源オフに許可する前に追加の制約が適用されます。</p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">&lt;child&gt;/power/control</span></code>:</dt><dd><p>必須です <code class="docutils literal notranslate"><span class="pre">auto</span></code>、そしてポートは <code class="docutils literal notranslate"><span class="pre">&lt;child&gt;/power/runtime_status</span></code>
+が「スリープ」状態を反映しています。デフォルト値は子デバイスドライバによって制御されます。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">&lt;child&gt;/power/persist</span></code>:</dt><dd><p>これはほとんどのデバイスでデフォルトで <code class="docutils literal notranslate"><span class="pre">1</span></code> であり、カーネルが電源セッションの喪失（スリープ／ポート電源イベント）時にデバイスの設定を維持できるかを示します。この値が <code class="docutils literal notranslate"><span class="pre">0</span></code> (特殊なデバイス)の場合、ポート電源オフが無効になります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">&lt;child&gt;/driver/unbind</span></code>:</dt><dd><p>ウェイクアップ可能なデバイスはポート電源オフをブロックします。この時点では、インターフェースデバイスのusb-internalウェイクアップ能力をクリアする唯一のメカニズムはドライバをアンバインドすることです。</p>
+</dd>
+</dl>
+</div></blockquote>
+<p>ポートデバイスに関する電源オフ前の必須設定のサマリー:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo 0 &gt; power/pm_qos_no_power_off
+echo 0 &gt; peer/power/pm_qos_no_power_off # if it exists
+echo auto &gt; power/control # this is the default value
+echo auto &gt; &lt;child&gt;/power/control
+echo 1 &gt; &lt;child&gt;/power/persist # this is the default value
+</pre></div>
+</div>
+</section>
+<section id="suggested-userspace-port-power-policy">
+<h2>推奨されるユーザー空間ポート電源ポリシー<a class="headerlink" href="#suggested-userspace-port-power-policy" title="この見出しへのパーマリンク">¶</a></h2>
+<p>上記のように、ユーザー空間は電源オフを許可するポートについて慎重かつ意図的に選択する必要があります。</p>
+<p>デフォルトの設定では、すべてのポートが
+<code class="docutils literal notranslate"><span class="pre">power/pm_qos_no_power_off</span></code> 設定に設定する <code class="docutils literal notranslate"><span class="pre">1</span></code> で初期化され、ポートが常にアクティブな状態を維持します。</p>
+<p>プラットフォームファームウェアがポートの説明（ポートのACPI _PLDレコードが「connect_type」を設定）を信頼できるとみなす場合、ユーザー空間はすべての「未使用」ポートに対してpm_qos_no_power_offをクリアできます。また、「ハードワイヤード」ポートについても、ポートの接続スイッチと電源オフを調整した上で同様の操作が可能です。</p>
+<p>より積極的なユーザー空間ポリシーは、ユーザーがシステムと対話を停止したことを外部要因が示すときにすべてのポートでUSBポート電源オフを有効にします（ <code class="docutils literal notranslate"><span class="pre">&lt;hubdev-portX&gt;/power/pm_qos_no_power_off</span></code> に（木の下から葉に向かって） <code class="docutils literal notranslate"><span class="pre">0</span></code>を設定）。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../driver-model/index.html">ドライバモデル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../basics.html">ドライバの基礎</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infrastructure.html">デバイスドライバのインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ioctl.html">ioctlベースのインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../early-userspace/index.html">初期ユーザースペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pm/index.html">CPUおよびデバイスの電源管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../clk.html">共通のCLKフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device-io.html">バスを問わないデバイスアクセス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dma-buf.html">バッファ共有と同期</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device_link.html">デバイスリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../component.html">複合ドライバ用コンポーネントヘルパ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../message-based.html">メッセージベースのデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../infiniband.html">InfiniBandおよびリモートDMA（RDMA）インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../frame-buffer.html">フレームバッファライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../regulator.html">電圧および電流レギュレータAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../input.html">入力サブシステム</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">Linux USB API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firewire.html">Firewire（IEEE 1394）ドライバインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pci/index.html">Linux PCIドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../spi.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i2c.html">I<sup>2</sup>CおよびSMBusサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmb.html">衛星MC用IPMBドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipmi.html">Linux IPMIドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../i3c/index.html">I3Cサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../interconnect.html">汎用システムインターコネクトサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../devfreq.html">デバイス周波数スケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hsi.html">高速同期シリアルインターフェース (HSI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../edac.html">エラー検出と訂正 (EDAC) デバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../scsi.html">SCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../libata.html">libATA開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../target.html">ターゲットおよびiSCSIインターフェースガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mailbox.html">共通メールボックスフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mtdnand.html">MTD NANDドライバプログラミングインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html">パラレルポートデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#x50-uart-driver">16x50 UARTドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../miscellaneous.html#pulse-width-modulation-pwm">パルス幅変調 (PWM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mei/index.html">インテル(R) マネジメントエンジニアリングインターフェース (インテル(R) MEI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mtd/index.html">メモリ技術デバイス (MTD)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mmc/index.html">MMC/SD/SDIOカードサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nvdimm/index.html">非揮発性メモリデバイス (NVDIMM)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../w1.html">W1: ダラスの1ワイヤーバス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rapidio/index.html">Linux RapidIO サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../s390-drivers.html">s390チャネルデバイスドライバの作成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vme.html">VMEデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../80211/index.html">Linux 802.11ドライバ開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../uio-howto.html">ユーザースペースI/O HOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../firmware/index.html">LinuxファームウェアAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pinctl.html">PINCTRL (PIN CONTROL)サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../gpio/index.html">汎用入出力 (GPIO)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../md/index.html">RAID</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../media/index.html">メディアサブシステム カーネル内部API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../misc_devices.html">その他のデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nfc/index.html">近距離通信 (NFC)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dmaengine/index.html">DMAエンジンドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../slimbus.html">LinuxカーネルSLIMbusサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../soundwire/index.html">SoundWireドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../thermal/index.html">熱管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../fpga/index.html">FPGAサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../acpi/index.html">ACPI サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../backlight/lp855x-driver.html">カーネルドライバlp855x</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../connector.html">カーネルコンネクタ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../console.html">コンソールドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dcdbas.html">Dellシステム管理ベースドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../eisa.html">EISAバスサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isa.html">ISAドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../isapnp.html">ISA Plug &amp; Playサポート (Jaroslav Kysela &lt;perex@suse.cz&gt;)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io-mapping.html">io_mapping関数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../io_ordering.html">メモリマップアドレスへのI/O書き込みの順序付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../generic-counter.html">汎用カウンタインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lightnvm-pblk.html">pblk: 物理ブロックデバイスターゲット</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../memory-devices/index.html">メモリコントローラー ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../men-chameleon-bus.html">MEN Chameleon Bus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ntb.html">NTB ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nvmem.html">NVMEM サブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../parport-lowlevel.html">PARPORT インターフェース ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pps.html">PPS - パルス毎秒 (Pulse Per Second)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ptp.html">Linux用PTP ハードウェアクロック インフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../phy/index.html">ジェネリック PHY フレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pti_intel_mid.html">インテル MID PTI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pwm.html">パルス幅変調 (PWM) インターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html">PLDM ファームウェア フラッシュアップデート ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pldmfw/index.html#overview-of-the-pldmfw-library">概要: <code class="docutils literal notranslate"><span class="pre">pldmfw</span></code> ライブラリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rfkill.html">rfkill - RFキルスイッチサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../serial/index.html">シリアルデバイスのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sm501.html">SM501 ドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../switchtec.html">Linux Switchtec サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sync_file.html">シンクファイル API ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio-mediated-device.html">VFIO メディエイテッドデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfio.html">VFIO - 「仮想ファンクション I/O」 </a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xilinx/index.html">Xilinx FPGA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xillybus.html">ジェネリックFPGAインターフェース用Xillybusドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../zorro.html">Zorroデバイス用のデバイスドライバの作成</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxドライバ実装者向けAPIガイド</a><ul>
+<li><a href="index.html">Linux USB API</a><ul>
+<li>前へ: <a href="URB.html" title="前章">USBリクエストブロック (URB)</a></li>
+<li>次へ: <a href="hotplug.html" title="次章">USBホットプラグ</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/driver-api/usb/power-management.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>
