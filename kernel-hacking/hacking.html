@@ -1,0 +1,616 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Linux Kernelのハッキングに関する不確実なガイド — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="locking.html" rel="next" title="Unreliable Guide To Locking"/>
+<link href="index.html" rel="prev" title="カーネルハッキングガイド"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="unreliable-guide-to-hacking-the-linux-kernel">
+<span id="kernel-hacking-hack"></span><h1>信頼性のないLinuxカーネルハッキングガイド<a class="headerlink" href="#unreliable-guide-to-hacking-the-linux-kernel" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Rusty Russell</p>
+</dd>
+</dl>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>読者諸君、ようこそRustyの remarkably 不確実なLinux Kernelハッキングガイドへ。このドキュメントでは、カーネルコードの一般的なルーチンと全体的な要件について説明しており、経験豊富なCプログラマ向けのLinuxカーネル開発の入門書としての目的を持っています。私は実装の詳細は避け、コードそのもので説明すべきものです。また、有用なルーチンの一部を無視しています。</p>
+<p>このドキュメントを読む前に、私はこのドキュメントを書きたくなかったことを理解してください。私は極めて資格が不足しているからです。しかし、常に読みたいと思っていたので、これが唯一の方法でした。このガイドがベストプラクティスのコンパニオン、一般的な出発点、ランダムな情報の集大成になることを願っています。</p>
+</section>
+<section id="the-players">
+<h2>参加者<a class="headerlink" href="#the-players" title="この見出しへのパーマリンク">¶</a></h2>
+<p>システム内のCPUはいつでも以下の状態のいずれかです:</p>
+<ul class="simple">
+<li><p>プロセスと関連付けられず、ハードウェア割込みを処理中;</p></li>
+<li><p>プロセスと関連付けられず、ソフトIRQまたはタスクレットを処理中;</p></li>
+<li><p>プロセス（ユーザーコンテキスト）と関連付けられ、カーネル空間で実行中;</p></li>
+<li><p>ユーザー空間でプロセスを実行中。</p></li>
+</ul>
+<p>これらには順序があります。下位の2つの状態はお互いにプリエンプション可能ですが、それ以上では厳格な階層構造があり、それぞれの状態は上位の状態のみによってプリエンプションされます。例えば、CPU上でソフトIRQが実行中であるとき、他のソフトIRQはその実行を中断できませんが、ハードウェア割込みは可能です。ただし、システム内の他のCPUは独立して実行されます。</p>
+<p>ユーザーコンテキストでは、割込みをブロックする方法がいくつかあり、本当に非プリエンプションになることが確認されます。</p>
+<section id="user-context">
+<h3>ユーザーコンテキスト<a class="headerlink" href="#user-context" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ユーザーコンテキストはシステムコールやその他のトラップから入る状態です。ユーザー空間と同様に、より重要なタスクや割込みによってプリエンプションされる可能性があります。sleep状態になるには、 <code class="xref c c-func docutils literal notranslate"><span class="pre">schedule()</span></code>.</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>を呼び出す必要があります。</p>
+</div>
+<p>モジュールのロード・アンロードやブロックデバイスレイヤーの操作中は常にユーザーコンテキストです。 <code class="docutils literal notranslate"><span class="pre">current</span></code> ポインタ（現在実行中のタスクを指すポインタ）は有効で、 <code class="xref c c-func docutils literal notranslate"><span class="pre">in_interrupt()</span></code>
+(<code class="docutils literal notranslate"><span class="pre">include/linux/preempt.h</span></code>)は偽です。</p>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p>プリエンプションまたはソフトIRQが無効になっている場合（以下参照）
+<code class="xref c c-func docutils literal notranslate"><span class="pre">in_interrupt()</span></code> は偽陽性を返します。</p>
+</div>
+</section>
+<section id="hardware-interrupts-hard-irqs">
+<h3>ハードウェア割込み（Hard IRQs）<a class="headerlink" href="#hardware-interrupts-hard-irqs" title="この見出しへのパーマリンク">¶</a></h3>
+<p>タイマータイク、ネットワークカード、キーボードはいつでも割込みを発生させる実際のハードウェアの例です。カーネルは割込みハンドラを実行し、ハードウェアを処理します。カーネルはこのハンドラが再入されないことを保証しており、同じ割込みが到来した場合、キューイング（または破棄）されます。このハンドラは割込みを無効化しているため、高速でなければなりません。頻繁に、このハンドラは割込みを確認し、ソフトウェア割込みの実行を示すフラグを設定して終了します。</p>
+<p>ハードウェア割込み中であることを知るには、
+<code class="xref c c-func docutils literal notranslate"><span class="pre">in_irq()</span></code> が真を返します。</p>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p>割り込みが無効になっている場合（以下参照）では偽陽性を返す可能性があるため注意してください。</p>
+</div>
+</section>
+<section id="software-interrupt-context-softirqs-and-tasklets">
+<h3>ソフトウェア割り込みコンテキスト: Softirqとタスクレット<a class="headerlink" href="#software-interrupt-context-softirqs-and-tasklets" title="この見出しへのパーマリンク">¶</a></h3>
+<p>システムコールがユーザー空間に戻る直前、またはハードウェア割り込みハンドラが終了するとき、待機中の「ソフトウェア割り込み」（通常はハードウェア割り込みによってマークされる）が実行されます（<code class="docutils literal notranslate"><span class="pre">kernel/softirq.c</span></code>).</p>
+<p>実際の割り込み処理の多くはここです。SMPへの移行初期には「ボトムハーフ」（BH）のみがあり、マルチCPUを活用していませんでした。風車式コンピュータ（マッチ棒と鼻水で作られた）から切り替えた直後に、この制限を廃止し「Softirq」に移行しました。</p>
+<p><code class="docutils literal notranslate"><span class="pre">include/linux/interrupt.h</span></code> ソフトウェア割り込みの種類をリストアップしています。非常に重要なソフトウェア割り込みはタイマーソフトウェア割り込み（<code class="docutils literal notranslate"><span class="pre">include/linux/timer.h</span></code>）です：指定された時間間隔で関数を呼び出すように登録できます。</p>
+<p>ソフトウェア割り込みは複数のCPUで同時に実行されるため扱いにくいです。そのためタスクレット（<code class="docutils literal notranslate"><span class="pre">include/linux/interrupt.h</span></code>）がより多く使われます：動的に登録可能（任意の数を登録できます）であり、タスクレットは常に1つのCPUのみで実行されるように保証されていますが、異なるタスクレットは同時に実行可能です。</p>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p>タスクレットという名前は誤解を招くかもしれません：タスクとは関係なく、当時アレクセイ・クズネツォフが飲んだ悪いボドカと関係があるのかもしれません。</p>
+</div>
+<p>ソフトウェア割り込み（またはタスクレット）内であることを確認するには、
+<code class="xref c c-func docutils literal notranslate"><span class="pre">in_softirq()</span></code> マクロ（<code class="docutils literal notranslate"><span class="pre">include/linux/preempt.h</span></code>).</p>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p>割り込みが無効になっている場合（以下参照）では偽陽性を返す可能性があるため注意してください。
+<a class="reference internal" href="#local-bh-disable"><span class="std std-ref">ボトムハーフロック</span></a> が保持されている場合。</p>
+</div>
+</section>
+</section>
+<section id="some-basic-rules">
+<h2>基本的なルール<a class="headerlink" href="#some-basic-rules" title="この見出しへのパーマリンク">¶</a></h2>
+<dl class="simple">
+<dt>メモリ保護はありません</dt><dd><p>メモリを破壊すると、ユーザー空間でも割り込み空間でも、全体がクラッシュします。ユーザー空間でやりたいことが出来ないことを確認していますか？</p>
+</dd>
+<dt>浮動小数点やMMXは使用できません</dt><dd><p>FPUコンテキストは保存されません。ユーザー空間でもFPU状態は現在のプロセスと一致しない可能性があります：ユーザープロセスのFPU状態を操作してしまいます。本当にこれを行いたい場合は、FPU状態を明示的に保存/復元する必要があります（コンテキストスイッチを避けることも）。これは一般的に悪いアイデアです；まず固定小数点算術を使用してください。</p>
+</dd>
+<dt>厳格なスタック制限</dt><dd><p>コンフィギュレーションオプションに応じて、32ビットアーキテクチャでは3Kから6K、64ビットアーキテクチャでは14K程度のサイズです。割り込みと共有されるため、すべての領域を確保できません。スタック上の深すぎる再帰や大きなローカル配列は避けてください（動的に割り当ててください）。</p>
+</dd>
+<dt>Linuxカーネルは移植性があります</dt><dd><p>このように維持してください。コードは64ビット対応で、エンドイアンの依存性を持たない必要があります。CPU固有の処理を最小限に抑え、インラインアセンブリはきれいにカプセル化し、移植性を高めるように簡潔に実装してください。基本的にアーキテクチャに依存するカーネルツリーの部分に限定してください。</p>
+</dd>
+</dl>
+</section>
+<section id="ioctls-not-writing-a-new-system-call">
+<h2>ioctls: 新しいシステムコールの作成は避ける<a class="headerlink" href="#ioctls-not-writing-a-new-system-call" title="この見出しへのパーマリンク">¶</a></h2>
+<p>システムコールは一般的に以下のように見えます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>asmlinkage long sys_mycall(int arg)
+{
+        return 0;
+}
+</pre></div>
+</div>
+<p>まず、ほとんどの場合、新しいシステムコールを作成する必要はありません。キャラクタデバイスを作成し、それに適切なioctlを実装してください。これはシステムコールよりも柔軟で、各アーキテクチャのファイルに記述する必要はなく、Linusに受け入れられやすいです。 <code class="docutils literal notranslate"><span class="pre">include/asm/unistd.h</span></code> および
+<code class="docutils literal notranslate"><span class="pre">arch/kernel/entry.S</span></code> ファイルに記述する必要はなく、Linus に受け入れられやすいです。</p>
+<p>すべての処理がパラメータの読み書きだけであれば、インターフェースの実装を検討してください。 <code class="xref c c-func docutils literal notranslate"><span class="pre">sysfs()</span></code> ioctl 内ではユーザー コンテキストでプロセスを処理します。エラーが発生した場合は、否定された errno を返します（参照</p>
+<p>)
+<code class="docutils literal notranslate"><span class="pre">include/uapi/asm-generic/errno-base.h</span></code>,
+<code class="docutils literal notranslate"><span class="pre">include/uapi/asm-generic/errno.h</span></code> および <code class="docutils literal notranslate"><span class="pre">include/linux/errno.h</span></code>エラーが発生しなければ 0 を返します。</p>
+<p>sleep した後は、シグナルが発生していないか確認する必要があります。Unix/Linux では、シグナルを処理するため、システムコールを一時的に終了してエラーを返します。
+<code class="docutils literal notranslate"><span class="pre">-ERESTARTSYS</span></code> システムコールのエントリーコードがユーザー コンテキストに戻り、シグナルハンドラを処理した後、システムコールが再開されます（ユーザーが無効にしなければ）。そのため、データ構造を操作している途中などで再開を処理する準備が必要です。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>if (signal_pending(current))
+        return -ERESTARTSYS;
+</pre></div>
+</div>
+<p>長い計算を行う場合は、まずユーザー スペースを考慮してください。カーネルで実行する場合は、CPU を放棄する必要があるか定期的に確認してください（CPU ごとに協調的なマルチタスクが存在するため）。
+<strong>本当に</strong> Idiom:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>cond_resched(); /* Will sleep */
+</pre></div>
+</div>
+<p>インターフェース設計に関する簡単な注意点: UNIX システムコールのモットーは「メカニズムを提供し、ポリシーは提供しない」です。</p>
+</section>
+<section id="recipes-for-deadlock">
+<h2>デッドロックの回避方法<a class="headerlink" href="#recipes-for-deadlock" title="この見出しへのパーマリンク">¶</a></h2>
+<p>睡眠を伴うルーチンを呼び出すことはできません（ただし、以下の条件を満たす場合を除く）:</p>
+<ul class="simple">
+<li><p>ユーザー コンテキストです。</p></li>
+<li><p>スピンロックを所有していません。</p></li>
+<li><p>割り込みが有効になっています（実際には、Andi Kleen がスケジューリングコードが自動的に有効にすると言っていますが、おそらくそれは望んでいないことでしょう）。</p></li>
+</ul>
+<p>一部の関数は暗黙的に睡眠を伴う可能性があります。一般的な例はユーザー スペースアクセス関数（*_user）とメモリ割当関数（on なし）です。 <code class="docutils literal notranslate"><span class="pre">GFP_ATOMIC</span></code>.</p>
+<p>常にカーネルをコンパイルしてください <code class="docutils literal notranslate"><span class="pre">CONFIG_DEBUG_ATOMIC_SLEEP</span></code> on でコンパイルし、これらのルールを破ると警告します。破った場合、 <strong>します</strong> ルールを破ると、最終的にマシンが停止します。</p>
+<p>本当に。</p>
+</section>
+<section id="common-routines">
+<h2>一般的なルーチン<a class="headerlink" href="#common-routines" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="printk">
+<h3><a class="reference internal" href="../core-api/printk-basics.html#c.printk" title="printk"><code class="xref c c-func docutils literal notranslate"><span class="pre">printk()</span></code></a><a class="headerlink" href="#printk" title="この見出しへのパーマリンク">¶</a></h3>
+<p>定義は <code class="docutils literal notranslate"><span class="pre">include/linux/printk.h</span></code></p>
+<p><a class="reference internal" href="../core-api/printk-basics.html#c.printk" title="printk"><code class="xref c c-func docutils literal notranslate"><span class="pre">printk()</span></code></a> コンソール、dmesg、syslog デーモンにカーネルのメッセージを転送します。デバッグやエラー報告に有用で、割込みコンテキストでも使用可能です。ただし注意が必要です：コンソールに printk メッセージが大量に表示されるとマシンは使用不能になります。ANSI C の printf とほぼ互換性のあるフォーマット文字列を使用し、C の文字列連結によって最初の「優先度」引数を提供します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>printk(KERN_INFO "i = %u\n", i);
+</pre></div>
+</div>
+<p>参照 <code class="docutils literal notranslate"><span class="pre">include/linux/kern_levels.h</span></code>; 他の <code class="docutils literal notranslate"><span class="pre">KERN_</span></code> 値も同様に扱われ、syslog によってレベルとして解釈されます。特殊なケースとして、IP アドレスを出力する場合は以下の形式を使用します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>__be32 ipaddress;
+printk(KERN_INFO "my ip: %pI4\n", &amp;ipaddress);
+</pre></div>
+</div>
+<p><a class="reference internal" href="../core-api/printk-basics.html#c.printk" title="printk"><code class="xref c c-func docutils literal notranslate"><span class="pre">printk()</span></code></a> 内部では 1KB のバッファを使用し、オーバーフローは捕捉しません。十分なサイズであることを確認してください。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>ユーザーのプログラムで printf を打つ代わりに printk を打つようになるとき、あなたは本物のカーネルハッカーです :)</p>
+</div>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>別の補足：元の Unix Version 6 のソースコードには printf 関数の上にコメントがあり、「Printf はチャットには使わない」とありました。そのアドバイスに従うべきです。</p>
+</div>
+</section>
+<section id="copy-to-user-copy-from-user-get-user-put-user">
+<h3><code class="xref c c-func docutils literal notranslate"><span class="pre">copy_to_user()</span></code> / <code class="xref c c-func docutils literal notranslate"><span class="pre">copy_from_user()</span></code> / <a class="reference internal" href="../core-api/mm-api.html#c.get_user" title="get_user"><code class="xref c c-func docutils literal notranslate"><span class="pre">get_user()</span></code></a> / <a class="reference internal" href="../core-api/mm-api.html#c.put_user" title="put_user"><code class="xref c c-func docutils literal notranslate"><span class="pre">put_user()</span></code></a><a class="headerlink" href="#copy-to-user-copy-from-user-get-user-put-user" title="この見出しへのパーマリンク">¶</a></h3>
+<p>定義は <code class="docutils literal notranslate"><span class="pre">include/linux/uaccess.h</span></code> / <code class="docutils literal notranslate"><span class="pre">asm/uaccess.h</span></code></p>
+<p><strong>[SLEEPS]</strong></p>
+<p><a class="reference internal" href="../core-api/mm-api.html#c.put_user" title="put_user"><code class="xref c c-func docutils literal notranslate"><span class="pre">put_user()</span></code></a> および <a class="reference internal" href="../core-api/mm-api.html#c.get_user" title="get_user"><code class="xref c c-func docutils literal notranslate"><span class="pre">get_user()</span></code></a> ユーザー空間と単一の値（int、char、long など）を取得・設定するために使用されます。ユーザー空間へのポインタは単純にデリファレンスすべきではありません：データはこれらのルーチンを使用してコピーする必要があります。どちらも <code class="docutils literal notranslate"><span class="pre">-EFAULT</span></code> を返します。</p>
+<p><code class="xref c c-func docutils literal notranslate"><span class="pre">copy_to_user()</span></code> および <code class="xref c c-func docutils literal notranslate"><span class="pre">copy_from_user()</span></code> はより一般的で、ユーザー空間と任意の量のデータをコピーします。</p>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p>ACPIテーブル内のオブジェクトとは異なり、 <a class="reference internal" href="../core-api/mm-api.html#c.put_user" title="put_user"><code class="xref c c-func docutils literal notranslate"><span class="pre">put_user()</span></code></a> および <a class="reference internal" href="../core-api/mm-api.html#c.get_user" title="get_user"><code class="xref c c-func docutils literal notranslate"><span class="pre">get_user()</span></code></a>、未コピーのデータ量を返します（つまり 0 でも成功を意味します）。</p>
+</div>
+<p>[この馬鹿げたインターフェースは私をイライラさせます。毎年のように炎上します。–RR.]</p>
+<p>これらの関数は暗黙的にスリープする可能性があります。ユーザー コンテキストの外で呼び出すべきではありません（意味がありません）、割込みが無効化されている場合、またはスピンロックを保持している場合でも呼び出すべきではありません。</p>
+</section>
+<section id="kmalloc-kfree">
+<h3><a class="reference internal" href="../core-api/mm-api.html#c.kmalloc" title="kmalloc"><code class="xref c c-func docutils literal notranslate"><span class="pre">kmalloc()</span></code></a>/<a class="reference internal" href="../core-api/mm-api.html#c.kfree" title="kfree"><code class="xref c c-func docutils literal notranslate"><span class="pre">kfree()</span></code></a><a class="headerlink" href="#kmalloc-kfree" title="この見出しへのパーマリンク">¶</a></h3>
+<p>定義は <code class="docutils literal notranslate"><span class="pre">include/linux/slab.h</span></code></p>
+<p><strong>[スリープ可能：下記を参照]</strong></p>
+<p>これらのルーチンは、malloc と free がユーザー空間で行うように、動的にポインタアライメントされたメモリのチャンクを動的に要求しますが、
+<a class="reference internal" href="../core-api/mm-api.html#c.kmalloc" title="kmalloc"><code class="xref c c-func docutils literal notranslate"><span class="pre">kmalloc()</span></code></a> は追加のフラグワードを取る点が異なります。重要な値：</p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">GFP_KERNEL</span></code></dt><dd><p>スリープ可能で、メモリを解放するためにスワップする可能性があります。ユーザー コンテキストでのみ許可されますが、メモリを割り当てる最も信頼性の高い方法です。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">GFP_ATOMIC</span></code></dt><dd><p>スリープしない。より信頼性が低いですが、割込みコンテキストから呼び出すことができます。エラー処理戦略をしっかり持つべきです。 <code class="docutils literal notranslate"><span class="pre">GFP_KERNEL</span></code>のほうが信頼性が高いので、 <strong>本当に</strong> はメモリ不足のエラー処理戦略をしっかり持つべきです。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">GFP_DMA</span></code></dt><dd><p>ISA DMA を 16MB 未満で割り当てます。ISA DMA が何であるか分からない場合は必要ありません。非常に信頼性が低いです。</p>
+</dd>
+</dl>
+<p>スリープする関数が無効なコンテキストから呼ばれた警告メッセージが表示された場合は、割込みコンテキストから <code class="docutils literal notranslate"><span class="pre">GFP_ATOMIC</span></code>を呼び出した可能性があります。その問題を修正すべきです。走るのではなく、走りなさい。</p>
+<p>少なくとも <code class="docutils literal notranslate"><span class="pre">PAGE_SIZE</span></code> (<code class="docutils literal notranslate"><span class="pre">asm/page.h</span></code> または
+<code class="docutils literal notranslate"><span class="pre">asm/page_types.h</span></code>) バイトを割り当てている場合、以下の関数を使用することを検討してください： <code class="xref c c-func docutils literal notranslate"><span class="pre">__get_free_pages()</span></code>
+(<code class="docutils literal notranslate"><span class="pre">include/linux/gfp.h</span></code>)。これはオーダー引数（0 はページサイズ、1 は2ページ、2 は4ページなど）と上記と同じメモリ優先度フラグワードを取ります。</p>
+<p>1 ページ以上を割り当てている場合は、
+<a class="reference internal" href="../core-api/mm-api.html#c.vmalloc" title="vmalloc"><code class="xref c c-func docutils literal notranslate"><span class="pre">vmalloc()</span></code></a>これはカーネルマップ内で仮想メモリを割り当てます。このブロックは物理メモリで連続していませんが、MMUはこれをあなたにとって連続しているように見えさせます（CPUには連続しているように見えるが、外部デバイスドライバーにはそう見えません）。もし本当に一部の特殊なデバイスのために物理的に連続したメモリが必要な場合、問題があります：Linuxではサポートが不十分で、時間が経つにつれて実行中のカーネルでのメモリのフラグメンテーションにより困難になります。最善の方法は、起動プロセスの初期段階でこのブロックを割り当てることです。 <code class="xref c c-func docutils literal notranslate"><span class="pre">alloc_bootmem()</span></code>
+ルーチン。</p>
+<p>よく使われるオブジェクトのキャッシュを自作する前に、Linuxのslabキャッシュを使用することを検討してください。 <code class="docutils literal notranslate"><span class="pre">include/linux/slab.h</span></code></p>
+</section>
+<section id="current">
+<h3><code class="xref c c-func docutils literal notranslate"><span class="pre">current()</span></code><a class="headerlink" href="#current" title="この見出しへのパーマリンク">¶</a></h3>
+<p>定義は <code class="docutils literal notranslate"><span class="pre">include/asm/current.h</span></code></p>
+<p>このグローバル変数（実際にはマクロ）は現在のタスク構造へのポインタを保持しており、ユーザーコンテキストでのみ有効です。たとえば、プロセスがシステムコールを実行するとき、このポインタは呼び出し元のプロセスのタスク構造を指します。これは <strong>NULLではありません</strong> 割込みコンテキストでは有効ではありません。</p>
+</section>
+<section id="mdelay-udelay">
+<h3><code class="xref c c-func docutils literal notranslate"><span class="pre">mdelay()</span></code>/<code class="xref c c-func docutils literal notranslate"><span class="pre">udelay()</span></code><a class="headerlink" href="#mdelay-udelay" title="この見出しへのパーマリンク">¶</a></h3>
+<p>定義は <code class="docutils literal notranslate"><span class="pre">include/asm/delay.h</span></code> / <code class="docutils literal notranslate"><span class="pre">include/linux/delay.h</span></code></p>
+<p>以下の <code class="xref c c-func docutils literal notranslate"><span class="pre">udelay()</span></code> および <code class="xref c c-func docutils literal notranslate"><span class="pre">ndelay()</span></code> 関数は小さな一時停止に使用できます。これらに大きな値を渡すとオーバーフローのリスクがありますので、ヘルパーファンクション <code class="xref c c-func docutils literal notranslate"><span class="pre">mdelay()</span></code> を使用するか、考慮してください。 <a class="reference internal" href="../driver-api/basics.html#c.msleep" title="msleep"><code class="xref c c-func docutils literal notranslate"><span class="pre">msleep()</span></code></a>.</p>
+</section>
+<section id="cpu-to-be32-be32-to-cpu-cpu-to-le32-le32-to-cpu">
+<h3><code class="xref c c-func docutils literal notranslate"><span class="pre">cpu_to_be32()</span></code>/<code class="xref c c-func docutils literal notranslate"><span class="pre">be32_to_cpu()</span></code>/<code class="xref c c-func docutils literal notranslate"><span class="pre">cpu_to_le32()</span></code>/<code class="xref c c-func docutils literal notranslate"><span class="pre">le32_to_cpu()</span></code><a class="headerlink" href="#cpu-to-be32-be32-to-cpu-cpu-to-le32-le32-to-cpu" title="この見出しへのパーマリンク">¶</a></h3>
+<p>定義は <code class="docutils literal notranslate"><span class="pre">include/asm/byteorder.h</span></code></p>
+<p>以下の <code class="xref c c-func docutils literal notranslate"><span class="pre">cpu_to_be32()</span></code> 「32」は64や16に、「be」は「le」に置き換えることができる「イン・スイットファミリ」は、カーネルでのエンディアン変換を行う一般的な方法です：これらは変換後の値を返します。すべての変種は逆の変換も提供します：
+<code class="xref c c-func docutils literal notranslate"><span class="pre">be32_to_cpu()</span></code>などの数値かもしれません。</p>
+<p>これらの関数には2つの主要な変種があります：ポインタを引数として受け取るポインタ変種、たとえば <code class="xref c c-func docutils literal notranslate"><span class="pre">cpu_to_be32p()</span></code>、および値を変換してvoidを返す「イン・スイットファミリ」、たとえば <code class="xref c c-func docutils literal notranslate"><span class="pre">cpu_to_be32s()</span></code>です。</p>
+</section>
+<section id="local-irq-save-local-irq-restore">
+<h3><code class="xref c c-func docutils literal notranslate"><span class="pre">local_irq_save()</span></code>/<code class="xref c c-func docutils literal notranslate"><span class="pre">local_irq_restore()</span></code><a class="headerlink" href="#local-irq-save-local-irq-restore" title="この見出しへのパーマリンク">¶</a></h3>
+<p>定義は <code class="docutils literal notranslate"><span class="pre">include/linux/irqflags.h</span></code></p>
+<p>これらのルーチンはローカルCPUのハードウェア割込みを無効にし、復元します。これらは再入可能で、前の状態を1つの引数で保存します。割込みが有効であることを知っている場合は、単に
+<code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">flags</span></code> を使用してください。 <code class="xref c c-func docutils literal notranslate"><span class="pre">local_irq_disable()</span></code> および
+<code class="xref c c-func docutils literal notranslate"><span class="pre">local_irq_enable()</span></code>.</p>
+</section>
+<section id="local-bh-disable-local-bh-enable">
+<span id="local-bh-disable"></span><h3><code class="xref c c-func docutils literal notranslate"><span class="pre">local_bh_disable()</span></code>/<code class="xref c c-func docutils literal notranslate"><span class="pre">local_bh_enable()</span></code><a class="headerlink" href="#local-bh-disable-local-bh-enable" title="この見出しへのパーマリンク">¶</a></h3>
+<p>定義は <code class="docutils literal notranslate"><span class="pre">include/linux/bottom_half.h</span></code></p>
+<p>これらのルーチンはローカルCPUのソフトウェア割込みを無効にし、復元します。これらは再入可能で、ソフトウェア割込みが事前に無効になっていた場合でも、この関数ペアが呼ばれた後でも無効のままです。これらは現在のCPU上でソフトirqとタスクレットの実行を防ぎます。</p>
+</section>
+<section id="smp-processor-id">
+<h3><code class="xref c c-func docutils literal notranslate"><span class="pre">smp_processor_id()</span></code><a class="headerlink" href="#smp-processor-id" title="この見出しへのパーマリンク">¶</a></h3>
+<p>定義は <code class="docutils literal notranslate"><span class="pre">include/linux/smp.h</span></code></p>
+<p><code class="xref c c-func docutils literal notranslate"><span class="pre">get_cpu()</span></code> プリエンプションを無効にし（他のCPUに突然移動されることを防ぎ）、現在のプロセッサ番号を0〜 <code class="docutils literal notranslate"><span class="pre">NR_CPUS</span></code>の間で返します。注意点として、プロセッサ番号は連続しない可能性があります。完了したら再び <code class="xref c c-func docutils literal notranslate"><span class="pre">put_cpu()</span></code> で返します。</p>
+<p>他のタスクによってプリエンプションされないことを知っている場合（つまり割込みコンテキスト内かプリエンプションが無効になっている場合）、smp_processor_id()を使用できます。</p>
+</section>
+<section id="init-exit-initdata">
+<h3><code class="docutils literal notranslate"><span class="pre">__init</span></code>/<code class="docutils literal notranslate"><span class="pre">__exit</span></code>/<code class="docutils literal notranslate"><span class="pre">__initdata</span></code><a class="headerlink" href="#init-exit-initdata" title="この見出しへのパーマリンク">¶</a></h3>
+<p>定義は  <code class="docutils literal notranslate"><span class="pre">include/linux/init.h</span></code></p>
+<p>起動後、カーネルは特別セクションを解放します。関数が
+<code class="docutils literal notranslate"><span class="pre">__init</span></code> でマークされ、データ構造が <code class="docutils literal notranslate"><span class="pre">__initdata</span></code> システム起動が完了した後、メモリが解放されます：同様に、モジュールは初期化後にこのメモリを破棄します。 <code class="docutils literal notranslate"><span class="pre">__exit</span></code> これは、ファイルがモジュールとしてコンパイルされない場合にのみ必要な関数を宣言するために使用されます：このファイルがモジュールとしてコンパイルされない場合、関数は破棄されます。ヘッダーファイルの使用方法を参照してください。注意として、この属性でマークされた関数が意味を持つことはありません。 <code class="docutils literal notranslate"><span class="pre">__init</span></code> モジュールにエクスポートされる必要があります <code class="xref c c-func docutils literal notranslate"><span class="pre">EXPORT_SYMBOL()</span></code> または <code class="xref c c-func docutils literal notranslate"><span class="pre">EXPORT_SYMBOL_GPL()</span></code>- これにより、システムが破損します。</p>
+</section>
+<section id="initcall-module-init">
+<h3><code class="xref c c-func docutils literal notranslate"><span class="pre">__initcall()</span></code>/<a class="reference internal" href="../driver-api/basics.html#c.module_init" title="module_init"><code class="xref c c-func docutils literal notranslate"><span class="pre">module_init()</span></code></a><a class="headerlink" href="#initcall-module-init" title="この見出しへのパーマリンク">¶</a></h3>
+<p>定義は  <code class="docutils literal notranslate"><span class="pre">include/linux/init.h</span></code> / <code class="docutils literal notranslate"><span class="pre">include/linux/module.h</span></code></p>
+<p>カーネルの多くの部分は、モジュール（動的にロード可能なカーネルの部分）として十分に機能します。使用する
+<a class="reference internal" href="../driver-api/basics.html#c.module_init" title="module_init"><code class="xref c c-func docutils literal notranslate"><span class="pre">module_init()</span></code></a> および <a class="reference internal" href="../driver-api/basics.html#c.module_exit" title="module_exit"><code class="xref c c-func docutils literal notranslate"><span class="pre">module_exit()</span></code></a> マクロにより、#ifdefを使用せずに、モジュールとして動作するかカーネルに組み込まれるかに関わらず動作するコードを簡単に記述できます。</p>
+<p>以下の <a class="reference internal" href="../driver-api/basics.html#c.module_init" title="module_init"><code class="xref c c-func docutils literal notranslate"><span class="pre">module_init()</span></code></a> マクロにより、モジュール挿入時（ファイルがモジュールとしてコンパイルされている場合）または起動時（ファイルがモジュールとしてコンパイルされていない場合）に呼び出す関数を定義します：ファイルがモジュールとしてコンパイルされていない場合、
+<a class="reference internal" href="../driver-api/basics.html#c.module_init" title="module_init"><code class="xref c c-func docutils literal notranslate"><span class="pre">module_init()</span></code></a> マクロは
+<code class="xref c c-func docutils literal notranslate"><span class="pre">__initcall()</span></code>に等しくなり、リンカのマジックにより起動時に関数が呼び出されます。</p>
+<p>関数は負のエラーナンバーを返してモジュールのロードを失敗させることができます（残念ながら、このモジュールがカーネルに組み込まれている場合、この機能は効果を持ちません）。この関数は割込みが有効なユーザーコンテキストで呼び出されるため、スリープすることが可能です。</p>
+</section>
+<section id="module-exit">
+<h3><a class="reference internal" href="../driver-api/basics.html#c.module_exit" title="module_exit"><code class="xref c c-func docutils literal notranslate"><span class="pre">module_exit()</span></code></a><a class="headerlink" href="#module-exit" title="この見出しへのパーマリンク">¶</a></h3>
+<p>定義は  <code class="docutils literal notranslate"><span class="pre">include/linux/module.h</span></code></p>
+<p>このマクロにより、モジュールの除去時（またはカーネルに組み込まれたファイルの場合は決して呼ばれない）に呼び出す関数を定義します。モジュールの使用カウントがゼロに達した場合にのみ呼び出されます。この関数もスリープ可能ですただし、失敗は起こりません：関数が返るまでにすべてのクリーンアップが完了しなければなりません。</p>
+<p>このマクロはオプションです：存在しない場合、モジュールは除去できません（'rmmod -f'を除く）。</p>
+</section>
+<section id="try-module-get-module-put">
+<h3><code class="xref c c-func docutils literal notranslate"><span class="pre">try_module_get()</span></code>/<code class="xref c c-func docutils literal notranslate"><span class="pre">module_put()</span></code><a class="headerlink" href="#try-module-get-module-put" title="この見出しへのパーマリンク">¶</a></h3>
+<p>定義は <code class="docutils literal notranslate"><span class="pre">include/linux/module.h</span></code></p>
+<p>これらはモジュールの使用カウントを操作し、除去を防ぐために使用されます（別のモジュールがエクスポートされたシンボルを使用している場合、モジュールは除去できません：以下を参照）。モジュールコードを呼び出す前に、
+<code class="xref c c-func docutils literal notranslate"><span class="pre">try_module_get()</span></code> マクロを呼び出してください：失敗した場合、モジュールが除去されているため、存在しないかのように振る舞う必要があります。それ以外の場合、モジュールに安全にアクセスし、完了時に
+<code class="xref c c-func docutils literal notranslate"><span class="pre">module_put()</span></code> を呼び出してください。</p>
+<p>ほとんどの登録可能な構造体には所有者フィールドがあります、例えば
+<code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">file_operations</span></code> 構造体にあります。このフィールドを <code class="docutils literal notranslate"><span class="pre">THIS_MODULE</span></code>.</p>
+</section>
+</section>
+<section id="wait-queues-include-linux-wait-h">
+<h2>Wait Queues <code class="docutils literal notranslate"><span class="pre">include/linux/wait.h</span></code><a class="headerlink" href="#wait-queues-include-linux-wait-h" title="この見出しへのパーマリンク">¶</a></h2>
+<p><strong>[SLEEPS]</strong></p>
+<p>ウェイトキューは、特定の条件が真であるときに誰かが自分を起こすのを待つために使用されます。これらは競合状態を防ぐために慎重に使用する必要があります。あなたは <code class="xref c c-type docutils literal notranslate"><span class="pre">wait_queue_head_t</span></code>を宣言し、その条件を待つプロセスは自分自身を参照する <code class="xref c c-type docutils literal notranslate"><span class="pre">wait_queue_entry_t</span></code>
+を宣言し、それをキューに追加します。</p>
+<section id="declaring">
+<h3>ウェイトキューの宣言<a class="headerlink" href="#declaring" title="この見出しへのパーマリンク">¶</a></h3>
+<p>あなたは <code class="docutils literal notranslate"><span class="pre">wait_queue_head_t</span></code> にキャストできるかどうかを確認する
+<code class="xref c c-func docutils literal notranslate"><span class="pre">DECLARE_WAIT_QUEUE_HEAD()</span></code> マクロを宣言するか、または初期化コード内で
+<code class="xref c c-func docutils literal notranslate"><span class="pre">init_waitqueue_head()</span></code> ルーチンを使用します。</p>
+</section>
+<section id="queuing">
+<h3>キューへの登録<a class="headerlink" href="#queuing" title="この見出しへのパーマリンク">¶</a></h3>
+<p>waitqueueに自身を登録する操作は比較的複雑です。これは、条件を確認する前にキューに自身を登録する必要があるためです。この操作を行うマクロは以下の通りです: <a class="reference internal" href="../driver-api/basics.html#c.wait_event_interruptible" title="wait_event_interruptible"><code class="xref c c-func docutils literal notranslate"><span class="pre">wait_event_interruptible()</span></code></a>
+(<code class="docutils literal notranslate"><span class="pre">include/linux/wait.h</span></code>) 第1引数はwait queueヘッドで、第2引数は評価される式です。この式が真である場合、またはシグナルが受信された場合、マクロは0を返します。 <code class="docutils literal notranslate"><span class="pre">-ERESTARTSYS</span></code> シグナルが受信された場合。The
+<a class="reference internal" href="../driver-api/basics.html#c.wait_event" title="wait_event"><code class="xref c c-func docutils literal notranslate"><span class="pre">wait_event()</span></code></a> バージョンはシグナルを無視します。</p>
+</section>
+<section id="waking-up-queued-tasks">
+<h3>キューに待機中のタスクを起こす<a class="headerlink" href="#waking-up-queued-tasks" title="この見出しへのパーマリンク">¶</a></h3>
+<p>を呼び出して、MMIOまたはIOポート範囲を利用可能にします。これを実施しないと、ドライバの再ロードができない状態になります。 <code class="xref c c-func docutils literal notranslate"><span class="pre">wake_up()</span></code> (<code class="docutils literal notranslate"><span class="pre">include/linux/wait.h</span></code>)、これはキュー内のすべてのプロセスを起こします。ただし、あるプロセスが設定されている場合、キューの残りの部分は起こされません。
+<code class="docutils literal notranslate"><span class="pre">TASK_EXCLUSIVE</span></code> この基本的な関数の他の変種は、同じヘッダーにあります。</p>
+</section>
+</section>
+<section id="atomic-operations">
+<h2>アトミック操作<a class="headerlink" href="#atomic-operations" title="この見出しへのパーマリンク">¶</a></h2>
+<p>特定の操作はすべてのプラットフォームでアトミックに保証されています。第1クラスの操作は <code class="xref c c-type docutils literal notranslate"><span class="pre">atomic_t</span></code> (<code class="docutils literal notranslate"><span class="pre">include/asm/atomic.h</span></code>)、これは符号付き整数（少なくとも32ビット長）を含み、これら関数を使用して操作または読み取りを行う必要があります。 <code class="xref c c-type docutils literal notranslate"><span class="pre">atomic_t</span></code> 変数。
+<code class="xref c c-func docutils literal notranslate"><span class="pre">atomic_read()</span></code> および <code class="xref c c-func docutils literal notranslate"><span class="pre">atomic_set()</span></code> カウンタを取得および設定する <code class="xref c c-func docutils literal notranslate"><span class="pre">atomic_add()</span></code>, <code class="xref c c-func docutils literal notranslate"><span class="pre">atomic_sub()</span></code>,
+<code class="xref c c-func docutils literal notranslate"><span class="pre">atomic_inc()</span></code>, <code class="xref c c-func docutils literal notranslate"><span class="pre">atomic_dec()</span></code>, and
+<code class="xref c c-func docutils literal notranslate"><span class="pre">atomic_dec_and_test()</span></code> （カウンタがゼロに減算された場合にtrueを返します）。</p>
+<p>はい。アトミック変数がゼロである場合、trueを返します（つまり、!= 0）。</p>
+<p>これらの関数は通常の算術よりも遅いため、不要に使用すべきではありません。</p>
+<p>第2クラスのアトミック操作は、ある
+<code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span></code>で初期化されます。定義されています <code class="docutils literal notranslate"><span class="pre">include/linux/bitops.h</span></code>。これらは一般的にビットパターンへのポインタとビット番号を取ります：0は最下位ビットです。 <a class="reference internal" href="../core-api/kernel-api.html#c.set_bit" title="set_bit"><code class="xref c c-func docutils literal notranslate"><span class="pre">set_bit()</span></code></a>,
+<a class="reference internal" href="../core-api/kernel-api.html#c.clear_bit" title="clear_bit"><code class="xref c c-func docutils literal notranslate"><span class="pre">clear_bit()</span></code></a> および <a class="reference internal" href="../core-api/kernel-api.html#c.change_bit" title="change_bit"><code class="xref c c-func docutils literal notranslate"><span class="pre">change_bit()</span></code></a> 指定されたビットを設定、クリア、および反転させます。 <a class="reference internal" href="../core-api/kernel-api.html#c.test_and_set_bit" title="test_and_set_bit"><code class="xref c c-func docutils literal notranslate"><span class="pre">test_and_set_bit()</span></code></a>,
+<a class="reference internal" href="../core-api/kernel-api.html#c.test_and_clear_bit" title="test_and_clear_bit"><code class="xref c c-func docutils literal notranslate"><span class="pre">test_and_clear_bit()</span></code></a> および
+<a class="reference internal" href="../core-api/kernel-api.html#c.test_and_change_bit" title="test_and_change_bit"><code class="xref c c-func docutils literal notranslate"><span class="pre">test_and_change_bit()</span></code></a> 同じ動作を行います。ただし、ビットが以前に設定されていた場合、trueを返します。これらは、アトミックにフラグを設定するのに特に有用です。</p>
+<p>これらの操作は、ビットインデックスが...より大きい場合でも呼び出すことが可能です。
+<code class="docutils literal notranslate"><span class="pre">BITS_PER_LONG</span></code>ただし、ビッグエンディアンプラットフォームではこの結果の挙動が不思議なので、このような操作は行わないのが良いでしょう。</p>
+</section>
+<section id="symbols">
+<h2>シンボル<a class="headerlink" href="#symbols" title="この見出しへのパーマリンク">¶</a></h2>
+<p>カーネル本体では、通常のリンクルールが適用されます（つまり、シンボルがファイルスコープに宣言されていない限り、カーネルのどこでも使用可能です）。ただし、モジュールの場合、カーネル本体へのエントリポイントを制限する特別なエクスポートされたシンボルテーブルが保持されます。モジュールはまた、シンボルをエクスポートすることもできます。 <code class="docutils literal notranslate"><span class="pre">static</span></code> これはシンボルをエクスポートする古典的な方法です：動的にロードされるモジュールは、シンボルを通常通り使用できます。</p>
+<section id="export-symbol">
+<h3><code class="xref c c-func docutils literal notranslate"><span class="pre">EXPORT_SYMBOL()</span></code><a class="headerlink" href="#export-symbol" title="この見出しへのパーマリンク">¶</a></h3>
+<p>定義は <code class="docutils literal notranslate"><span class="pre">include/linux/export.h</span></code></p>
+<p>これはシンボルをエクスポートする古典的な方法です：動的にロードされるモジュールは、シンボルを通常通り使用できます。</p>
+</section>
+<section id="export-symbol-gpl">
+<h3><code class="xref c c-func docutils literal notranslate"><span class="pre">EXPORT_SYMBOL_GPL()</span></code><a class="headerlink" href="#export-symbol-gpl" title="この見出しへのパーマリンク">¶</a></h3>
+<p>定義は <code class="docutils literal notranslate"><span class="pre">include/linux/export.h</span></code></p>
+<p>同様ですが <code class="xref c c-func docutils literal notranslate"><span class="pre">EXPORT_SYMBOL()</span></code> ただし、エクスポートされるシンボルは <code class="xref c c-func docutils literal notranslate"><span class="pre">EXPORT_SYMBOL_GPL()</span></code> のみ、特定のライセンスを指定したモジュールによってみることができる <code class="xref c c-func docutils literal notranslate"><span class="pre">MODULE_LICENSE()</span></code> GPL互換のライセンスを指定した場合、関数は内部実装の問題とみなされ、インターフェースとはみなされない。一部のメンテナや開発者は、新しいAPIや機能を追加する際にEXPORT_SYMBOL_GPL()を要求する場合があります</p>
+</section>
+<section id="export-symbol-ns">
+<h3><code class="xref c c-func docutils literal notranslate"><span class="pre">EXPORT_SYMBOL_NS()</span></code><a class="headerlink" href="#export-symbol-ns" title="この見出しへのパーマリンク">¶</a></h3>
+<p>定義は <code class="docutils literal notranslate"><span class="pre">include/linux/export.h</span></code></p>
+<p>これは <cite>EXPORT_SYMBOL()</cite> シンボルネームスペースを指定可能にする
+<a class="reference internal" href="../core-api/symbol-namespaces.html"><span class="doc">シンボルネームスペース</span></a></p>
+</section>
+<section id="export-symbol-ns-gpl">
+<h3><code class="xref c c-func docutils literal notranslate"><span class="pre">EXPORT_SYMBOL_NS_GPL()</span></code><a class="headerlink" href="#export-symbol-ns-gpl" title="この見出しへのパーマリンク">¶</a></h3>
+<p>定義は <code class="docutils literal notranslate"><span class="pre">include/linux/export.h</span></code></p>
+<p>これは <cite>シンボルネームスペースについては、</cite> シンボルネームスペースを指定可能にする
+<a class="reference internal" href="../core-api/symbol-namespaces.html"><span class="doc">シンボルネームスペース</span></a></p>
+</section>
+</section>
+<section id="routines-and-conventions">
+<h2>ルーチンとコンベンション<a class="headerlink" href="#routines-and-conventions" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="double-linked-lists-include-linux-list-h">
+<h3>ダブルリンクリスト <code class="docutils literal notranslate"><span class="pre">include/linux/list.h</span></code><a class="headerlink" href="#double-linked-lists-include-linux-list-h" title="この見出しへのパーマリンク">¶</a></h3>
+<p>かつてカーネルヘッダに存在していたリンクリストのルーチンは3セットありましたが、これは最強の選択肢です。単一のリストが必要な特別な理由がなければ、この選択肢は優れています。</p>
+<p>特に <a class="reference internal" href="../core-api/kernel-api.html#c.list_for_each_entry" title="list_for_each_entry"><code class="xref c c-func docutils literal notranslate"><span class="pre">list_for_each_entry()</span></code></a> これは役立ちます。</p>
+</section>
+<section id="return-conventions">
+<h3>戻り値の仕様<a class="headerlink" href="#return-conventions" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ユーザーコンテキストで呼ばれるコードでは、Cの規約を無視してよく0を成功として返し、負のエラー番号（例： <code class="docutils literal notranslate"><span class="pre">-EFAULT</span></code>)を失敗として返します。最初は直感的でないかもしれませんが、カーネルでは広く採用されています。</p>
+<p>Using <code class="xref c c-func docutils literal notranslate"><span class="pre">ERR_PTR()</span></code> (<code class="docutils literal notranslate"><span class="pre">include/linux/err.h</span></code>)で負のエラー番号をポインタにエンコードし、 <code class="xref c c-func docutils literal notranslate"><span class="pre">IS_ERR()</span></code> および
+<code class="xref c c-func docutils literal notranslate"><span class="pre">PTR_ERR()</span></code> でそれを再取得する：エラー番号に別途ポインタパラメータを用意する必要がありません。不快ですが、良い意味でのものです。</p>
+</section>
+<section id="breaking-compilation">
+<h3>コンパイルの破壊<a class="headerlink" href="#breaking-compilation" title="この見出しへのパーマリンク">¶</a></h3>
+<p>リンスと他の開発者たちは開発カーネルで関数や構造体の名前を変更することがあります。これは単に皆を気を引き締めさせるためではなく、根本的な変更（例：割込みが有効な状態で呼ばれることはできず、追加のチェックを行う、または以前に検出されていたチェックを行わないなど）を反映しています。通常、これはlinux-kernelメーリングリストに詳細な説明を添えて投稿され、アーカイブを検索してください。ファイル全体を置き換えるだけでは問題が <strong>悪化</strong>.</p>
+</section>
+<section id="initializing-structure-members">
+<h3>構造体メンバの初期化<a class="headerlink" href="#initializing-structure-members" title="この見出しへのパーマリンク">¶</a></h3>
+<p>構造体の初期化には、ISO C99で定義された指定初期化子を使用するのが望ましいです。例：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static struct block_device_operations opt_fops = {
+        .open               = opt_open,
+        .release            = opt_release,
+        .ioctl              = opt_ioctl,
+        .check_media_change = opt_media_change,
+};
+</pre></div>
+</div>
+<p>これにより、grepで検索しやすく、どの構造体フィールドが設定されているかが明確になります。これを実施するのは、見た目がカッコイイからです。</p>
+</section>
+<section id="gnu-extensions">
+<h3>GNU拡張<a class="headerlink" href="#gnu-extensions" title="この見出しへのパーマリンク">¶</a></h3>
+<p>GNU拡張はLinuxカーネル内で明示的に許可されています。一部の複雑な拡張は一般的な使用が少ないのでサポートが不十分ですが、以下のものは標準とされています（詳細はGCCのinfoページの「C拡張」セクションを参照 - はい、本当にinfoページです、manページはその内容の要約です）。</p>
+<ul class="simple">
+<li><p>インライン関数</p></li>
+<li><p>ステートメント式（つまり、({ と })構文）。</p></li>
+<li><p>関数／変数／型の属性（__attribute__）の宣言</p></li>
+<li><p>typeof</p></li>
+<li><p>ゼロ長さ配列</p></li>
+<li><p>マクロ変数引数</p></li>
+<li><p>voidポインタの算術演算</p></li>
+<li><p>非定数初期化子</p></li>
+<li><p>アセンブリ命令（arch/ および include/asm/ の外側では使用不可）</p></li>
+<li><p>関数名を文字列として（__func__）。</p></li>
+<li><p>__builtin_constant_p()</p></li>
+</ul>
+<p>カーネル内でlong longを使用する際は注意が必要です。gccが生成するコードは悪質で、i386では割り算や乗算が動作しません（なぜなら、カーネル環境にGCCのランタイム関数が存在しないからです）。</p>
+</section>
+<section id="c">
+<h3>C++<a class="headerlink" href="#c" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルでC++を使用するのは通常悪い考えです。カーネルは必要なランタイム環境を提供せず、インクルードファイルもそのためにテストされていないからです。それでも可能ですが、推奨されません。本当にこれをやりたい場合は、少なくとも例外処理については無視してください。</p>
+</section>
+<section id="if">
+<h3>#if<a class="headerlink" href="#if" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ヘッダーファイル（または.cファイルの先頭）でマクロを使用して関数を抽象化する方が、ソースコード全体に`#if`プリプロセッサステートメントを使用するよりも一般的に綺麗とされています。</p>
+</section>
+</section>
+<section id="putting-your-stuff-in-the-kernel">
+<h2>カーネルにあなたのコードを配置する<a class="headerlink" href="#putting-your-stuff-in-the-kernel" title="この見出しへのパーマリンク">¶</a></h2>
+<p>公式の採用に向けたあなたのコードを整えるため、または丁寧なパッチを作成するためには、行政的な作業が必要です：</p>
+<ul>
+<li><p>どの池に尿をかけているかを確認してください。ソースファイルの先頭、 <code class="docutils literal notranslate"><span class="pre">MAINTAINERS</span></code> ファイル内、そして最後に
+<code class="docutils literal notranslate"><span class="pre">CREDITS</span></code> ファイルを確認してください。この人物と連携し、労力を重複させたり、すでに却下された試みを繰り返さないよう確認してください。</p>
+<p>作成または大幅に変更したファイルの先頭にあなたの名前とEMailアドレスを記載してください。これはバグを見つけたとき、または <strong>彼らが</strong> 変更を加えるときに最初に確認される場所です。</p>
+</li>
+<li><p>通常、あなたのカーネルのハックに設定オプションを用意したいです。適切なディレクトリの
+<code class="docutils literal notranslate"><span class="pre">Kconfig</span></code> を編集してください。Config言語は切り貼りで簡単に使用でき、
+<code class="docutils literal notranslate"><span class="pre">Documentation/kbuild/kconfig-language.rst</span></code>.</p>
+<p>に完全なドキュメンテーションがあります。オプションの説明では、専門家ユーザーとあなたの機能について何も知らないユーザーの両方を対象にし、不相容性や問題点をここで記載してください。 <strong>絶対に</strong> 説明の終わりには「疑問がある場合はN」と記載してください（または、まれに`Y`）。これは、あなたが何を話しているか分からない人々のために用意されています。</p>
+</li>
+<li><p>を編集してください。CONFIG変数はここでエクスポートされるため、通常は「obj-$(CONFIG_xxx) += xxx.o」の行を追加するだけで済みます。構文は <code class="docutils literal notranslate"><span class="pre">Makefile</span></code>にドキュメンテーションされています。 <code class="docutils literal notranslate"><span class="pre">Documentation/kbuild/makefiles.rst</span></code>.</p></li>
+<li><p>を意識してください <code class="docutils literal notranslate"><span class="pre">CREDITS</span></code> 何か重要なことをした場合（単一ファイルを超える場合）、ソースファイルの先頭にあなたの名前が記載されているべきです。 <code class="docutils literal notranslate"><span class="pre">MAINTAINERS</span></code> これは、サブシステムの変更に相談を求めたり、バグについて知らされたりする意欲を示し、コードの一部に対するより深いコミットメントを意味します。</p></li>
+<li><p>最後に、以下のドキュメントを読むのを忘れないでください
+<code class="docutils literal notranslate"><span class="pre">Documentation/process/submitting-patches.rst</span></code> およびおそらく
+<code class="docutils literal notranslate"><span class="pre">Documentation/process/submitting-drivers.rst</span></code>.</p></li>
+</ul>
+</section>
+<section id="kernel-cantrips">
+<h2>カーネルのトリック<a class="headerlink" href="#kernel-cantrips" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ソースコードを閲覧した中からのお気に入りです。このリストに追加してください。</p>
+<p><code class="docutils literal notranslate"><span class="pre">arch/x86/include/asm/delay.h</span></code>:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#define ndelay(n) (__builtin_constant_p(n) ? \
+        ((n) &gt; 20000 ? __bad_ndelay() : __const_udelay((n) * 5ul)) : \
+        __ndelay(n))
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">include/linux/fs.h</span></code>:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/*
+ * Kernel pointers have redundant information, so we can use a
+ * scheme where we can return either an error code or a dentry
+ * pointer with the same return value.
+ *
+ * This should be a per-architecture thing, to allow different
+ * error and pointer decisions.
+ */
+ #define ERR_PTR(err)    ((void *)((long)(err)))
+ #define PTR_ERR(ptr)    ((long)(ptr))
+ #define IS_ERR(ptr)     ((unsigned long)(ptr) &gt; (unsigned long)(-1000))
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">arch/x86/include/asm/uaccess_32.h:</span></code>:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#define copy_to_user(to,from,n)                         \
+        (__builtin_constant_p(n) ?                      \
+         __constant_copy_to_user((to),(from),(n)) :     \
+         __generic_copy_to_user((to),(from),(n)))
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">arch/sparc/kernel/head.S:</span></code>:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/*
+ * Sun people can't spell worth damn. "compatability" indeed.
+ * At least we *know* we can't spell, and use a spell-checker.
+ */
+
+/* Uh, actually Linus it is I who cannot spell. Too much murky
+ * Sparc assembly will do this to ya.
+ */
+C_LABEL(cputypvar):
+        .asciz "compatibility"
+
+/* Tested on SS-5, SS-10. Probably someone at Sun applied a spell-checker. */
+        .align 4
+C_LABEL(cputypvar_sun4m):
+        .asciz "compatible"
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">arch/sparc/lib/checksum.S:</span></code>:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/* Sun, you just can't beat me, you just can't.  Stop trying,
+ * give up.  I'm serious, I am going to kick the living shit
+ * out of you, game over, lights out.
+ */
+</pre></div>
+</div>
+</section>
+<section id="thanks">
+<h2>感謝します<a class="headerlink" href="#thanks" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Andi Kleen氏にアイデア提供、質問への回答、間違いの修正、コンテンツの補完などへの感謝。 Philipp Rumpf氏にはスペル修正と明確さの向上、そしていくつかの重要なポイントへの感謝。 Werner Almesberger氏には、私に素晴らしい要約を提供してくれたことに感謝します。 <a class="reference internal" href="../core-api/genericirq.html#c.disable_irq" title="disable_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">disable_irq()</span></code></a>Jes Sorensen 様と Andrea Arcangeli 様が注意点を追加しました。Michael Elizabeth Chastain 様がチェックおよび Configure セクションへの追加を行いました。Telsa Gwynne 様が私に DocBook を教えてくださいました。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">カーネルハッキングガイド</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">信頼性のないLinuxカーネルハッキングガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="locking.html">Unreliable Guide To Locking</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">カーネルハッキングガイド</a><ul>
+<li>前へ: <a href="index.html" title="前章">カーネルハッキングガイド</a></li>
+<li>次へ: <a href="locking.html" title="次章">Unreliable Guide To Locking</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/kernel-hacking/hacking.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

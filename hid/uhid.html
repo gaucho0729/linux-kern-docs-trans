@@ -1,0 +1,248 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>UHID - ユーザースペースI/Oドライバのサポート — Linuxカーネルドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="hid-alps.html" rel="next" title="ALPS HID Touchpad Protocol"/>
+<link href="hid-transport.html" rel="prev" title="HID I/Oトランスポートドライバ"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="uhid-user-space-i-o-driver-support-for-hid-subsystem">
+<h1>UHID - HIDサブシステム用ユーザースペースI/Oドライバサポート<a class="headerlink" href="#uhid-user-space-i-o-driver-support-for-hid-subsystem" title="この見出しへのパーマリンク">¶</a></h1>
+<p>UHIDは、ユーザースペースでHIDトランスポートドライバを実装するための仕組みです。HIDトランスポートドライバについての導入はhid-transport.txtをご参照ください。このドキュメントはその定義に大きく依存しています。</p>
+<p>UHIDにより、ユーザースペース制御のバスに接続された各デバイスに対してカーネルのhidデバイスを生成できます。UHID APIは、カーネルからユーザースペースへのI/Oイベントおよび逆にユーザースペースからカーネルへのI/Oイベントを定義しています。</p>
+<p>例として、./samples/uhid/uhid-example.cにユーザースペースアプリケーションがあります</p>
+<section id="the-uhid-api">
+<h2>UHID API<a class="headerlink" href="#the-uhid-api" title="この見出しへのパーマリンク">¶</a></h2>
+<p>UHIDはキャラクターミスチップデバイスを通じてアクセスされます。マイナーナンバーは動的に割り当てられるため、udev（または類似のツール）に依存してデバイスノードを生成する必要があります。デフォルトでは/dev/uhidです。</p>
+<p>新しいデバイスがHID I/Oドライバによって検出され、HIDサブシステムに登録する必要がある場合、登録する各デバイスに対して/dev/uhidを開く必要があります。以降の通信はすべてread()またはwrite()でstruct uhid_eventオブジェクトを処理します。非ブロッキング操作はO_NONBLOCKを設定することでサポートされます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct uhid_event {
+      __u32 type;
+      union {
+              struct uhid_create2_req create2;
+              struct uhid_output_req output;
+              struct uhid_input2_req input2;
+              ...
+      } u;
+};
+</pre></div>
+</div>
+<p>「type」フィールドにはイベントのIDが含まれています。IDによって異なるペイロードが送信されます。単一のイベントは複数のread()またはwrite()に分割してはいけません。常に1つのイベントとして送信する必要があります。さらに、read()またはwrite()ごとに1つのイベントのみを送信できます。待機中のデータは無視されます。複数のイベントを1つのシステムコールで処理する場合は、readv()/writev()によるベクタI/Oを使用してください。「type」フィールドでペイロードを指定します。各typeには、ユニオン「u」内のペイロード構造体が用意されています（空のペイロードを除く）。このペイロードには管理情報および/またはデバイスデータが含まれます。</p>
+<p>最初に行うべきことは、UHID_CREATE2イベントを送信することです。これによりデバイスが登録されます。UHIDはUHID_STARTイベントで応答します。これでデータをUHIDに送信し、UHIDからデータを読み取る作業を開始できます。ただし、UHIDがUHID_OPENイベントを送信しない限り、内部的に接続されているHIDデバイスドライバにはユーザーが接続されていないため、デバイスがスリープ状態になる可能性があります。UHID_OPENイベントを受信した場合は、I/Oを開始する必要があります。最後のユーザーがHIDデバイスを閉じると、UHID_CLOSEイベントを受信します。その後、再度UHID_OPENイベントが送信される可能性があります。ユーザー空間で参照カウントを管理する必要はありません。つまり、UHID_CLOSEイベントが発生しない限り、複数のUHID_OPENイベントを受信することはありません。HIDサブシステムが参照カウントを管理します。UHID_OPEN/UHID_CLOSEイベントを無視することも可能です。デバイスにユーザーがいない場合でもI/Oは許可されます。</p>
+<p>HIDサブシステムに割り込みチャネルでデータを送信したい場合は、rawデータペイロードを含むHID_INPUT2イベントを送信します。逆に、カーネルが割り込みチャネルでデバイスにデータを送信したい場合は、UHID_OUTPUTイベントを読み取る必要があります。現在、コントロールチャネルでのデータリクエストはGET_REPORTとSET_REPORTに限定されており、他のデータレポートは未定義です。これらのリクエストは常に同期処理です。つまり、カーネルがUHID_GET_REPORTやUHID_SET_REPORTイベントを送信し、これらをコントロールチャネルでデバイスに転送する必要があります。デバイスが応答した後、UHID_GET_REPORT_REPLYとUHID_SET_REPORT_REPLYを介してカーネルに応答を転送しなければなりません。カーネルはこのようなラウンドトリップ中（ハードコードされた期間後にタイムアウト）に内部ドライバの実行をブロックします。</p>
+<p>デバイスが切断した場合は、UHID_DESTROYイベントを送信してください。これによりデバイスが登録解除されます。これで再度UHID_CREATE2を送信して新しいデバイスを登録できます。fdをclose()した場合、デバイスは自動的に登録解除され内部的に破壊されます。</p>
+</section>
+<section id="write">
+<h2>write()<a class="headerlink" href="#write" title="この見出しへのパーマリンク">¶</a></h2>
+<p>write()はデバイスの状態を変更し、カーネルに入力データを供給できます。カーネルはイベントを即座に解析し、イベントIDがサポートされていない場合は-EOPNOTSUPPを返します。ペイロードが無効な場合は-EINVALを返します。それ以外の場合は、読み取ったデータ量を返し、リクエストが成功しました。O_NONBLOCKはwrite()に影響を与えません。なぜなら、write()は常に非ブロッキングモードで即座に処理されるからです。今後、O_NONBLOCKがリクエスト処理に利用される可能性があります。</p>
+<dl class="simple">
+<dt>UHID_CREATE2:</dt><dd><p>これは内部のHIDデバイスを作成します。このイベントをカーネルに送信するまで、入出力操作はできません。ペイロードはstruct uhid_create2_req型で、デバイスに関する情報を含みます。これで入出力操作を開始できます。</p>
+</dd>
+<dt>UHID_DESTROY:</dt><dd><p>これは内部のHIDデバイスを破壊します。これ以降の入出力操作は受け付けません。未処理のメッセージがまだある可能性があり、read()で受信できますが、これ以降のUHID_INPUTイベントをカーネルに送信することはできません。新しいデバイスを作成するには再度UHID_CREATE2を送信してください。キャラクタデバイスを再オープンする必要はありません。</p>
+</dd>
+<dt>UHID_INPUT2:</dt><dd><p>カーネルに入力データを送信する前にUHID_CREATE2を必ず送信してください。このイベントはデータペイロードを含みます。これは割り込みチャネルからデバイスから読み取る素データです。カーネルがHIDレポートを解析します。</p>
+</dd>
+<dt>UHID_GET_REPORT_REPLY:</dt><dd><p>UHID_GET_REPORTリクエストを受信した場合は、このリクエストで応答してください。リクエストの「id」フィールドを応答の「id」フィールドにコピーしてください。「err」フィールドはエラーが発生しなかった場合は0、I/Oエラーが発生した場合はEIOを設定してください。「err」が0の場合は、応答のバッファにGET_REPORTリクエストの結果を書き込み、「size」をそれに合わせて設定してください。</p>
+</dd>
+<dt>UHID_SET_REPORT_REPLY:</dt><dd><p>これはUHID_GET_REPORT_REPLYのSET_REPORT相当です。GET_REPORTとは異なり、SET_REPORTはデータバッファを返しません。そのため、「id」および「err」フィールドを正しく設定するだけで十分です。</p>
+</dd>
+</dl>
+</section>
+<section id="read">
+<h2>read()<a class="headerlink" href="#read" title="この見出しへのパーマリンク">¶</a></h2>
+<p>read()はキューイングされた出力レポートを返します。これらに対して特に反応する必要はありませんが、必要に応じて処理してください。</p>
+<dl>
+<dt>UHID_START:</dt><dd><p>HIDデバイスが起動したときに送信されます。これはUHID_CREATE2への応答として考えることができます。常に最初に送信されるイベントです。注意点として、write(UHID_CREATE2)が返る直後にこのイベントが必ず送信されるとは限りません。ドライバは遅延されたセットアップを必要とする場合があります。このイベントのペイロードはuhid_start_req型で、「dev_flags」フィールドはデバイスの特殊な動作を記述します。以下のフラグが定義されています：</p>
+<blockquote>
+<div><ul>
+<li><p>UHID_DEV_NUMBERED_FEATURE_REPORTS</p></li>
+<li><p>UHID_DEV_NUMBERED_OUTPUT_REPORTS</p></li>
+<li><p>UHID_DEV_NUMBERED_INPUT_REPORTS</p>
+<blockquote>
+<div><p>これらのフラグは、それぞれのレポートタイプが番号付きレポートを使用するかどうかを定義します。番号付きレポートが使用されるタイプの場合、カーネルから送信されるすべてのメッセージにはレポート番号がプレフィックスとして付加されます。それ以外の場合は、カーネルがプレフィックスを追加しません。ユーザー空間からカーネルに送信するメッセージでは、これらのフラグに応じてプレフィックスを調整する必要があります。</p>
+</div></blockquote>
+</li>
+</ul>
+</div></blockquote>
+</dd>
+<dt>UHID_STOP:</dt><dd><p>HIDデバイスが停止したときに送信されます。これはUHID_DESTROYへの応答として考えることができます。</p>
+<p>UHID_DESTROYでデバイスを破壊しなかった場合でも、カーネルがUHID_STOPイベントを送信した場合は通常無視してください。これはカーネルがHIDデバイスにロードされたドライバを再ロード/変更した（または他のメンテナンス作業が行われた）ことを意味します。</p>
+<p>UHID_STOPイベントは通常安全に無視できます。</p>
+</dd>
+<dt>UHID_OPEN:</dt><dd><p>これはHIDデバイスが開かれたときに送信されます。つまり、HIDデバイスが提供するデータが他のプロセスによって読み取られている状態です。このイベントは無視しても問題ありませんが、電源管理に有用です。UHID_OPENイベントを受信していない限り、他のプロセスがデータを読み取っていませんので、UHID_INPUT2イベントをカーネルに送信する必要はありません。</p>
+</dd>
+<dt>UHID_CLOSE:</dt><dd><p>これにより、HIDデータを読み取るプロセスがもう存在しないことを示します。これはUHID_OPENの対応イベントであり、このイベントも無視しても問題ありません。</p>
+</dd>
+<dt>UHID_OUTPUT:</dt><dd><p>HIDドライバが割込みチャネルを通じてI/Oデバイスにrawデータを送信したい場合に送信されます。ペイロードを読み取り、デバイスに転送する必要があります。ペイロードは「struct uhid_output_req」型です。UHID_OPENイベントを受信していない場合でもこのイベントを受信する可能性があります。</p>
+</dd>
+<dt>UHID_GET_REPORT:</dt><dd><p>カーネルドライバがHID仕様で定義されたコントロールチャネルでのGET_REPORTリクエストを実行する場合に送信されます。レポートタイプとレポート番号はペイロードに含まれています。カーネルはGET_REPORTリクエストをシリアル化するため、同時に複数のリクエストは発生しません。ただし、UHID_GET_REPORT_REPLYで応答しなかった場合、リクエストは静かにタイムアウトする可能性があります。GET_REPORTリクエストを読み取った後は、HIDデバイスに転送し、ペイロードの「id」フィールドを記憶してください。HIDデバイスがGET_REPORTに応答した（または失敗した）後、リクエストに使われた「id」と同じ値を用いてUHID_GET_REPORT_REPLYをカーネルに送信する必要があります。リクエストがすでにタイムアウトしていた場合、カーネルは応答を無視します。「id」フィールドは再利用されないため、競合が発生しません。</p>
+</dd>
+<dt>UHID_SET_REPORT:</dt><dd><p>これはUHID_GET_REPORTのSET_REPORT相当です。受信時にHIDデバイスにSET_REPORTリクエストを送信してください。応答後はUHID_SET_REPORT_REPLYを通じてカーネルに結果を報告してください。UHID_GET_REPORTと同様の制限が適用されます。</p>
+</dd>
+</dl>
+<hr class="docutils"/>
+<p>2012年に書かれました、David Herrmann &lt;<a class="reference external" href="mailto:dh.herrmann%40gmail.com">dh<span>.</span>herrmann<span>@</span>gmail<span>.</span>com</a>&gt;</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">ヒューマンインターフェースデバイス（HID）</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="hiddev.html">Human Interface Devicesのお手入れガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hidraw.html">HIDRAW - USBおよびBluetooth Human Interface DevicesへのRAWアクセス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hid-sensor.html">HIDセンサーフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hid-transport.html">HID I/Oトランスポートドライバ</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">UHID - HIDサブシステム用ユーザースペースI/Oドライバサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hid-alps.html">ALPS HID Touchpad Protocol</a></li>
+<li class="toctree-l2"><a class="reference internal" href="intel-ish-hid.html">インテル統合センサー・ハブ（ISH）</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">ヒューマンインターフェースデバイス（HID）</a><ul>
+<li>前へ: <a href="hid-transport.html" title="前章">HID I/Oトランスポートドライバ</a></li>
+<li>次へ: <a href="hid-alps.html" title="次章">ALPS HID Touchpad Protocol</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/hid/uhid.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

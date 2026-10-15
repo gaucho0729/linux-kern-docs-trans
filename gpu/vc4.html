@@ -1,0 +1,260 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>drm/vc4 Broadcom VC4 グラフィックスドライバー — The Linux Kernel ドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="vkms.html" rel="next" title="drm/vkms Virtual Kernel Modesetting"/>
+<link href="v3d.html" rel="prev" title="drm/v3d Broadcom V3Dグラフィックスドライバ"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="drm-vc4-broadcom-vc4-graphics-driver">
+<h1>drm/vc4 Broadcom VC4グラフィックスドライバ<a class="headerlink" href="#drm-vc4-broadcom-vc4-graphics-driver" title="この見出しへのパーマリンク">¶</a></h1>
+<p>Broadcom VideoCore 4（ラズベリーパイに搭載）には、OpenGL ES 2.0互換の3DエンジンであるV3Dと、HDMI、DSI、DPI、およびコンポジットTV出力に対応した高機能なディスプレイ出力パイプラインが含まれています。</p>
+<p>この3Dエンジンは、頂点シェーダーおよびフラグメントシェーダーとして使用されるGLES 2.0の同じシェーダー処理を用いて、任意のコンピュートシェーダー形式のジョブを送信するインターフェースも備えています。ただし、ハードウェアがOpenGLコンピュートシェーダーやOpenCLなどの標準インターフェースを露出できないため、このドライバーではサポートされていません。</p>
+<section id="display-hardware-handling">
+<h2>ディスプレイハードウェアの処理<a class="headerlink" href="#display-hardware-handling" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このセクションは、表示ハードウェアに関連するすべての内容をカバーしています。モード設定インフラストラクチャ、プレーン、スプライトおよびカーソルの処理、表示、出力プローブおよび関連するトピックを含みます。</p>
+<section id="pixel-valve-drm-crtc">
+<h3>ピクセルバルブ（DRM CRTC）<a class="headerlink" href="#pixel-valve-drm-crtc" title="この見出しへのパーマリンク">¶</a></h3>
+<p>VC4において、ピクセルバルブ（Pixel Valve）はDRMのCRTC（クロック同期レジスタトランスレータ）の概念に最も近いものです。PVはエンコーダーのクロックとその設定を基にビデオタイミングを生成し、そのタイミングでHVSからスケーリングされたピクセルを取得してエンコーダーに供給します。</p>
+<p>ただし、DRM CRTCは、それに接続されたすべてのDRM平面の設定も収集します。その結果、CRTCはHVSチャネルを使用する際のディスプレイリストの書き込みにも責任を負います。</p>
+<p>2835には3つの異なるピクセルバルブがあります。pv0はオーディオ電源ドメインでDSI0またはDPIに供給し、pv1はDS1またはSMIに供給します。pv2は画像ドメインでHDMIまたはSDTVコントローラーに供給でき、muxで選択された出力タイプに応じてCPRMANクロック（HSMはHDMI、VECはSDTVなど）を選択します。</p>
+<p>電源管理では、ピクセルバルブのレジスタはすべてAXIクロックでクロックされ、タイミングとFIFOは出力固有のクロックを使用します。エンコーダーもCPRMANクロックを直接消費し、必要なタイミングを把握しているため、エンコーダーがクロックを設定します。</p>
+</section>
+<section id="hvs">
+<h3>HVS<a class="headerlink" href="#hvs" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ハードウェアビデオスケーラー（HVS）は、フレームバッファに保存されたピクセルをトランスレート、スケーリング、カラースペース変換、コンポジットして、ピクセルバルブ（CRTC）に送出するFIFOに変換するハードウェアです。これはシステムクロックレート（特にシステムオーディオクロックゲート）で動作し、ピクセルクロックレートよりもはるかに高速です。</p>
+<p>単一のグローバルHVSがあり、複数の出力FIFOがPVに消費されます。このファイルはHVSのリソースを管理するだけで、vc4_crtc.cコードが各CRTCのHVS設定を実際に駆動します。</p>
+</section>
+<section id="hvs-planes">
+<h3>HVSプレーン<a class="headerlink" href="#hvs-planes" title="この見出しへのパーマリンク">¶</a></h3>
+<p>各DRM平面はHVSがスキャンアウトするピクセルのレイヤーです。</p>
+<p>アトミックモードセットチェック時に、画面（その配置が無効かどうかを確認する機会を提供）を表示するために必要なHVS表示要素の状態を計算し、アトミックフラッシュ時にCRTCがHVSに割り当てた領域に要素状態を書き込むように依頼します。</p>
+</section>
+<section id="hdmi-encoder">
+<h3>HDMIエンコーダー<a class="headerlink" href="#hdmi-encoder" title="この見出しへのパーマリンク">¶</a></h3>
+<p>HDMIコアにはステートマシンとPHYが含まれています。BCM2835では、ほとんどのユニットがCPRMANのHSMクロックで動作します。また、PHYにはPLLH_PIXクロックが内部的に使用されます。</p>
+<p>HDMIインフォーフレームは小型のパケットRAMに保持され、各パケットはフレームに含めるかどうかを個別に有効化できます。</p>
+<p>HDMIオーディオはHDMI IPブロック内で完全に実装されています。HDMIエンコーダー内のレジスタはDMAエンジンからSPDIFフレームを取得し、内部のMAI（マルチチャネルオーディオインターコネクト）バスを介してエンコーダー側に転送し、ビデオブランク領域に挿入します。</p>
+<p>ドライバーのHDMIエンコーダーは現在パワーマネジメントをサポートしていません。HDMIエンコーダーのパワードメインとHSM/ピクセルクロックは常に動作し、HDMIロジックとパケットRAMのみが無効/有効時に電源が切られます。</p>
+<p>ドライバーはCEC制御をサポートしていませんが、HDMIエンコーダーブロックにはCECのサポートがあります。</p>
+</section>
+<section id="dsi-encoder">
+<h3>DSIエンコーダー<a class="headerlink" href="#dsi-encoder" title="この見出しへのパーマリンク">¶</a></h3>
+<p>BCM2835にはDSIモジュールが2つあり、DSI0とDSI1です。DSI0は単一レーンのDSIコントローラーで、DSI1はより現代的な4レーンのDSIコントローラーです。</p>
+<p>ほとんどのRaspberry PiボードはDSI1を「ディスプレイ」コネクタとして露出していますが、コンピュートモジュールはDSI0とDSI1の両方を外部に接続します。</p>
+<p>このドライバーは現在DSI1のビデオモード表示のみテストされており、DSI0に関する必要な情報はほぼ揃っていると考えられます。</p>
+</section>
+<section id="dpi-encoder">
+<h3>DPIエンコーダー<a class="headerlink" href="#dpi-encoder" title="この見出しへのパーマリンク">¶</a></h3>
+<p>VC4 DPIハードウェアはMIPI DPIタイプ4およびノキアViSSI信号をサポートしています。BCM2835では、これらをGPIO0-27のALT2機能を介して出力できます。</p>
+</section>
+<section id="vec-composite-tv-out-encoder">
+<h3>VEC（コンポジットTV出力）エンコーダー<a class="headerlink" href="#vec-composite-tv-out-encoder" title="この見出しへのパーマリンク">¶</a></h3>
+<p>VECエンコーダーはPALまたはNTSCの複合ビデオ出力生成を行います。</p>
+<p>テレビモード選択はエンコーダーのアトミックプロパティによって行われます。なぜなら、drm_mode_modeinfoではPALとPAL-MやNTSCとNTSC-Jを区別できないからです。</p>
+</section>
+</section>
+<section id="memory-management-and-3d-command-submission">
+<h2>メモリ管理および3Dコマンド送信<a class="headerlink" href="#memory-management-and-3d-command-submission" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このセクションではvc4ドライバーにおけるGEMの実装について説明します。</p>
+<section id="gpu-buffer-object-bo-management">
+<h3>GPUバッファオブジェクト（BO）管理<a class="headerlink" href="#gpu-buffer-object-bo-management" title="この見出しへのパーマリンク">¶</a></h3>
+<p>VC4 GPUアーキテクチャ（スキャンアウトおよびレンダリングを含む）はMMUなしでシステムメモリに直接アクセスできます。これをサポートするため、GEM CMAヘルパ関数を使用してBO用の物理メモリの連続領域を割り当てます。</p>
+<p>CMAアロケータは非常に遅いため、最近解放されたBOをキャッシュしておき、カーネルが3Dレンダリング用のオブジェクトを迅速に割り当てられるようにします。</p>
+</section>
+<section id="v3d-binner-command-list-bcl-validation">
+<h3>V3Dバインナーコマンドリスト（BCL）検証<a class="headerlink" href="#v3d-binner-command-list-bcl-validation" title="この見出しへのパーマリンク">¶</a></h3>
+<p>VC4はシステムメモリとの間にIOMMUが存在しないため、コマンドリストの実行にアクセスできるユーザーが、システムメモリを上書きして権限昇格（フレームバッファとして描画する）したり、不正にアクセスすべきシステムメモリを読み取る（頂点バッファやインデックスバッファとして読み取る）ことで権限を昇格させることが可能です。</p>
+<p>ビンナーコマンドリストを検証することで、すべてのアクセスが参照されているGEMオブジェクトの範囲内であることを保証します。これは明示的にパケットを白リストにし、アドレスフィールドのオフセットを確認して参照しているBO（バーチャルオブジェクト）内に収まるかを検証します。</p>
+<p>CL検証ではユーザーが提出したCLを読み込み、GPUが実際に読み込むメモリに検証済みのコピーを書き出すため、ここがGEMリロケーション処理（BO参照をGPUが使用する実際のアドレスに変換）も行われます。</p>
+</section>
+<section id="v3d-render-command-list-rcl-generation">
+<h3>V3Dレンダリングコマンドリスト（RCL）生成<a class="headerlink" href="#v3d-render-command-list-rcl-generation" title="この見出しへのパーマリンク">¶</a></h3>
+<p>V3Dハードウェアでは、レンダリングコマンドリストがフレームバッファのタイルをロードおよびストアし、オプションでビンナーコマンドリストを呼び出してそのタイルの3D描画を実行します。</p>
+<p>VC4ドライバーではレンダリングコマンドリストの生成はカーネルが行います。これはユーザーが提出したコマンドリストを検証するのは難しいことかつCPUオーバーヘッドが大きいからで、レンダリングコマンドリストの有効な構成は実際にはかなり限定的です。</p>
+</section>
+<section id="shader-validator-for-vc4">
+<h3>VC4用シェーダー検証器<a class="headerlink" href="#shader-validator-for-vc4" title="この見出しへのパーマリンク">¶</a></h3>
+<p>VC4はシステムメモリとの間にIOMMUが存在しないため、シェーダーの実行にアクセスできるユーザーが、システムメモリを上書きして権限昇格（汎用DMAモードでのVPM書き込みアドレスレジスタを使用）したり、不正にアクセスすべきシステムメモリを読み取る（テクスチャ、ユニフォームデータ、または直接アドレス指定TMU検索として読み取る）ことが可能です。</p>
+<p>シェーダー検証では、シェーダーのBOを走査し、そのアクセスが適切に制限されていることを確認し、テクスチャアクセスの位置を記録して、ユニフォームストリームでリロケーション処理を行います。</p>
+<p>シェーダーBOはそのライフタイム内では変更不可能（マップを許可しない、GEMプライムエクスポートを許可しない、CLからレンダリングを許可しない）ため、この検証はBO作成時のみ行われます。</p>
+</section>
+<section id="v3d-interrupts">
+<h3>V3D割込み<a class="headerlink" href="#v3d-interrupts" title="この見出しへのパーマリンク">¶</a></h3>
+<p>割り込みステータスレジスタ（V3D_INTCTL）があり、割り込みを報告し、1を書き込むとその割り込みをクリアします。また、ペアの割り込みレジスタ（V3D_INTENA/V3D_INTDIS）があり、ビットに1を書き込むと特定の割り込みを有効または無効にし、0を書き込むと無視され（読み込むと有効な割り込みのセットが返されます）。</p>
+<p>ビニングの完了を検出する際には、次のフレームをビニング処理に送信し、完了したフレームをレンダリングスレッドに移動する必要があります。</p>
+<p>レンダリングフレームの中断を検出する際には、フレームが完了を待機しているプロセスを起動し、次のフレームをすぐに送信する必要があります（ハードウェアが仕事があるときに待機状態にならないようにするため）。</p>
+<p>メモリ割込みからバインナを外す際には、新しいメモリを確保し、バインナに渡す必要があります。これにより、現在のジョブが進捗を遂げられるようになります。</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linux GPUドライバ開発者ガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="introduction.html">はじめに</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-internals.html">DRM内部</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-mm.html">DRMメモリ管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-kms.html">カーネルモード設定 (KMS)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-kms-helpers.html">モード設定ヘルパ関数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-uapi.html">ユーザランドインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-client.html">カーネルクライアント</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="drivers.html">GPUドライバドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="backlight.html">バックライトサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vga-switcheroo.html">VGAスイッチーロー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vgaarbiter.html">VGAアービトラー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="todo.html">TODOリスト</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linux GPUドライバ開発者ガイド</a><ul>
+<li><a href="drivers.html">GPUドライバドキュメンテーション</a><ul>
+<li>前へ: <a href="v3d.html" title="前章">drm/v3d Broadcom V3Dグラフィックスドライバ</a></li>
+<li>次へ: <a href="vkms.html" title="次章">drm/vkms Virtual Kernel Modesetting</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/gpu/vc4.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

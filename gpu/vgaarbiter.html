@@ -1,0 +1,408 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>VGA Arbiter — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="todo.html" rel="next" title="TODOリスト"/>
+<link href="vga-switcheroo.html" rel="prev" title="VGAスイッチーロー"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="vga-arbiter">
+<h1>VGAアービトラー<a class="headerlink" href="#vga-arbiter" title="この見出しへのパーマリンク">¶</a></h1>
+<p>グラフィックデバイスはI/Oまたはメモリ空間の範囲を通じてアクセスされます。ほとんどの現代のデバイスはこのような範囲の再配置を許容しますが、一部の「レガシー」VGAデバイスはPCIバス上に実装されると、ISAバス時代と同様の「ハードデコード済み」アドレスが使用されることが一般的です。詳細については、「PCIバスバインディング IEEE Std 1275-1994標準の起動（初期化設定）ファームウェアリビジョン2.1」セクション7「レガシーデバイス」を参照してください。</p>
+<p>Xサーバー内のリソースアクセス制御（RAC）モジュール[0]は、複数のレガシーデバイスが同じマシンに存在する場合、レガシーVGA仲裁タスク（他のバス管理タスクも含む）を処理するために存在しました。しかし、これらのデバイスが異なるユーザースペースクライアント（例：並列で動作する2つのサーバー）によってアクセスしようとした場合、アドレス割り当てが衝突します。さらに、理想的にはユーザースペースアプリケーションとしてのXサーバーはバスリソースを制御する役割を担うべきではありません。したがって、Xサーバーの外側で仲裁スキームを実装し、これらのリソースの共有を制御する必要があります。このドキュメントでは、Linuxカーネル用に実装されたVGA仲裁の動作について説明します。</p>
+<section id="vgaarb-kernel-userspace-abi">
+<h2>vgaarbカーネル/ユーザースペースABI<a class="headerlink" href="#vgaarb-kernel-userspace-abi" title="この見出しへのパーマリンク">¶</a></h2>
+<p>vgaarbはLinuxカーネルのモジュールです。初期ロード時にすべてのPCIデバイスをスキャンし、VGAデバイスを仲裁処理に追加します。その後、仲裁器はVGAレガシーインストラクションの各デバイスにおけるデコードの有無を有効/無効にします。仲裁器を使用したくない/必要ないデバイスは、明示的に呼び出すことで指定できます。 <a class="reference internal" href="#c.vga_set_legacy_decoding" title="vga_set_legacy_decoding"><code class="xref c c-func docutils literal notranslate"><span class="pre">vga_set_legacy_decoding()</span></code></a>.</p>
+<p>カーネルはクライアントに対してキャラクタデバイスインターフェース（/dev/vga_arbiter）をエクスポートします。このインターフェースのセマンティクスは以下の通りです：</p>
+<dl>
+<dt>open</dt><dd><p>アービターユーザーインスタンスを開きます。デフォルトでは、システムのデフォルトVGAデバイスに接続されます。</p>
+</dd>
+<dt>close</dt><dd><p>ユーザーアイテントスインスタンスを閉じます。ユーザーアクションで取得したロックを解放します。</p>
+</dd>
+<dt>読み取り</dt><dd><p>ターゲットの状態を示す文字列を返します。例：</p>
+<p>「&lt;card_ID&gt;,decodes=&lt;io_state&gt;,owns=&lt;io,mem,io+mem,none&gt;,locks=&lt;io_state&gt; (ic,mc)」</p>
+<p>IO状態文字列は{io,mem,io+mem,none}の形式で、mcおよびicはそれぞれメモリとIOロックカウント（デバッグ/診断用のみ）です。「decodes」はカードが現在デコードしている内容、「owns」は現在有効な内容、「locks」はこのカードでロックされている内容を示します。カードが挿されている場合でない場合は、card_IDに「invalid」が返され、新しいカードがターゲットに指定されるまで、すべてのコマンドに-ENODEVエラーが返されます。</p>
+</dd>
+<dt>書き込み</dt><dd><p>アービターにコマンドを書き込みます。コマンド一覧：</p>
+<dl class="simple">
+<dt>target &lt;card_ID&gt;</dt><dd><p>ターゲットをカード&lt;card_ID&gt;に切り替えます（以下を参照）</p>
+</dd>
+<dt>lock &lt;io_state&gt;</dt><dd><p>ターゲットにロックを取得します（「none」は無効なio_stateです）</p>
+</dd>
+<dt>trylock &lt;io_state&gt;</dt><dd><p>ターゲットにブロッキングしないロックを取得 (失敗した場合、EBUSYを返す)</p>
+</dd>
+<dt>io_stateをアンロック</dt><dd><p>ターゲットのロックを解放</p>
+</dd>
+<dt>すべてをアンロック</dt><dd><p>このユーザーが保持しているターゲットのすべてのロックを解放 (未実装です)</p>
+</dd>
+<dt>io_stateをデコード</dt><dd><p>カードのレガシーデコード属性を設定</p>
+</dd>
+<dt>poll</dt><dd><p>任意のカードで変更があった場合のイベント (ターゲットに限らない)</p>
+</dd>
+</dl>
+<p>card_IDの形式は「PCI:domain:bus:dev.fn」です。これを「default」に設定すると、システムのデフォルトカードに戻ります (TODO: 未実装です)。現在はPCIのみがサポートされていますが、今後ユーザー空間APIが他のバスタイプをサポートする可能性があります (現在のカーネル実装ではサポートされていません)</p>
+</dd>
+</dl>
+<p>ロックに関する注意点:</p>
+<p>ドライバーは、どのユーザーがどのカードにどのロックを保持しているかを追跡します。これはカーネルのそれと同様のスタッキングをサポートしています。この実装はやや複雑ですが、ユーザー空間の問題に耐えられるようにし、プロセスが終了した際に適切にクリーンアップできるようにします。現在、1つのユーザー (ファイルディスクリプタインスタンス) に対して同時に16枚のカードのロックを発行できます。</p>
+<p>デバイスがホット-{un,}plugされた場合、pci_notify()というフックがあり、システムに追加/削除されたことを通知し、自動的にarbiterに追加/削除されます。</p>
+<p>DRM、vgacon、その他のドライバーが使用できるように、カーネル内にarbiterのAPIがあります。</p>
+</section>
+<section id="in-kernel-interface">
+<h2>カーネル内インターフェース<a class="headerlink" href="#in-kernel-interface" title="この見出しへのパーマリンク">¶</a></h2>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.vga_set_legacy_decoding">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">vga_set_legacy_decoding</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pci_dev</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">pdev</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">デコード</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.vga_set_legacy_decoding" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pci_dev</span> <span class="pre">*pdev</span></code></dt><dd><p>VGAカードのPCIデバイス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">decodes</span></code></dt><dd><p>カードがデコードするレガシーレギオンのビットマスク</p>
+<p>カードがレガシービジーログIO、レガシービジーログメモリ、両方、またはどちらもデコードしないかをアービトラータに通知します。すべてのカードはデフォルトで両方をデコードしますが、カードドライバー (例: fbdev) がレガシーデコードを無効にした場合、アービトラータに通知してカードをアービトラシオンプロセスから除外し、いつでも割り込みを安全に取得できるようにします。</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.vga_get_interruptible">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">vga_get_interruptible</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pci_dev</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">pdev</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">rsrc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.vga_get_interruptible" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pci_dev</span> <span class="pre">*pdev</span></code></dt><dd><p>VGAカードのPCIデバイスまたはシステムデフォルトのNULL</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">rsrc</span></code></dt><dd><p>取得およびロックするリソースのビットマスク</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>interruptibleをtrueに設定したvga_getのショートカット</p>
+<p>成功した場合、次のコマンドでVGAリソースを再解放します <a class="reference internal" href="#c.vga_put" title="vga_put"><code class="xref c c-func docutils literal notranslate"><span class="pre">vga_put()</span></code></a>.</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.vga_get_uninterruptible">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">vga_get_uninterruptible</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pci_dev</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">pdev</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">rsrc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.vga_get_uninterruptible" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ショートカット <a class="reference internal" href="#c.vga_get" title="vga_get"><code class="xref c c-func docutils literal notranslate"><span class="pre">vga_get()</span></code></a></p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pci_dev</span> <span class="pre">*pdev</span></code></dt><dd><p>VGAカードのPCIデバイスまたはシステムデフォルトのNULL</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">rsrc</span></code></dt><dd><p>取得およびロックするリソースのビットマスク</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>interruptibleをfalseに設定したvga_getのショートカット</p>
+<p>成功した場合、次のコマンドでVGAリソースを再解放します <a class="reference internal" href="#c.vga_put" title="vga_put"><code class="xref c c-func docutils literal notranslate"><span class="pre">vga_put()</span></code></a>.</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.vga_default_device">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pci_dev</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">vga_default_device</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">void</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.vga_default_device" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>vgacon用のデフォルトVGAデバイスを返します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span></code></dt><dd><p>引数なし</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>このデフォルト実装は単純で、複数のVGAカードやx86プラットフォーム以外では正しく動作しない可能性があります。</p>
+<p>VGAデフォルトデバイスがPCIでない場合、ここではNULLを返す必要があります。この場合、PCIカードと競合することはないものと仮定しています。もしもこれが正しくない場合、VGAデフォルトデバイスを有効/無効にするための2つのアーキテクチャハックを定義する必要があります。これは実際の_ISA_ VGAカードにも問題が生じる可能性があり、PCIデバイスにも適用されます。この時点では、そのカードの処理方法がわかりません。彼らのIOを無効化することは可能でしょうか？不可能であれば、適切なアーキテクチャハックでその状況を通知するだけで、誰も成功させないことが基本となるでしょう。
+<a class="reference internal" href="#c.vga_get" title="vga_get"><code class="xref c c-func docutils literal notranslate"><span class="pre">vga_get()</span></code></a>…</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.vga_remove_vgacon">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">vga_remove_vgacon</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pci_dev</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">pdev</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.vga_remove_vgacon" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>VGAコンソールを非アクティブ化</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pci_dev</span> <span class="pre">*pdev</span></code></dt><dd><p>PCIデバイス。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>pdevがデフォルトのVGAデバイスである場合、VGAコンソールをアンバインドし登録解除します。GPUドライバが初期化時に呼び出すことで、VGAコンソールによるレジスタアクセスがデバイスに影響を与えないようにします。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.vga_get">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">vga_get</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pci_dev</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">pdev</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">rsrc</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">割込み可能</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.vga_get" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>VGAリソースの取得とロック</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pci_dev</span> <span class="pre">*pdev</span></code></dt><dd><p>VGAカードのPCIデバイスまたはシステムデフォルトのNULL</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">rsrc</span></code></dt><dd><p>取得およびロックするリソースのビットマスク</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">interruptible</span></code></dt><dd><p>割込みによってブロッキングは可能でしょうか？</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この関数は指定されたカードのVGAリソースを取得し、それらのリソースをロックします。リソースが「通常」（非レガシ）の場合、アービトラーはそのリソースタイプのレガシデコードを行っているかを確認します。行っている場合、ロックは「レガシリソースロック」に変換されます。</p>
+<p>アービトラーは、競合する可能性のあるすべてのVGAカードを検索し、それらのIOおよび/またはメモリアクセスを無効化（必要に応じてP2PブリッジのVGAフォワーディングも含む）します。これにより、リクエストされたリソースを使用できるようになります。その後、カードがこれらのリソースをロックしているとマークされ、IOおよび/またはメモリアクセスが有効化されます（必要に応じて親P2PブリッジのVGAフォワーディングも含む）。</p>
+<p>ある競合するカードがすでにリクエストされたリソースの1つをロックしている場合、この関数はブロッキングします（異なるバスセグメントのリソースも含むため、P2PブリッジはVGAメモリとIOを区別しないと推測されます）。ユーザー空間インターフェースでこのブロッキングを割込み信号で中断可能かどうかを指定できます。</p>
+<p>割込み時間やアトミックコンテキストでは呼び出せません。カードがすでにリソースを所有している場合、関数は成功します。ネストされた呼び出しはサポートされています（リソースごとのカウンターが維持されます）</p>
+<p>成功した場合、次のコマンドでVGAリソースを再解放します <a class="reference internal" href="#c.vga_put" title="vga_put"><code class="xref c c-func docutils literal notranslate"><span class="pre">vga_put()</span></code></a>.</p>
+<p>成功時は 0、失敗時は負のエラーコードを返します</p>
+<p><strong>戻り値</strong></p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.vga_put">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">vga_put</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pci_dev</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">pdev</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">rsrc</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.vga_put" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>レガシVGAリソースのロックを解放</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pci_dev</span> <span class="pre">*pdev</span></code></dt><dd><p>VGAカードのPCIデバイスまたはシステムデフォルトのNULL</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">rsrc</span></code></dt><dd><p>解放するリソースのマスク</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この関数は、 <a class="reference internal" href="#c.vga_get" title="vga_get"><code class="xref c c-func docutils literal notranslate"><span class="pre">vga_get()</span></code></a> vga_tryget()で以前ロックされたリソースを解放します。リソースはすぐに無効化されず、同じカードの後続の
+<a class="reference internal" href="#c.vga_get" title="vga_get"><code class="xref c c-func docutils literal notranslate"><span class="pre">vga_get()</span></code></a> 操作が即座に成功します。リソースにはカウンターがあり、カウンターが0になるまでロックは解放されません。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.vga_client_register">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">vga_client_register</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">pci_dev</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">pdev</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">cookie</span></span>, <span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">(</span></span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">irq_set_state</span></span><span class="p"><span class="pre">)</span></span><span class="p"><span class="pre">(</span></span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">cookie</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n"><span class="pre">状態</span></span><span class="p"><span class="pre">)</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="p"><span class="pre">(</span></span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">set_vga_decode</span></span><span class="p"><span class="pre">)</span></span><span class="p"><span class="pre">(</span></span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">cookie</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n"><span class="pre">デコード</span></span><span class="p"><span class="pre">)</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.vga_client_register" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>VGA仲裁クライアントの登録または解除</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pci_dev</span> <span class="pre">*pdev</span></code></dt><dd><p>VGAクライアントのPCIデバイス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*cookie</span></code></dt><dd><p>コールバックで使用するクライアントクッキー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">(*irq_set_state)(void</span> <span class="pre">*cookie,</span> <span class="pre">bool</span> <span class="pre">state)</span></code></dt><dd><p>IRQ状態変化コールバック</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">(*set_vga_decode)(void</span> <span class="pre">*cookie,</span> <span class="pre">bool</span> <span class="pre">decode)</span></code></dt><dd><p>VGAデコード変化コールバック</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>クライアントは2つのコールバックメカニズムを使用できます。</p>
+<p><strong>irq_set_state</strong> コールバック: クライアントがGPUのVGAリソースを無効にできない場合、メモリおよびI/Oデコードをオフにした際にIRQをオフにするよう依頼する必要があります。</p>
+<p><strong>set_vga_decode</strong> コールバック: クライアントがGPUのVGAリソースを無効化できる場合、このコールバックからエンコード/デコード状態を設定されます。</p>
+<p>理由: VGAデコードリソースを無条件で無効化できないため、一部の単一GPUノートPCはACPIやBIOS経由でVGAレジスタにアクセスしてバックライトなどの制御が必要な場合があります。新しいマルチGPUノートPCではより合理的な処理が行われ、デスクトップではこのための特殊なACPIは存在しないと期待しています。ドライバはユーザー空間でVGA仲裁が最初に使用されるときにコールバックを受け取り、一部の古いXサーバーの問題に対応します。</p>
+<p>この関数は、クライアントが <strong>pdev</strong> すでに登録されているかどうかを確認しません。</p>
+<p>解除するには、同じクライアントを元に登録したときに使用したものを除いて、両方をNULLに設定してこの関数を呼び出します。 <strong>irq_set_state</strong> および <strong>set_vga_decode</strong>
+解除するには、同じクライアントを元に登録したときに使用したものを除いて、両方をNULLに設定してこの関数を呼び出します。 <strong>pdev</strong> 元に登録したときに使用したものを除いて、両方をNULLに設定してこの関数を呼び出します。</p>
+<p><strong>戻り値</strong></p>
+<p>成功時は0、失敗時は-1</p>
+</section>
+<section id="libpciaccess">
+<h2>libpciaccess<a class="headerlink" href="#libpciaccess" title="この見出しへのパーマリンク">¶</a></h2>
+<p>VGA仲裁キャラクターデバイスを使用するため、libpciaccessライブラリ内にAPIが実装されました。システム内の各デバイスに該当するstruct pci_deviceに1つのフィールドが追加されました：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/* the type of resource decoded by the device */
+int vgaarb_rsrc;
+</pre></div>
+</div>
+<p>さらに、pci_systemに以下のフィールドが追加されました：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int vgaarb_fd;
+int vga_count;
+struct pci_device *vga_target;
+struct pci_device *vga_default_dev;
+</pre></div>
+</div>
+<p>vga_countは、仲裁されているカードの数を追跡するために使用され、たとえば1枚のカードしかない場合、完全に仲裁を回避できます。</p>
+<p>以下の関数は、指定されたカードに対してVGAリソースを取得し、それらのリソースをロックします。リソースが「通常」（レガシーでない）場合、アービターはまずその種類のリソースに対してカードがレガシーデコードを行っているかを確認します。確認結果が肯定的であれば、ロックは「レガシーリソースロック」に変換されます。アービターはまず、競合する可能性のあるすべてのVGAカードを検出し、そのIOやメモリアクセスを無効化し、必要に応じてP2PブリッジのVGAフォワーディングも無効化します。これにより、リクエストされたリソースを使用できるようにします。その後、カードがこれらのリソースをロックしているとマークされ、カードのIOおよび/またはメモリアクセスが有効化されます（必要に応じて親P2PブリッジのVGAフォワーディングも有効化されます）。vga_arb_lock()の場合、競合するカードがすでに必要なリソースのいずれか（または異なるバスセグメントのリソース、P2_PFブリッジがVGAメモリとIOを区別しないことから）をロックしている場合、関数はブロックします。カードがすでにリソースを所有している場合は、関数は成功します。vga_arb_trylock()は、ブロック代わりに(-EBUSY)を返します。ネストされた呼び出しはサポートされており（リソースごとのカウンタが維持されます）。</p>
+<p>このクライアントのターゲットデバイスを設定します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int  pci_device_vgaarb_set_target   (struct pci_device *dev);
+</pre></div>
+</div>
+<p>たとえば、x86で同じバス上の2つのデバイスが異なるリソースをロックしようとしても、どちらも成功します（ロックされます）。異なるバス上のデバイスが異なるリソースをロックしようとしても、最初に試したデバイスだけが成功します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int  pci_device_vgaarb_lock         (void);
+int  pci_device_vgaarb_trylock      (void);
+</pre></div>
+</div>
+<p>デバイスのリソースをアンロックします。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int  pci_device_vgaarb_unlock       (void);
+</pre></div>
+</div>
+<p>カードがレガシービジーログIO、レガシービジーログメモリ、両方、またはどちらもデコードしないかをアービトラータに通知します。すべてのカードはデフォルトで両方をデコードしますが、カードドライバー (例: fbdev) がレガシーデコードを無効にした場合、アービトラータに通知してカードをアービトラシオンプロセスから除外し、いつでも割り込みを安全に取得できるようにします。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int  pci_device_vgaarb_decodes      (int new_vgaarb_rsrc);
+</pre></div>
+</div>
+<p>アービターのデバイスに接続し、構造体を割り当てます</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int  pci_device_vgaarb_init         (void);
+</pre></div>
+</div>
+<p>接続を閉じます</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void pci_device_vgaarb_fini         (void);
+</pre></div>
+</div>
+</section>
+<section id="xf86vgaarbiter-x-server-implementation">
+<h2>xf86VGAArbiter (Xサーバー実装)<a class="headerlink" href="#xf86vgaarbiter-x-server-implementation" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Xサーバーは、VGAレジスタに触れるすべての関数を何らかの形でラップしています。</p>
+</section>
+<section id="references">
+<h2>参考文献<a class="headerlink" href="#references" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ベンジャミン・ヘレンシュミッツ（IBM？）は2005年にXorgコミュニティとこの設計について議論した際にこの作業を開始しました[1, 2]。2007年末には、パウロ・ザノーニとティアゴ・ヴィナッティ（ともにC3SL/パラナイバ州立大学）が彼の作業を継続し、カーネルコードをカーネルモジュールとして適応させ、ユーザー空間側の実装も行いました[3]。現在（2009年）ティアゴ・ヴィナッティとデイブ・エアリーがこの作業を完成させ、ジェシー・バーンズのPCIツリーに並べました。</p>
+<ol class="arabic simple" start="0">
+<li><p><a class="reference external" href="https://cgit.freedesktop.org/xorg/xserver/commit/?id=4b42448a2388d40f257774fbffdccaea87bd0347">https://cgit.freedesktop.org/xorg/xserver/commit/?id=4b42448a2388d40f257774fbffdccaea87bd0347</a></p></li>
+<li><p><a class="reference external" href="https://lists.freedesktop.org/archives/xorg/2005-March/006663.html">https://lists.freedesktop.org/archives/xorg/2005-March/006663.html</a></p></li>
+<li><p><a class="reference external" href="https://lists.freedesktop.org/archives/xorg/2005-March/006745.html">https://lists.freedesktop.org/archives/xorg/2005-March/006745.html</a></p></li>
+<li><p><a class="reference external" href="https://lists.freedesktop.org/archives/xorg/2007-October/029507.html">https://lists.freedesktop.org/archives/xorg/2007-October/029507.html</a></p></li>
+</ol>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linux GPUドライバ開発者ガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="introduction.html">はじめに</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-internals.html">DRM内部</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-mm.html">DRMメモリ管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-kms.html">カーネルモード設定 (KMS)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-kms-helpers.html">モード設定ヘルパ関数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-uapi.html">ユーザランドインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drm-client.html">カーネルクライアント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="drivers.html">GPUドライバドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="backlight.html">バックライトサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vga-switcheroo.html">VGAスイッチーロー</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">VGAアービトラー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="todo.html">TODOリスト</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linux GPUドライバ開発者ガイド</a><ul>
+<li>前へ: <a href="vga-switcheroo.html" title="前章">VGAスイッチーロー</a></li>
+<li>次へ: <a href="todo.html" title="次章">TODOリスト</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/gpu/vgaarbiter.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

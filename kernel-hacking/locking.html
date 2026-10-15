@@ -1,0 +1,1925 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>信頼性のないロックガイド — Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="../trace/index.html" rel="next" title="Linuxトレーシング技術"/>
+<link href="hacking.html" rel="prev" title="信頼性のないLinuxカーネルハッキングガイド"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="unreliable-guide-to-locking">
+<span id="kernel-hacking-lock"></span><h1>Unreliable Guide To Locking<a class="headerlink" href="#unreliable-guide-to-locking" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Rusty Russell</p>
+</dd>
+</dl>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ようこそ、Rustyの信じられないほど信頼性のないカーネルロック問題ガイドへ。このドキュメントは、Linux Kernel 2.6におけるロックシステムについて説明しています。</p>
+<p>HyperThreadingの広範な利用とLinux Kernelにおけるプリエンプションにより、カーネルを操作するすべての人々は、SMPにおける並行性とロックの基本を理解する必要があります。</p>
+</section>
+<section id="the-problem-with-concurrency">
+<h2>並行性の問題<a class="headerlink" href="#the-problem-with-concurrency" title="この見出しへのパーマリンク">¶</a></h2>
+<p>（レースコンディションをご存知であれば、このセクションはスキップしてください）</p>
+<p>通常のプログラムでは、カウンタをインクリメントするには以下のようにします：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>very_important_count++;
+</pre></div>
+</div>
+<p>これは彼らが期待する結果です：</p>
+<table class="docutils align-default" id="id1">
+<caption><span class="caption-text">予期される結果</span><a class="headerlink" href="#id1" title="この表へのパーマリンク">¶</a></caption>
+<colgroup>
+<col style="width: 50%"/>
+<col style="width: 50%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>インスタンス 1</p></th>
+<th class="head"><p>インスタンス 2</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>very_important_countを読み取る (5)</p></td>
+<td></td>
+</tr>
+<tr class="row-odd"><td><p>1を加算 (6)</p></td>
+<td></td>
+</tr>
+<tr class="row-even"><td><p>very_important_countを書き込む (6)</p></td>
+<td></td>
+</tr>
+<tr class="row-odd"><td></td>
+<td><p>very_important_countを読み取る (6)</p></td>
+</tr>
+<tr class="row-even"><td></td>
+<td><p>1を加算 (7)</p></td>
+</tr>
+<tr class="row-odd"><td></td>
+<td><p>very_important_countを書き込む (7)</p></td>
+</tr>
+</tbody>
+</table>
+<p>これは起こり得ることです:</p>
+<table class="docutils align-default" id="id2">
+<caption><span class="caption-text">可能性のある結果</span><a class="headerlink" href="#id2" title="この表へのパーマリンク">¶</a></caption>
+<colgroup>
+<col style="width: 50%"/>
+<col style="width: 50%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>インスタンス 1</p></th>
+<th class="head"><p>インスタンス 2</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>very_important_countを読み取る (5)</p></td>
+<td></td>
+</tr>
+<tr class="row-odd"><td></td>
+<td><p>very_important_countを読み取る (5)</p></td>
+</tr>
+<tr class="row-even"><td><p>1を加算 (6)</p></td>
+<td></td>
+</tr>
+<tr class="row-odd"><td></td>
+<td><p>1を加算 (6)</p></td>
+</tr>
+<tr class="row-even"><td><p>very_important_countを書き込む (6)</p></td>
+<td></td>
+</tr>
+<tr class="row-odd"><td></td>
+<td><p>very_important_countを書き込む (6)</p></td>
+</tr>
+</tbody>
+</table>
+<section id="race-conditions-and-critical-regions">
+<h3>レースコンディションとクリティカルリージョン<a class="headerlink" href="#race-conditions-and-critical-regions" title="この見出しへのパーマリンク">¶</a></h3>
+<p>この重なり、結果が複数のタスクの相対的なタイミングに依存する状況はレースコンディションと呼ばれます。並行処理の問題を含むコードの部分はクリティカルリージョンと呼ばれます。特にLinuxがSMPマシンで動作し始めた後、これらはカーネル設計と実装における主要な問題の一つとなっています。</p>
+<p>プリエンプションでも同様の効果が生じます。CPUが1台しかなければ、クリティカルリージョン中にタスクをプリエンプションすることで、同じレースコンディションが発生します。この場合、プリエンプションしたスレッドがクリティカルリージョン自体を実行する可能性があります。</p>
+<p>解決策は、これらの同時アクセスが発生するタイミングを認識し、ロックを使用して一度に1つのインスタンスしかクリティカルリージョンに進入させないことです。Linuxカーネルにはこのようなロックの導入を支援する多くのフレンドリーなプリミティブがあります。そして、フレンドリーでないプリミティブもありますが、私はそれらの存在を無視します。</p>
+</section>
+</section>
+<section id="locking-in-the-linux-kernel">
+<h2>Linuxカーネルにおけるロック<a class="headerlink" href="#locking-in-the-linux-kernel" title="この見出しへのパーマリンク">¶</a></h2>
+<p>もし1つのアドバイスを伝えるなら、自分より狂った人とは一緒に寝るべきではありません。しかし、ロックに関するアドバイスを伝えるなら: <strong>シンプルに保つ</strong>.</p>
+<p>新しいロックの導入に消極的になるべきです。</p>
+<p>奇妙なことに、この最後のアドバイスは、あなたが <strong>が</strong> 自分より狂った人と一緒に寝たときの私のアドバイスと逆です。そして、大きな犬を飼うことを検討すべきです。</p>
+<section id="two-main-types-of-kernel-locks-spinlocks-and-mutexes">
+<h3>カーネルロックの2つの主なタイプ: スピンロックとミューテックス<a class="headerlink" href="#two-main-types-of-kernel-locks-spinlocks-and-mutexes" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルロックの主な2つのタイプがあります。基本的なタイプはスピンロック（<code class="docutils literal notranslate"><span class="pre">include/asm/spinlock.h</span></code>）で、これは非常に単純な1つの保持者を持つロックです：スピンロックを取得できない場合は、常に試行し続ける（スピンする）まで待ちます。スピンロックは非常に小さく高速で、どこでも使用できます。</p>
+<p>2番目のタイプはミューテックス（<code class="docutils literal notranslate"><span class="pre">include/linux/mutex.h</span></code>): これはスピンロックに似ていますが、ミューテックスを保持しながらブロックする可能性があります。ミューテックスをロックできない場合、タスクは自身を一時停止し、ミューテックスが解放されるまで待機します。これにより、待機している間にもCPUは他の処理を行えるようになります。あなたが待機している間にスリープできないケースは多くあります（参照
+<a class="reference external" href="#sleeping-things">割込みから安全に呼び出せる関数はどれ？</a>）、そのためスピンロックを使用する必要があります。</p>
+<p>どちらのロックも再入可能ではありません：参照
+<a class="reference external" href="#deadlock">デッドロック: 簡単で高度な</a>.</p>
+</section>
+<section id="locks-and-uniprocessor-kernels">
+<h3>ロックとシングルプロセッサカーネル<a class="headerlink" href="#locks-and-uniprocessor-kernels" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルがコンパイル時に <code class="docutils literal notranslate"><span class="pre">CONFIG_SMP</span></code>が設定されていない場合、スピンロックは存在しません。これは優れた設計決定です：他のプロセスが同時に実行できない場合、ロックの必要性はありません。
+<code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT</span></code> カーネルがコンパイル時に</p>
+<p>が設定されていない場合、スピンロックはプリエンプションを無効化するだけで、競合を防ぐための十分な手段です。ほとんどの用途では、プリエンプションをSMP（対称マルチプロセッサ）と同等と見なし、別途考慮する必要はありません。 <code class="docutils literal notranslate"><span class="pre">CONFIG_SMP</span></code>ただし、 <code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT</span></code>
+ロックコードをテストする際は常に</p>
+<p>を有効にしてください。SMPテスト用のボックスがなくても、いくつかのロックに関するバグを検出できます。 <code class="docutils literal notranslate"><span class="pre">CONFIG_SMP</span></code> および
+<code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT</span></code> ミューテックスはユーザーコンテキスト間の同期に必要なので、以下で説明するように存在します。</p>
+<p>ユーザーコンテキストでのみロックを行う</p>
+</section>
+<section id="locking-only-in-user-context">
+<h3>ユーザーコンテキストのみでアクセスされるデータ構造がある場合、シンプルなミューテックス（<a class="headerlink" href="#locking-only-in-user-context" title="この見出しへのパーマリンク">¶</a></h3>
+<p>）で保護できます。これは最も単純なケースです：ミューテックスを初期化し、<code class="docutils literal notranslate"><span class="pre">include/linux/mutex.h</span></code>でミューテックスを取得し、 <a class="reference internal" href="#c.mutex_lock_interruptible" title="mutex_lock_interruptible"><code class="xref c c-func docutils literal notranslate"><span class="pre">mutex_lock_interruptible()</span></code></a> で解放します。また、 <a class="reference internal" href="#c.mutex_unlock" title="mutex_unlock"><code class="xref c c-func docutils literal notranslate"><span class="pre">mutex_unlock()</span></code></a> という関数も存在しますが、シグナルを受信した場合に返らないため、避けるべきです。
+<a class="reference internal" href="#c.mutex_lock" title="mutex_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">mutex_lock()</span></code></a>nf_register_sockopt() を使って新たな setsockopt() および getsockopt() の呼び出しを登録できます。登録と解除はモジュールのロードとアンロード（および起動時、その際は並行性がありません）時にのみ行われ、未知の setsockopt() または getsockopt() システムコールの際にのみ登録リストが参照されます。このため、</p>
+<p>例: <code class="docutils literal notranslate"><span class="pre">net/netfilter/nf_sockopt.c</span></code> はこの用途に最適です。特に、setsockopt および getsockopt 呼び出しはスリープする可能性があるためです。 <code class="docutils literal notranslate"><span class="pre">nf_sockopt_mutex</span></code> ユーザーコンテキストとソフトIRQ間でのロック</p>
+</section>
+<section id="locking-between-user-context-and-softirqs">
+<h3>ソフトIRQがユーザーコンテキストとデータを共有する場合、2つの問題があります。まず、現在のユーザーコンテキストはソフトIRQによって中断される可能性があり、次に、クリティカルセクションは別のCPUからも進入する可能性があります。このような場合に使用されるのが spin_lock_bh()（<a class="headerlink" href="#locking-between-user-context-and-softirqs" title="この見出しへのパーマリンク">¶</a></h3>
+<p>）です。この関数は、そのCPUのソフトIRQを無効化した後、ロックを取得します。spin_unlock_bh() は逆の操作を行います。（「_bh」のサフィックスは、「ボトムハーフ（Bottom Halves）」という古いソフトウェア割り込みの名称からの歴史的参照です。理想的には spin_lock_softirq() と呼ぶべきです）。<code class="docutils literal notranslate"><span class="pre">include/linux/spinlock.h</span></code>はこの用途に最適です。特に、setsockopt および getsockopt 呼び出しはスリープする可能性があるためです。</p>
+<p>ここではspin_lock_irq()またはspin_lock_irqsave()を使用することもできます。これらはハードウェア割込みを停止します: 参照 <a class="reference external" href="#hard-irq-context">ハードIRQコンテキスト</a>.</p>
+<p>UPでも完全に動作します: スピンロックは消え、このマクロは単にlocal_bh_disable()（<code class="docutils literal notranslate"><span class="pre">include/linux/interrupt.h</span></code>）になります。これはソフトIRQが実行されるのを防いでくれます。</p>
+</section>
+<section id="locking-between-user-context-and-tasklets">
+<h3>ユーザー コンテキストとタスクレット間のロック<a class="headerlink" href="#locking-between-user-context-and-tasklets" title="この見出しへのパーマリンク">¶</a></h3>
+<p>これは上記と同じです。タスクレットは実際にはソフトIRQから実行されるからです。</p>
+</section>
+<section id="locking-between-user-context-and-timers">
+<h3>ユーザー コンテキストとタイマ間のロック<a class="headerlink" href="#locking-between-user-context-and-timers" title="この見出しへのパーマリンク">¶</a></h3>
+<p>これも上記と同じです。タイマは実際にはソフトIRQから実行されるためです。ロックの観点から見れば、タスクレットとタイマは同一です。</p>
+</section>
+<section id="locking-between-tasklets-timers">
+<h3>タスクレット/タイマ間のロック<a class="headerlink" href="#locking-between-tasklets-timers" title="この見出しへのパーマリンク">¶</a></h3>
+<p>たまにタスクレットまたはタイマが別のタスクレットまたはタイマとデータを共有したい場合があります。</p>
+<section id="the-same-tasklet-timer">
+<h4>同じタスクレット/タイマ<a class="headerlink" href="#the-same-tasklet-timer" title="この見出しへのパーマリンク">¶</a></h4>
+<p>タスクレットは一度に2つのCPUで実行されることはないため、SMPでもタスクレットが再入可能（同時に2回実行される）になる心配は必要ありません。</p>
+</section>
+<section id="different-tasklets-timers">
+<h4>異なるタスクレット/タイマ<a class="headerlink" href="#different-tasklets-timers" title="この見出しへのパーマリンク">¶</a></h4>
+<p>別のタスクレット/タイマがあなたのタスクレットまたはタイマとデータを共有したい場合、双方がspin_lock()とspin_unlock()を呼び出す必要があります。spin_lock_bh()は必要ありません。なぜなら、すでにタスクレット内にあり、同じCPU上で他のタスクレットが実行されることはないからです。</p>
+</section>
+</section>
+<section id="locking-between-softirqs">
+<h3>ソフトIRQ間のロック<a class="headerlink" href="#locking-between-softirqs" title="この見出しへのパーマリンク">¶</a></h3>
+<p>しばしばソフトIRQは自身またはタスクレット/タイマとデータを共有したい場合があります。</p>
+<section id="the-same-softirq">
+<h4>同じソフトIRQ<a class="headerlink" href="#the-same-softirq" title="この見出しへのパーマリンク">¶</a></h4>
+<p>同じソフトIRQは他のCPUでも実行できます。パーセルCPU配列（参照 <a class="reference external" href="#per-cpu-data">パーセルCPUデータ</a>）でより高いパフォーマンスを実現できます。ソフトIRQを使用するほど進んでいるなら、スケーラブルなパフォーマンスを重視するため、追加の複雑さを正当化するほどです。</p>
+<p>共有データにはspin_lock()とspin_unlock()を使用する必要があります。</p>
+</section>
+<section id="different-softirqs">
+<h4>異なるソフトIRQ<a class="headerlink" href="#different-softirqs" title="この見出しへのパーマリンク">¶</a></h4>
+<p>共有データにはspin_lock()とspin_unlock()を使用する必要があります。それがタイマ、タスクレット、異なるソフトIRQ、同じか別のソフトIRQであっても、どれもが別のCPUで実行されている可能性があるためです。</p>
+</section>
+</section>
+</section>
+<section id="hard-irq-context">
+<h2>ハードIRQコンテキスト<a class="headerlink" href="#hard-irq-context" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ハードウェア割込みは通常、タスクレットまたはソフトIRQと通信します。これは、作業をキューに格納する頻繁な作業で、ソフトIRQがそれを取り出します。</p>
+<section id="locking-between-hard-irq-and-softirqs-tasklets">
+<h3>ハードIRQとソフトIRQ/タスクレット間のロック<a class="headerlink" href="#locking-between-hard-irq-and-softirqs-tasklets" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ハードウェアIRQハンドラがソフトIRQとデータを共有する場合、2つの懸念があります。まず、ソフトIRQの処理はハードウェア割込みによって中断される可能性があり、次に、別のCPUのハードウェア割込みがクリティカルな領域に進入する可能性があります。これはspin_lock_irq()が使用される場面です。これは、そのCPUの割込みを無効にしてからロックを取得するように定義されています。spin_unlock_irq()はこれを逆を行います。</p>
+<p>IRQハンドラはspin_lock_irq()を使用する必要がありません。なぜなら、softirqはIRQハンドラが実行されている間は実行されないからです。代わりにspin_lock()を使用できます。これはやや高速です。ただし、別のハードウェアIRQハンドラが同じロックを使用している場合を除いては、spin_lock_irq()はそのハンドラが私たちを妨害しないようにします。</p>
+<p>これはUPでも完全に機能します。スピンロックは消失し、このマクロは単にlocal_irq_disable()（<code class="docutils literal notranslate"><span class="pre">include/asm/smp.h</span></code>）になります。これによりsoftirq/tasklet/BHが実行されることを防ぎます。</p>
+<p>spin_lock_irqsave（<code class="docutils literal notranslate"><span class="pre">include/linux/spinlock.h</span></code>）は、割り込みが有効か無効かをフラグワードに保存する変体です。これはspin_unlock_irqrestore()に渡されます。これにより、同じコードをハードウェアIRQハンドラ（割り込みがすでに無効になっている状態）とsoftirq（割り込み無効が必要な状態）の両方で使用できます。</p>
+<p>注意してください。softirq（およびタスクレットとタイマも含む）はハードウェア割り込みからの戻り時に実行されるため、spin_lock_irq()もこれらを停止します。この意味では、spin_lock_irqsave()が最も一般的で強力なロック関数です。</p>
+</section>
+<section id="locking-between-two-hard-irq-handlers">
+<h3>2つのハードIRQハンドラ間でのロック<a class="headerlink" href="#locking-between-two-hard-irq-handlers" title="この見出しへのパーマリンク">¶</a></h3>
+<p>2つのIRQハンドラ間でデータを共有する必要は滅多にありませんが、必要であればspin_lock_irqsave()を使用すべきです。IRQハンドラ自体内ですべての割り込みを無効にするかどうかはアーキテクチャに依存します。</p>
+</section>
+</section>
+<section id="cheat-sheet-for-locking">
+<h2>ロックに関するチートシート<a class="headerlink" href="#cheat-sheet-for-locking" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Pete Zaitcevが提供した要約:</p>
+<ul class="simple">
+<li><p>プロセスコンテキスト（任意のシステムコール）で他のプロセスをロックアウトしたい場合は、ミューテックスを使用してください。ミューテックスを取得し、待機できます（<code class="docutils literal notranslate"><span class="pre">copy_from_user*(</span></code> または <code class="docutils literal notranslate"><span class="pre">kmalloc(x,GFP_KERNEL)</span></code>).</p></li>
+<li><p>）。</p></li>
+<li><p>スピンロックを5行以上のコードで保持したり、関数呼び出しを跨って保持しないでください（readb()などのアクセッサ関数を除く）。</p></li>
+</ul>
+<section id="table-of-minimum-requirements">
+<h3>最小要件一覧<a class="headerlink" href="#table-of-minimum-requirements" title="この見出しへのパーマリンク">¶</a></h3>
+<p>次の表は、 <strong>最小値</strong> さまざまなコンテキスト間でのロック要件を示しています。一部のコンテキストは1つのCPUのみで実行されるため、そのコンテキストでのロックは必要ありません（例：特定のスレッドは1つのCPUのみで実行され、他のスレッドとデータを共有する必要がある場合にのみロックが必要です）。</p>
+<p>上のアドバイスを常に思い出してください。spin_lock_irqsave()はすべての他のスピンロックプリミティブを含むスーパーセットです。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 12%"/>
+<col style="width: 11%"/>
+<col style="width: 11%"/>
+<col style="width: 8%"/>
+<col style="width: 8%"/>
+<col style="width: 8%"/>
+<col style="width: 8%"/>
+<col style="width: 6%"/>
+<col style="width: 6%"/>
+<col style="width: 12%"/>
+<col style="width: 12%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>.</p></th>
+<th class="head"><p>IRQハンドラA</p></th>
+<th class="head"><p>IRQハンドラB</p></th>
+<th class="head"><p>softirq A</p></th>
+<th class="head"><p>softirq B</p></th>
+<th class="head"><p>タスクレットA</p></th>
+<th class="head"><p>タスクレットB</p></th>
+<th class="head"><p>タイマA</p></th>
+<th class="head"><p>タイマB</p></th>
+<th class="head"><p>ユーザコンテキストA</p></th>
+<th class="head"><p>ユーザコンテキストB</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>IRQハンドラA</p></td>
+<td><p>なし</p></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr class="row-odd"><td><p>IRQハンドラB</p></td>
+<td><p>SLIS</p></td>
+<td><p>なし</p></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr class="row-even"><td><p>softirq A</p></td>
+<td><p>SLI</p></td>
+<td><p>SLI</p></td>
+<td><p>SL</p></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr class="row-odd"><td><p>softirq B</p></td>
+<td><p>SLI</p></td>
+<td><p>SLI</p></td>
+<td><p>SL</p></td>
+<td><p>SL</p></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr class="row-even"><td><p>タスクレットA</p></td>
+<td><p>SLI</p></td>
+<td><p>SLI</p></td>
+<td><p>SL</p></td>
+<td><p>SL</p></td>
+<td><p>なし</p></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr class="row-odd"><td><p>タスクレットB</p></td>
+<td><p>SLI</p></td>
+<td><p>SLI</p></td>
+<td><p>SL</p></td>
+<td><p>SL</p></td>
+<td><p>SL</p></td>
+<td><p>なし</p></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr class="row-even"><td><p>タイマA</p></td>
+<td><p>SLI</p></td>
+<td><p>SLI</p></td>
+<td><p>SL</p></td>
+<td><p>SL</p></td>
+<td><p>SL</p></td>
+<td><p>SL</p></td>
+<td><p>なし</p></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr class="row-odd"><td><p>タイマB</p></td>
+<td><p>SLI</p></td>
+<td><p>SLI</p></td>
+<td><p>SL</p></td>
+<td><p>SL</p></td>
+<td><p>SL</p></td>
+<td><p>SL</p></td>
+<td><p>SL</p></td>
+<td><p>なし</p></td>
+<td></td>
+<td></td>
+</tr>
+<tr class="row-even"><td><p>ユーザコンテキストA</p></td>
+<td><p>SLI</p></td>
+<td><p>SLI</p></td>
+<td><p>SLBH</p></td>
+<td><p>SLBH</p></td>
+<td><p>SLBH</p></td>
+<td><p>SLBH</p></td>
+<td><p>SLBH</p></td>
+<td><p>SLBH</p></td>
+<td><p>なし</p></td>
+<td></td>
+</tr>
+<tr class="row-odd"><td><p>ユーザコンテキストB</p></td>
+<td><p>SLI</p></td>
+<td><p>SLI</p></td>
+<td><p>SLBH</p></td>
+<td><p>SLBH</p></td>
+<td><p>SLBH</p></td>
+<td><p>SLBH</p></td>
+<td><p>SLBH</p></td>
+<td><p>SLBH</p></td>
+<td><p>MLI</p></td>
+<td><p>なし</p></td>
+</tr>
+</tbody>
+</table>
+<p>表: ロック要件一覧</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 22%"/>
+<col style="width: 78%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>SLIS</p></td>
+<td><p>spin_lock_irqsave</p></td>
+</tr>
+<tr class="row-even"><td><p>SLI</p></td>
+<td><p>spin_lock_irq</p></td>
+</tr>
+<tr class="row-odd"><td><p>SL</p></td>
+<td><p>spin_lock</p></td>
+</tr>
+<tr class="row-even"><td><p>SLBH</p></td>
+<td><p>spin_lock_bh</p></td>
+</tr>
+<tr class="row-odd"><td><p>MLI</p></td>
+<td><p>mutex_lock_interruptible</p></td>
+</tr>
+</tbody>
+</table>
+<p>表: ロック要件表の凡例</p>
+</section>
+</section>
+<section id="the-trylock-functions">
+<h2>trylock関数<a class="headerlink" href="#the-trylock-functions" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ロックを一度だけ取得しようと試み、その結果を成功または失敗として即座に値で返す関数があります。他のスレッドがロックを保持している間でもデータにアクセスする必要がない場合に使用できます。その後データにアクセスが必要な場合は、後でロックを取得する必要があります。</p>
+<p>spin_trylock()はスピンせずに、最初の試行でスピンロックを取得できた場合は非ゼロ値を、取得できなかった場合はゼロを返します。この関数はspin_lock()と同様にすべてのコンテキストで使用できますが、中断する可能性のあるコンテキストを無効にしてからスピンロックを取得する必要があります。</p>
+<p><a class="reference internal" href="#c.mutex_trylock" title="mutex_trylock"><code class="xref c c-func docutils literal notranslate"><span class="pre">mutex_trylock()</span></code></a> タスクの待機をせず、最初の試行でミューテックスを取得できた場合は非ゼロ値を、取得できなかった場合はゼロを返します。ハードウェアまたはソフトウェア割込みコンテキストでは安全に使用できません（待機しないにもかかわらず）。</p>
+</section>
+<section id="common-examples">
+<h2>一般的な例<a class="headerlink" href="#common-examples" title="この見出しへのパーマリンク">¶</a></h2>
+<p>簡単な例をステップごとに見てみましょう：数値から名前のマッピングを保持するキャッシュ。このキャッシュは各オブジェクトの使用頻度をカウントし、満杯になると最も使用頻度の低いオブジェクトを削除します。</p>
+<section id="all-in-user-context">
+<h3>すべてユーザーコンテキスト内<a class="headerlink" href="#all-in-user-context" title="この見出しへのパーマリンク">¶</a></h3>
+<p>最初の例ではすべての操作がユーザーコンテキスト（つまりシステムコールから）で行われると仮定します（つまり待機が可能）。これにより、キャッシュとその内のすべてのオブジェクトを保護するミューテックスを使用できます。以下がコードです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/list.h&gt;
+#include &lt;linux/slab.h&gt;
+#include &lt;linux/string.h&gt;
+#include &lt;linux/mutex.h&gt;
+#include &lt;asm/errno.h&gt;
+
+struct object
+{
+        struct list_head list;
+        int id;
+        char name[32];
+        int popularity;
+};
+
+/* Protects the cache, cache_num, and the objects within it */
+static DEFINE_MUTEX(cache_lock);
+static LIST_HEAD(cache);
+static unsigned int cache_num = 0;
+#define MAX_CACHE_SIZE 10
+
+/* Must be holding cache_lock */
+static struct object *__cache_find(int id)
+{
+        struct object *i;
+
+        list_for_each_entry(i, &amp;cache, list)
+                if (i-&gt;id == id) {
+                        i-&gt;popularity++;
+                        return i;
+                }
+        return NULL;
+}
+
+/* Must be holding cache_lock */
+static void __cache_delete(struct object *obj)
+{
+        BUG_ON(!obj);
+        list_del(&amp;obj-&gt;list);
+        kfree(obj);
+        cache_num--;
+}
+
+/* Must be holding cache_lock */
+static void __cache_add(struct object *obj)
+{
+        list_add(&amp;obj-&gt;list, &amp;cache);
+        if (++cache_num &gt; MAX_CACHE_SIZE) {
+                struct object *i, *outcast = NULL;
+                list_for_each_entry(i, &amp;cache, list) {
+                        if (!outcast || i-&gt;popularity &lt; outcast-&gt;popularity)
+                                outcast = i;
+                }
+                __cache_delete(outcast);
+        }
+}
+
+int cache_add(int id, const char *name)
+{
+        struct object *obj;
+
+        if ((obj = kmalloc(sizeof(*obj), GFP_KERNEL)) == NULL)
+                return -ENOMEM;
+
+        strscpy(obj-&gt;name, name, sizeof(obj-&gt;name));
+        obj-&gt;id = id;
+        obj-&gt;popularity = 0;
+
+        mutex_lock(&amp;cache_lock);
+        __cache_add(obj);
+        mutex_unlock(&amp;cache_lock);
+        return 0;
+}
+
+void cache_delete(int id)
+{
+        mutex_lock(&amp;cache_lock);
+        __cache_delete(__cache_find(id));
+        mutex_unlock(&amp;cache_lock);
+}
+
+int cache_find(int id, char *name)
+{
+        struct object *obj;
+        int ret = -ENOENT;
+
+        mutex_lock(&amp;cache_lock);
+        obj = __cache_find(id);
+        if (obj) {
+                ret = 0;
+                strcpy(name, obj-&gt;name);
+        }
+        mutex_unlock(&amp;cache_lock);
+        return ret;
+}
+</pre></div>
+</div>
+<p>追加、削除、またはキャッシュの検索を行う際には常にキャッシュ_lockを取得していることを確認しています。キャッシュインフラストラクチャ自体とオブジェクトの内容もロックで保護されています。この場合、ユーザーにデータをコピーして直接オブジェクトにアクセスさせないため、簡単に実装できます。</p>
+<p>キャッシュ_add()ではロックを取得する前にオブジェクトのフィールドを設定するという軽量な最適化があります。これは、ロックを取得する前にオブジェクトをキャッシュに追加するため、誰もアクセスできないため安全です。</p>
+</section>
+<section id="accessing-from-interrupt-context">
+<h3>割込みコンテキストからのアクセス<a class="headerlink" href="#accessing-from-interrupt-context" title="この見出しへのパーマリンク">¶</a></h3>
+<p>キャッシュ_find()が割込みコンテキスト（ハードウェア割込みまたはソフトウェア割込み）から呼び出されるケースを検討しましょう。例として、タイマーコンテキストでキャッシュからオブジェクトを削除する例があります。</p>
+<p>以下に標準的なパッチ形式で変更内容を示します： <code class="docutils literal notranslate"><span class="pre">-</span></code> 削除される行は <code class="docutils literal notranslate"><span class="pre">+</span></code> 追加される行は</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>--- cache.c.usercontext 2003-12-09 13:58:54.000000000 +1100
++++ cache.c.interrupt   2003-12-09 14:07:49.000000000 +1100
+@@ -12,7 +12,7 @@
+         int popularity;
+ };
+
+-static DEFINE_MUTEX(cache_lock);
++static DEFINE_SPINLOCK(cache_lock);
+ static LIST_HEAD(cache);
+ static unsigned int cache_num = 0;
+ #define MAX_CACHE_SIZE 10
+@@ -55,6 +55,7 @@
+ int cache_add(int id, const char *name)
+ {
+         struct object *obj;
++        unsigned long flags;
+
+         if ((obj = kmalloc(sizeof(*obj), GFP_KERNEL)) == NULL)
+                 return -ENOMEM;
+@@ -63,30 +64,33 @@
+         obj-&gt;id = id;
+         obj-&gt;popularity = 0;
+
+-        mutex_lock(&amp;cache_lock);
++        spin_lock_irqsave(&amp;cache_lock, flags);
+         __cache_add(obj);
+-        mutex_unlock(&amp;cache_lock);
++        spin_unlock_irqrestore(&amp;cache_lock, flags);
+         return 0;
+ }
+
+ void cache_delete(int id)
+ {
+-        mutex_lock(&amp;cache_lock);
++        unsigned long flags;
++
++        spin_lock_irqsave(&amp;cache_lock, flags);
+         __cache_delete(__cache_find(id));
+-        mutex_unlock(&amp;cache_lock);
++        spin_unlock_irqrestore(&amp;cache_lock, flags);
+ }
+
+ int cache_find(int id, char *name)
+ {
+         struct object *obj;
+         int ret = -ENOENT;
++        unsigned long flags;
+
+-        mutex_lock(&amp;cache_lock);
++        spin_lock_irqsave(&amp;cache_lock, flags);
+         obj = __cache_find(id);
+         if (obj) {
+                 ret = 0;
+                 strcpy(name, obj-&gt;name);
+         }
+-        mutex_unlock(&amp;cache_lock);
++        spin_unlock_irqrestore(&amp;cache_lock, flags);
+         return ret;
+ }
+</pre></div>
+</div>
+<p>spin_lock_irqsave()は割込みが有効であれば無効にし、すでに割込みハンドラ内であれば何もしないため、これらの関数は任意のコンテキストから安全に呼び出すことができます。</p>
+<p>残念ながら、cache_add()は <a class="reference internal" href="../core-api/mm-api.html#c.kmalloc" title="kmalloc"><code class="xref c c-func docutils literal notranslate"><span class="pre">kmalloc()</span></code></a>
+これは、そのコア内のすべての論理CPU（SMTスレッド）が <code class="docutils literal notranslate"><span class="pre">GFP_KERNEL</span></code> フラグを呼び出しており、これはユーザーコンテキストでのみ有効です。cache_add()が依然としてユーザーコンテキストで呼び出されるものと仮定していますが、そうでない場合はcache_add()のパラメータにすべきです。</p>
+</section>
+<section id="exposing-objects-outside-this-file">
+<h3>このファイルの外にオブジェクトを公開する<a class="headerlink" href="#exposing-objects-outside-this-file" title="この見出しへのパーマリンク">¶</a></h3>
+<p>もしオブジェクトに含まれる情報がより多くなれば、情報をコピーするだけでは不十分になる可能性がある: 他のコードの一部がこれらのオブジェクトへのポインタを保持したい場合があり、毎回idを検索するのではなく。これにより2つの問題が生じる。</p>
+<p>最初の問題は、我々が <code class="docutils literal notranslate"><span class="pre">cache_lock</span></code> オブジェクトを保護するために使用している: 他のコードが使用できるようにするには、これを静的でないものにしなければならない。これにより、ロックの管理が複雑になる。ロックがすべて1ヶ所に集中しているため、</p>
+<p>2番目の問題は寿命の問題である: 他の構造体がオブジェクトへのポインタを保持している場合、そのポインタが有効であることを期待している。しかし、これはロックを保持している間だけ保証される。ロックを解放した後、誰かがcache_delete()を呼び出したり、さらに悪いことに同じアドレスを再利用して別のオブジェクトを追加したりする可能性がある。</p>
+<p>ただ一つのロックしか存在しないため、これを永遠に保持することはできない: 他の誰も作業ができなくなるからだ。</p>
+<p>この問題の解決策は参照カウントを使用することです。オブジェクトへのポインタを持つすべてのユーザーがオブジェクトを取得する際には参照カウントを増やし、使用が終わったら減少させます。参照カウントがゼロになったら、オブジェクトは使用されていないと判断され、実際に削除できます。</p>
+<p>以下がコードです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>--- cache.c.interrupt   2003-12-09 14:25:43.000000000 +1100
++++ cache.c.refcnt  2003-12-09 14:33:05.000000000 +1100
+@@ -7,6 +7,7 @@
+ struct object
+ {
+         struct list_head list;
++        unsigned int refcnt;
+         int id;
+         char name[32];
+         int popularity;
+@@ -17,6 +18,35 @@
+ static unsigned int cache_num = 0;
+ #define MAX_CACHE_SIZE 10
+
++static void __object_put(struct object *obj)
++{
++        if (--obj-&gt;refcnt == 0)
++                kfree(obj);
++}
++
++static void __object_get(struct object *obj)
++{
++        obj-&gt;refcnt++;
++}
++
++void object_put(struct object *obj)
++{
++        unsigned long flags;
++
++        spin_lock_irqsave(&amp;cache_lock, flags);
++        __object_put(obj);
++        spin_unlock_irqrestore(&amp;cache_lock, flags);
++}
++
++void object_get(struct object *obj)
++{
++        unsigned long flags;
++
++        spin_lock_irqsave(&amp;cache_lock, flags);
++        __object_get(obj);
++        spin_unlock_irqrestore(&amp;cache_lock, flags);
++}
++
+ /* Must be holding cache_lock */
+ static struct object *__cache_find(int id)
+ {
+@@ -35,6 +65,7 @@
+ {
+         BUG_ON(!obj);
+         list_del(&amp;obj-&gt;list);
++        __object_put(obj);
+         cache_num--;
+ }
+
+@@ -63,6 +94,7 @@
+         strscpy(obj-&gt;name, name, sizeof(obj-&gt;name));
+         obj-&gt;id = id;
+         obj-&gt;popularity = 0;
++        obj-&gt;refcnt = 1; /* The cache holds a reference */
+
+         spin_lock_irqsave(&amp;cache_lock, flags);
+         __cache_add(obj);
+@@ -79,18 +111,15 @@
+         spin_unlock_irqrestore(&amp;cache_lock, flags);
+ }
+
+-int cache_find(int id, char *name)
++struct object *cache_find(int id)
+ {
+         struct object *obj;
+-        int ret = -ENOENT;
+         unsigned long flags;
+
+         spin_lock_irqsave(&amp;cache_lock, flags);
+         obj = __cache_find(id);
+-        if (obj) {
+-                ret = 0;
+-                strcpy(name, obj-&gt;name);
+-        }
++        if (obj)
++                __object_get(obj);
+         spin_unlock_irqrestore(&amp;cache_lock, flags);
+-        return ret;
++        return obj;
+ }
+</pre></div>
+</div>
+<p>参照カウントは標準の'get'と'put'関数でカプセル化しています。これにより、cache_find()からオブジェクト自体を返すことが可能となり、ユーザーがオブジェクトを保持しながら睡眠する（例: copy_to_user()でユーザー空間に名前をコピー）ことができます。</p>
+<p>注意すべきもう一つの点は、オブジェクトへのすべてのポインタに対して参照を保持すべきであるということです: キャッシュに最初に挿入された際には参照カウントが1になります。一部のバージョンではフレームワークが参照カウントを保持しないが、それらはより複雑です。</p>
+<section id="using-atomic-operations-for-the-reference-count">
+<h4>参照カウントにアトミック操作を使用する<a class="headerlink" href="#using-atomic-operations-for-the-reference-count" title="この見出しへのパーマリンク">¶</a></h4>
+<p>実際には、 <code class="xref c c-type docutils literal notranslate"><span class="pre">atomic_t</span></code> refcntには通常、 <code class="docutils literal notranslate"><span class="pre">include/asm/atomic.h</span></code>で定義されたアトミック操作が使用される: これらはシステム内のすべてのCPUからアトミックに見られることが保証されており、ロックは必要ない。この場合、スピンロックよりもシンプルだが、非自明な場合にはスピンロックの方が明確である。atomic_inc()とatomic_dec_and_test()は標準のインクリメントとデクリメント演算子ではなく使用される。参照カウント自体を保護するロックはもう使われない。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>--- cache.c.refcnt  2003-12-09 15:00:35.000000000 +1100
++++ cache.c.refcnt-atomic   2003-12-11 15:49:42.000000000 +1100
+@@ -7,7 +7,7 @@
+ struct object
+ {
+         struct list_head list;
+-        unsigned int refcnt;
++        atomic_t refcnt;
+         int id;
+         char name[32];
+         int popularity;
+@@ -18,33 +18,15 @@
+ static unsigned int cache_num = 0;
+ #define MAX_CACHE_SIZE 10
+
+-static void __object_put(struct object *obj)
+-{
+-        if (--obj-&gt;refcnt == 0)
+-                kfree(obj);
+-}
+-
+-static void __object_get(struct object *obj)
+-{
+-        obj-&gt;refcnt++;
+-}
+-
+ void object_put(struct object *obj)
+ {
+-        unsigned long flags;
+-
+-        spin_lock_irqsave(&amp;cache_lock, flags);
+-        __object_put(obj);
+-        spin_unlock_irqrestore(&amp;cache_lock, flags);
++        if (atomic_dec_and_test(&amp;obj-&gt;refcnt))
++                kfree(obj);
+ }
+
+ void object_get(struct object *obj)
+ {
+-        unsigned long flags;
+-
+-        spin_lock_irqsave(&amp;cache_lock, flags);
+-        __object_get(obj);
+-        spin_unlock_irqrestore(&amp;cache_lock, flags);
++        atomic_inc(&amp;obj-&gt;refcnt);
+ }
+
+ /* Must be holding cache_lock */
+@@ -65,7 +47,7 @@
+ {
+         BUG_ON(!obj);
+         list_del(&amp;obj-&gt;list);
+-        __object_put(obj);
++        object_put(obj);
+         cache_num--;
+ }
+
+@@ -94,7 +76,7 @@
+         strscpy(obj-&gt;name, name, sizeof(obj-&gt;name));
+         obj-&gt;id = id;
+         obj-&gt;popularity = 0;
+-        obj-&gt;refcnt = 1; /* The cache holds a reference */
++        atomic_set(&amp;obj-&gt;refcnt, 1); /* The cache holds a reference */
+
+         spin_lock_irqsave(&amp;cache_lock, flags);
+         __cache_add(obj);
+@@ -119,7 +101,7 @@
+         spin_lock_irqsave(&amp;cache_lock, flags);
+         obj = __cache_find(id);
+         if (obj)
+-                __object_get(obj);
++                object_get(obj);
+         spin_unlock_irqrestore(&amp;cache_lock, flags);
+         return obj;
+ }
+</pre></div>
+</div>
+</section>
+</section>
+<section id="protecting-the-objects-themselves">
+<h3>オブジェクト自体の保護<a class="headerlink" href="#protecting-the-objects-themselves" title="この見出しへのパーマリンク">¶</a></h3>
+<p>これらの例では、オブジェクト（参照カウントを除く）が作成後で変更されることはないものと仮定しています。もし名前を変更できるようにしたい場合、以下の3つの可能性があります:</p>
+<ul class="simple">
+<li><p>You can make <code class="docutils literal notranslate"><span class="pre">cache_lock</span></code> 静的でないため、オブジェクトの名前を変更する前にそのロックを取得してほしい。</p></li>
+<li><p>callerに名前を変更するためのロックを取得し、名前を変更するcache_obj_rename()関数を提供し、誰もがその関数を使用するように伝えることができます。</p></li>
+<li><p>キャッシュを <code class="docutils literal notranslate"><span class="pre">cache_lock</span></code> キャッシュ自体のみを保護し、名前を保護するための別のロックを使用してください。</p></li>
+</ul>
+<p>理論的には、各フィールド、各オブジェクトごとにロックを細かく設定できます。実際には、最も一般的な変種は以下の通りです：</p>
+<ul class="simple">
+<li><p>インフラストラクチャ（この例のリスト）とすべてのオブジェクトを保護する1つのロック。 <code class="docutils literal notranslate"><span class="pre">cache</span></code> この例のリストとすべてのオブジェクトを保護する1つのロック。これはこれまでの実装です。</p></li>
+<li><p>インフラストラクチャ（オブジェクト内のリストポインタを含む）を保護する1つのロック、およびオブジェクト内に存在するそのオブジェクトの残り部分を保護する1つのロック。</p></li>
+<li><p>インフラストラクチャを保護する複数のロック（例：ハッシュチェーンごとに1つのロック）、オブジェクトごとの別ロックを含む可能性があります。</p></li>
+</ul>
+<p>ここに「オブジェクトごとのロック」の実装です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>--- cache.c.refcnt-atomic   2003-12-11 15:50:54.000000000 +1100
++++ cache.c.perobjectlock   2003-12-11 17:15:03.000000000 +1100
+@@ -6,11 +6,17 @@
+
+ struct object
+ {
++        /* These two protected by cache_lock. */
+         struct list_head list;
++        int popularity;
++
+         atomic_t refcnt;
++
++        /* Doesn't change once created. */
+         int id;
++
++        spinlock_t lock; /* Protects the name */
+         char name[32];
+-        int popularity;
+ };
+
+ static DEFINE_SPINLOCK(cache_lock);
+@@ -77,6 +84,7 @@
+         obj-&gt;id = id;
+         obj-&gt;popularity = 0;
+         atomic_set(&amp;obj-&gt;refcnt, 1); /* The cache holds a reference */
++        spin_lock_init(&amp;obj-&gt;lock);
+
+         spin_lock_irqsave(&amp;cache_lock, flags);
+         __cache_add(obj);
+</pre></div>
+</div>
+<p>インフラストラクチャロックではなく、オブジェクトごとのロックで保護する必要があります。これは、それが（オブジェクト内のものと同様に）インフラストラクチャに論理的に含まれるためです。
+<code class="docutils literal notranslate"><span class="pre">cache_lock</span></code> オブジェクトごとのロックではなく：これは、それが（オブジェクト内のものと同様に）インフラストラクチャに論理的に含まれるためです。 <code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">list_head</span></code> オブジェクト内にある）は論理的にインフラストラクチャの一部です。このようにして、__cache_add()で最も人気のないものを検索する際、すべてのオブジェクトのロックを取得する必要がありません。</p>
+<p>また、idメンバが変更不可能であると判断しました。そのため、__cache_find()でidを調べる際、各オブジェクトのロックを取得する必要がありません。オブジェクトロックは、名前フィールドを読み書きする呼び出し元だけが使用します。</p>
+<p>また、どのロックがどのデータを保護するかを記述したコメントを追加しました。これは非常に重要です。コードの実行時動作を説明しており、単に読むだけでは得にくい情報です。アラン・コックスが言うように、「データをロックし、コードをロックしない」のです。</p>
+</section>
+</section>
+<section id="common-problems">
+<h2>一般的な問題<a class="headerlink" href="#common-problems" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="deadlock-simple-and-advanced">
+<h3>デッドロック: 簡単で高度な<a class="headerlink" href="#deadlock-simple-and-advanced" title="この見出しへのパーマリンク">¶</a></h3>
+<p>コードがスピンロックを2回取得しようとするバグがあります。これにより、ロックが解放されるのを待つため、永遠にスピンします（Linuxではスピンロック、rwロック、ミューテックスは再入不可です）。これは簡単に診断できます：5晩徹夜してフワフワしたコードのうさぎと話すような問題ではありません。</p>
+<p>やや複雑なケースを想像してください。ソフトIRQとユーザーコンテキストが共有する領域があり、spin_lock()呼び出しで保護する場合、ユーザーコンテキストがロックを保持している間にソフトIRQが割り込み、ソフトIRQが同じロックを取得しようと永遠にスピンする可能性があります。</p>
+<p>これらはどちらもデッドロックと呼ばれます。上記のように、単一のCPUでも発生することがあります（ただし、UPコンパイルではスピンロックがカーネルコンパイルで消失するため、発生しません）。 <code class="docutils literal notranslate"><span class="pre">CONFIG_SMP</span></code>=n。2番目の例ではデータ腐敗が発生します。</p>
+<p>この完全なロックアップは簡単に診断できます: SMPマシンではウォッチドッグタイマーやコンパイル時に <code class="docutils literal notranslate"><span class="pre">DEBUG_SPINLOCK</span></code> set (<code class="docutils literal notranslate"><span class="pre">include/linux/spinlock.h</span></code>) が発生したときにすぐにこの現象を示します。</p>
+<p>より複雑な問題は「デッドリーエンブレース」と呼ばれるものです。これは2つ以上のロックを関与する問題で、ハッシュテーブルがあるとします。テーブルの各エントリがスピンロックで、ハッシュされたオブジェクトのチェーンがあります。ソフトIRQハンドラ内で、ハッシュ内の1か所から別の場所にオブジェクトを変更したい場合があります。このとき、古いハッシュチェーンのスピンロックと新しいハッシュチェーンのスピンロックを取得し、古いチェーンからオブジェクトを削除して新しいチェーンに挿入します。</p>
+<p>ここには2つの問題があります。まず、コードがオブジェクトを同じチェーンに移動しようとした場合、自身のロックを2回取得しようとしてデッドロックします。次に、別のCPUで同じソフトIRQが逆方向にオブジェクトを移動しようとしている場合、以下のことが起こり得ます:</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 50%"/>
+<col style="width: 50%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>CPU 1</p></th>
+<th class="head"><p>CPU 2</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>ロックAを取得 -&gt; OK</p></td>
+<td><p>ロックBを取得 -&gt; OK</p></td>
+</tr>
+<tr class="row-odd"><td><p>ロックBを取得 -&gt; スピン</p></td>
+<td><p>ロックAを取得 -&gt; スピン</p></td>
+</tr>
+</tbody>
+</table>
+<p>テーブル: 結果</p>
+<p>2つのCPUは永遠にスピンし続け、相手のロックを放棄するのを待つことになります。これはクラッシュのように見え、匂い、感じられます。</p>
+</section>
+<section id="preventing-deadlock">
+<h3>デッドロックの防止<a class="headerlink" href="#preventing-deadlock" title="この見出しへのパーマリンク">¶</a></h3>
+<p>教科書はロックの順序を常に統一すればこのようなデッドロックを防げると教えます。しかし実際にはこのアプローチはスケーラビリティが低く、新しいロックを追加する際、カーネルの理解が不十分で5000個のロック階層のどこに配置されるか分からないため、実用性がありません。</p>
+<p>最良のロックはカプセル化されており、ヘッダーに露出せず、同じファイル外の非自明な関数呼び出しの間に保持されません。このコードを読むと、他のロックを取得しながらこのロックを保持しないので決してデッドロックしないことが分かります。あなたのコードを使う人々はロックを使っていることすら知らなくても良いです。</p>
+<p>ここでの典型的な問題はコールバックやハックを提供することです。ロックを保持しながらこれらの関数を呼び出すと、単純なデッドロックやデッドリーエンブレース（コールバックが何をするか分からない）のリスクがあります。他のプログラマが狙っているのを忘れないで、このようなことはしないでください。</p>
+<section id="overzealous-prevention-of-deadlocks">
+<h4>過剰なデッドロック防止<a class="headerlink" href="#overzealous-prevention-of-deadlocks" title="この見出しへのパーマリンク">¶</a></h4>
+<p>デッドロックは問題ですが、データ腐敗ほど深刻ではありません。読み込みロックを取得し、リストを検索して目的のオブジェクトが見つからなかった場合、読み込みロックを解放して書き込みロックを取得してオブジェクトを挿入するコードはレースコンディションがあります。</p>
+<p>なぜか理解できないなら、私のコードから遠ざけてくれ。</p>
+</section>
+</section>
+<section id="racing-timers-a-kernel-pastime">
+<h3>タイマーレース: カーネルの趣味<a class="headerlink" href="#racing-timers-a-kernel-pastime" title="この見出しへのパーマリンク">¶</a></h3>
+<p>タイマーはレース条件を引き起こす独自の問題を生じることがあります。リスト、ハッシュなど、各オブジェクトが自身を破壊する予定のタイマーを持つコレクションを考慮してください。</p>
+<p>モジュールの削除など、コレクション全体を破壊したい場合、以下の手順を取るかもしれません：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/* THIS CODE BAD BAD BAD BAD: IF IT WAS ANY WORSE IT WOULD USE
+   HUNGARIAN NOTATION */
+spin_lock_bh(&amp;list_lock);
+
+while (list) {
+        struct foo *next = list-&gt;next;
+        del_timer(&amp;list-&gt;timer);
+        kfree(list);
+        list = next;
+}
+
+spin_unlock_bh(&amp;list_lock);
+</pre></div>
+</div>
+<p>SMP（対称マルチプロセッサ）ではいつかクラッシュします。タイマーがspin_lock_bh()の前に起動してしまい、spin_unlock_bh()後にロックを取得した後、すでに破壊された要素を解放しようとするからです。</p>
+<p>これを回避するには、以下の結果を確認する必要があります。
+<a class="reference internal" href="../driver-api/basics.html#c.del_timer" title="del_timer"><code class="xref c c-func docutils literal notranslate"><span class="pre">del_timer()</span></code></a>返り値が1であればタイマーは削除済みです。0であれば（この場合）タイマーが現在実行中であることを意味し、以下のように処理できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>retry:
+        spin_lock_bh(&amp;list_lock);
+
+        while (list) {
+                struct foo *next = list-&gt;next;
+                if (!del_timer(&amp;list-&gt;timer)) {
+                        /* Give timer a chance to delete this */
+                        spin_unlock_bh(&amp;list_lock);
+                        goto retry;
+                }
+                kfree(list);
+                list = next;
+        }
+
+        spin_unlock_bh(&amp;list_lock);
+</pre></div>
+</div>
+<p>もう一つの一般的な問題は、タイマー関数の終わりで自分自身を再起動するタイマーを削除することです（callする）。このケースはレース条件に陥りやすく、頻繁に発生するため、 <a class="reference internal" href="../driver-api/basics.html#c.add_timer" title="add_timer"><code class="xref c c-func docutils literal notranslate"><span class="pre">add_timer()</span></code></a> del_timer_sync()を使用すべきです。これはタイマーが自分自身を再び追加するのを止められるまで、タイマーを削除する回数を返します。 <a class="reference internal" href="../driver-api/basics.html#c.del_timer_sync" title="del_timer_sync"><code class="xref c c-func docutils literal notranslate"><span class="pre">del_timer_sync()</span></code></a> (<code class="docutils literal notranslate"><span class="pre">include/linux/timer.h</span></code>)を用いることでこのケースを処理できます。これはタイマーが自分自身を再び追加するのを止められるまで、タイマーを削除する回数を返します。</p>
+</section>
+</section>
+<section id="locking-speed">
+<h2>ロックの速度<a class="headerlink" href="#locking-speed" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ロックの使用に関するコードの速度を考慮する際、主に3つの点に注意する必要があります。1つ目はコンカレンシー（複数のプロセスがロックを保持している間、待機するプロセスの数）。2つ目は、競合が起きないロックの取得と解放にかかる時間。3つ目は、より少ない数のロックや賢いロックの使用です。私はロックが頻繁に使用されるものと仮定しています。そうでなければ、効率を気にする必要はありません。</p>
+<p>コンカレンシーはロックを保持する時間に依存します。必要なだけ保持し、それ以上は保持しないようにしてください。キャッシュの例では、ロックを保持せずにオブジェクトを作成し、リストに挿入する準備ができたらロックを取得します。</p>
+<p>取得時間は、ロック操作がパイプラインに与える影響（パイプラインストール）や、このCPUが最後にロックを取得した可能性（つまり、このCPUにとってロックがキャッシュヒットしているか）に依存します。CPUが多ければ多いほど、この可能性は急速に低下します。700MHzのIntel Pentium IIIでは、1命令は約0.7ナノ秒、アトミックインクリメントは約58ナノ秒、このCPUでキャッシュヒットしているロックは160ナノ秒、他のCPUからキャッシュラインを取得するにはさらに170〜360ナノ秒かかります。（これらの数値はPaul McKenneyの <a class="reference external" href="http://www.linuxjournal.com/article.php?sid=6993">Linux Journal RCU記事から抜粋</a>).</p>
+<p>これらの2つの目標は衝突しています: ロックを短時間保持するには、ロックを部分に分けて（例えば最終的なオブジェクトごとのロックの例のように）実現できますが、これによりロック取得の回数が増加し、結果として単一のロックを使用するよりもしばしば遅くなります。これはもう一つのロックの簡潔さを推奨する理由です。</p>
+<p>3番目の懸念については以下で説明します: 一部の方法で行うロックの量を減らすことが可能です。</p>
+<section id="read-write-lock-variants">
+<h3>読み込み/書き込みロックの変種<a class="headerlink" href="#read-write-lock-variants" title="この見出しへのパーマリンク">¶</a></h3>
+<p>スピンロックとミューテックスの両方には読み込み/書き込み用の変種があります: <code class="docutils literal notranslate"><span class="pre">rwlock_t</span></code> および
+<code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">rw_semaphore</span></code>これらはユーザーを読者とライターの2つのクラスに分けることで、データを読み込むだけであれば読み込みロックを取得できますが、データを書き込むには書き込みロックが必要です。多くのユーザーが読み込みロックを保持できますが、ライターは唯一の保持者でなければなりません。</p>
+<p>コードが読者/ライターの線で明確に分かれている場合（例えばキャッシュコードのように）かつロックが読者によって長時間保持されている場合、これらのロックを使用することで効果が得られます。ただし、通常のロックに比べてやや遅いため、実際には <code class="docutils literal notranslate"><span class="pre">rwlock_t</span></code> 通常は得がありません。</p>
+</section>
+<section id="avoiding-locks-read-copy-update">
+<h3>ロックを避ける: レッドコピー更新<a class="headerlink" href="#avoiding-locks-read-copy-update" title="この見出しへのパーマリンク">¶</a></h3>
+<p>読み込み/書き込みロックの特別な方法として「レッドコピー更新（RCU）」があります。RCUを使用することで、読者はロックをまったく取得することなく動作できます: キャッシュが更新よりも読み込みされることが期待されるため（そうでなければキャッシュは時間の無駄です）、この最適化の候補になります。</p>
+<p>読み込みロックをどのように排除するのでしょうか？読み込みロックを排除することで、ライターは読者以下のリストを変更できるようになります。これは実際には非常に簡単です: 書き手が要素を慎重に追加する場合、読者がリンクされたリストを読み込むことができます。例えば、 <code class="docutils literal notranslate"><span class="pre">new</span></code> を単一のリンクされたリスト <code class="docutils literal notranslate"><span class="pre">list</span></code>:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>new-&gt;next = list-&gt;next;
+wmb();
+list-&gt;next = new;
+</pre></div>
+</div>
+<p>に追加する場合、wmb()は書き込みメモリバリアです。これは、新しい要素の <code class="docutils literal notranslate"><span class="pre">next</span></code> ポインタを設定する最初の操作が完了し、すべてのCPUに見えること、その後の操作（新しい要素をリストに追加する）が行われる前に保証します。これは重要です、なぜなら現代のコンパイラと現代のCPUは、指示を再配置する場合がありますが、それ以外の指示は再配置されません: 読み込み者が新しい要素をまったく見ないか、またはリストの残り部分を正しく指す <code class="docutils literal notranslate"><span class="pre">next</span></code> ポインタとともに見るようにしたいからです。</p>
+<p>幸いなことに、標準の
+<code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">list_head</span></code> リストに対してこの処理を行う関数があります:
+<a class="reference internal" href="../core-api/kernel-api.html#c.list_add_rcu" title="list_add_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">list_add_rcu()</span></code></a> (<code class="docutils literal notranslate"><span class="pre">include/linux/list.h</span></code>).</p>
+<p>リストから要素を削除するのはさらに簡単です: 旧要素へのポインタをその次の要素へのポインタに置き換え、読者はそれを見たり、スキップしたりします。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>list-&gt;next = old-&gt;next;
+</pre></div>
+</div>
+<p>あります <a class="reference internal" href="../core-api/kernel-api.html#c.list_del_rcu" title="list_del_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">list_del_rcu()</span></code></a> (<code class="docutils literal notranslate"><span class="pre">include/linux/list.h</span></code>) はこの処理を行います（通常のバージョンは古いオブジェクトを毒として処理しますが、これは望んでいません）。</p>
+<p>読者も注意が必要です: 一部のCPUは <code class="docutils literal notranslate"><span class="pre">next</span></code>
+次の要素の内容を早期に読み始めるポインタですが、ポインタが下にある要素の内容が間違っていることに気づかない。再び、ある <code class="docutils literal notranslate"><span class="pre">next</span></code>
+ポインタが変更されると、リーダーはゴミ領域にジャンプしてクラッシュします。我々は、この要素を削除したときにリストを走査していたすべてのリーダーが完了するのを待つ必要があります。我々は
+<a class="reference internal" href="../core-api/kernel-api.html#c.list_for_each_entry_rcu" title="list_for_each_entry_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">list_for_each_entry_rcu()</span></code></a> (<code class="docutils literal notranslate"><span class="pre">include/linux/list.h</span></code>）でご支援いたします。もちろん、ライターは単に
+<a class="reference internal" href="../core-api/kernel-api.html#c.list_for_each_entry" title="list_for_each_entry"><code class="xref c c-func docutils literal notranslate"><span class="pre">list_for_each_entry()</span></code></a>、同時に2つのライターが存在できないためです。</p>
+<p>最終的な問題は、実際に削除された要素をいつ破壊できるかということです。思い出してください、現在リスト内でこの要素を走査しているリーダーがいるかもしれません：もしこの要素を解放し、 <code class="docutils literal notranslate"><span class="pre">next</span></code> ポインタが変更されると、リーダーはゴミ領域にジャンプしてクラッシュします。我々は、この要素を削除したときにリストを走査していたすべてのリーダーが完了するのを待つ必要があります。我々は
+<a class="reference internal" href="../core-api/kernel-api.html#c.call_rcu" title="call_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">call_rcu()</span></code></a> すべての既存のリーダーが完了したときに実際にオブジェクトを破壊するコールバックを登録します。代替案として、 <a class="reference internal" href="../core-api/kernel-api.html#c.synchronize_rcu" title="synchronize_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code></a> を用いて、すべての既存のリーダーが完了するのをブロックするのも可能です。</p>
+<p>では、Read Copy Updateはリーダーが完了したタイミングをどのように知るのでしょうか？その方法は以下の通りです：まず、リーダーは常にリストを
+<a class="reference internal" href="../core-api/kernel-api.html#c.rcu_read_lock" title="rcu_read_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code></a>/<a class="reference internal" href="../core-api/kernel-api.html#c.rcu_read_unlock" title="rcu_read_unlock"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_read_unlock()</span></code></a> ペア：これらは単にプリエンプションを無効化し、リーダーがリストを読みながら眠らないようにします。</p>
+<p>RCUは、他のすべてのCPUが少なくとも一度は眠ったのを待つ：リーダーは眠ることができないため、削除中にリストを走査していたすべてのリーダーが完了したとわかることになります。コールバックがトリガーされます。実際のRead Copy Updateコードはこれより少し最適化されていますが、これは基本的なアイデアです。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>--- cache.c.perobjectlock   2003-12-11 17:15:03.000000000 +1100
++++ cache.c.rcupdate    2003-12-11 17:55:14.000000000 +1100
+@@ -1,15 +1,18 @@
+ #include &lt;linux/list.h&gt;
+ #include &lt;linux/slab.h&gt;
+ #include &lt;linux/string.h&gt;
++#include &lt;linux/rcupdate.h&gt;
+ #include &lt;linux/mutex.h&gt;
+ #include &lt;asm/errno.h&gt;
+
+ struct object
+ {
+-        /* These two protected by cache_lock. */
++        /* This is protected by RCU */
+         struct list_head list;
+         int popularity;
+
++        struct rcu_head rcu;
++
+         atomic_t refcnt;
+
+         /* Doesn't change once created. */
+@@ -40,7 +43,7 @@
+ {
+         struct object *i;
+
+-        list_for_each_entry(i, &amp;cache, list) {
++        list_for_each_entry_rcu(i, &amp;cache, list) {
+                 if (i-&gt;id == id) {
+                         i-&gt;popularity++;
+                         return i;
+@@ -49,19 +52,25 @@
+         return NULL;
+ }
+
++/* Final discard done once we know no readers are looking. */
++static void cache_delete_rcu(void *arg)
++{
++        object_put(arg);
++}
++
+ /* Must be holding cache_lock */
+ static void __cache_delete(struct object *obj)
+ {
+         BUG_ON(!obj);
+-        list_del(&amp;obj-&gt;list);
+-        object_put(obj);
++        list_del_rcu(&amp;obj-&gt;list);
+         cache_num--;
++        call_rcu(&amp;obj-&gt;rcu, cache_delete_rcu);
+ }
+
+ /* Must be holding cache_lock */
+ static void __cache_add(struct object *obj)
+ {
+-        list_add(&amp;obj-&gt;list, &amp;cache);
++        list_add_rcu(&amp;obj-&gt;list, &amp;cache);
+         if (++cache_num &gt; MAX_CACHE_SIZE) {
+                 struct object *i, *outcast = NULL;
+                 list_for_each_entry(i, &amp;cache, list) {
+@@ -104,12 +114,11 @@
+ struct object *cache_find(int id)
+ {
+         struct object *obj;
+-        unsigned long flags;
+
+-        spin_lock_irqsave(&amp;cache_lock, flags);
++        rcu_read_lock();
+         obj = __cache_find(id);
+         if (obj)
+                 object_get(obj);
+-        spin_unlock_irqrestore(&amp;cache_lock, flags);
++        rcu_read_unlock();
+         return obj;
+ }
+</pre></div>
+</div>
+<p>リーダーが__cache_find()内のpopularityメンバを変更することに注意してください。現在はロックを保持していません。解決策の一つはこれを <code class="docutils literal notranslate"><span class="pre">atomic_t</span></code>、ただしこの用途では競合条件にあまり気にせず、近似値でも十分なので変更していません。</p>
+<p>結果として、cache_find()は他の関数との同期を必要としないため、SMP環境でもUP環境と同様にほぼ同じ速度で動作します。</p>
+<p>さらに最適化が可能です：元のキャッシュコードを思い出してください、参照カウントがなく、呼び出し元がオブジェクトを使用するたびにロックを保持していた場合？これはまだ可能です：ロックを保持している限り、誰もオブジェクトを削除できませんので、参照カウントの取得と解放は必要ありません。</p>
+<p>現在、RCUの「読み込みロック」は単にプリエンプションを無効化するだけなので、cache_find()を呼び出し、object_put()を呼び出す間にプリエンプションが常に無効になっている呼び出し元は、参照カウントの取得と解放を実際には行う必要がありません：__cache_find()を静的でなくして公開することで、このような呼び出し元は単にそれを呼び出すだけで済みます。</p>
+<p>ここでの利点は参照カウントが書き込まれないことであり、オブジェクトはまったく変更されないため、キャッシュによる高速化でSMPマシンでは大幅に高速化されます。</p>
+</section>
+<section id="per-cpu-data">
+<h3>パーセルCPUデータ<a class="headerlink" href="#per-cpu-data" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ロックを回避するためのもう一つの技術として、各CPUごとに情報を複製する方法があり、これは広く利用されています。たとえば、共通な状態のカウントを維持したい場合、スピンロックと単一のカウンターを使用する方法がシンプルで効率的です。</p>
+<p>その方法が遅すぎる場合（通常はそうではありませんが、非常に大きなマシンでテストし、それが実際に起きていたと示せる場合）、代わりに各CPUごとにカウンターを使用することで、どのCPUも排他ロックを必要としなくなります。詳しくはDEFINE_PER_CPU()、get_cpu_var()、put_cpu_var()を参照してください（<code class="docutils literal notranslate"><span class="pre">include/linux/percpu.h</span></code>).</p>
+<p>シンプルなper-CPUカウンタには特に有用な <code class="docutils literal notranslate"><span class="pre">local_t</span></code> 型、およびcpu_local_inc()などの関連する関数があり、一部のアーキテクチャではシンプルなコードより効率的です（<code class="docutils literal notranslate"><span class="pre">include/asm/local.h</span></code>).</p>
+<p>このようなカウンターの正確な値を取得するためには、より多くのロックを導入することなく簡単で信頼性の高い方法は存在しません。これは一部の用途では問題ではありません。</p>
+</section>
+<section id="data-which-mostly-used-by-an-irq-handler">
+<h3>IRQハンドラで主に使用されるデータ<a class="headerlink" href="#data-which-mostly-used-by-an-irq-handler" title="この見出しへのパーマリンク">¶</a></h3>
+<p>データが常に同じIRQハンドラ内でアクセスされる場合、ロックは一切必要ありません。カーネルはIRQハンドラが複数のCPUで同時に実行されないことを保証しています。</p>
+<p>Manfred Spraulは、データがユーザコンテキストやsoftirqs/taskletsで非常にまれにアクセスされる場合でも、この方法は依然として有効であると指摘しています。IRQハンドラはロックを使用せず、他のアクセスは以下の通り行われます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>spin_lock(&amp;lock);
+disable_irq(irq);
+...
+enable_irq(irq);
+spin_unlock(&amp;lock);
+</pre></div>
+</div>
+<p>以下の <a class="reference internal" href="../core-api/genericirq.html#c.disable_irq" title="disable_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">disable_irq()</span></code></a> IRQハンドラの実行を防ぎ（他のCPUで実行中であれば終了を待つ）、スピンロックは同時に他のアクセスを防ぎます。これは単なるspin_lock_irq()呼び出しより遅いため、この種のアクセスが極めてまれにしか起きていない場合にのみ意味があります。</p>
+</section>
+</section>
+<section id="what-functions-are-safe-to-call-from-interrupts">
+<h2>割込みから安全に呼び出せる関数はどれ？<a class="headerlink" href="#what-functions-are-safe-to-call-from-interrupts" title="この見出しへのパーマリンク">¶</a></h2>
+<p>カーネル内の多くの関数はスリープします（つまりschedule()を直接または間接的に呼び出します）。スピンロックを保持している間やプリエンプションが無効になっている状態では、これらを呼び出すことはできません。また、これらを呼び出すにはユーザコンテキストでなければならないため、割り込みから呼び出すことは違法です。</p>
+<section id="some-functions-which-sleep">
+<h3>スリープする関数<a class="headerlink" href="#some-functions-which-sleep" title="この見出しへのパーマリンク">¶</a></h3>
+<p>最も一般的な関数は以下に示されていますが、他の呼び出しも安全かどうかはコードを読む必要があります。他のすべての呼び出しでスリープが可能であれば、あなたもスリープが可能である必要があります。特に、登録および解除関数は通常ユーザコンテキストから呼び出され、スリープ可能です。</p>
+<ul>
+<li><p>ユーザースペースへのアクセス：</p>
+<ul class="simple">
+<li><p>copy_from_user()</p></li>
+<li><p>copy_to_user()</p></li>
+<li><p><a class="reference internal" href="../core-api/mm-api.html#c.get_user" title="get_user"><code class="xref c c-func docutils literal notranslate"><span class="pre">get_user()</span></code></a></p></li>
+<li><p><a class="reference internal" href="../core-api/mm-api.html#c.put_user" title="put_user"><code class="xref c c-func docutils literal notranslate"><span class="pre">put_user()</span></code></a></p></li>
+</ul>
+</li>
+<li><p>kmalloc(GP_KERNEL) &lt;kmalloc&gt;`</p></li>
+<li><p><a class="reference internal" href="#c.mutex_lock_interruptible" title="mutex_lock_interruptible"><code class="xref c c-func docutils literal notranslate"><span class="pre">mutex_lock_interruptible()</span></code></a> および
+<a class="reference internal" href="#c.mutex_lock" title="mutex_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">mutex_lock()</span></code></a></p>
+<p>There is a <a class="reference internal" href="#c.mutex_trylock" title="mutex_trylock"><code class="xref c c-func docutils literal notranslate"><span class="pre">mutex_trylock()</span></code></a> 睡眠しない。それでも、割り込みコンテキスト内での使用は安全でないため、使用を避けてください。 <a class="reference internal" href="#c.mutex_unlock" title="mutex_unlock"><code class="xref c c-func docutils literal notranslate"><span class="pre">mutex_unlock()</span></code></a>
+睡眠することもありません。割り込みコンテキストでの使用もできません。ミュートックスは取得したタスクによってのみ解放しなければなりません。</p>
+</li>
+</ul>
+</section>
+<section id="some-functions-which-don-t-sleep">
+<h3>睡眠しない関数の一覧<a class="headerlink" href="#some-functions-which-don-t-sleep" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ほぼすべてのロックを保持している状態でも安全に呼び出せる関数もあります。</p>
+<ul class="simple">
+<li><p><a class="reference internal" href="../core-api/printk-basics.html#c.printk" title="printk"><code class="xref c c-func docutils literal notranslate"><span class="pre">printk()</span></code></a></p></li>
+<li><p><a class="reference internal" href="../core-api/mm-api.html#c.kfree" title="kfree"><code class="xref c c-func docutils literal notranslate"><span class="pre">kfree()</span></code></a></p></li>
+<li><p><a class="reference internal" href="../driver-api/basics.html#c.add_timer" title="add_timer"><code class="xref c c-func docutils literal notranslate"><span class="pre">add_timer()</span></code></a> および <a class="reference internal" href="../driver-api/basics.html#c.del_timer" title="del_timer"><code class="xref c c-func docutils literal notranslate"><span class="pre">del_timer()</span></code></a></p></li>
+</ul>
+</section>
+</section>
+<section id="mutex-api-reference">
+<h2>ミューテックスAPIリファレンス<a class="headerlink" href="#mutex-api-reference" title="この見出しへのパーマリンク">¶</a></h2>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.mutex_init">
+<span class="sig-name descname"><span class="n"><span class="pre">mutex_init</span></span></span><a class="headerlink" href="#c.mutex_init" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">mutex_init</span> <span class="pre">(mutex)</span></code></p>
+<blockquote>
+<div><p>ミュートックスを初期化します</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">mutex</span></code></dt><dd><p>初期化するミュートックス</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ミュートックスをアンロックされた状態に初期化します。</p>
+<p>すでにロックされているミュートックスを初期化することはできません。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.mutex_is_locked">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mutex_is_locked</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">mutex</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">lock</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.mutex_is_locked" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ミュートックスがロックされているかを確認します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">mutex</span> <span class="pre">*lock</span></code></dt><dd><p>確認するミュートックス</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ミューテックスがロックされている場合はtrueを返します。ロックされていない場合はfalseを返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.mutex_trylock_recursive">
+<span class="k"><span class="pre">enum</span></span><span class="w"> </span><span class="n"><span class="pre">mutex_trylock_recursive_enum</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mutex_trylock_recursive</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">mutex</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">lock</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.mutex_trylock_recursive" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>再帰的なロックを許可するトライロックの変体</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">mutex</span> <span class="pre">*lock</span></code></dt><dd><p>ロックするミュートックス</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>この関数は一切使用してはいけません。これは単なるデバッグ用の冗長なコードであり、そのようなコードがなくなるとこの関数は削除されます。</p>
+<p><strong>戻り値</strong></p>
+<blockquote>
+<div><ul class="simple">
+<li><p>MUTEX_TRYLOCK_FAILED - トライロックが失敗しました、</p></li>
+<li><p>MUTEX_TRYLOCK_SUCCESS - ロックを取得しました、</p></li>
+<li><p>MUTEX_TRYLOCK_RECURSIVE - すでにロックを保有しています。</p></li>
+</ul>
+</div></blockquote>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.mutex_lock">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mutex_lock</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">mutex</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">lock</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.mutex_lock" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ミュートックスを取得します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">mutex</span> <span class="pre">*lock</span></code></dt><dd><p>取得するミュートックス</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>このタスク専用でミュートックスを排他的にロックします。現在ミュートックスが利用不可であれば、取得するまで睡眠します。</p>
+<p>このミュートックスは、取得したタスクによってのみ後で解放しなければなりません。再帰的なロックは許可されません。タスクはミュートックスを解放せずに終了してはいけません。また、ミュートックスがロックされたままでは、カーネルメモリを解放してはいけません。ミュートックスは初期化（または静的定義）されてからロック可能です。 <a class="reference internal" href="../core-api/kernel-api.html#c.memset" title="memset"><code class="xref c c-func docutils literal notranslate"><span class="pre">memset()</span></code></a>ミュートックスを0に設定することはできません。</p>
+<p>(CONFIG_DEBUG_MUTEXES .configオプションはデバッグチェックを有効化し、制限を強制します。また、デッドロックのデバッグも行います)</p>
+<p>この関数はdown()と類似していますが、同等ではありません。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.mutex_unlock">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mutex_unlock</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">mutex</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">lock</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.mutex_unlock" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ミュートックスを解放します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">mutex</span> <span class="pre">*lock</span></code></dt><dd><p>解放するミュートックス</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>このタスクが以前にロックしたミュートックスを解放します。</p>
+<p>この関数は割り込みコンテキストでは使用できません。未ロックのミュートックスを解放することはできません。</p>
+<p>この関数はup()と類似していますが、同等ではありません。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.ww_mutex_unlock">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">ww_mutex_unlock</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">ww_mutex</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">lock</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.ww_mutex_unlock" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>w/wミュートックスを解放します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">ww_mutex</span> <span class="pre">*lock</span></code></dt><dd><p>解放するミュートックス</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ww_mutex_lock*関数のいずれかでロックされたミュートックスを解放します（割り込みコンテキストを含む）。割り込みコンテキストを解放した後ではロックを解放してはいけません。</p>
+<p>この関数は割り込みコンテキストでは使用できません。未ロックのミュートックスを解放することはできません。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.mutex_lock_interruptible">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mutex_lock_interruptible</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">mutex</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">lock</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.mutex_lock_interruptible" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>シグナルによって中断可能な状態でミュートックスを取得します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">mutex</span> <span class="pre">*lock</span></code></dt><dd><p>取得するミュートックス</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ミュートックスをロックするようにします <a class="reference internal" href="#c.mutex_lock" title="mutex_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">mutex_lock()</span></code></a>プロセスがスリープしている間、シグナルが届いた場合、この関数はミューテックスを取得せずに返します。</p>
+<p><strong>コンテキスト</strong></p>
+<p>プロセスコンテキスト。</p>
+<p><strong>戻り値</strong></p>
+<p>ミューテックスを成功裏に取得した場合は0、 <code class="docutils literal notranslate"><span class="pre">-EINTR</span></code> シグナルが到達した場合は0を返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.mutex_lock_killable">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mutex_lock_killable</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">mutex</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">lock</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.mutex_lock_killable" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ミューテックスを取得し、致命的なシグナルによって割り込まれます。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">mutex</span> <span class="pre">*lock</span></code></dt><dd><p>取得するミュートックス</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ミュートックスをロックするようにします <a class="reference internal" href="#c.mutex_lock" title="mutex_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">mutex_lock()</span></code></a>プロセスがスリープしている間、現在のプロセスにとって致命的なシグナルが届いた場合、この関数はミューテックスを取得せずに返します。</p>
+<p><strong>コンテキスト</strong></p>
+<p>プロセスコンテキスト。</p>
+<p><strong>戻り値</strong></p>
+<p>ミューテックスを成功裏に取得した場合は0、 <code class="docutils literal notranslate"><span class="pre">-EINTR</span></code> 致命的なシグナルが到達した場合。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.mutex_lock_io">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mutex_lock_io</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">mutex</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">lock</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.mutex_lock_io" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ミューテックスを取得し、プロセスをI/O待機状態にマークします。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">mutex</span> <span class="pre">*lock</span></code></dt><dd><p>取得するミュートックス</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ミュートックスをロックするようにします <a class="reference internal" href="#c.mutex_lock" title="mutex_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">mutex_lock()</span></code></a>タスクがこのミューテックスを待っている間、スケジューラはタスクをIO待機状態としてカウントします。</p>
+<p><strong>コンテキスト</strong></p>
+<p>プロセスコンテキスト。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.mutex_trylock">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mutex_trylock</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">mutex</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">lock</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.mutex_trylock" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ミューテックスを取得しようとしますが、待機せずに。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">mutex</span> <span class="pre">*lock</span></code></dt><dd><p>取得するミュートックス</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ミューテックスを原子的に取得しようとします。成功した場合は1を、競合した場合は0を返します。</p>
+<p>この関数は割込みコンテキストでは使用できません。ミューテックスは取得したタスクと同じタスクによって解放する必要があります。</p>
+<p><strong>注意</strong></p>
+<p>この関数はspin_trylock()の規約に従うため、down_trylock()の返却値とは逆になります！セマフォアのユーザーをミューテックスに変換する際にはこの点に注意してください。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.atomic_dec_and_mutex_lock">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">atomic_dec_and_mutex_lock</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">atomic_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">cnt</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">mutex</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">lock</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.atomic_dec_and_mutex_lock" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>デクリメント後、値が0になった場合にミューテックスを保持して返します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">atomic_t</span> <span class="pre">*cnt</span></code></dt><dd><p>デクリメントするアトミック変数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">mutex</span> <span class="pre">*lock</span></code></dt><dd><p>デクリメント後、値が0になった場合に保持して返すミューテックス</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>デクリメント後、値が0になった場合はtrueを返しミューテックスを保持、それ以外はfalseを返します</p>
+</section>
+<section id="futex-api-reference">
+<h2>ファットスAPIリファレンス<a class="headerlink" href="#futex-api-reference" title="この見出しへのパーマリンク">¶</a></h2>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.futex_q">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">futex_q</span></span></span><a class="headerlink" href="#c.futex_q" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ハッシュされたfutexキュー項目、待機中のタスクごとに1つ</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct futex_q {
+  struct plist_node list;
+  struct task_struct *task;
+  spinlock_t *lock_ptr;
+  union futex_key key;
+  struct futex_pi_state *pi_state;
+  struct rt_mutex_waiter *rt_waiter;
+  union futex_key *requeue_pi_key;
+  u32 bitset;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">list</span></code></dt><dd><p>このfutexを待っているタスクの優先度順に並べられたリスト</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">task</span></code></dt><dd><p>futexを待っているタスク</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">lock_ptr</span></code></dt><dd><p>ハッシュバケットロック</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">key</span></code></dt><dd><p>futexがハッシュされるキー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">pi_state</span></code></dt><dd><p>オプションの優先度継承状態</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">rt_waiter</span></code></dt><dd><p>requeue_pi用のRT_waiterストレージ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">requeue_pi_key</span></code></dt><dd><p>requeue_piターゲットfutexのキー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bitset</span></code></dt><dd><p>オプションのビットマスクによるウェイクアップ用のビットセット</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>通常のwait_queue_entry_tではなく、このハッシュドウェイキューを使用するため、関連する項目のみをウェイクアップできます（ハッシュキューは共有される可能性があります）。</p>
+<p>futex_qはタスクがTASK_RUNNING状態にあるように、woken状態を持ちます。plist_node_empty(<code class="xref c c-type docutils literal notranslate"><span class="pre">q-&gt;list</span></code>) || q-&gt;lock_ptr == 0のとき、考慮されます。ウェイクアップの順序は常に最初の条件を真にするのを優先し、次に二番目の条件を真にします。</p>
+<p>PI futexは通常、ハッシュリストから削除される前にrt_mutexコードによってウェイクアップされます。unqueue_me_pi()を参照してください。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.hash_futex">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">futex_hash_bucket</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">hash_futex</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">ユニオン</span></span><span class="w"> </span><span class="n"><span class="pre">futex_key</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">key</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.hash_futex" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>グローバルハッシュ内のハッシュバケットを返します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">union</span> <span class="pre">futex_key</span> <span class="pre">*key</span></code></dt><dd><p>ハッシュが計算されるためのfutexキーへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>get_futex_key（以下参照）から返されるキーに基づいてハッシュし、グローバルハッシュ内の対応するハッシュバケットを返します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.match_futex">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">match_futex</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">ユニオン</span></span><span class="w"> </span><span class="n"><span class="pre">futex_key</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">key1</span></span>, <span class="k"><span class="pre">ユニオン</span></span><span class="w"> </span><span class="n"><span class="pre">futex_key</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">key2</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.match_futex" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>2つのfutexキーが等しいかどうかを確認する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">union</span> <span class="pre">futex_key</span> <span class="pre">*key1</span></code></dt><dd><p>key1へのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">union</span> <span class="pre">futex_key</span> <span class="pre">*key2</span></code></dt><dd><p>key2へのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>2つのfutex_keysが等しい場合は1を返し、それ以外は0を返す。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.futex_setup_timer">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="../driver-api/basics.html#c.hrtimer_sleeper" title="hrtimer_sleeper"><span class="n"><span class="pre">hrtimer_sleeper</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">futex_setup_timer</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">ktime_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">時間</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="../driver-api/basics.html#c.hrtimer_sleeper" title="hrtimer_sleeper"><span class="n"><span class="pre">hrtimer_sleeper</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">タイムアウト</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span>, <span class="n"><span class="pre">u64</span></span><span class="w"> </span><span class="n"><span class="pre">range_ns</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.futex_setup_timer" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>スリープ中のhrtimerを設定する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">ktime_t</span> <span class="pre">*time</span></code></dt><dd><p>指定されたタイムアウト値へのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">hrtimer_sleeper</span> <span class="pre">*timeout</span></code></dt><dd><p>設定するhrtimer_sleeper構造体</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">flags</span></code></dt><dd><p>futexフラグ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">u64</span> <span class="pre">range_ns</span></code></dt><dd><p>オプションのナノ秒単位の範囲</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<dl class="simple">
+<dt>初期化済みのhrtimer_sleeper構造体またはタイムアウトがない場合のNULL</dt><dd><p>指定された値</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.get_futex_key">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">get_futex_key</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">u32</span></span><span class="w"> </span><span class="pre">__user</span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">uaddr</span></span>, <span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n"><span class="pre">fshared</span></span>, <span class="k"><span class="pre">ユニオン</span></span><span class="w"> </span><span class="n"><span class="pre">futex_key</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">key</span></span>, <span class="k"><span class="pre">enum</span></span><span class="w"> </span><span class="n"><span class="pre">futex_access</span></span><span class="w"> </span><span class="n"><span class="pre">rw</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.get_futex_key" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>futexのキーとなるパラメータを取得する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">u32</span> <span class="pre">__user</span> <span class="pre">*uaddr</span></code></dt><dd><p>futexの仮想アドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">fshared</span></code></dt><dd><p>PROCESS_PRIVATEのfutexに対してfalse、PROCESS_SHAREDに対してtrue</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">union</span> <span class="pre">futex_key</span> <span class="pre">*key</span></code></dt><dd><p>結果を格納するアドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">enum</span> <span class="pre">futex_access</span> <span class="pre">rw</span></code></dt><dd><p>マッピングは読み書き可能でなければならない（値: FUTEX_READ, FUTEX_WRITE）</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>負のエラーコードまたは0</p>
+<p><strong>説明</strong></p>
+<p>キーワードは以下に格納されています <strong>key</strong> 成功した場合、0を返します。</p>
+<p>共有マッピングの場合（when <strong>fshared</strong>) そのキーは:</p>
+<blockquote>
+<div><p>( inode-&gt;i_sequence, page-&gt;index, offset_within_page )</p>
+</div></blockquote>
+<p>[ get_inode_sequence_number() を参照してください ]</p>
+<p>プライベートマッピングの場合（またはwhen <strong>!fshared</strong>) そのキーは:</p>
+<blockquote>
+<div><p>( current-&gt;mm, address, 0 )</p>
+</div></blockquote>
+<p>これは（必要に応じてクロスプロセスでも）、FUTEX_WAITの期間中でもページをピン留めせずにfutexを識別することを可能にします。</p>
+<p>lock_page()はスリープする可能性があるため、呼び出し元はスピンロックを保持してはいけません。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.fault_in_user_writeable">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">fault_in_user_writeable</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">u32</span></span><span class="w"> </span><span class="pre">__user</span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">uaddr</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.fault_in_user_writeable" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ユーザーアドレスのフェーズインとRWアクセスの確認</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">u32</span> <span class="pre">__user</span> <span class="pre">*uaddr</span></code></dt><dd><p>エラー発生したユーザー空間アドレスへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>アトミックな書き込みアクセス中に発生したフェーズインの修正に使用される遅いパス <strong>uaddr</strong>.</p>
+<p>ユーザーアドレスへの非破壊的な書き込みの汎用的な実装はありません。アトミックなページフォールト無効セクションでフェーズインしたことを知っているため、get_user_pages()をすぐに呼び出すことで#PFオーバーヘッドを回避できます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.futex_top_waiter">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.futex_q" title="futex_q"><span class="n"><span class="pre">futex_q</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="sig-name descname"><span class="n"><span class="pre">futex_top_waiter</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">futex_hash_bucket</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">hb</span></span>, <span class="k"><span class="pre">ユニオン</span></span><span class="w"> </span><span class="n"><span class="pre">futex_key</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">key</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.futex_top_waiter" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>フェイクスの最高優先度の待機中のタスクを返す</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_hash_bucket</span> <span class="pre">*hb</span></code></dt><dd><p>フェイクス_q が存在するハッシュバケット</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">union</span> <span class="pre">futex_key</span> <span class="pre">*key</span></code></dt><dd><p>フェイクスの識別子（他のフェイクスのフェイクス_q と区別するため）</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>hb ロックを保持して呼び出す必要があります。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.wait_for_owner_exiting">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">wait_for_owner_exiting</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">ret</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">task_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">exiting</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.wait_for_owner_exiting" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>オーナーが終了するまでブロックする</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">ret</span></code></dt><dd><p>オーナーの現在のフェイクスロック状態</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">task_struct</span> <span class="pre">*exiting</span></code></dt><dd><p>終了中のタスクへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>呼び出し元は refcount を保持する必要があります。 <strong>exiting</strong>.</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.futex_lock_pi_atomic">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">futex_lock_pi_atomic</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">u32</span></span><span class="w"> </span><span class="pre">__user</span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">uaddr</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">futex_hash_bucket</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">hb</span></span>, <span class="k"><span class="pre">ユニオン</span></span><span class="w"> </span><span class="n"><span class="pre">futex_key</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">key</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">futex_pi_state</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ps</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">task_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">task</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">task_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">exiting</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">set_waiters</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.futex_lock_pi_atomic" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>PI 対応フェイクスを取得するためのアトミックな作業</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">u32</span> <span class="pre">__user</span> <span class="pre">*uaddr</span></code></dt><dd><p>PI フェイクスのユーザーメモリアドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_hash_bucket</span> <span class="pre">*hb</span></code></dt><dd><p>PI フェイクスのハッシュバケット</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">union</span> <span class="pre">futex_key</span> <span class="pre">*key</span></code></dt><dd><p>uaddr と hb に関連するフェイクスキー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_pi_state</span> <span class="pre">**ps</span></code></dt><dd><p>検索結果を保存する pi_state ポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">task_struct</span> <span class="pre">*task</span></code></dt><dd><p>アトミックなロック作業を実行するタスク。通常は "current" ですが、再登録PIの場合は異なります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">task_struct</span> <span class="pre">**exiting</span></code></dt><dd><p>終了中のオーナータスクのタスクポインタを保存するポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">set_waiters</span></code></dt><dd><p>FUTEX_WAITERS ビットを強制的に設定する（1）かしない（0）か</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<blockquote>
+<div><ul class="simple">
+<li><p>0 - 待機可能;</p></li>
+<li><p>1 - ロックを取得;</p></li>
+<li><p>&lt;0 - エラー</p></li>
+</ul>
+</div></blockquote>
+<p><strong>説明</strong></p>
+<p>hb-&gt;lock と futex_key の参照は呼び出し元が保持する必要があります。</p>
+<p><strong>exiting</strong> 戻り値が -EBUSY の場合にのみ設定されます。その場合、返却時に終了中のタスクへの refcount を保持しており、呼び出し元は終了の完了を待ってから refcount を解放する必要があります。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.__unqueue_futex">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">__unqueue_futex</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.futex_q" title="futex_q"><span class="n"><span class="pre">futex_q</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">q</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.__unqueue_futex" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>フェイクス_q をフェイクスハッシュバケットから削除する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_q</span> <span class="pre">*q</span></code></dt><dd><p>削除するフェイクス_q</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>q-&gt;lock_ptr は NULL であってはならず、呼び出し元が保持する必要があります。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.requeue_futex">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">requeue_futex</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.futex_q" title="futex_q"><span class="n"><span class="pre">futex_q</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">q</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">futex_hash_bucket</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">hb1</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">futex_hash_bucket</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">hb2</span></span>, <span class="k"><span class="pre">ユニオン</span></span><span class="w"> </span><span class="n"><span class="pre">futex_key</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">key2</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.requeue_futex" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>hb から別の hb にフェイクス_q を再登録する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_q</span> <span class="pre">*q</span></code></dt><dd><p>再登録するフェイクス_q</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_hash_bucket</span> <span class="pre">*hb1</span></code></dt><dd><p>ソースハッシュバケット</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_hash_bucket</span> <span class="pre">*hb2</span></code></dt><dd><p>ターゲットハッシュバケット</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">union</span> <span class="pre">futex_key</span> <span class="pre">*key2</span></code></dt><dd><p>再登録されたフェイクス_q に割り当てる新しいキー</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.requeue_pi_wake_futex">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">requeue_pi_wake_futex</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.futex_q" title="futex_q"><span class="n"><span class="pre">futex_q</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">q</span></span>, <span class="k"><span class="pre">ユニオン</span></span><span class="w"> </span><span class="n"><span class="pre">futex_key</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">key</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">futex_hash_bucket</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">hb</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.requeue_pi_wake_futex" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>再キューイング中にロックを取得したタスクを起こす</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_q</span> <span class="pre">*q</span></code></dt><dd><p>the futex_q</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">union</span> <span class="pre">futex_key</span> <span class="pre">*key</span></code></dt><dd><p>再キューイング対象のfutexのキー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_hash_bucket</span> <span class="pre">*hb</span></code></dt><dd><p>再キューイング対象のfutexのハッシュバケット</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>futex_requeueでrequeue_pi=1を指定した場合、競合がなければターゲットのfutexを取得可能またはロックステールによって取得可能。再キューイング対象のfutexのfutex_qキーを設定し、ウェイタが正しいfutexで起こされることを検出できるようにするが、hbから削除し、rt_waiterをNULLにすることで原子的ロック取得を検出できるようにする。q-&gt;lock_ptrを再キューイング対象hb-&gt;lockに設定し、pi_stateへのアクセスを保護して後に所有者を修正する。q-&gt;lock_ptrとhb-&gt;lockを保持して呼び出す必要がある。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.futex_proxy_trylock_atomic">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">futex_proxy_trylock_atomic</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">u32</span></span><span class="w"> </span><span class="pre">__user</span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">pifutex</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">futex_hash_bucket</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">hb1</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">futex_hash_bucket</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">hb2</span></span>, <span class="k"><span class="pre">ユニオン</span></span><span class="w"> </span><span class="n"><span class="pre">futex_key</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">key1</span></span>, <span class="k"><span class="pre">ユニオン</span></span><span class="w"> </span><span class="n"><span class="pre">futex_key</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">key2</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">futex_pi_state</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ps</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">task_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">exiting</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">set_waiters</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.futex_proxy_trylock_atomic" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>トップウェイタの原子的ロックを試行する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">u32</span> <span class="pre">__user</span> <span class="pre">*pifutex</span></code></dt><dd><p>to futexのユーザアドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_hash_bucket</span> <span class="pre">*hb1</span></code></dt><dd><p>from futexのハッシュバケット、呼び出し元がロックしている必要がある</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_hash_bucket</span> <span class="pre">*hb2</span></code></dt><dd><p>to futexのハッシュバケット、呼び出し元がロックしている必要がある</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">union</span> <span class="pre">futex_key</span> <span class="pre">*key1</span></code></dt><dd><p>from futexのキー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">union</span> <span class="pre">futex_key</span> <span class="pre">*key2</span></code></dt><dd><p>to futexのキー</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_pi_state</span> <span class="pre">**ps</span></code></dt><dd><p>pi_stateポインタを保存するアドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">task_struct</span> <span class="pre">**exiting</span></code></dt><dd><p>終了中のオーナータスクのタスクポインタを保存するポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">set_waiters</span></code></dt><dd><p>FUTEX_WAITERS ビットを強制的に設定する（1）かしない（0）か</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>トップウェイタの代わりに原子的ロックを取得できる場合、取得成功時にトップウェイタを起こす。呼び出し元がset_waitersを指定した場合は、FUTEX_WAITERSビットを強制的に設定する。 <a class="reference internal" href="#c.futex_lock_pi_atomic" title="futex_lock_pi_atomic"><code class="xref c c-func docutils literal notranslate"><span class="pre">futex_lock_pi_atomic()</span></code></a> hb1とhb2は呼び出し元が保持している必要がある。</p>
+<p><strong>exiting</strong> 戻り値が -EBUSY の場合にのみ設定されます。その場合、返却時に終了中のタスクへの refcount を保持しており、呼び出し元は終了の完了を待ってから refcount を解放する必要があります。</p>
+<p><strong>戻り値</strong></p>
+<blockquote>
+<div><ul class="simple">
+<li><p>0 - 原子的ロック取得に失敗;</p></li>
+<li><p>＞0 - ロックを取得、戻り値はトップウェイタのvpid</p></li>
+<li><p>&lt;0 - エラー</p></li>
+</ul>
+</div></blockquote>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.futex_requeue">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">futex_requeue</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">u32</span></span><span class="w"> </span><span class="pre">__user</span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">uaddr1</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span>, <span class="n"><span class="pre">u32</span></span><span class="w"> </span><span class="pre">__user</span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">uaddr2</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nr_wake</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">nr_requeue</span></span>, <span class="n"><span class="pre">u32</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">cmpval</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">requeue_pi</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.futex_requeue" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>uaddr1からuaddr2へウェイターリクエストを再キューイングする</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">u32</span> <span class="pre">__user</span> <span class="pre">*uaddr1</span></code></dt><dd><p>ソースfutexのユーザアドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">flags</span></code></dt><dd><p>futexフラグ（FLAGS_SHAREDなど）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">u32</span> <span class="pre">__user</span> <span class="pre">*uaddr2</span></code></dt><dd><p>ターゲットfutexのユーザアドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nr_wake</span></code></dt><dd><p>起こすウェイタ数（requeue_piの場合は1でなければならない）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">nr_requeue</span></code></dt><dd><p>再キューイングするウェイタ数（0-INT_MAX）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">u32</span> <span class="pre">*cmpval</span></code></dt><dd><p><strong>uaddr1</strong> 期待値（または <code class="docutils literal notranslate"><span class="pre">NULL</span></code>)</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">requeue_pi</span></code></dt><dd><p>非pi futexからpi futexへの再キューイングを試行する（piからpiへの再キューイングはサポートされていない）</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>uaddr1のウェイタをuaddr2に再キューイングする。requeue_piの場合、トップウェイタの代わりにuaddr2を原子的ロック取得を試行する。</p>
+<p><strong>戻り値</strong></p>
+<blockquote>
+<div><ul class="simple">
+<li><p>＞=0 - 成功時、再キューイングまたは起こしたタスク数;</p></li>
+<li><p>＜0 - エラー</p></li>
+</ul>
+</div></blockquote>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.queue_me">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">queue_me</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.futex_q" title="futex_q"><span class="n"><span class="pre">futex_q</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">q</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">futex_hash_bucket</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">hb</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.queue_me" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>futex_hash_bucketにfutex_qをキューイングする</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_q</span> <span class="pre">*q</span></code></dt><dd><p>キューイングするfutex_q</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_hash_bucket</span> <span class="pre">*hb</span></code></dt><dd><p>宛先のハッシュバケット</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>hb-&gt;lockは呼び出し元が保持している必要があります。ここで解放されます。呼び出しは
+<a class="reference internal" href="#c.queue_me" title="queue_me"><code class="xref c c-func docutils literal notranslate"><span class="pre">queue_me()</span></code></a> 通常はちょうど1回の呼び出しとペアになります。 <a class="reference internal" href="#c.unqueue_me" title="unqueue_me"><code class="xref c c-func docutils literal notranslate"><span class="pre">unqueue_me()</span></code></a>. <a class="reference internal" href="#c.futex_wait_requeue_pi" title="futex_wait_requeue_pi"><code class="xref c c-func docutils literal notranslate"><span class="pre">futex_wait_requeue_pi()</span></code></a> 例外はPI関連の操作を含み、これらはunqueue_me_pi()を使用するか、wakeプロセスの一部としてunqueueが行われ、目覚めたタスクの状態にunqueue状態が暗黙的に含まれる場合、何も使用しない場合があります（参照</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.unqueue_me">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">unqueue_me</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.futex_q" title="futex_q"><span class="n"><span class="pre">futex_q</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">q</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.unqueue_me" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>フェイクス_q をフェイクスハッシュバケットから削除する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_q</span> <span class="pre">*q</span></code></dt><dd><p>削除するフェイクス_q</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>q-&gt;lock_ptrは呼び出し元が保持してはいけません。呼び出しは <a class="reference internal" href="#c.unqueue_me" title="unqueue_me"><code class="xref c c-func docutils literal notranslate"><span class="pre">unqueue_me()</span></code></a> 通常はちょうど1回の以前の呼び出しとペアになります。 <a class="reference internal" href="#c.queue_me" title="queue_me"><code class="xref c c-func docutils literal notranslate"><span class="pre">queue_me()</span></code></a>.</p>
+<p><strong>戻り値</strong></p>
+<blockquote>
+<div><ul class="simple">
+<li><p>1 - futex_qがまだキューイングされていた場合（そして私たちはそれを非キューイングしました）；</p></li>
+<li><p>0 - futex_qが既に起きるスレッドによって削除されていた場合</p></li>
+</ul>
+</div></blockquote>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.fixup_owner">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">fixup_owner</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">u32</span></span><span class="w"> </span><span class="pre">__user</span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">uaddr</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.futex_q" title="futex_q"><span class="n"><span class="pre">futex_q</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">q</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">ロックされている</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.fixup_owner" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ロック後のpi_stateとコーナーケースの管理</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">u32</span> <span class="pre">__user</span> <span class="pre">*uaddr</span></code></dt><dd><p>futexのユーザーアドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_q</span> <span class="pre">*q</span></code></dt><dd><p>futex_q（pi_stateを含み、rt_mutexへのアクセスを提供）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">locked</span></code></dt><dd><p>rt_mutexの取得が成功した場合（1）または失敗した場合（0）</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>rt_mutexの取得を試みた後、この関数はpi_state所有者のクリーンアップおよびレース条件を処理するために呼び出されます。hbロックを保持して呼び出す必要があります。</p>
+<p><strong>戻り値</strong></p>
+<blockquote>
+<div><ul class="simple">
+<li><p>1 - 成功、ロックを取得しました；</p></li>
+<li><p>0 - 成功、ロックを取得できませんでした；</p></li>
+<li><p>&lt;0 - エラー（-EFAULT）</p></li>
+</ul>
+</div></blockquote>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.futex_wait_queue_me">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">futex_wait_queue_me</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">futex_hash_bucket</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">hb</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.futex_q" title="futex_q"><span class="n"><span class="pre">futex_q</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">q</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="../driver-api/basics.html#c.hrtimer_sleeper" title="hrtimer_sleeper"><span class="n"><span class="pre">hrtimer_sleeper</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">タイムアウト</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.futex_wait_queue_me" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p><a class="reference internal" href="#c.queue_me" title="queue_me"><code class="xref c c-func docutils literal notranslate"><span class="pre">queue_me()</span></code></a> およびウェイクアップ、タイムアウト、シグナルの待機</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_hash_bucket</span> <span class="pre">*hb</span></code></dt><dd><p>futexハッシュバケット、呼び出し元がロックしている必要があります</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_q</span> <span class="pre">*q</span></code></dt><dd><p>キューイングするfutex_q</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">hrtimer_sleeper</span> <span class="pre">*timeout</span></code></dt><dd><p>準備されたhrtimer_sleeper、タイムアウトがない場合はnull</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.futex_wait_setup">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">futex_wait_setup</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">u32</span></span><span class="w"> </span><span class="pre">__user</span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">uaddr</span></span>, <span class="n"><span class="pre">u32</span></span><span class="w"> </span><span class="n"><span class="pre">val</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.futex_q" title="futex_q"><span class="n"><span class="pre">futex_q</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">q</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">futex_hash_bucket</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">hb</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.futex_wait_setup" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>futexの待機準備</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">u32</span> <span class="pre">__user</span> <span class="pre">*uaddr</span></code></dt><dd><p>futexのユーザー空間アドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">u32</span> <span class="pre">val</span></code></dt><dd><p>期待される値</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">flags</span></code></dt><dd><p>futexフラグ（FLAGS_SHAREDなど）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_q</span> <span class="pre">*q</span></code></dt><dd><p>関連するfutex_q</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_hash_bucket</span> <span class="pre">**hb</span></code></dt><dd><p>呼び出し元に返されるhash_bucketポインタのストレージ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>futex_qを設定し、hash_bucketを特定します。futexの値を取得し、期待される値と比較します。アトミックなエラーを内部で処理します。成功時はhbロックを保持しq.key参照を返し、失敗時はロックを解除しq.key参照を返しません。</p>
+<p><strong>戻り値</strong></p>
+<blockquote>
+<div><ul class="simple">
+<li><p>0 - uaddrにvalが含まれており、hbがロックされています；</p></li>
+<li><p>&lt;1 - -EFAULTまたは-EWOULDBLOCK（uaddrにvalが含まれていません）およびhbがロックされていません</p></li>
+</ul>
+</div></blockquote>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.handle_early_requeue_pi_wakeup">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">handle_early_requeue_pi_wakeup</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">futex_hash_bucket</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">hb</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.futex_q" title="futex_q"><span class="n"><span class="pre">futex_q</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">q</span></span>, <span class="k"><span class="pre">ユニオン</span></span><span class="w"> </span><span class="n"><span class="pre">futex_key</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">key2</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="../driver-api/basics.html#c.hrtimer_sleeper" title="hrtimer_sleeper"><span class="n"><span class="pre">hrtimer_sleeper</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">タイムアウト</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.handle_early_requeue_pi_wakeup" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>初期futexでの早期ウェイクアップを検出</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_hash_bucket</span> <span class="pre">*hb</span></code></dt><dd><p>ハッシュバケットfutex_qが元のキューイングされていた</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">futex_q</span> <span class="pre">*q</span></code></dt><dd><p>再キューイングを待っている間にウェイクアップされたfutex_q</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">union</span> <span class="pre">futex_key</span> <span class="pre">*key2</span></code></dt><dd><p>再キューイング対象futexのfutex_key</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">hrtimer_sleeper</span> <span class="pre">*timeout</span></code></dt><dd><p>待機に関連するタイムアウト（ない場合はNULL）</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>タスクが初期のfutexで目覚めたか、再キューイング先のfutexで目覚めたかを検出します。その場合、目覚めの原因がタイムアウトかシグナルかを判断し、適切なエラーコードを呼び出し元に返します。hbロックを保持しながら呼び出す必要があります。</p>
+<p><strong>戻り値</strong></p>
+<blockquote>
+<div><ul class="simple">
+<li><p>0 = 早期のウェイクアップが検出されなかった場合;</p></li>
+<li><p>&lt;0 = -ETIMEDOUTまたは-ERESTARTNOINTR</p></li>
+</ul>
+</div></blockquote>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.futex_wait_requeue_pi">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">futex_wait_requeue_pi</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">u32</span></span><span class="w"> </span><span class="pre">__user</span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">uaddr</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span>, <span class="n"><span class="pre">u32</span></span><span class="w"> </span><span class="n"><span class="pre">val</span></span>, <span class="n"><span class="pre">ktime_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">abs_time</span></span>, <span class="n"><span class="pre">u32</span></span><span class="w"> </span><span class="n"><span class="pre">bitset</span></span>, <span class="n"><span class="pre">u32</span></span><span class="w"> </span><span class="pre">__user</span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">uaddr2</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.futex_wait_requeue_pi" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>uaddrに待機し、uaddr2を取得します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">u32</span> <span class="pre">__user</span> <span class="pre">*uaddr</span></code></dt><dd><p>最初に待機したfutex（非PI）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">flags</span></code></dt><dd><p>futexフラグ（FLAGS_SHARED、FLAGS_CLOCKRTなど）、これらは同じタイプでなければならず、プライベートから共有への再キューイングはできません。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">u32</span> <span class="pre">val</span></code></dt><dd><p>uaddrの期待される値</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">ktime_t</span> <span class="pre">*abs_time</span></code></dt><dd><p>絶対タイムアウト</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">u32</span> <span class="pre">bitset</span></code></dt><dd><p>ユーザー空間が設定する32ビットのウェイクアップビットセット、デフォルトはすべて</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">u32</span> <span class="pre">__user</span> <span class="pre">*uaddr2</span></code></dt><dd><p>ユーザー空間に戻る前に取得するPI futex</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>呼び出し元はuaddrに待機し、 <a class="reference internal" href="#c.futex_requeue" title="futex_requeue"><code class="xref c c-func docutils literal notranslate"><span class="pre">futex_requeue()</span></code></a> uaddr2に再キューイングされます。uaddr2はPI対応でuaddrと異なる必要があります。通常のウェイクアップではuaddr2で目覚め、rt_mutexの取得を完了してからユーザー空間に戻ります。これにより、rt_mutexが待機中のタスクがあるときに所有者を保持します。所有者がいない場合、piロジックがどのタスクをブースト/デブーストするかを判断できません。</p>
+<p>scheduleを呼び出します <a class="reference internal" href="#c.futex_wait_queue_me" title="futex_wait_queue_me"><code class="xref c c-func docutils literal notranslate"><span class="pre">futex_wait_queue_me()</span></code></a> キューイングして以下の通り戻ります– 1) 原子的なロック取得後にuaddr2でのウェイクアップ後、 <a class="reference internal" href="#c.futex_requeue" title="futex_requeue"><code class="xref c c-func docutils literal notranslate"><span class="pre">futex_requeue()</span></code></a>
+2) 再キューイング後のuaddr2でのウェイクアップ 3) シグナル 4) タイムアウト</p>
+<p>3の場合は、クリーンアップして-ERESTARTNOINTRを返します。</p>
+<p>2の場合は、rt_mutexの取得を試みながらブロックし、以下の通り戻ります: 5) 成功したロック取得 6) シグナル 7) タイムアウト 8) 他のロック取得失敗</p>
+<p>6の場合は、-EWOULDBLOCKを返します（シスリルを再開しても同じ結果になります）。</p>
+<p>4または7の場合は、クリーンアップして-ETIMEDOUTを返します。</p>
+<p><strong>戻り値</strong></p>
+<blockquote>
+<div><ul class="simple">
+<li><p>0 - 成功の場合;</p></li>
+<li><p>&lt;0 - エラーの場合</p></li>
+</ul>
+</div></blockquote>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.sys_set_robust_list">
+<span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">sys_set_robust_list</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">robust_list_head</span></span><span class="w"> </span><span class="pre">__user</span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">ヘッド</span></span>, <span class="n"><span class="pre">size_t</span></span><span class="w"> </span><span class="n"><span class="pre">len</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.sys_set_robust_list" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>タスクのrobust-futexリストのヘッドを設定します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">robust_list_head</span> <span class="pre">__user</span> <span class="pre">*</span> <span class="pre">head</span></code></dt><dd><p>リストヘッドへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">size_t</span> <span class="pre">len</span></code></dt><dd><p>ユーザー空間が期待するリストヘッドの長さ</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.sys_get_robust_list">
+<span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">sys_get_robust_list</span></span></span><span class="sig-paren">(</span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">pid</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">robust_list_head</span></span><span class="w"> </span><span class="pre">__user</span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="pre">__user</span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">head_ptr</span></span>, <span class="n"><span class="pre">size_t</span></span><span class="w"> </span><span class="pre">__user</span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">len_ptr</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.sys_get_robust_list" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>タスクのrobust-futexリストのヘッドを取得します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">pid</span></code></dt><dd><p>プロセスのpid [現在のタスクにはゼロ]</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">robust_list_head</span> <span class="pre">__user</span> <span class="pre">*</span> <span class="pre">__user</span> <span class="pre">*</span> <span class="pre">head_ptr</span></code></dt><dd><p>リストヘッドポインタへのポインタ、カーネルがこれを埋めます</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">size_t</span> <span class="pre">__user</span> <span class="pre">*</span> <span class="pre">len_ptr</span></code></dt><dd><p>長さフィールドへのポインタ、カーネルがヘッダーサイズを埋めます</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.futex_exit_recursive">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">futex_exit_recursive</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="n"><span class="pre">task_struct</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">tsk</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.futex_exit_recursive" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>タスクのfutex状態をFUTEX_STATE_DEADに設定します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">task_struct</span> <span class="pre">*tsk</span></code></dt><dd><p>状態を設定するタスク</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>タスクのfutex終了状態をロックなしで設定します。futexウェイターコードはタスクが終了する際、この状態を観察し、タスクが実際にfutexクリーンアップを完了するまでループします。最悪の場合、ウェイターは状態が可視になるまで待機ループを繰り返します。</p>
+<p>これはdo_exit()内の再帰的なエラー処理パスから呼び出されます。</p>
+<p>これはベストエフォートです。ファイツェックスの終了コードがすでに実行されているか、されていないかのいずれかです。ファイツェックスのOWNER_DIEDビットが設定されている場合、待機中のプロセスはそれを引き継ぐことができます。設定されていない場合は、問題はユーザー空間に押し戻されます。ファイツェックスの終了コードがまだ実行されていない場合、既にキューに並んでいた待機プロセスが永遠にブロックされる可能性がありますが、その対処法はありません。</p>
+</section>
+<section id="further-reading">
+<h2>さらに読む<a class="headerlink" href="#further-reading" title="この見出しへのパーマリンク">¶</a></h2>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">Documentation/locking/spinlocks.rst</span></code>: カーネルソース内のリンウス・トーバルズのスピンロックチュートリアル。</p></li>
+<li><p>Unix Systems for Modern Architectures: Symmetric Multiprocessing and Caching for Kernel Programmers:</p>
+<p>カート・シュミッセルのカーネルレベルのロックに関する非常に良い入門書（Linux用には書かれていませんが、ほぼすべてが適用されます）。この本は高価ですが、SMPロックを理解するには本当に価値があります。[ISBN: 0201633388]</p>
+</li>
+</ul>
+</section>
+<section id="thanks">
+<h2>感謝します<a class="headerlink" href="#thanks" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ドクボッキング、見直し、スタイル追加にTelsa Gwynneに感謝します。</p>
+<p>Proofreading、修正、批判、コメントにMartin Pool、Philipp Rumpf、Stephen Rothwell、Paul Mackerras、Ruedi Aschwanden、Alan Cox、Manfred Spraul、Tim Waugh、Pete Zaitcev、James Morris、Robert Love、Paul McKenney、John Ashbyに感謝します。</p>
+<p>このドキュメントに影響を与えることのなかったcabalに感謝します。</p>
+</section>
+<section id="glossary">
+<h2>用語集<a class="headerlink" href="#glossary" title="この見出しへのパーマリンク">¶</a></h2>
+<dl>
+<dt>プリエミュプション</dt><dd><p>2.5以前、または <code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT</span></code> が未設定の場合、ユーザー コンテキスト内でカーネル内にいるプロセスはお互いにプリエミュプションを行いません（つまり、CPUを手放すまで占有し、割り込みを除く）。2.5.4で
+<code class="docutils literal notranslate"><span class="pre">CONFIG_PREEMPT</span></code> が追加され、この挙動が変更されました：ユーザー コンテキスト内では、優先度が高いタスクが「割り込む」ことができます。スピンロックはUPでもプリエミュプションを無効にするようになりました。</p>
+</dd>
+<dt>bh</dt><dd><p>ボトムハーフ：歴史的経緯により、'bh'を含む関数は現在、ソフトウェア割り込みを指すことが多く、例えばspin_lock_bh()は現在のCPUで任意のソフトウェア割り込みをブロックします。ボトムハーフは非推奨となり、最終的にはタスクレットで置き換えられます。同時に1つのボトムハーフのみが実行されます。</p>
+</dd>
+<dt>ハードウェア割り込み / ハードウェアIRQ</dt><dd><p>ハードウェア割り込みリクエスト。in_irq()はハードウェア割り込みハンドラ内ではtrueを返します。</p>
+</dd>
+<dt>割り込みコンテキスト</dt><dd><p>ユーザー コンテキストではありません：ハードウェアIRQまたはソフトウェアIRQの処理中です。in_interrupt()マクロがtrueを返します。</p>
+</dd>
+<dt>SMP</dt><dd><p>対称マルチプロセッサ：複数CPUマシン用にコンパイルされたカーネル。（<code class="docutils literal notranslate"><span class="pre">CONFIG_SMP=y</span></code>).</p>
+</dd>
+<dt>ソフトウェア割り込み / ソフティーリクエスト</dt><dd><p>ソフトウェア割り込みハンドラ。in_irq()はfalseを返し、in_softirq()はtrueを返します。タスクレットとソフトウェア割り込みはどちらも「ソフトウェア割り込み」のカテゴリに属します。</p>
+<p>厳密には、ソフトウェア割り込みとは、複数のCPUで同時に実行可能な最大32のソフトウェア割り込みのうちの1つです。有時、タスクレット全体を指す場合もあります（つまりすべてのソフトウェア割り込みを指します）。</p>
+</dd>
+<dt>tasklet</dt><dd><p>動的に登録可能なソフトウェア割込みで、一度に1つのCPUのみで実行されることが保証されています。</p>
+</dd>
+<dt>タイマ</dt><dd><p>指定された時間（またはそれに近い時間）に実行される動的に登録可能なソフトウェア割込みです。実行中はtaskletとほぼ同じ挙動を示します（実際にはtaskletから呼び出されます）。 <code class="docutils literal notranslate"><span class="pre">TIMER_SOFTIRQ</span></code>).</p>
+</dd>
+<dt>UP</dt><dd><p>ユニプロセッサ: SMPでない。（<code class="docutils literal notranslate"><span class="pre">CONFIG_SMP=n</span></code>).</p>
+</dd>
+<dt>ユーザーコンテキスト</dt><dd><p>特定のプロセス（システムコールやトラップなど）やカーネルスレッドの代行として実行されるカーネルです。実行中のプロセスは「マクロ」で確認できます。
+<code class="docutils literal notranslate"><span class="pre">current</span></code> ユーザースペースとは混同しないでください。ソフトウェアまたはハードウェア割込みによって中断されることがあります。</p>
+</dd>
+<dt>ユーザースペース</dt><dd><p>カーネルの外で自身のコードを実行するプロセス</p>
+</dd>
+</dl>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">カーネルハッキングガイド</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="hacking.html">信頼性のないLinuxカーネルハッキングガイド</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Unreliable Guide To Locking</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">カーネルハッキングガイド</a><ul>
+<li>前へ: <a href="hacking.html" title="前章">信頼性のないLinuxカーネルハッキングガイド</a></li>
+<li>次へ: <a href="../trace/index.html" title="次章">Linuxトレーシング技術</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/kernel-hacking/locking.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

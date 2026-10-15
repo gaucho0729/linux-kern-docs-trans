@@ -1,0 +1,254 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>InfiniBand Midlayer Locking — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="ipoib.html" rel="next" title="InfiniBand上でのIP"/>
+<link href="index.html" rel="prev" title="InfiniBand"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="infiniband-midlayer-locking">
+<h1>InfiniBandミドルレイヤーのロック<a class="headerlink" href="#infiniband-midlayer-locking" title="この見出しへのパーマリンク">¶</a></h1>
+<blockquote>
+<div><p>このガイドでは、InfiniBand midlayerが行うロックの前提条件を明確にし、midlayerの下にある低レベルドライバーやmidlayerを使用する上位プロトコルに対する要件を説明しています。</p>
+</div></blockquote>
+<section id="sleeping-and-interrupt-context">
+<h2>スリープと割込みコンテキスト<a class="headerlink" href="#sleeping-and-interrupt-context" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><p>struct ib_deviceのすべてのメソッドの低レベルドライバーアイムPLEMENTATIONは、以下の例外を除いてスリープすることがあります。例外は以下のメソッドです：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>create_ah</p></li>
+<li><p>modify_ah</p></li>
+<li><p>query_ah</p></li>
+<li><p>destroy_ah</p></li>
+<li><p>post_send</p></li>
+<li><p>post_recv</p></li>
+<li><p>poll_cq</p></li>
+<li><p>req_notify_cq</p></li>
+</ul>
+</div></blockquote>
+<p>これらはスリープしない可能性があり、任意のコンテキストから呼び出せる必要があります。</p>
+<p>上位プロトコル消費者にエクスポートされる関連する関数：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>rdma_create_ah</p></li>
+<li><p>rdma_modify_ah</p></li>
+<li><p>rdma_query_ah</p></li>
+<li><p>rdma_destroy_ah</p></li>
+<li><p>ib_post_send</p></li>
+<li><p>ib_post_recv</p></li>
+<li><p>ib_req_notify_cq</p></li>
+</ul>
+</div></blockquote>
+<p>これらはしたがって、任意のコンテキストから呼び出すことができます。</p>
+<p>さらに、低レベルドライバーがmidlayerを通じて非同期イベントをディスパッチする際に使用する関数</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>ib_dispatch_event</p></li>
+</ul>
+</div></blockquote>
+<p>も任意のコンテキストから呼び出すことができます。</p>
+</div></blockquote>
+<section id="reentrancy">
+<h3>再入可能<a class="headerlink" href="#reentrancy" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>low-level driverがエクスポートするstruct ib_deviceのすべてのメソッドは完全に再入可能でなければなりません。低レベルドライバーは、同一オブジェクトを複数の関数呼び出しが同時に実行される場合でも、一貫性を維持するためのすべての同期処理を実行する必要があります。</p>
+<p>IB midlayerは関数呼び出しのシリアル化を行いません。</p>
+<p>低レベルドライバーが再入可能であるため、上位プロトコル消費者はシリアル化を行う必要はありません。ただし、適切な結果を得るために一部のシリアル化が必要な場合があります。たとえば、消費者はib_poll_cq()を複数のCPUで同時に呼び出すことができますが、ib_poll_cq()の異なる呼び出し間での作業完了情報の順序は定義されていません。</p>
+</div></blockquote>
+</section>
+<section id="callbacks">
+<h3>コールバック<a class="headerlink" href="#callbacks" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>低レベルドライバーは、ib_deviceメソッド呼び出しの同じコールチェーンから直接コールバックを実行してはなりません。たとえば、low-level driverはpost_sendメソッドから消費者の完了イベントハンドラを直接呼び出すことはできません。代わりに、タスクレットをスケジュールしてコールバックを実行するなど、コールバックを遅延させる必要があります。</p>
+<p>low-level driverは、同一のCQに対する複数の完了イベントハンドラが同時に呼び出されないようにする必要があります。ドライバーは、特定のCQに対して同時に1つのみCQイベントハンドラが実行されていることを保証しなければなりません。言い換えれば、以下の状況は許容されません：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>      CPU1                                    CPU2
+
+low-level driver -&gt;
+  consumer CQ event callback:
+    /* ... */
+    ib_req_notify_cq(cq, ...);
+                                      low-level driver -&gt;
+    /* ... */                           consumer CQ event callback:
+                                          /* ... */
+    return from CQ event handler
+</pre></div>
+</div>
+<p>完了イベントおよび非同期イベントコールバックが実行されるコンテキストは定義されていません。低レベルドライバーによっては、プロセスコンテキスト、ソフトIRQコンテキスト、または割込みコンテキストのいずれかになる可能性があります。上位レベルプロトコル消費者はコールバック内でスリープしてはいけません。</p>
+</div></blockquote>
+</section>
+<section id="hot-plug">
+<h3>ホットプラグ<a class="headerlink" href="#hot-plug" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>低レベルドライバーが消費者がデバイスを使用できるようにする際には、デバイスが利用可能であることを通知するために、 <a class="reference internal" href="../driver-api/infiniband.html#c.ib_register_device" title="ib_register_device"><code class="xref c c-func docutils literal notranslate"><span class="pre">ib_register_device()</span></code></a>この呼び出しを行う前にすべての初期化が完了している必要があります。ドライバーがこの呼び出しを行うまで、デバイスは利用可能でなければなりません。 <a class="reference internal" href="../driver-api/infiniband.html#c.ib_unregister_device" title="ib_unregister_device"><code class="xref c c-func docutils literal notranslate"><span class="pre">ib_unregister_device()</span></code></a> が返却した後には使用しません。</p>
+<p>低レベルドライバーは、プロセスコンテキストから呼び出す必要があります。 <a class="reference internal" href="../driver-api/infiniband.html#c.ib_register_device" title="ib_register_device"><code class="xref c c-func docutils literal notranslate"><span class="pre">ib_register_device()</span></code></a> および
+<a class="reference internal" href="../driver-api/infiniband.html#c.ib_unregister_device" title="ib_unregister_device"><code class="xref c c-func docutils literal notranslate"><span class="pre">ib_unregister_device()</span></code></a> これらの呼び出しを通じて消費者がドライバーに逆にコールバックする場合に、デッドロックを引き起こす可能性のあるセマフォアを保持してはいけません。</p>
+<p>上位レベルプロトコル消費者は、そのstruct ib_clientのaddメソッドがデバイスに対して呼び出された時点で、IBデバイスを使用を開始できます。消費者はremoveメソッドから戻る前に、デバイスに関するすべてのクリーンアップを完了し、すべてのリソースを解放する必要があります。</p>
+<p>消費者はaddおよびremoveメソッド内でスリープすることが許可されています。</p>
+</div></blockquote>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">InfiniBand</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">InfiniBandミドルレイヤーのロック</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipoib.html">InfiniBand上でのIP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="opa_vnic.html">インテルオミニパス(OPA)仮想ネットワークインターフェースコントローラー(VNIC)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysfs.html">Sysfsファイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tag_matching.html">タグマッチングロジック</a></li>
+<li class="toctree-l2"><a class="reference internal" href="user_mad.html">ユーザースペースMADアクセス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="user_verbs.html">ユーザースペースバーブスアクセス</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">InfiniBand</a><ul>
+<li>前へ: <a href="index.html" title="前章">InfiniBand</a></li>
+<li>次へ: <a href="ipoib.html" title="次章">InfiniBand上でのIP</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/infiniband/core_locking.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

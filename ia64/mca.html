@@ -1,0 +1,224 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>IA64 MCAおよびINIT処理に関する一時的なノートの集まり — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="serial.html" rel="next" title="シリアルデバイス"/>
+<link href="irq-redir.html" rel="prev" title="IA64プラットフォームにおけるIRQアフィニティ"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="an-ad-hoc-collection-of-notes-on-ia64-mca-and-init-processing">
+<h1>IA64 MCAおよびINIT処理に関する一時的なメモの集まり<a class="headerlink" href="#an-ad-hoc-collection-of-notes-on-ia64-mca-and-init-processing" title="この見出しへのパーマリンク">¶</a></h1>
+<p>不明瞭な部分についてのノートを追加していただいて構いません。</p>
+<p>—</p>
+<p>MCA/INITは完全に非同期です。OSがどのような状態であってもいつでも発生する可能性があり、1つのCPUがすでにスピンロックを保持している状態でも発生します。MCA/INIT状態からロックを取得しようとするとデッドロックのリスクがあります。さらに、ロックで保護されている構造体の状態は不定であり、連結リストを含むすべての構造体が該当します。</p>
+<p>—</p>
+<p>複雑なia64 MCA処理。これはIntelのia64 SAL仕様、エラー回復およびアンワインドの要件であり、選択肢がないのです。</p>
+<ul class="simple">
+<li><p>MCAは通常、二重ビットメモリエラーにより1つのCPUで発生します。このCPUを「モンアーキーCPU」と呼びます。</p></li>
+<li><p>SALはMCAリーディングインターセプト（これは通常の割り込み）をすべての他のCPUに送信します。これらは「スレーブCPU」と呼ばれます。</p></li>
+<li><p>MCA割り込みを受信したスレーブCPUはSALに処理を移し、MCA処理中は無効なスピンロック状態になります。</p></li>
+<li><p>MCA発生時にすでにスピンロック状態だったスレーブCPUはMCA割り込みを処理できません。SALは約20秒待って、まだリーディングしていないスレーブCPUに非マスク可能なINITイベントを送信します。</p></li>
+<li><p>MCA/INITはいつでも発生する可能性があり、CPUがPALの物理モードで停止している場合も含まれます。イベント発生時のレジスタ値は完全に未定義です。特にMCA/INITハンドラはスレッドポインタに依存できません。PALの物理モードでは（実際にそうしています）TPを変更することが許可されており、戻るときにTPをリセットすれば問題ありません。しかしMCA/INITイベントはこれらのPAL内部TP変更にさらされるため、curr_task()を使用します。</p></li>
+<li><p>カーネルが実行中（ユーザースペースではない）でPALを呼び出した後、MCA/INITイベントが発生した場合、ハンドラはカーネルスタックが適切な状態にあると仮定できません。主にPALがスタックポインタを内部的に保持するかどうかが不定だからです。カーネルスタックを信頼できないため、ハンドラは各自のCPUごとのスタックを使用します。MCA/INITスタックは必要なタスク状態を含むだけの形式で事前に準備されています。</p></li>
+<li><p>他のアーキテクチャと異なり、ia64のstruct taskはカーネルスタックに埋め込まれています[1]。そのため、新しいカーネルスタックに切り替えると、新しいタスクにも切り替わります。カーネルのさまざまな部分がcurrentがstruct task内を指していると想定しているため、新しいスタックに切り替えるとcurrentの値も変わります。</p></li>
+<li><p>すべてのスレーブが集合し、スピンを停止した後、マウンテンが実行されます。マウンテンは現在、問題の診断を行い、復旧が可能かどうかを判断します。</p></li>
+<li><p>マウンテンの役割の一部は、他のタスクの状態を確認することです。ia64では、これを実行する唯一の方法は、インテルが義務付けているunwinderを呼び出すことです。</p></li>
+<li><p>アンワインドの開始点は、タスクが実行中かどうかによって異なります。つまり、CPU上で実行中か、ブロックされているかを判断する必要があります。マウンテンは、タスクがどのCPU上で実行中かを確認しないと、アンワインドを開始する方法を知りません。MCAまたはINITイベントを受け取ったタスクはもう実行されておらず、ブロックされたタスクに変換されています。ただし（これは大きな問題ですが）、MCAレンドイズvous割り込みを受け取ったCPUはまだ、通常のカーネルスタックで実行中です！</p></li>
+<li><p>これらの2つのケースを区別するため、マウンテンはどのタスクがCPU上で実行中で、どのタスクがそうでないかを把握する必要があります。そのため、各スレーブCPUがMCA/INITスタックに切り替わる際、set_curr_task()を呼び出して新しいスタックを登録します。これにより、マウンテンはそのCPU上で元のタスクがもう実行されていないことを知ることができます。これにより、元のタスクの有効なバックトレースを取得する可能性が高まります。</p></li>
+<li><p>MCA/INITはネストして実行でき、どのCPUでも最大2段階まで可能です。ネストされたエラーの場合は、失敗したMCA/INITハンドラの診断が必要です。元のタスクではなく。これもset_curr_task()が必要で、MCA/INITハンドラがそのCPU上で自身のスタックを実行中として登録できます。これにより、再帰的なエラーが発生した場合、失敗したハンドラの「タスク」のトレースが取得できます。</p></li>
+</ul>
+<dl class="simple">
+<dt>[1]</dt><dd><p>私の（ケith・オウエノウズ）元の設計では、ia64がstruct taskとカーネルスタックを分離していました。これにより、MCA/INITデータはi386の割り込みスタックのようにチェーン状のスタックに配置できます。ただし、これにはia64の他の部分への大幅な手術と、関連するパフォーマンス低下を伴う追加のハードウェアワイヤードTLBエントリが必要でした。David・モスバーガーがこのアプローチを拒否したため、MCA/INITハンドラには別個のカーネルスタックが意味する別個の「タスク」を必要としました。</p>
+</dd>
+</dl>
+<p>—</p>
+<p>INITはMCAよりも複雑ではありません。NMIボタンを押すか、管理コンソールで同等のコマンドを実行すると、すべてのCPUにINITが送信されます。SALはCPUのうち1つをマウンテンとし、他のCPUをスレーブとします。すべてのOS INITハンドラはほぼ同時に実行されます。OSマウンテンはすべてのタスクの状態を出力した後、戻り、スレーブが戻るのを待ってシステムが再開します。</p>
+<p>少なくともそれこそが予定されていることである。しかし残念なことに、SAL（System Abstraction Layer）の破損したバージョンが存在している。一部のバージョンではすべてのCPUを君主として動作させ、一部ではすべてのCPUを奴隷として動作させる。また、一部では1つのCPUを君主として動作させ、そのCPUがOSから戻るのを待って、残りのCPUを奴隷として動作させる。さらに一部のSALバージョンでは、OSから戻る処理すら行えないため、再起動時にSAL内で無限ループしてしまう。OSのINITコードはこれらの破損したSALの症状に対して一部の対処法を備えているが、すべてをOS側から修正することはできない。</p>
+<p>—</p>
+<p>ia64が使用するスケジューラーホック（curr_task、set_curr_task）はレイヤー違反である。残念なことにMCA/INITは初期から大規模なレイヤー違反（いつでも発生可能）であり、それからさらに問題が複雑化していく。</p>
+<p>少なくともia64はハードウェアエラーからの回復を試みているが、これらのエラーの非同期性により問題が難しい。非マスク可能割込みを処理する際には、ロックを取得できないという制限に対応する特別なコードが必要となる場合がある。</p>
+<p>—</p>
+<p>ia64のMCA/INITはx86のNMIとはどのように異なるのか？</p>
+<ul class="simple">
+<li><p>x86のNMIは通常1つのCPUに割り当てられる。MCA/INITはすべてのCPUに送信される。</p></li>
+<li><p>x86のNMIはネスト可能ではない。MCA/INITは1つのCPUあたり最大2層までネスト可能である。</p></li>
+<li><p>x86は別個のstruct taskを持ち、複数のカーネルスタックのうちの1つを指す。一方、ia64ではstruct taskが単一のカーネルスタックに埋め込まれているため、スタックの切り替えとはタスクの切り替えを意味する。</p></li>
+<li><p>x86はBIOSを呼び出さないため、NMIハンドラはレジスタが変更されている心配をする必要がない。一方、MCA/INITはCPUが物理モードのPAL（Processor Abstraction Layer）内で発生する可能性があり、その際レジスタやカーネルスタックの状態は未定義となる。</p></li>
+<li><p>i386のバックトレースはプロセスが実行中かどうかにあまり敏感ではないが、ia64のアンワインドはプロセスが実行中かどうかに非常に、非常に敏感である。</p></li>
+</ul>
+<p>—</p>
+<p>MCA/INITがCPUがユーザースペースコードを実行しているときに届いた場合、どうなるのか？</p>
+<p>OSに入る際、ユーザーモードのレジスタはMCA/INITのRSE（Register Save Area）領域に保存され、OSからSALに戻る際にはそこから復元されるため、回復可能なMCA/INITではユーザーモードのレジスタが保持される。OSはユーザースペーススタックのアンワインドデータを把握していないため、MCA/INITはユーザースペースのバックトレースを試みない。つまり、OSはユーザースペースプロセスをブロックタスクのように見なす必要がないため、pt_regsやswitch_stackをユーザースペーススタックにコピーしない。また、OSはユーザースペースのRSEやメモリスタックのサイズを把握していないため、保存された状態をユーザーモードスタックにコピーするのはリスクが高すぎる。</p>
+<p>—</p>
+<p>MCA/INITが届いたときに実行されていたタスクのバックトレースを取得する方法は？</p>
+<p>mca.c:::ia64_mca_modify_original_stack()は、元のカーネルスタックを特定・検証し、MCA/INITスタックのRSEから汚染されたレジスタを元のスタックのRSEにコピーし、スケルトンのstruct pt_regsとswitch_stackを元のスタックにコピーします。PAL minstate領域からスケルトン構造体を埋め込み、元のスタックのthread.kspを更新します。これにより、元のスタックは他のブロックタスクと同様に見え、現在はスリープ状態に見えます。バックトレースを取得するには、元のタスクのthread.kspから通常のスリープタスクと同じようにアンワインドします。</p>
+<p>—</p>
+<p>MCA/INITが配信された際に行われていたタスクをどのように特定するのでしょうか？</p>
+<p>前のタスクが検証されブロック状態に変換された場合、MCA/INITスタックのsos-&gt;prev_taskは前のタスクを指すよう更新されます。ダンプやデバッガーでこのフィールドを確認できます。ハンドラと元のタスクを区別するため、ハンドラのthread_info.flagsには_TIF_MCA_INITが設定されます。</p>
+<p>sosデータは常にMCA/INITハンドラスタックのMCA_SOS_OFFSETオフセット位置に存在します。この値はmca_asm.hから取得可能で、KERNEL_STACK_SIZE - sizeof(struct pt_regs) - sizeof(struct ia64_sal_os_state)として計算可能です。すべての構造体には16バイトアライメントが適用されます。</p>
+<p>また、MCA/INITタスクのcommフィールドは元のタスクのpidを含めるように修正されており、人間が使用するためのものです。例えば、commフィールドが「MCA 12159」と表示されている場合、pid 12159がMCA配信時に実行されていたことを示します。</p>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">IA-64アーキテクチャ</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="ia64.html">IA-64プラットフォーム用Linuxカーネルリリース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="aliasing.html">Memory Attribute Aliasing on IA-64</a></li>
+<li class="toctree-l2"><a class="reference internal" href="efirtc.html">EFIリアルタイムクロックドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="err_inject.html">IPF Machine Check (MC) エラーランタイムツール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="fsys.html">IA-64用の軽量システムコール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="irq-redir.html">IA64プラットフォームにおけるIRQアフィニティ</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">IA64 MCAおよびINIT処理に関する一時的なメモの集まり</a></li>
+<li class="toctree-l2"><a class="reference internal" href="serial.html">シリアルデバイス</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">IA-64アーキテクチャ</a><ul>
+<li>前へ: <a href="irq-redir.html" title="前章">IA64プラットフォームにおけるIRQアフィニティ</a></li>
+<li>次へ: <a href="serial.html" title="次章">シリアルデバイス</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/ia64/mca.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

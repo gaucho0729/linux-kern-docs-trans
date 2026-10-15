@@ -1,0 +1,529 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Intel Integrated Sensor Hub (ISH) — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="../i2c/index.html" rel="next" title="I2C/SMBusサブシステム"/>
+<link href="hid-alps.html" rel="prev" title="ALPS HID Touchpad Protocol"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="intel-integrated-sensor-hub-ish">
+<h1>インテル統合センサー・ハブ（ISH）<a class="headerlink" href="#intel-integrated-sensor-hub-ish" title="この見出しへのパーマリンク">¶</a></h1>
+<p>センサーホブは、センサーのポーリングやアルゴリズム処理を専用の低消費電力コプロセッサにオフロードする機能を提供します。これにより、コアプロセッサが低電力モードに入る頻度が増えるため、バッテリー寿命が向上します。</p>
+<p>HIDセンサーアクセステーブルに準拠した外部センサーホブを提供するベンダーは多く、タブレットや2in1コンバーテッドノートPC、埋め込み製品などに採用されています。LinuxはLinux 3.9からこのサポートを提供しています。</p>
+<p>Intel®は、Cherry Trail以降のSoCに統合センサーホブを導入し、現在は複数世代のCPUパッケージでサポートしています。すでに多くの商用製品に統合センサーホブ（ISH）が搭載されています。これらのISHはHIDセンサースペックにも準拠していますが、通信に使用するトランスポートプロトコルが異なります。外部センサーホブは主にHID over i2CまたはUSBを使用しますが、ISHはi2CまたはUSBを使用していません。</p>
+<section id="overview">
+<h2>1. 概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>USBhidの実装と同様のモデルで、非常に高速な通信を実現しています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>-----------------               ----------------------
+|    USB HID    |       --&gt;     |    ISH HID         |
+-----------------               ----------------------
+-----------------               ----------------------
+|  USB protocol |       --&gt;     |    ISH Transport   |
+-----------------               ----------------------
+-----------------               ----------------------
+|  EHCI/XHCI    |       --&gt;     |    ISH IPC         |
+-----------------               ----------------------
+      PCI                                PCI
+-----------------               ----------------------
+|Host controller|       --&gt;     |    ISH processor   |
+-----------------               ----------------------
+     USB Link
+-----------------               ----------------------
+| USB End points|       --&gt;     |    ISH Clients     |
+-----------------               ----------------------
+</pre></div>
+</div>
+<p>USBプロトコルがデバイスの列挙、リンク管理、ユーザーデータのエンカプスレーションを提供するのと同様に、ISHも同様のサービスを提供します。ただし、これは軽量で、ファームウェア内に実装されたISHクライアントアプリケーションとやり取りするためのものです。</p>
+<p>ISHはファームウェア内で複数のセンサーマネジメントアプリケーションを実行できます。USBエンドポイントのように、メッセージングはクライアントとやり取りされます。列挙プロセスの一部として、これらのクライアントが識別されます。クライアントは単純なHIDセンサーアプリケーション、センサー補正アプリケーション、センサーファームウェア更新アプリケーションなどです。</p>
+<p>実装モデルはUSBバスと同様で、ISHトランスポートもバスとして実装されています。ISHプロセッサで実行される各クライアントアプリケーションはこのバス上のデバイスとして登録されます。ドライバー（ISH HIDドライバー）はデバイスタイプを特定し、hidコアに登録します。</p>
+</section>
+<section id="ish-implementation-block-diagram">
+<h2>2. ISH実装: ブロック図<a class="headerlink" href="#ish-implementation-block-diagram" title="この見出しへのパーマリンク">¶</a></h2>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>       ---------------------------
+      |  User Space Applications  |
+       ---------------------------
+
+----------------IIO ABI----------------
+       --------------------------
+      |  IIO Sensor Drivers     |
+       --------------------------
+       --------------------------
+      |        IIO core         |
+       --------------------------
+       --------------------------
+      |   HID Sensor Hub MFD    |
+       --------------------------
+       --------------------------
+      |       HID Core          |
+       --------------------------
+       --------------------------
+      |   HID over ISH Client   |
+       --------------------------
+       --------------------------
+      |   ISH Transport (ISHTP) |
+       --------------------------
+       --------------------------
+      |      IPC Drivers        |
+       --------------------------
+OS
+---------------- PCI -----------------
+Hardware + Firmware
+       ----------------------------
+      | ISH Hardware/Firmware(FW) |
+       ----------------------------
+</pre></div>
+</div>
+</section>
+<section id="high-level-processing-in-above-blocks">
+<h2>3. 上記ブロックにおける高レベル処理<a class="headerlink" href="#high-level-processing-in-above-blocks" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="hardware-interface">
+<h3>3.1 ハードウェアインターフェース<a class="headerlink" href="#hardware-interface" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ISHはホストに対して「Non-VGA未分類PCIデバイス」として公開されます。PCI製品およびベンダーデータIDはプロセッサの世代ごとに変更されるため、ドライバを列挙するソースコードは世代ごとに更新が必要です。</p>
+</section>
+<section id="inter-processor-communication-ipc-driver">
+<h3>3.2 インタープロセッサ通信（IPC）ドライバー<a class="headerlink" href="#inter-processor-communication-ipc-driver" title="この見出しへのパーマリンク">¶</a></h3>
+<p>場所: drivers/hid/intel-ish-hid/ipc</p>
+<p>IPCメッセージはメモリマップドI/Oを使用します。レジスタはhw-ish-regs.hで定義されています。</p>
+<section id="ipc-fw-message-types">
+<h4>3.2.1 IPC/FWメッセージの種類<a class="headerlink" href="#ipc-fw-message-types" title="この見出しへのパーマリンク">¶</a></h4>
+<p>メッセージは2種類あります。1つはリンクの管理用で、もう1つはトランスポート層間でのやり取り用です。</p>
+<section id="tx-and-rx-of-transport-messages">
+<h5>トランスポートメッセージのTXとRX<a class="headerlink" href="#tx-and-rx-of-transport-messages" title="この見出しへのパーマリンク">¶</a></h5>
+<p>メモリマップレジスタのセットは、マルチバイトメッセージのTXとRXをサポートします（例：IPC_REG_ISH2HOST_MSG、IPC_REG_HOST2ISH_MSG）。IPCレイヤーは内部キューを維持してメッセージを順序よくFWに送信します。必要に応じて、コールバックハンドラを登録して完了通知を受け取ることができます。メッセージングではドアベルメカニズムが使用され、ホストとクライアントFW側での処理をトリガーします。ISH割込みハンドラが呼ばれた際、ホストドライバはISH2HOSTドアベルレジスタを使用して割込みがISHであることを確認します。</p>
+<p>各側には32の32ビットメッセージレジスタと32ビットドアベルがあります。ドアベルレジスタの形式は以下の通りです：ビット0～6：フラグメント長（7ビット使用）ビット10～13：エンカプスレーションプロトコルビット16～19：管理コマンド（IPC管理プロトコル用）ビット31：ドアベルトリガー（他側にH/W割込みを信号）その他のビットは予約されており、0にする必要があります。</p>
+</section>
+</section>
+<section id="transport-layer-interface">
+<h4>3.2.2 トランスポートレイヤーインターフェース<a class="headerlink" href="#transport-layer-interface" title="この見出しへのパーマリンク">¶</a></h4>
+<p>HWレベルのIPC通信を抽象化するために、コールバック関数が登録されます。トランスポートレイヤーはこれらを使用してメッセージを送受信します。ishtp_hw_ops構造体を参照してください。</p>
+</section>
+</section>
+<section id="ish-transport-layer">
+<h3>3.3 ISHトランスポートレイヤー<a class="headerlink" href="#ish-transport-layer" title="この見出しへのパーマリンク">¶</a></h3>
+<p>場所: drivers/hid/intel-ish-hid/ishtp/</p>
+<section id="a-generic-transport-layer">
+<h4>3.3.1 一般的なトランスポートレイヤー<a class="headerlink" href="#a-generic-transport-layer" title="この見出しへのパーマリンク">¶</a></h4>
+<p>トランスポートレイヤーは双方向プロトコルで、以下の機能を定義します：- 接続・切断・フロー制御のコマンド（ishtp/hbm.hを参照）- バッファオーバーフローを防ぐフロー制御メカニズム</p>
+<p>このプロトコルは以下のドキュメントで説明されているバスメッセージに似ています：
+<a class="reference external" href="http://www.intel.com/content/dam/www/public/us/en/documents/technical">http://www.intel.com/content/dam/www/public/us/en/documents/technical</a>-specifications/dcmi-hi-1-0-spec.pdf 「第7章: バスメッセージレイヤー」</p>
+</section>
+<section id="connection-and-flow-control-mechanism">
+<h4>3.3.2 接続とフロー制御メカニズム<a class="headerlink" href="#connection-and-flow-control-mechanism" title="この見出しへのパーマリンク">¶</a></h4>
+<p>各FWクライアントとプロトコルはUUIDで識別されます。FWクライアントと通信するには、接続要求と応答のバスメッセージを使用して接続を確立する必要があります。成功すると、(ホストクライアントIDとFWクライアントID)のペアで接続を識別します。</p>
+<p>接続が確立されると、ピア同士がフロー制御のバスメッセージを独立して送信します。各ピアはフロー制御クレジットを受信した後にのみメッセージを送信できます。メッセージを送信した後は、次のフロー制御クレジットを受信するまで他のメッセージを送信できません。どちらかの側が切断要求のバスメッセージを送信することで通信を終了できます。また、重大なFWリセットが発生した場合、リンクは切断されます。</p>
+</section>
+<section id="peer-to-peer-data-transfer">
+<h4>3.3.3 ピアトピアデータ転送<a class="headerlink" href="#peer-to-peer-data-transfer" title="この見出しへのパーマリンク">¶</a></h4>
+<p>ピアツーピアのデータ転送はDMAを使用するかしないかに関わらず実行可能です。センサーの帯域幅要件に応じて、intel_ishtpのモジュールパラメータishtp_use_dmaを使用してDMAを有効化できます。</p>
+<p>各側（ホストとFW）がDMA転送メモリを独立して管理します。ホストまたはFW側のISHTPクライアントが何かを送信したい場合、IPC経由かDMA経由かを決定します。各転送ごとに決定は独立しています。送信側は、メッセージがそれぞれのホストバッファ（ホストクライアントが送信する際はTX、FWクライアントが送信する際はRX）にあるときにDMA_XFERメッセージを送信します。DMAメッセージの受信者はDMA_XFER_ACKで応答し、送信者にそのメッセージのメモリ領域が再利用可能であることを示します。</p>
+<p>DMAの初期化は、ホストがDMA_ALLOC_NOTIFYバスメッセージ（RXバッファを含む）を送信することによって開始され、FWがDMA_ALLOC_NOTIFY_ACKで応答します。DMAアドレス通信に加えて、このシーケンスは機能を確認します。ホストがDMAをサポートしない場合、DMA割当を送信しないため、FWもDMAを送信できません。FWがDMAをサポートしない場合、DMA_ALLOC_NOTIFY_ACKを応答しないため、ホストはDMA転送を使用しません。ここではISHがバスマスターDMAコントローラーとして動作します。したがって、ホストがDMA_XFERを送信する際は、ホスト→ISHのDMA転送を求めるものであり、FWがDMA_XFERを送信する際は、DMAがすでに実行され、メッセージがホストに存在することを示します。このため、DMA_XFERとDMA_XFER_ACKは所有権を示すインジケータとして機能します。</p>
+<p>初期状態ではすべての出力メモリが送信者（ホストへのTX、FWへのRX）に属します。DMA_XFERはISHTPメッセージを含む領域の所有権を受信側に移譲し、DMA_XFER_ACKは所有権を送信者に戻します。送信者は前のDMA_XFERのACKを待つ必要がなく、自身の所有権内の残りの連続メモリが十分であれば別のメッセージを送信できます。原則として、複数のDMA_XFERおよびDMA_XFER_ACKメッセージが一度に送信可能（IPC MTUまで）であり、これにより割り込み制限が可能になります。現在、ISH FWはISHTPメッセージが3つのIPCフラグメント以上である場合にDMA経由で送信し、それ以外はIPC経由で送信します。</p>
+</section>
+<section id="ring-buffers">
+<h4>3.3.4 リングバッファ<a class="headerlink" href="#ring-buffers" title="この見出しへのパーマリンク">¶</a></h4>
+<p>クライアントが接続を開始するとき、リングまたはRXとTXバッファが割り当てられます。リングのサイズはクライアントが指定できます。HIDクライアントはTXバッファに16、RXバッファに32を設定します。クライアントからの送信リクエストでは、送信データが送信リングバッファの1つにコピーされ、バスメッセージプロトコルを用いて送信スケジュールされます。これらのバッファが必要なのは、FWが最後のメッセージを処理していない可能性があり、十分なフロー制御クレジットが不足しているためです。受信側でも同様のことが適用され、フロー制御が必要です。</p>
+</section>
+<section id="host-enumeration">
+<h4>3.3.5 ホストの列挙<a class="headerlink" href="#host-enumeration" title="この見出しへのパーマリンク">¶</a></h4>
+<p>ホスト列挙バスコマンドは、FW内に存在するクライアントの発見を可能にします。複数のセンサークライアントや校正機能用のクライアントが存在する可能性があります。</p>
+<p>実装を容易にし、各クライアントを独立したドライバで処理できるようにするため、このトランスポート層はLinuxバスドライバーモデルを活用しています。各クライアントはトランスポートバス（ishtpバス）上のデバイスとして登録されます。</p>
+<p>列挙メッセージの順序:</p>
+<ul class="simple">
+<li><p>ホストはHOST_START_REQ_CMDを送信し、ホストISHTPレイヤーが起動していることを示します。</p></li>
+<li><p>FWはHOST_START_RES_CMDで応答します。</p></li>
+<li><p>ホストはHOST_ENUM_REQ_CMD（FWクライアントの列挙）を送信します。</p></li>
+<li><p>FWは利用可能なFWクライアントIDのビットマップを含むHOST_ENUM_RES_CMDで応答します。</p></li>
+<li><p>そのビットマップ内で見つかった各FW IDに対して、ホストはHOST_CLIENT_PROPERTIES_REQ_CMDを送信します。</p></li>
+<li><p>FWはHOST_CLIENT_PROPERTIES_RES_CMDで応答し、プロパティにはUUID、最大ISHTPメッセージサイズなどが含まれます。</p></li>
+<li><p>ホストが最後に発見したクライアントのプロパティを受信した後、ISHTPデバイスが完全に機能しているとみなされ（DMAバッファを割り当てます）。</p></li>
+</ul>
+</section>
+</section>
+<section id="hid-over-ish-client">
+<h3>3.4 HID over ISHクライアント<a class="headerlink" href="#hid-over-ish-client" title="この見出しへのパーマリンク">¶</a></h3>
+<p>場所: drivers/hid/intel-ish-hid</p>
+<p>ISHTPクライアントドライバの責任は以下の通りです:</p>
+<ul class="simple">
+<li><p>FW ISHクライアント下のHIDデバイスを列挙する</p></li>
+<li><p>レポート記述子を取得する</p></li>
+<li><p>HIDコアにLLドライバとして登録する</p></li>
+<li><p>Get/Setフィーチャーリクエストを処理する</p></li>
+<li><p>入力レポートを取得する</p></li>
+</ul>
+</section>
+<section id="hid-sensor-hub-mfd-and-iio-sensor-drivers">
+<h3>3.5 HIDセンサー・ハブ MFDおよびIIOセンサードライバ<a class="headerlink" href="#hid-sensor-hub-mfd-and-iio-sensor-drivers" title="この見出しへのパーマリンク">¶</a></h3>
+<p>これらのドライバの機能は外部センサー・ハブと同様です。参照してください
+<a class="reference internal" href="hid-sensor.html"><span class="doc">HIDセンサーフレームワーク</span></a> HIDセンサー ドキュメンテーション/ABI/testing/sysfs-bus-iio におけるIIO ABIのユーザー空間へのマッピング</p>
+</section>
+<section id="end-to-end-hid-transport-sequence-diagram">
+<h3>3.6 トランスポートのエンドツーエンド HIDシーケンス図<a class="headerlink" href="#end-to-end-hid-transport-sequence-diagram" title="この見出しへのパーマリンク">¶</a></h3>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>HID-ISH-CLN                    ISHTP                    IPC                             HW
+        |                        |                       |                               |
+        |                        |                       |-----WAKE UP------------------&gt;|
+        |                        |                       |                               |
+        |                        |                       |-----HOST READY---------------&gt;|
+        |                        |                       |                               |
+        |                        |                       |&lt;----MNG_RESET_NOTIFY_ACK----- |
+        |                        |                       |                               |
+        |                        |&lt;----ISHTP_START------ |                               |
+        |                        |                       |                               |
+        |                        |&lt;-----------------HOST_START_RES_CMD-------------------|
+        |                        |                       |                               |
+        |                        |------------------QUERY_SUBSCRIBER--------------------&gt;|
+        |                        |                       |                               |
+        |                        |------------------HOST_ENUM_REQ_CMD-------------------&gt;|
+        |                        |                       |                               |
+        |                        |&lt;-----------------HOST_ENUM_RES_CMD--------------------|
+        |                        |                       |                               |
+        |                        |------------------HOST_CLIENT_PROPERTIES_REQ_CMD------&gt;|
+        |                        |                       |                               |
+        |                        |&lt;-----------------HOST_CLIENT_PROPERTIES_RES_CMD-------|
+        |       Create new device on in ishtp bus        |                               |
+        |                        |                       |                               |
+        |                        |------------------HOST_CLIENT_PROPERTIES_REQ_CMD------&gt;|
+        |                        |                       |                               |
+        |                        |&lt;-----------------HOST_CLIENT_PROPERTIES_RES_CMD-------|
+        |       Create new device on in ishtp bus        |                               |
+        |                        |                       |                               |
+        |                        |--Repeat HOST_CLIENT_PROPERTIES_REQ_CMD-till last one--|
+        |                        |                       |                               |
+     probed()
+        |----ishtp_cl_connect---&gt;|----------------- CLIENT_CONNECT_REQ_CMD--------------&gt;|
+        |                        |                       |                               |
+        |                        |&lt;----------------CLIENT_CONNECT_RES_CMD----------------|
+        |                        |                       |                               |
+        |register event callback |                       |                               |
+        |                        |                       |                               |
+        |ishtp_cl_send(
+        HOSTIF_DM_ENUM_DEVICES)  |----------fill ishtp_msg_hdr struct write to HW-----  &gt;|
+        |                        |                       |                               |
+        |                        |                       |&lt;-----IRQ(IPC_PROTOCOL_ISHTP---|
+        |                        |                       |                               |
+        |&lt;--ENUM_DEVICE RSP------|                       |                               |
+        |                        |                       |                               |
+for each enumerated device
+        |ishtp_cl_send(
+        HOSTIF_GET_HID_DESCRIPTOR|----------fill ishtp_msg_hdr struct write to HW-----  &gt;|
+        |                        |                       |                               |
+        ...Response
+        |                        |                       |                               |
+for each enumerated device
+        |ishtp_cl_send(
+     HOSTIF_GET_REPORT_DESCRIPTOR|--------------fill ishtp_msg_hdr struct write to HW-- &gt;|
+        |                        |                       |                               |
+        |                        |                       |                               |
+ hid_allocate_device
+        |                        |                       |                               |
+ hid_add_device                  |                       |                               |
+        |                        |                       |                               |
+</pre></div>
+</div>
+</section>
+<section id="ish-debugging">
+<h3>3.7 ISHのデバッグ<a class="headerlink" href="#ish-debugging" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ISHのデバッグにはイベントトレーシングメカニズムが使用されます。デバッグログを有効にするには、echo 1 &gt; /sys/kernel/debug/tracing/events/intel_ish/enable cat sys/kernel/debug/tracing/trace を実行します。</p>
+</section>
+<section id="ish-iio-sysfs-example-on-lenovo-thinkpad-yoga-260">
+<h3>3.8 Lenovo thinkpad Yoga 260におけるISH IIO sysfsの例<a class="headerlink" href="#ish-iio-sysfs-example-on-lenovo-thinkpad-yoga-260" title="この見出しへのパーマリンク">¶</a></h3>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>root@otcpl-ThinkPad-Yoga-260:~# tree -l /sys/bus/iio/devices/
+/sys/bus/iio/devices/
+├── iio:device0 -&gt; ../../../devices/0044:8086:22D8.0001/HID-SENSOR-200073.9.auto/iio:device0
+│   ├── buffer
+│   │   ├── enable
+│   │   ├── length
+│   │   └── watermark
+...
+│   ├── in_accel_hysteresis
+│   ├── in_accel_offset
+│   ├── in_accel_sampling_frequency
+│   ├── in_accel_scale
+│   ├── in_accel_x_raw
+│   ├── in_accel_y_raw
+│   ├── in_accel_z_raw
+│   ├── name
+│   ├── scan_elements
+│   │   ├── in_accel_x_en
+│   │   ├── in_accel_x_index
+│   │   ├── in_accel_x_type
+│   │   ├── in_accel_y_en
+│   │   ├── in_accel_y_index
+│   │   ├── in_accel_y_type
+│   │   ├── in_accel_z_en
+│   │   ├── in_accel_z_index
+│   │   └── in_accel_z_type
+...
+│   │   ├── devices
+│   │   │   │   ├── buffer
+│   │   │   │   │   ├── enable
+│   │   │   │   │   ├── length
+│   │   │   │   │   └── watermark
+│   │   │   │   ├── dev
+│   │   │   │   ├── in_intensity_both_raw
+│   │   │   │   ├── in_intensity_hysteresis
+│   │   │   │   ├── in_intensity_offset
+│   │   │   │   ├── in_intensity_sampling_frequency
+│   │   │   │   ├── in_intensity_scale
+│   │   │   │   ├── name
+│   │   │   │   ├── scan_elements
+│   │   │   │   │   ├── in_intensity_both_en
+│   │   │   │   │   ├── in_intensity_both_index
+│   │   │   │   │   └── in_intensity_both_type
+│   │   │   │   ├── trigger
+│   │   │   │   │   └── current_trigger
+...
+│   │   │   │   ├── buffer
+│   │   │   │   │   ├── enable
+│   │   │   │   │   ├── length
+│   │   │   │   │   └── watermark
+│   │   │   │   ├── dev
+│   │   │   │   ├── in_magn_hysteresis
+│   │   │   │   ├── in_magn_offset
+│   │   │   │   ├── in_magn_sampling_frequency
+│   │   │   │   ├── in_magn_scale
+│   │   │   │   ├── in_magn_x_raw
+│   │   │   │   ├── in_magn_y_raw
+│   │   │   │   ├── in_magn_z_raw
+│   │   │   │   ├── in_rot_from_north_magnetic_tilt_comp_raw
+│   │   │   │   ├── in_rot_hysteresis
+│   │   │   │   ├── in_rot_offset
+│   │   │   │   ├── in_rot_sampling_frequency
+│   │   │   │   ├── in_rot_scale
+│   │   │   │   ├── name
+...
+│   │   │   │   ├── scan_elements
+│   │   │   │   │   ├── in_magn_x_en
+│   │   │   │   │   ├── in_magn_x_index
+│   │   │   │   │   ├── in_magn_x_type
+│   │   │   │   │   ├── in_magn_y_en
+│   │   │   │   │   ├── in_magn_y_index
+│   │   │   │   │   ├── in_magn_y_type
+│   │   │   │   │   ├── in_magn_z_en
+│   │   │   │   │   ├── in_magn_z_index
+│   │   │   │   │   ├── in_magn_z_type
+│   │   │   │   │   ├── in_rot_from_north_magnetic_tilt_comp_en
+│   │   │   │   │   ├── in_rot_from_north_magnetic_tilt_comp_index
+│   │   │   │   │   └── in_rot_from_north_magnetic_tilt_comp_type
+│   │   │   │   ├── trigger
+│   │   │   │   │   └── current_trigger
+...
+│   │   │   │   ├── buffer
+│   │   │   │   │   ├── enable
+│   │   │   │   │   ├── length
+│   │   │   │   │   └── watermark
+│   │   │   │   ├── dev
+│   │   │   │   ├── in_anglvel_hysteresis
+│   │   │   │   ├── in_anglvel_offset
+│   │   │   │   ├── in_anglvel_sampling_frequency
+│   │   │   │   ├── in_anglvel_scale
+│   │   │   │   ├── in_anglvel_x_raw
+│   │   │   │   ├── in_anglvel_y_raw
+│   │   │   │   ├── in_anglvel_z_raw
+│   │   │   │   ├── name
+│   │   │   │   ├── scan_elements
+│   │   │   │   │   ├── in_anglvel_x_en
+│   │   │   │   │   ├── in_anglvel_x_index
+│   │   │   │   │   ├── in_anglvel_x_type
+│   │   │   │   │   ├── in_anglvel_y_en
+│   │   │   │   │   ├── in_anglvel_y_index
+│   │   │   │   │   ├── in_anglvel_y_type
+│   │   │   │   │   ├── in_anglvel_z_en
+│   │   │   │   │   ├── in_anglvel_z_index
+│   │   │   │   │   └── in_anglvel_z_type
+│   │   │   │   ├── trigger
+│   │   │   │   │   └── current_trigger
+...
+│   │   │   │   ├── buffer
+│   │   │   │   │   ├── enable
+│   │   │   │   │   ├── length
+│   │   │   │   │   └── watermark
+│   │   │   │   ├── dev
+│   │   │   │   ├── in_anglvel_hysteresis
+│   │   │   │   ├── in_anglvel_offset
+│   │   │   │   ├── in_anglvel_sampling_frequency
+│   │   │   │   ├── in_anglvel_scale
+│   │   │   │   ├── in_anglvel_x_raw
+│   │   │   │   ├── in_anglvel_y_raw
+│   │   │   │   ├── in_anglvel_z_raw
+│   │   │   │   ├── name
+│   │   │   │   ├── scan_elements
+│   │   │   │   │   ├── in_anglvel_x_en
+│   │   │   │   │   ├── in_anglvel_x_index
+│   │   │   │   │   ├── in_anglvel_x_type
+│   │   │   │   │   ├── in_anglvel_y_en
+│   │   │   │   │   ├── in_anglvel_y_index
+│   │   │   │   │   ├── in_anglvel_y_type
+│   │   │   │   │   ├── in_anglvel_z_en
+│   │   │   │   │   ├── in_anglvel_z_index
+│   │   │   │   │   └── in_anglvel_z_type
+│   │   │   │   ├── trigger
+│   │   │   │   │   └── current_trigger
+...
+</pre></div>
+</div>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">ヒューマンインターフェースデバイス（HID）</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="hiddev.html">Human Interface Devicesのお手入れガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hidraw.html">HIDRAW - USBおよびBluetooth Human Interface DevicesへのRAWアクセス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hid-sensor.html">HIDセンサーフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hid-transport.html">HID I/Oトランスポートドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="uhid.html">UHID - HIDサブシステム用ユーザースペースI/Oドライバサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hid-alps.html">ALPS HID Touchpad Protocol</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">インテル統合センサー・ハブ（ISH）</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">ヒューマンインターフェースデバイス（HID）</a><ul>
+<li>前へ: <a href="hid-alps.html" title="前章">ALPS HID Touchpad Protocol</a></li>
+<li>次へ: <a href="../i2c/index.html" title="次章">I2C/SMBusサブシステム</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/hid/intel-ish-hid.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

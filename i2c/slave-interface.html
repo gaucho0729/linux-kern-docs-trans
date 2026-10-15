@@ -1,0 +1,276 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Linux I2C Slaveインターフェースの説明 — Linux Kernelドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="slave-eeprom-backend.html" rel="next" title="Linux I2C slave EEPROMバックエンド"/>
+<link href="i2c-stub.html" rel="prev" title="i2c-stub"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="linux-i2c-slave-interface-description">
+<h1>Linux I2C スレーブインターフェースの説明<a class="headerlink" href="#linux-i2c-slave-interface-description" title="この見出しへのパーマリンク">¶</a></h1>
+<p>by Wolfram Sang &lt;<a class="reference external" href="mailto:wsa%40sang-engineering.com">wsa<span>@</span>sang-engineering<span>.</span>com</a>&gt; 2014年〜23年</p>
+<p>Linuxは、使用中のI2CコントローラーにSlave機能が備わっている場合、I2C Slaveとしても動作可能です。この機能を実現するには、バスドライバーにSlaveサポートが必要であり、ハードウェアに依存しないソフトウェアバックエンドが実際の機能を提供する必要があります。後者の例として、slave-eepromドライバーがあり、これはデュアルメモリドライバーとして動作します。バス上の他のI2Cマスターは通常のEEPROMとしてアクセスできますが、Linux I2C Slaveはsysfs経由でコンテンツにアクセスし、必要に応じてデータを処理します。バックエンドドライバーとI2Cバスドライバーはイベントを通じて通信します。以下はデータフローとデータ転送方法を視覚化した小さなグラフです。破線は単なる例です。バックエンドはキャラクタデバイスを使用するか、カーネル内に限定するか、あるいはまったく異なる方法を採用することも可能です。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>            e.g. sysfs        I2C slave events        I/O registers
++-----------+   v    +---------+     v     +--------+  v  +------------+
+| Userspace +........+ Backend +-----------+ Driver +-----+ Controller |
++-----------+        +---------+           +--------+     +------------+
+                                                              | |
+----------------------------------------------------------------+--  I2C
+--------------------------------------------------------------+----  Bus
+</pre></div>
+</div>
+<p>注意: 技術的には、バックエンドとドライバーの間にI2Cコアが存在します。しかし、本書の執筆時点ではこのレイヤーは透過的です。</p>
+<section id="user-manual">
+<h2>ユーザーマニュアル<a class="headerlink" href="#user-manual" title="この見出しへのパーマリンク">¶</a></h2>
+<p>I2C Slaveバックエンドは標準のI2Cクライアントと同様の動作を行います。したがって、「instantiating-devices」ドキュメントで説明されている方法でインスタンス化可能です。違いは、I2C Slaveバックエンドが独自のアドレス空間を持つことです。そのため、元々リクエストするアドレスに0x1000を加える必要があります。例えば、バス1上の7ビットアドレス0x64でslave-eepromドライバーをユーザースペースからインスタンス化する場合:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo slave-24c02 0x1064 &gt; /sys/bus/i2c/devices/i2c-1/new_device
+</pre></div>
+</div>
+<p>各バックエンドには、その特定の動作と設定を説明する個別のドキュメンテーションが同梱されるべきです。</p>
+</section>
+<section id="developer-manual">
+<h2>開発者マニュアル<a class="headerlink" href="#developer-manual" title="この見出しへのパーマリンク">¶</a></h2>
+<p>まず、バスドライバーとバックエンドが使用するイベントについて詳細に説明します。その後、バスドライバーの拡張とバックエンドの実装に関するヒントを提供します。</p>
+<section id="i2c-slave-events">
+<h3>I2C Slaveイベント<a class="headerlink" href="#i2c-slave-events" title="この見出しへのパーマリンク">¶</a></h3>
+<p>バスドライバーは以下の関数を使用してバックエンドにイベントを送信します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>ret = i2c_slave_event(client, event, &amp;val)
+</pre></div>
+</div>
+<p>「client」はI2C Slaveデバイスを表し、「event」は後述の特別なイベントタイプの一つです。「val」は読み書きするデータバイトを表すu8値であり、双方向です。valへのポインタは常に提供する必要があります（valがイベントで使用されない場合でも）。retはバックエンドからの戻り値です。必須イベントはバスドライバーが提供し、バックエンドドライバーが必ずチェックする必要があります。</p>
+<p>イベントタイプ:</p>
+<ul>
+<li><p>I2C_SLAVE_WRITE_REQUESTED (必須)</p>
+<p>「val」: 使用しない</p>
+<p>「ret」: 常に0</p>
+</li>
+</ul>
+<p>別のI2Cマスターが私たちにデータを書き込もうとしています。このイベントは、私たちのアドレスとライトビットが検出されたときに送信すべきです。データはまだ届いていないため、処理または返却するものがありません。ウェイクアップや初期化の処理が必要な可能性があります。</p>
+<ul>
+<li><p>I2C_SLAVE_READ_REQUESTED (必須)</p>
+<p>‘val’: バックエンドが送信する最初のバイト</p>
+<p>「ret」: 常に0</p>
+</li>
+</ul>
+<p>別のI2Cマスターが私たちからデータを読み取りたいです。このイベントは、私たちのアドレスとリードビットが検出されたときに送信すべきです。返却後、バスドライバーが最初のバイトを送信する必要があります。</p>
+<ul>
+<li><p>I2C_SLAVE_WRITE_RECEIVED (必須)</p>
+<p>‘val’: バスドライバーが受け取ったバイト</p>
+<p>‘ret’: バイトをACKする場合は0、NACKする場合はエラー番号</p>
+</li>
+</ul>
+<p>別のI2Cマスターが私たちにバイトを送信しました。このバイトは‘val’に設定する必要があります。‘ret’が0の場合は、バスドライバーがこのバイトをACKする必要があります。‘ret’がエラー番号の場合は、このバイトをNACKする必要があります。</p>
+<ul>
+<li><p>I2C_SLAVE_READ_PROCESSED (必須)</p>
+<p>‘val’: バックエンドが送信する次のバイト</p>
+<p>「ret」: 常に0</p>
+</li>
+</ul>
+<p>バスドライバーが‘val’に次のバイトを送信するよう要求しています。重要: これは前のバイトがACKされたことを意味するわけではなく、前のバイトがバスにシフトアウトされたことを意味します。無停電で連続的に通信を確保するため、多くのハードウェアは前のバイトがまだシフトアウトしている間に次のバイトを要求します。マスターがNACKを送信し、現在シフトアウトされているバイトの読み込みを停止した場合、このバイトはここでの要求は使われず、次のI2C_SLAVE_READ_REQUESTで再送信する必要があります。ただし、バックエンドによって多少異なります。</p>
+<ul>
+<li><p>I2C_SLAVE_STOP (必須)</p>
+<p>「val」: 使用しない</p>
+<p>「ret」: 常に0</p>
+</li>
+</ul>
+<p>ストップ条件が受信されました。これはいつでも発生する可能性があり、バックエンドはI2C転送の状態機械をリセットして新しいリクエストを受信できるようにする必要があります。</p>
+</section>
+<section id="software-backends">
+<h3>ソフトウェアバックエンド<a class="headerlink" href="#software-backends" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ソフトウェアバックエンドを作成したい場合:</p>
+<ul class="simple">
+<li><p>標準のi2c_driverとそのメカニズムを使用する</p></li>
+<li><p>上記のスレーブイベントを処理するslave_callbackを記述する（状態機械を使用するのが最適）</p></li>
+<li><p>このコールバックをi2c_slave_register()で登録する</p></li>
+</ul>
+<p>i2c-slave-eepromドライバーを例に確認してください。</p>
+</section>
+<section id="bus-driver-support">
+<h3>バスドライバーのサポート<a class="headerlink" href="#bus-driver-support" title="この見出しへのパーマリンク">¶</a></h3>
+<p>バスドライバーにスレーブサポートを追加したい場合:</p>
+<ul class="simple">
+<li><p>スレーブを登録/解除するためのコールを実装し、
+<a class="reference internal" href="../driver-api/i2c.html#c.i2c_algorithm" title="i2c_algorithm"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">i2c_algorithm</span></code></a>. 登録時にI2Cスレーブアドレスを設定し、スレーブ固有の割込みを有効にする必要があります。ランタイムPMを使用する場合、pm_runtime_get_sync()を使用する必要があります。なぜなら、デバイスが常に電源が入っている必要があるからです。解除時には上述の逆を行います。</p></li>
+<li><p>スレーブ割り込みを捕捉し、適切なi2c_slave_eventsをバックエンドに送信してください。</p></li>
+</ul>
+<p>ほとんどのハードウェアは同じバス上でマスター_および_スレーブの両方をサポートしています。バスドライバーを拡張する場合は、ドライバーも同様にサポートしていることを確認してください。ほぼすべてのケースでは、スレーブサポートはマスター機能を無効にする必要がありません。</p>
+<p>i2c-rcarドライバーを例に確認してください。</p>
+</section>
+<section id="about-ack-nack">
+<h3>ACK/NACKについて<a class="headerlink" href="#about-ack-nack" title="この見出しへのパーマリンク">¶</a></h3>
+<p>アドレスフェーズのACKは常に良い動作であり、マスターがデバイスが存在するか神秘的に消失したかを確認できます。NACKで忙しいことを示すのは問題があります。SMBusは常にアドレスフェーズをACKする必要がありますが、I2C仕様はこの点についてより緩い規定です。ほとんどのI2Cコントローラーはスレーブアドレスを検出すると自動的にACKするため、NACKするオプションはありません。そのため、このAPIはアドレスフェーズでのNACKをサポートしていません。</p>
+<p>現在、マスターが私たちからデータを読み取る際にACKまたはNACKしたかどうかを報告するスレーブイベントはありません。必要に応じてこのイベントをオプションとして導入できますが、ケースは極めてまれです。なぜなら、マスターはその後STOPを送信するものであり、そのイベントがありますからです。また、すべてのI2Cコントローラーがこのイベントを報告できるわけではないことをご注意ください。</p>
+</section>
+<section id="about-buffers">
+<h3>バッファについて<a class="headerlink" href="#about-buffers" title="この見出しへのパーマリンク">¶</a></h3>
+<p>このAPIの開発中に、バイトではなくバッファを使用するというアイデアが議論されました。このような拡張は理論上可能ですが、現在の時点ではその有用性は不明です。バッファを使用する際のいくつかのポイント:</p>
+<ul class="simple">
+<li><p>バッファはオプトインでなければなりません。バックエンドドライバーは常にバイトベースのトランザクションをサポートしなければならないため、これはほとんどのハードウェアがこの仕組みを採用しているからです。</p></li>
+<li><p>ハードウェアレジスタをシミュレートするバックエンドでは、バッファはほとんど役立ちません。なぜなら、各バイトが書き込まれるとすぐにアクションをトリガーする必要がありますからです。読み込みでは、バックエンドが内部処理のためにレジスタを更新した場合、バッファに保持されたデータが古くなる可能性があります。</p></li>
+<li><p>マスターはいつでもSTOPを送信できます。部分的に転送されたバッファの場合、これは例外処理を扱うための追加コードを必要とします。このようなコードはエラーが発生しやすい傾向があります。</p></li>
+</ul>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">I2C/SMBusサブシステム</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#introduction">はじめに</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#writing-device-drivers">デバイスドライバーの作成</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#debugging">デバッグ</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#slave-i2c">スレーブI2C</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#advanced-topics">高度なトピック</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#legacy-documentation">レガシドキュメンテーション</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">I2C/SMBusサブシステム</a><ul>
+<li>前へ: <a href="i2c-stub.html" title="前章">i2c-stub</a></li>
+<li>次へ: <a href="slave-eeprom-backend.html" title="次章">Linux I2C slave EEPROMバックエンド</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/i2c/slave-interface.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>
