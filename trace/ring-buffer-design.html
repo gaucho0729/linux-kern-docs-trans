@@ -1,0 +1,981 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>ロックレスリングバッファ設計 — Linuxカーネルドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="stm.html" rel="next" title="システムトレースモジュール"/>
+<link href="intel_th.html" rel="prev" title="Intel(R)トレースハブ（TH）"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="lockless-ring-buffer-design">
+<h1>ロックレスリングバッファ設計<a class="headerlink" href="#lockless-ring-buffer-design" title="この見出しへのパーマリンク">¶</a></h1>
+<p>2009年 Red Hat Inc. による著作権</p>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Steven Rostedt &lt;<a class="reference external" href="mailto:srostedt%40redhat.com">srostedt<span>@</span>redhat<span>.</span>com</a>&gt;</p>
+</dd>
+<dt class="field-even">ライセンス</dt>
+<dd class="field-even"><p>GNU Free Documentation License, Version 1.2（GPL v2 にもかかわらず双方向ライセンス）</p>
+</dd>
+<dt class="field-odd">レビュー担当者</dt>
+<dd class="field-odd"><p>Mathieu Desnoyers, Huang Ying, Hidetoshi Seto, および Frederic Weisbecker.</p>
+</dd>
+</dl>
+<p>対応バージョン: 2.6.31</p>
+<section id="terminology-used-in-this-document">
+<h2>このドキュメントで使用する用語<a class="headerlink" href="#terminology-used-in-this-document" title="この見出しへのパーマリンク">¶</a></h2>
+<dl>
+<dt>テール</dt><dd><ul class="simple">
+<li><p>リングバッファ内に新しい書き込みが発生する場所</p></li>
+</ul>
+</dd>
+<dt>ヘッド</dt><dd><ul class="simple">
+<li><p>リングバッファ内に新しい読み取りが発生する場所</p></li>
+</ul>
+</dd>
+<dt>プロデューサー</dt><dd><ul class="simple">
+<li><p>リングバッファに書き込むタスク（ライターと同じ）</p></li>
+</ul>
+</dd>
+<dt>ライター</dt><dd><ul class="simple">
+<li><p>プロデューサーと同じ</p></li>
+</ul>
+</dd>
+<dt>consumer</dt><dd><ul class="simple">
+<li><p>リングバッファから読み取るタスク（リーダーと同じ）</p></li>
+</ul>
+</dd>
+<dt>リーダー</dt><dd><ul class="simple">
+<li><p>コンシューマーと同じ</p></li>
+</ul>
+</dd>
+<dt>リーダーページ</dt><dd><ul class="simple">
+<li><p>リングバッファ外でリーダー専用に使用されるページ（ほぼすべて）</p></li>
+</ul>
+</dd>
+<dt>ヘッドページ</dt><dd><ul class="simple">
+<li><p>リーダーが次に使用するページへのポインタ</p></li>
+</ul>
+</dd>
+<dt>テールページ</dt><dd><ul class="simple">
+<li><p>次に書き込むページへのポインタ</p></li>
+</ul>
+</dd>
+<dt>コミットページ</dt><dd><ul class="simple">
+<li><p>最後に完了した非ネスト型書き込みのページへのポインタ</p></li>
+</ul>
+</dd>
+<dt>cmpxchg</dt><dd><ul>
+<li><p>ハードウェア支援型アトミックトランザクションで以下の動作を行う</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>A = B if previous A == C
+
+R = cmpxchg(A, C, B) is saying that we replace A with B if and only
+    if current A is equal to C, and we put the old (current)
+    A into R
+
+R gets the previous A regardless if A is updated with B or not.
+</pre></div>
+</div>
+<p>更新が成功したかを確認するには、 <code class="docutils literal notranslate"><span class="pre">R</span> <span class="pre">==</span> <span class="pre">C</span></code>
+比較が使用される</p>
+</li>
+</ul>
+</dd>
+</dl>
+</section>
+<section id="the-generic-ring-buffer">
+<h2>ジェネリックリングバッファ<a class="headerlink" href="#the-generic-ring-buffer" title="この見出しへのパーマリンク">¶</a></h2>
+<p>リングバッファは上書きモードまたはプロデューサー/コンシューマーモードのいずれかで使用可能</p>
+<p>プロデューサー/コンシューマーモードでは、プロデューサーがコンシューマーが解放する前にバッファを満たすと、プロデューサーは書き込みを停止する。これにより最近のイベントが失われる</p>
+<p>上書きモードでは、プロデューサーがコンシューマーが解放する前にバッファを満たすと、プロデューサーは古いデータを上書きする。これにより最も古いイベントが失われる</p>
+<p>複数のライターが同じパーセルCPUバッファで同時に書き込みを行うことはできないが、ライターは他のライターを中断できる。ただし、前のライターが再開するまで書き込みを終了しなければならない。これはアルゴリズムにとって非常に重要である。ライターは「スタック」のように動作する。割り込みの仕組みがこの動作を強制する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>writer1 start
+   &lt;preempted&gt; writer2 start
+       &lt;preempted&gt; writer3 start
+                   writer3 finishes
+               writer2 finishes
+writer1 finishes
+</pre></div>
+</div>
+<p>これはライターが割り込みによって中断され、割り込みが同時に書き込みを行うような状況に非常に近い</p>
+<p>リーダーはいつでも発生するが、同時に複数のリーダーが実行されることはない。また、リーダーが他のリーダーを中断・割り込みすることはできない。リーダーはライターを中断・割り込みできないが、ライターが書き込みしている間でもバッファから読み取り/消費を行うことができる。ただし、読み取りを行うには別のプロセッサが必要である。リーダーは自身のプロセッサで読み取りを行い、ライターによって中断される可能性がある</p>
+<p>ライターはリーダーを中断できるが、リーダーはライターを中断できない。ただし、ライターが書き込みしている間でもリーダーは別のプロセッサでバッファを読み取ることができる</p>
+<p>リングバッファはリンクリストで結びつけられたページのリストから構成される</p>
+<p>初期化時にリーダー専用のページがリーダー用に割り当てられる。これはリングバッファの一部ではない</p>
+<p>head_page、tail_page、commit_pageはすべて同じページを指すように初期化されます。</p>
+<p>リーダー ページは次のポインタがhead_pageを指し、前のポインタがhead_pageの前のページを指すように初期化されます。</p>
+<p>リーダーは独自のページを使用します。起動時にこのページは割り当てられますが、リストに接続されていません。リーダーがバッファから読み込む場合、そのページが空である（起動時のように）場合、リーダーのページとhead_pageを交換します。古いリーダー ページはリング バッファに組み込まれ、head_pageは削除されます。挿入されたページ（古いリーダー ページ）の次のページが新しいhead_pageになります。</p>
+<p>新しいページがリーダーに渡された後、リーダーはそのページに対して何をしても構いません（ライターがそのページを解放した後であれば）。</p>
+<p>リーダー ページが交換される様子の例：この例ではバッファ内のhead_pageは表示されていません。これは交換を示すためのものです。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+------+
+|reader|          RING BUFFER
+|page  |
++------+
+                +---+   +---+   +---+
+                |   |--&gt;|   |--&gt;|   |
+                |   |&lt;--|   |&lt;--|   |
+                +---+   +---+   +---+
+                 ^ |             ^ |
+                 | +-------------+ |
+                 +-----------------+
+
+
++------+
+|reader|          RING BUFFER
+|page  |-------------------+
++------+                   v
+  |             +---+   +---+   +---+
+  |             |   |--&gt;|   |--&gt;|   |
+  |             |   |&lt;--|   |&lt;--|   |&lt;-+
+  |             +---+   +---+   +---+  |
+  |              ^ |             ^ |   |
+  |              | +-------------+ |   |
+  |              +-----------------+   |
+  +------------------------------------+
+
++------+
+|reader|          RING BUFFER
+|page  |-------------------+
++------+ &lt;---------------+ v
+  |  ^          +---+   +---+   +---+
+  |  |          |   |--&gt;|   |--&gt;|   |
+  |  |          |   |   |   |&lt;--|   |&lt;-+
+  |  |          +---+   +---+   +---+  |
+  |  |             |             ^ |   |
+  |  |             +-------------+ |   |
+  |  +-----------------------------+   |
+  +------------------------------------+
+
++------+
+|buffer|          RING BUFFER
+|page  |-------------------+
++------+ &lt;---------------+ v
+  |  ^          +---+   +---+   +---+
+  |  |          |   |   |   |--&gt;|   |
+  |  |  New     |   |   |   |&lt;--|   |&lt;-+
+  |  | Reader   +---+   +---+   +---+  |
+  |  |  page ----^                 |   |
+  |  |                             |   |
+  |  +-----------------------------+   |
+  +------------------------------------+
+</pre></div>
+</div>
+<p>リング バッファ内のデータがバッファ ページに保持されているデータよりも少ない場合、交換されるページがcommit_pageやtail_pageである可能性があります。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>          reader page    commit page   tail page
+              |              |             |
+              v              |             |
+             +---+           |             |
+             |   |&lt;----------+             |
+             |   |&lt;------------------------+
+             |   |------+
+             +---+      |
+                        |
+                        v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |---&gt;|   |---&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>このケースもこのアルゴリズムでは依然として有効です。ライターがページを解放するとき、リーダー ページがリング バッファの次の位置を指しているため、そのページはリング バッファに直接組み込まれます。</p>
+<p>主なポインタ：</p>
+<blockquote>
+<div><dl class="simple">
+<dt>リーダー ページ</dt><dd><ul class="simple">
+<li><p>リーダー専用のページで、リング バッファの一部ではありません（交換可能）</p></li>
+</ul>
+</dd>
+<dt>head_page</dt><dd><ul class="simple">
+<li><p>リーダー ページと交換されるリング バッファの次のページ</p></li>
+</ul>
+</dd>
+<dt>tail_page</dt><dd><ul class="simple">
+<li><p>次の書き込みが行われるページ</p></li>
+</ul>
+</dd>
+<dt>commit_page</dt><dd><ul class="simple">
+<li><p>最後に書き込みが完了したページ</p></li>
+</ul>
+</dd>
+</dl>
+</div></blockquote>
+<p>commit_pageはライター スタックの外側のライターのみが更新します。他のライターが優先的に実行される場合でも、commit_pageは移動しません。</p>
+<p>リング バッファにデータを書き込むと、リング バッファ内で位置が確保され、その位置がライターに返されます。ライターがその位置にデータを書き終わると、書き込みをコミットします。</p>
+<p>このトランザクション中に別の書き込み（または読み込み）がいつでも行われることがあります。別の書き込みが発生した場合、それは前の書き込みが完了するまで終了する必要があります。</p>
+<blockquote>
+<div><blockquote>
+<div><p>書き込み予約：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span> Buffer page
++---------+
+|written  |
++---------+  &lt;--- given back to writer (current commit)
+|reserved |
++---------+ &lt;--- tail pointer
+| empty   |
++---------+
+</pre></div>
+</div>
+<p>書き込みコミット：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span> Buffer page
++---------+
+|written  |
++---------+
+|written  |
++---------+  &lt;--- next position for write (current commit)
+| empty   |
++---------+
+</pre></div>
+</div>
+</div></blockquote>
+<p>最初の予約の後に書き込みが発生した場合：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>     Buffer page
+    +---------+
+    |written  |
+    +---------+  &lt;-- current commit
+    |reserved |
+    +---------+  &lt;--- given back to second writer
+    |reserved |
+    +---------+ &lt;--- tail pointer
+
+After second writer commits::
+
+
+     Buffer page
+    +---------+
+    |written  |
+    +---------+  &lt;--(last full commit)
+    |reserved |
+    +---------+
+    |pending  |
+    |commit   |
+    +---------+ &lt;--- tail pointer
+
+When the first writer commits::
+
+     Buffer page
+    +---------+
+    |written  |
+    +---------+
+    |written  |
+    +---------+
+    |written  |
+    +---------+  &lt;--(last full commit and tail pointer)
+</pre></div>
+</div>
+</div></blockquote>
+<p>コミット ポインタは、他の書き込みを優先せずにコミットされた最後の書き込み位置を指します。他の書き込みを優先してコミットされた書き込みは、保留中のコミットとなり、すべての書き込みがコミットされるまで完全なコミットとはなりません。</p>
+<p>コミットページは最後の完全なコミットを持つページを指します。テールページはコミット前の最後の書き込みを持つページを指します。</p>
+<p>テールページは常にコミットページと同じかそれ以降の位置にあり、複数のページ先に位置する場合もあります。テールページがコミットページに追いつくと、以降の書き込みは行われません（リングバッファのモードに関係なく、オーバーライドモードとプロデューサー/コンシューマーモードのいずれも含む）。</p>
+<p>ページの順序は以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>head page
+commit page
+tail page
+</pre></div>
+</div>
+<p>可能性のあるシナリオ：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>                             tail page
+  head page         commit page  |
+      |                 |        |
+      v                 v        v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |---&gt;|   |---&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>特殊なケースとして、ヘッドページがコミットページおよびテールページのいずれかの後にある場合があります。これはコミット（およびテール）ページがリーダーページと交換された状態です。これはヘッドページが常にリングバッファの一部であるのに対し、リーダーページはそうではないためです。リングバッファ内で完全なページ未満がコミットされ、リーダーがページを交換する場合、コミットページが交換される可能性があります。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>          reader page    commit page   tail page
+              |              |             |
+              v              |             |
+             +---+           |             |
+             |   |&lt;----------+             |
+             |   |&lt;------------------------+
+             |   |------+
+             +---+      |
+                        |
+                        v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |---&gt;|   |---&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+                        ^
+                        |
+                    head page
+</pre></div>
+</div>
+<p>この場合、テールとコミットがリングバッファに戻る際でもヘッドページは移動しません。</p>
+<p>コミットページがまだそのページに存在している場合、リーダーはリングバッファにページを交換できません。読み込みが最後のコミット（実際のコミットで、保留中または予約されていないもの）に達した場合、読み込むべきデータはもうありません。バッファは次の完全なコミットが完了するまで空とみなされます。</p>
+<p>テールページがヘッドページに達した場合、オーバーライドモードではヘッドページが1つ進み、プロデューサー/コンシューマーモードでは書き込みが失敗します。</p>
+<p>オーバーライドモード：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>            tail page
+               |
+               v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |---&gt;|   |---&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+                        ^
+                        |
+                    head page
+
+
+            tail page
+               |
+               v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |---&gt;|   |---&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+                                 ^
+                                 |
+                             head page
+
+
+                    tail page
+                        |
+                        v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |---&gt;|   |---&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+                                 ^
+                                 |
+                             head page
+</pre></div>
+</div>
+<p>注意：リーダーページは依然として前のヘッドページを指しますが、交換が発生した際には最新のヘッドページを使用します。</p>
+</section>
+<section id="making-the-ring-buffer-lockless">
+<h2>リングバッファをロックレスにする:<a class="headerlink" href="#making-the-ring-buffer-lockless" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ロックレスアルゴリズムの主な考え方は、ヘッドページポインタの移動とリーダーとのページ交換を組み合わせることです。状態フラグはページポインタ内に配置され、これを行うには各ページがメモリで4バイトアライメントされる必要があります。これにより、アドレスの2つの下位ビットをフラグとして使用できるようになり、アドレスの下位ビットは常にゼロになります。アドレスを取得するには、フラグをマスクするだけでよいです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>MASK = ~3
+
+address &amp; MASK
+</pre></div>
+</div>
+<p>この2つのビットで保持されるフラグは以下の通りです：</p>
+<blockquote>
+<div><dl class="simple">
+<dt>HEADER</dt><dd><ul class="simple">
+<li><p>ポインタで示すページがヘッドページであることを示します。</p></li>
+</ul>
+</dd>
+<dt>UPDATE</dt><dd><ul class="simple">
+<li><p>ポインタで示すページがライターによって更新されており、以前または現在ヘッドページであったか、または今後ヘッドページになる可能性があることを示します。</p></li>
+</ul>
+</dd>
+</dl>
+</div></blockquote>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>          reader page
+              |
+              v
+            +---+
+            |   |------+
+            +---+      |
+                        |
+                        v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-H-&gt;|   |---&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>上記のポインタ「-H-&gt;」はHEADERフラグが設定されています。つまり、次のページがリーダーによってスワップされる次のページです。このポインタは次のページがヘッドページであることを示します。</p>
+<p>テールページがヘッドポインタに達した場合、cmpxchgを使用してポインタをUPDATE状態に変更します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>            tail page
+               |
+               v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-H-&gt;|   |---&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+
+            tail page
+               |
+               v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-U-&gt;|   |---&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>「-U-&gt;」はUPDATE状態のポインタを表します。</p>
+<p>リーダーへのアクセスには、リーダーを同期化するためのロックを取得する必要がありますが、ライターはリングバッファへの書き込みにロックを取得しません。これは、我々が単一のリーダーのみに注意を払えばよいこと、および書き込みは「スタック」形式で優先的に実行されることを意味します。</p>
+<p>リーダーがリングバッファとページを交換しようとする際にはcmpxchgを使用します。ヘッドページのポインタのフラグビットにHEADERフラグが設定されていない場合、比較が失敗し、リーダーは新しいヘッドページを検索して再試行する必要があります。注意：UPDATEとHEADERフラグは同時に設定されることはありません。</p>
+<p>リーダーは以下の手順でリーダーページを交換します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+------+
+|reader|          RING BUFFER
+|page  |
++------+
+                +---+    +---+    +---+
+                |   |---&gt;|   |---&gt;|   |
+                |   |&lt;---|   |&lt;---|   |
+                +---+    +---+    +---+
+                 ^ |               ^ |
+                 | +---------------+ |
+                 +-----H-------------+
+</pre></div>
+</div>
+<p>リーダーはヘッドページの次のページにHEADERフラグを設定してリーダーページの次のポインタを設定します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+------+
+|reader|          RING BUFFER
+|page  |-------H-----------+
++------+                   v
+  |             +---+    +---+    +---+
+  |             |   |---&gt;|   |---&gt;|   |
+  |             |   |&lt;---|   |&lt;---|   |&lt;-+
+  |             +---+    +---+    +---+  |
+  |              ^ |               ^ |   |
+  |              | +---------------+ |   |
+  |              +-----H-------------+   |
+  +--------------------------------------+
+</pre></div>
+</div>
+<p>以前のヘッドページのポインタをリーダーページのポインタに変更するcmpxchgを行います。新しいポインタにはHEADERフラグが設定されていません。この操作はヘッドページを原子的に進めるようにします：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+------+
+|reader|          RING BUFFER
+|page  |-------H-----------+
++------+                   v
+  |  ^          +---+   +---+   +---+
+  |  |          |   |--&gt;|   |--&gt;|   |
+  |  |          |   |&lt;--|   |&lt;--|   |&lt;-+
+  |  |          +---+   +---+   +---+  |
+  |  |             |             ^ |   |
+  |  |             +-------------+ |   |
+  |  +-----------------------------+   |
+  +------------------------------------+
+</pre></div>
+</div>
+<p>新しいヘッドページが設定された後、ヘッドページの前のポインタをリーダーページに更新します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+------+
+|reader|          RING BUFFER
+|page  |-------H-----------+
++------+ &lt;---------------+ v
+  |  ^          +---+   +---+   +---+
+  |  |          |   |--&gt;|   |--&gt;|   |
+  |  |          |   |   |   |&lt;--|   |&lt;-+
+  |  |          +---+   +---+   +---+  |
+  |  |             |             ^ |   |
+  |  |             +-------------+ |   |
+  |  +-----------------------------+   |
+  +------------------------------------+
+
++------+
+|buffer|          RING BUFFER
+|page  |-------H-----------+  &lt;--- New head page
++------+ &lt;---------------+ v
+  |  ^          +---+   +---+   +---+
+  |  |          |   |   |   |--&gt;|   |
+  |  |  New     |   |   |   |&lt;--|   |&lt;-+
+  |  | Reader   +---+   +---+   +---+  |
+  |  |  page ----^                 |   |
+  |  |                             |   |
+  |  +-----------------------------+   |
+  +------------------------------------+
+</pre></div>
+</div>
+<p>重要な点：リーダーページが前のポインタで指すページ（新しいヘッドページを指すもの）は、リーダーページ自身を指さないため、リングバッファには含まれません。次のポインタを介してリングバッファをトラバースする場合、常にリングバッファ内に留まりますが、前のポインタを介してトラバースする場合、そうとは限りません。</p>
+<p>ページの前のポインタを調べることでリーダーページを特定できます。前のページの次のポインタが元のページを指していない場合、元のページはリーダーページです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span> +--------+
+ | reader |  next   +----+
+ |  page  |--------&gt;|    |&lt;====== (buffer page)
+ +--------+         +----+
+     |                | ^
+     |                v | next
+prev |              +----+
+     +-------------&gt;|    |
+                    +----+
+</pre></div>
+</div>
+<p>ヘッドページが進む方法：</p>
+<p>テールページがヘッドページに到達し、バッファがオーバーライドモードで動作しており、さらに書き込みが行われる場合、ライターがテールページを進める前にヘッドページを進める必要があります。ライターはcmpxchgを実行して、ヘッドページのポインタをHEADERフラグからUPDATEフラグに変換します。これにより、リーダーはバッファからヘッドページを交換できなくなり、ヘッドページを進めるのを停止します。</p>
+<p>これにより、リーダーがライターに対して競合状態を生じることはありません。リーダーはスピンする必要があり、これがリーダーがライターを優先的に実行できない理由です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>            tail page
+               |
+               v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-H-&gt;|   |---&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+
+            tail page
+               |
+               v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-U-&gt;|   |---&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>次のページが新しいヘッドページになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>           tail page
+               |
+               v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-U-&gt;|   |-H-&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>新しいヘッドページが設定された後、古いヘッドページのポインタをNORMALに戻すことができます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>           tail page
+               |
+               v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |---&gt;|   |-H-&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>ヘッドページが移動した後、テールページは今度は前進する可能性があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>                    tail page
+                        |
+                        v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |---&gt;|   |-H-&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>上記は単純な更新です。より複雑なシナリオについて説明します。</p>
+<p>前述した通り、十分な書き込みが最初の書き込みを妨害した場合、テールページはバッファを一周してコミットページと出会う可能性があります。このとき、書き込みをドロップする必要があります（通常はユーザーに警告を伴います）。ただし、コミットがリーダーページにまだ残っている場合、どうなりますか？コミットページはリングバッファの一部ではありません。テールページはこの状況を考慮する必要があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>          reader page    commit page
+              |              |
+              v              |
+             +---+           |
+             |   |&lt;----------+
+             |   |
+             |   |------+
+             +---+      |
+                        |
+                        v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-H-&gt;|   |---&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+               ^
+               |
+           tail page
+</pre></div>
+</div>
+<p>テールページが単にヘッドページを前進させても、リーダーページを離れる際のコミットが正しいページを指していない可能性があります。</p>
+<p>この問題を解決するには、ヘッドページを前進させる前にコミットページがリーダーページにあるかをテストする必要があります。もしリーダーページにある場合、テールページがバッファを巻き上げたとみなされ、新しい書き込みをドロップする必要があります。</p>
+<p>これはレースコンディションではありません。コミットページは外側のライター（プレエミットされたライター）のみが動かすため、ライターがテールページを動かしている間、コミットページは動かないからです。リーダーはリーダーページをスワップすることができません（リーダーページがコミットページとしても使われている場合）。リーダーは単にコミットがリーダーページから外れているかを確認するだけでよいです。コミットページがリーダーページを離れた後は、それ以降リーダーページに戻ることはなく、リーダーがバッファページ（コミットページでもある）と再度スワップしない限りです。</p>
+</section>
+<section id="nested-writes">
+<h2>ネストされた書き込み<a class="headerlink" href="#nested-writes" title="この見出しへのパーマリンク">¶</a></h2>
+<p>テールページを前進させる際には、ヘッドページが次のページである場合にまずヘッドページを前進させる必要があります。ヘッドページが次のページでない場合、テールページはcmpxchgで単に更新されます。</p>
+<p>テールページを動かすのはライターのみです。この操作は原子的に行う必要があります（ネストされたライターを防ぐため）:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>temp_page = tail_page
+next_page = temp_page-&gt;next
+cmpxchg(tail_page, temp_page, next_page)
+</pre></div>
+</div>
+<p>上記は、テールページが予期するページを指している場合にのみテールページを更新します。失敗した場合、ネストされた書き込みがテールページを前進させたため、現在の書き込みはそれを押し上げる必要はありません:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>           temp page
+               |
+               v
+            tail page
+               |
+               v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |---&gt;|   |---&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>ネストされたライターが入り、テールページを前進させます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>                    tail page (moved by nested writer)
+            temp page   |
+               |        |
+               v        v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |---&gt;|   |---&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>上記はcmpxchgで失敗しますが、テールページがすでに前進しているため、ライターは新しいテールページでストレージを再び確保しようと試みます。</p>
+<p>しかし、ヘッドページの前進はやや複雑です:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>            tail page
+               |
+               v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-H-&gt;|   |---&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>ライターはヘッドページポインタをUPDATEに変換します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>            tail page
+               |
+               v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-U-&gt;|   |---&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>しかし、ネストされたライターがここで優先的に実行した場合、次のページがヘッドページであることが確認されますが、それもまたネストされています。ライターはネストされていることを検出しますし、その情報を保存します。検出のポイントは、ヘッダーやノーマルポインタではなく、UPDATEフラグを確認することです。</p>
+<p>ネストされたライターは新しいヘッドページポインタを設定します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>           tail page
+               |
+               v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-U-&gt;|   |-H-&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>ただし、UPDATEをノーマルに戻すことはしません。HEADからUPDATEにポインタを変換したライターだけが、それをノーマルに戻します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>                    tail page
+                        |
+                        v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-U-&gt;|   |-H-&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>ネストされたライターが完了した後、最外層のライターがUPDATEポインタをノーマルに戻します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>                    tail page
+                        |
+                        v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |---&gt;|   |-H-&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>複数のネストされた書き込みが入り、テールページが複数のページ分進んだ場合、状況はさらに複雑になります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(first writer)
+
+            tail page
+               |
+               v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-H-&gt;|   |---&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>ライターはヘッドページポインタをUPDATEに変換します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>            tail page
+               |
+               v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-U-&gt;|   |---&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>次のライターが入ると、UPDATEを確認し、新しいヘッドページを設定します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(second writer)
+
+           tail page
+               |
+               v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-U-&gt;|   |-H-&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>ネストされたライターはテールページを前へ進めるが、古いUPDATEページをノーマルに戻すことはしない。なぜなら、最外層のライターではないからです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>                    tail page
+                        |
+                        v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-U-&gt;|   |-H-&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>別のライターが優先的に実行し、テールページの次のページがヘッドページであることを確認します。それをHEADからUPDATEに変更します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(third writer)
+
+                    tail page
+                        |
+                        v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-U-&gt;|   |-U-&gt;|   |---&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>ライターはヘッドページを前へ進めます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(third writer)
+
+                    tail page
+                        |
+                        v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-U-&gt;|   |-U-&gt;|   |-H-&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>しかし、第三のライターがHEADフラグをUPDATEに変更したため、それをノーマルに戻します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(third writer)
+
+                    tail page
+                        |
+                        v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-U-&gt;|   |---&gt;|   |-H-&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>その後、テールページを進めて、第二のライターに戻ります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(second writer)
+
+                             tail page
+                                 |
+                                 v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-U-&gt;|   |---&gt;|   |-H-&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>第二のライターはテールページを進めることが失敗し、すでに進んでいたため、再度試行して新しいテールページにデータを追加します。その後、第一のライターに戻ります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(first writer)
+
+                             tail page
+                                 |
+                                 v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-U-&gt;|   |---&gt;|   |-H-&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>第一のライターは、自身がHEADページを更新している間にテールページが進んだかどうかを原子的に確認できません。そのため、HEADページを自身が考える新しいヘッドページに更新します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(first writer)
+
+                             tail page
+                                 |
+                                 v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-U-&gt;|   |-H-&gt;|   |-H-&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>cmpxchgがポインタの古い値を返すため、第一のライターはノーマルからHEADへのポインタ更新を成功と判断します。しかし、この状態では不十分です。テールページが以前の位置か、次のページかを確認する必要があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(first writer)
+
+               A        B    tail page
+               |        |        |
+               v        v        v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-U-&gt;|   |-H-&gt;|   |-H-&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>テールページがAでもBでもなければ、ポインタをノーマルに戻す必要があります。ネストされたライターのみが懸念されるため、HEADページを設定した後だけチェックする必要があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(first writer)
+
+               A        B    tail page
+               |        |        |
+               v        v        v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |-U-&gt;|   |---&gt;|   |-H-&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+<p>これでライターがヘッドページを更新できます。また、ヘッドページはUPDATE状態のまま、最外層のライターのみがノーマルに戻す必要があるため、リーダーが誤ったヘッドページを確認しないようにします:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(first writer)
+
+               A        B    tail page
+               |        |        |
+               v        v        v
+    +---+    +---+    +---+    +---+
+&lt;---|   |---&gt;|   |---&gt;|   |---&gt;|   |-H-&gt;
+---&gt;|   |&lt;---|   |&lt;---|   |&lt;---|   |&lt;---
+    +---+    +---+    +---+    +---+
+</pre></div>
+</div>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxトレーシング技術</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="ftrace-design.html">関数トレーサー設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tracepoint-analysis.html">イベントとトレースポイントを用いた挙動分析ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ftrace.html">ftrace - 関数トレーサー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ftrace-uses.html">ftraceを用いた関数へのフック</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kprobes.html">カーネルプローブ（Kprobes）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kprobetrace.html">Kprobesベースのイベントトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="uprobetracer.html">Uprobe-tracer: Uprobeベースのイベントトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tracepoints.html">Linuxカーネルトレースポイントの利用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events.html">イベントトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-kmem.html">サブシステムトレースポイント: kmem</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-power.html">サブシステムトレースポイント: power</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-nmi.html">NMIトレースイベント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-msr.html">MSRトレースイベント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mmiotrace.html">カーネル内メモリマップI/Oトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="histogram.html">イベントヒストグラム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="histogram-design.html">ヒストグラム設計ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="boottime-trace.html">ブートタイムトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hwlat_detector.html">ハードウェアレイテンシ検出器</a></li>
+<li class="toctree-l2"><a class="reference internal" href="intel_th.html">Intel(R)トレースハブ（TH）</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">ロックレスリングバッファ設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="stm.html">システムトレースモジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sys-t.html">MIPI SyS-T over STP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="coresight/index.html">CoreSight - ARMハードウェアトレース</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxトレーシング技術</a><ul>
+<li>前へ: <a href="intel_th.html" title="前章">Intel(R)トレースハブ（TH）</a></li>
+<li>次へ: <a href="stm.html" title="次章">システムトレースモジュール</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/trace/ring-buffer-design.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

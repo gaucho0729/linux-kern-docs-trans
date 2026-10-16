@@ -1,0 +1,362 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>TEEサブシステム — Linuxカーネルドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="xz.html" rel="next" title="LinuxにおけるXZデータ圧縮"/>
+<link href="static-keys.html" rel="prev" title="スタティックキー"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="tee-subsystem">
+<h1>TEEサブシステム<a class="headerlink" href="#tee-subsystem" title="この見出しへのパーマリンク">¶</a></h1>
+<p>このドキュメントでは、LinuxにおけるTEEサブシステムについて説明します。</p>
+<p>TEE（Trusted Execution Environment）は、あるセキュアな環境で実行される信頼できるOSであり、例えばARM CPUのTrustZoneや、別個のセキュアコプロセッサなどがあります。TEEドライバーは、TEEと通信するために必要な詳細を処理します。</p>
+<p>このサブシステムは以下の処理を行います:</p>
+<ul class="simple">
+<li><p>TEEドライバーの登録</p></li>
+<li><p>LinuxとTEE間の共有メモリの管理</p></li>
+<li><p>TEEに対する汎用APIの提供</p></li>
+</ul>
+<section id="the-tee-interface">
+<h2>TEE インターフェース<a class="headerlink" href="#the-tee-interface" title="この見出しへのパーマリンク">¶</a></h2>
+<p>include/uapi/linux/tee.hはTEEに対する汎用インターフェースを定義します。</p>
+<p>ユーザー空間（クライアント）は、/dev/tee[0-9]*または/dev/teepriv[0-9]*を開くことでドライバーに接続します。</p>
+<ul class="simple">
+<li><p>TEE_IOC_SHM_ALLOCは共有メモリを割り当て、ユーザー空間がmmapできるファイル記述子を返します。ユーザー空間がファイル記述子を必要なくなった場合、それを閉じるべきです。共有メモリが不要になった場合は、munmap()でアンマップし、メモリの再利用を許可する必要があります。</p></li>
+<li><p>TEE_IOC_VERSIONは、このドライバーが処理するTEEとその機能をユーザー空間に通知します。</p></li>
+<li><p>TEE_IOC_OPEN_SESSIONは信頼アプリケーションへの新しいセッションを開きます。</p></li>
+<li><p>TEE_IOC_INVOKEは信頼アプリケーション内の関数を呼び出します。</p></li>
+<li><p>TEE_IOC_CANCELは進行中のTEE_IOC_OPEN_SESSIONまたはTEE_IOC_INVOKEをキャンセルする可能性があります。</p></li>
+<li><p>TEE_IOC_CLOSE_SESSIONは信頼アプリケーションへのセッションを閉じます。</p></li>
+</ul>
+<p>クライアントには通常クライアントとsupplicantという2つのクラスがあります。後者はTEEがLinux内のリソースにアクセスするための補助プロセスであり、たとえばファイルシステムアクセスなどです。通常クライアントは/dev/tee[0-9]*を開き、supplicantは/dev/teepriv[0-9]を開きます。</p>
+<p>クライアントとTEE間の多くの通信はドライバーには透明です。ドライバーの主な役割は、クライアントからのリクエストを受信し、TEEに転送し、結果を返すことです。supplicantの場合、通信は逆方向になります。TEEがsupplicantにリクエストを送り、それから結果を返します。</p>
+</section>
+<section id="the-tee-kernel-interface">
+<h2>TEE カーネルインターフェース<a class="headerlink" href="#the-tee-kernel-interface" title="この見出しへのパーマリンク">¶</a></h2>
+<p>カーネルはTEEバスインフラストラクチャを提供し、信頼アプリケーションはユニバーサルユニーク識別子（UUID）で識別されるデバイスとして表されます。クライアントドライバーはサポートするデバイスUUIDの一覧を登録します。</p>
+<p>TEEバスインフラストラクチャが登録するAPIは以下の通りです：</p>
+<dl class="simple">
+<dt>match():</dt><dd><p>クライアントドライバーのUUIDテーブルを走査し、デバイスUUIDに一致するものを検索します。一致が見つかった場合、この特定のデバイスはクライアントドライバーが登録した対応するprobe APIを通じてプローブされます。このプロセスは、デバイスまたはクライアントドライバーがTEEバスに登録されるたびに発生します。</p>
+</dd>
+<dt>uevent():</dt><dd><p>TEEバスに新しいデバイスが登録されるたびにユーザースペース（udev）に通知し、モジュール化されたクライアントドライバーの自動ロードを実現します。</p>
+</dd>
+</dl>
+<p>TEEバスデバイスの列挙は、基盤となるTEE実装に依存するため、TEEドライバが対応する実装を提供できるように開放されています。</p>
+<p>その後、TEEクライアントドライバは、include/linux/tee_drv.hに記載されたAPIを通じて、一致した信頼アプリケーションと通信できます。</p>
+<section id="tee-client-driver-example">
+<h3>TEEクライアントドライバの例<a class="headerlink" href="#tee-client-driver-example" title="この見出しへのパーマリンク">¶</a></h3>
+<p>TEEクライアントドライバが信頼アプリケーションと通信する必要がある場合、UUID: <code class="docutils literal notranslate"><span class="pre">ac6a4085-0e82-4c33-bf98-8eb8e118b6c2</span></code>を持つ信頼アプリケーションを想定すると、ドライバ登録のスニペットは以下のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static const struct tee_client_device_id client_id_table[] = {
+        {UUID_INIT(0xac6a4085, 0x0e82, 0x4c33,
+                   0xbf, 0x98, 0x8e, 0xb8, 0xe1, 0x18, 0xb6, 0xc2)},
+        {}
+};
+
+MODULE_DEVICE_TABLE(tee, client_id_table);
+
+static struct tee_client_driver client_driver = {
+        .id_table       = client_id_table,
+        .driver         = {
+                .name           = DRIVER_NAME,
+                .bus            = &amp;tee_bus_type,
+                .probe          = client_probe,
+                .remove         = client_remove,
+        },
+};
+
+static int __init client_init(void)
+{
+        return driver_register(&amp;client_driver.driver);
+}
+
+static void __exit client_exit(void)
+{
+        driver_unregister(&amp;client_driver.driver);
+}
+
+module_init(client_init);
+module_exit(client_exit);
+</pre></div>
+</div>
+</section>
+</section>
+<section id="op-tee-driver">
+<h2>OP-TEE ドライバー<a class="headerlink" href="#op-tee-driver" title="この見出しへのパーマリンク">¶</a></h2>
+<p>OP-TEEドライバはOP-TEEベースのTEEを処理します。現在はARM TrustZoneベースのOP-TEEソリューションのみがサポートされています。</p>
+<p>OP-TEEとの最低レベルの通信はARM SMC Calling Convention（SMCCC）に基づいています。これはOP-TEEのSMCインターフェースの基礎であり、ドライバが内部的に使用するインターフェースです。その上にOP-TEEメッセージプロトコルが積み重なっています。</p>
+<p>OP-TEE SMCインターフェースはSMCCCに必要な基本機能を提供し、OP-TEE固有の追加機能も提供します。特に注目すべき関数は以下の通りです：</p>
+<ul class="simple">
+<li><p>OPTEE_SMC_FUNCID_CALLS_UID（SMCCCの一部）はバージョン情報を返し、その後TEE_IOC_VERSIONで返されます。</p></li>
+<li><p>OPTEE_SMC_CALL_GET_OS_UUIDは特定のOP-TEE実装を返し、たとえばTrustZoneベースのOP-TEEと別セキュアコプロセッサ上で実行されるOP-TEEを区別します。</p></li>
+<li><p>OPTEE_SMC_CALL_WITH_ARGはOP-TEEメッセージプロトコルを駆動します。</p></li>
+<li><p>OPTEE_SMC_GET_SHM_CONFIGはドライバとOP-TEEがLinuxとOP-TEE間で共有メモリとして使用するメモリ範囲を合意します。</p></li>
+</ul>
+<p>GlobalPlatform TEEクライアントAPIは一般的なTEE APIの上に実装されています。</p>
+<p>OP-TEEアーキテクチャ内のさまざまなコンポーネント間の関係の図：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>   User space                  Kernel                   Secure world
+   ~~~~~~~~~~                  ~~~~~~                   ~~~~~~~~~~~~
++--------+                                             +-------------+
+| Client |                                             | Trusted     |
++--------+                                             | Application |
+   /\                                                  +-------------+
+   || +----------+                                           /\
+   || |tee-      |                                           ||
+   || |supplicant|                                           \/
+   || +----------+                                     +-------------+
+   \/      /\                                          | TEE Internal|
++-------+  ||                                          | API         |
++ TEE   |  ||            +--------+--------+           +-------------+
+| Client|  ||            | TEE    | OP-TEE |           | OP-TEE      |
+| API   |  \/            | subsys | driver |           | Trusted OS  |
++-------+----------------+----+-------+----+-----------+-------------+
+|      Generic TEE API        |       |     OP-TEE MSG               |
+|      IOCTL (TEE_IOC_*)      |       |     SMCCC (OPTEE_SMC_CALL_*) |
++-----------------------------+       +------------------------------+
+</pre></div>
+</div>
+<p>RPC（リモートプロシージャコール）はセキュアワールドからカーネルドライバまたはtee-supplicantへのリクエストです。RPCはOPTEE_SMC_CALL_WITH_ARGから特定のSMCCC戻り値範囲で識別されます。カーネル宛てのRPCメッセージはカーネルドライバによって処理され、他のRPCメッセージはドライバの関与を除いて共有メモリバッファの表現形式を切り替えることでtee-supplicantに転送されます。</p>
+<section id="op-tee-device-enumeration">
+<h3>OP-TEEデバイス列挙<a class="headerlink" href="#op-tee-device-enumeration" title="この見出しへのパーマリンク">¶</a></h3>
+<p>OP-TEEはデバイス列挙をサポートするためにdrivers/tee/optee/device.cという仮想の信頼アプリケーションを提供します。言い換えれば、OP-TEEドライバはこのアプリケーションを呼び出して、TEEバスに登録可能な信頼アプリケーションの一覧を取得します。</p>
+</section>
+</section>
+<section id="amd-tee-driver">
+<h2>AMD-TEE ドライバー<a class="headerlink" href="#amd-tee-driver" title="この見出しへのパーマリンク">¶</a></h2>
+<p>AMD-TEEドライバーは、AMDのTEE環境と通信を処理します。TEE環境はAMD Secure Processorによって提供されます。</p>
+<p>AMD Secure Processor（以前はPlatform Security ProcessorまたはPSPと呼ばれていました）は、ARM TrustZone技術を搭載した専用プロセッサであり、第三者の信頼アプリケーションを実行可能にするソフトウェアベースの信頼実行環境（TEE）を備えています。この機能は現在、APUのみで有効化されています。</p>
+<p>以下の図は、AMD-TEEの概要を示しています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>                                            |
+   x86                                      |
+                                            |
+User space            (Kernel space)        |    AMD Secure Processor (PSP)
+~~~~~~~~~~            ~~~~~~~~~~~~~~        |    ~~~~~~~~~~~~~~~~~~~~~~~~~~
+                                            |
++--------+                                  |       +-------------+
+| Client |                                  |       | Trusted     |
++--------+                                  |       | Application |
+    /\                                      |       +-------------+
+    ||                                      |             /\
+    ||                                      |             ||
+    ||                                      |             \/
+    ||                                      |         +----------+
+    ||                                      |         |   TEE    |
+    ||                                      |         | Internal |
+    \/                                      |         |   API    |
++---------+           +-----------+---------+         +----------+
+| TEE     |           | TEE       | AMD-TEE |         | AMD-TEE  |
+| Client  |           | subsystem | driver  |         | Trusted  |
+| API     |           |           |         |         |   OS     |
++---------+-----------+----+------+---------+---------+----------+
+|   Generic TEE API        |      | ASP     |      Mailbox       |
+|   IOCTL (TEE_IOC_*)      |      | driver  | Register Protocol  |
++--------------------------+      +---------+--------------------+
+</pre></div>
+</div>
+<p>x86レベルで最も低い位置にあるAMD Secure Processor（ASP）ドライバーは、CPUをPSPメモリーメールボックスレジスタを使用してPSPにコマンドを送信します。コマンドバッファの形式はASPドライバーには非透明です。ASPドライバーの役割は、セキュアプロセッサにコマンドを送信し、結果をAMD-TEEドライバーに返すことです。AMD-TEEドライバーとAMD Secure Processorドライバー間のインターフェースは[6]に記載されています。</p>
+<p>AMD-TEEドライバーは、TEEでの処理に必要なコマンニバッファのペイロードをパッケージ化します。異なるTEEコマンドのコマンドバッファ形式は[7]に記載されています。</p>
+<p>AMD-TEE信頼OSがサポートするTEEコマンドは以下の通りです。</p>
+<ul class="simple">
+<li><dl class="simple">
+<dt>TEE_CMD_ID_LOAD_TA - 信頼アプリケーション（TA）バイナリを</dt><dd><p>TEE環境にロードします。</p>
+</dd>
+</dl>
+</li>
+<li><p>TEE_CMD_ID_UNLOAD_TA - TAバイナリをTEE環境からアンロードします。</p></li>
+<li><p>TEE_CMD_ID_OPEN_SESSION - ロード済みのTAとのセッションを開きます。</p></li>
+<li><p>TEE_CMD_ID_CLOSE_SESSION - ロード済みのTAとのセッションを閉じます</p></li>
+<li><p>TEE_CMD_ID_INVOKE_CMD - ロード済みのTAでコマンドを実行します</p></li>
+<li><p>TEE_CMD_ID_MAP_SHARED_MEM - シェアードメモリをマップします</p></li>
+<li><p>TEE_CMD_ID_UNMAP_SHARED_MEM - シェアードメモリをアンマップします</p></li>
+</ul>
+<p>AMD-TEE信頼OSはAMD Secure Processor上で動作するファームウェアです。</p>
+<p>AMD-TEEドライバはTEEサブシステムに自身を登録し、以下のドライバ関数コールバックを実装します:</p>
+<ul class="simple">
+<li><p>get_version - ドライバの実装IDと機能を返します。</p></li>
+<li><p>open - ドライバのコンテキストデータ構造を設定します。</p></li>
+<li><p>release - ドライバリソースを解放します。</p></li>
+<li><p>open_session - TAバイナリをロードし、ロードされたTAとのセッションを開きます。</p></li>
+<li><p>close_session - ロードされたTAとのセッションを閉じて、それをアンロードします。</p></li>
+<li><p>invoke_func - ロードされたTAを使用してコマンドを実行します。</p></li>
+</ul>
+<p>cancel_req ドライバコールバックはAMD-TEEでサポートされていません。</p>
+<p>GlobalPlatform TEE Client API [5]は、ユーザー空間（クライアント）がAMDのTEEと通信するために使用できます。AMDのTEEは、TAとのロード、セッションのオープン、コマンドの実行、セッションのクロージングに安全な環境を提供します。</p>
+</section>
+<section id="references">
+<h2>参考文献<a class="headerlink" href="#references" title="この見出しへのパーマリンク">¶</a></h2>
+<p>[1] <a class="reference external" href="https://github.com/OP-TEE/optee_os">https://github.com/OP-TEE/optee_os</a></p>
+<p>[2] <a class="reference external" href="http://infocenter.arm.com/help/topic/com.arm.doc.den0028a/index.html">http://infocenter.arm.com/help/topic/com.arm.doc.den0028a/index.html</a></p>
+<p>[3] drivers/tee/optee/optee_smc.h</p>
+<p>[4] drivers/tee/optee/optee_msg.h</p>
+<dl class="simple">
+<dt>[5] <a class="reference external" href="http://www.globalplatform.org/specificationsdevice.asp">http://www.globalplatform.org/specificationsdevice.asp</a> 探してください</dt><dd><p>「TEE Client API Specification v1.0」をクリックしてダウンロードしてください。</p>
+</dd>
+</dl>
+<p>[6] include/linux/psp-tee.h</p>
+<p>[7] drivers/tee/amdtee/amdtee_if.h</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">未整理のドキュメンテーション</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="crc32.html">CRC計算の簡単なチュートリアル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lzo.html">LinuxのLZOデコンプレッサーが理解するLZOストリーム形式</a></li>
+<li class="toctree-l2"><a class="reference internal" href="remoteproc.html">リモートプロセッサフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rpmsg.html">リモートプロセッサメッセージ(rpmsg)フレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="speculation.html">スペキュレーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="speculation.html#mitigating-speculation-side-channels">スペキュレーション側チャネルの緩和</a></li>
+<li class="toctree-l2"><a class="reference internal" href="static-keys.html">スタティックキー</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">TEEサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xz.html">LinuxにおけるXZデータ圧縮</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">未整理のドキュメンテーション</a><ul>
+<li>前へ: <a href="static-keys.html" title="前章">スタティックキー</a></li>
+<li>次へ: <a href="xz.html" title="次章">LinuxにおけるXZデータ圧縮</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/staging/tee.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

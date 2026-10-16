@@ -1,0 +1,408 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>TCM Userspace Design — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="tcm_mod_builder.html" rel="next" title="TCM v4 ファブリックモジュールスクリプトジェネレータ"/>
+<link href="index.html" rel="prev" title="TCM仮想デバイス"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="tcm-userspace-design">
+<h1>TCM ユーザースペース設計<a class="headerlink" href="#tcm-userspace-design" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="design">
+<h2>設計<a class="headerlink" href="#design" title="この見出しへのパーマリンク">¶</a></h2>
+<p>TCM は LIO（カーネル内 iSCSI ターゲット（サーバー））の別名であり、既存の TCM ターゲットはカーネル内に実行されています。TCMU（TCM のユーザー空間実装）は、iSCSI ターゲットとして動作するユーザー空間のプログラムを書くことを可能にします。このドキュメントでは設計について説明します。</p>
+<p>既存のカーネルは、さまざまな SCSI トランスポートプロトコル用のモジュールを提供しています。TCM はデータストレージもモジュール化しており、ファイル、ブロックデバイス、RAM、または他の SCSI デバイスをストレージとして使用するモジュールが既に存在します。これらは「バックストア（backstores）」または「ストレージエンジン（storage engines）」と呼ばれます。これらの組み込みモジュールはすべてカーネルコードで実装されています。</p>
+<section id="background">
+<h3>背景<a class="headerlink" href="#background" title="この見出しへのパーマリンク">¶</a></h3>
+<p>SCSI コマンドを運ぶためのトランスポートプロトコル（「ファブリック（fabrics）」）だけでなく、Linux カーネルのターゲットである LIO は、実際にデータストレージもモジュール化しています。これらは「バックストア（backstores）」または「ストレージエンジン（storage engines）」と呼ばれます。ターゲットは、エクスポートされる SCSI LUN に必要なローカルストレージとしてファイル、ブロックデバイス、RAM、または他の SCSI デバイスを用いるためのバックストアを提供します。LIO の他の部分同様、これらはすべてカーネルコードで実装されています。</p>
+<p>これらのバックストアは一般的な用途をカバーしていますが、すべてではありません。他の非カーネルターゲットソリューション（たとえば tgt）がサポートできる新しい用途の一つは、Gluster の GLFS や Ceph の RBD をバックストアとして使用することです。このターゲットは、これらの非伝統的なネットワークストレージシステムにデータを保存させながら、標準プロトコルのみを使用するように、イニシエーターに翻訳者として機能します。</p>
+<p>ターゲットがユーザー空間プロセスである場合、サポートは比較的簡単です。たとえば tgt は、それぞれに対して小さなアダプターモジュールのみが必要で、モジュールは RBD と GLFS の利用可能なユーザー空間ライブラリを使用するだけで済みます。</p>
+<p>LIO でこれらのバックストアをサポートするには considerably 困難です。なぜなら LIO はすべてカーネルコードで実装されているからです。GLFS や RBD の API とプロトコルをカーネルに移植するための大幅な作業を実施する代わりに、LIO 用のユーザー空間透過バックストア「TCMU」を作成するという別のアプローチが採用されます。</p>
+</section>
+<section id="benefits">
+<h3>Benefits<a class="headerlink" href="#benefits" title="この見出しへのパーマリンク">¶</a></h3>
+<p>RBD と GLFS のサポートを比較的容易にするだけでなく、TCMU は新しいバックストアの開発も容易にします。TCMU は LIO ループバックファブリックと組み合わせることで、ファイルシステム層ではなく SCSI 層で動作する FUSE（Filesystem in Userspace）に似たものです。いわば SUSE（SUSE は Linux ディストリビューションの一つ）のようなものです。</p>
+<p>デメリットは、設定する必要のある異なるコンポーネントがより多く、故障する可能性があることです。これは避けられませんが、可能な限りシンプルにすることで致命的な問題にはならないことを願っています。</p>
+</section>
+<section id="design-constraints">
+<h3>Design constraints<a class="headerlink" href="#design-constraints" title="この見出しへのパーマリンク">¶</a></h3>
+<ul>
+<li><p>高性能: 高スループット、低レイテンシー</p></li>
+<li><p>ユーザー空間が以下の場合も適切に処理:</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>アタッチしない</p></li>
+<li><p>ハングする</p></li>
+<li><p>終了する</p></li>
+<li><p>不適切な動作をする</p></li>
+</ol>
+</div></blockquote>
+</li>
+<li><p>今後のユーザー空間とカーネルの実装における柔軟性を確保</p></li>
+<li><p>合理的なメモリ効率を確保</p></li>
+<li><p>設定および実行が簡単</p></li>
+<li><p>ユーザー空間のバックエンドを書くのが簡単</p></li>
+</ul>
+</section>
+<section id="implementation-overview">
+<h3>実装概要<a class="headerlink" href="#implementation-overview" title="この見出しへのパーマリンク">¶</a></h3>
+<p>TCMUインターフェースのコアは、カーネルとユーザー空間が共有するメモリ領域です。この領域には、制御領域（メモブックス）、ロックフリーなプロダクション/コンシューマー環状バッファ（コマンドを上位に渡すためのもの、およびステータスを返すためのもの）、および入出力データバッファ領域が含まれます。</p>
+<p>TCMUは事前に存在するUIOサブシステムを使用しています。UIOはユーザー空間でのデバイスドライバ開発を可能にし、これはTCMUの使用ケースと概念的に非常に近いです。ただし、物理デバイスではなく、SCSIコマンド用に設計されたメモリマップレイアウトを実装しています。UIOを使用することにより、TCMUはデバイスの自己認識（例: ユーザー空間が共有領域のサイズを確認する方法）や両方向のシグナル処理を処理できます。</p>
+<p>メモリ領域には埋め込まれたポインタがありません。すべての情報は、領域の開始アドレスからのオフセットとして表現されます。これにより、ユーザープロセスが終了して再起動され、領域が異なる仮想アドレスにマッピングされた場合でも環状バッファが動作します。</p>
+<p>構造体の定義についてはtarget_core_user.hを参照してください。</p>
+</section>
+<section id="the-mailbox">
+<h3>メモブックス<a class="headerlink" href="#the-mailbox" title="この見出しへのパーマリンク">¶</a></h3>
+<p>メモブックスは常に共有メモリ領域の開始位置にあり、バージョン、コマンドリングの開始オフセットとサイズの詳細、およびカーネルとユーザー空間が環状バッファにコマンドを置く際やコマンドが完了したことを示すためのヘッドとテールポインタが含まれます。</p>
+<p>バージョン - 1（他の場合にユーザー空間は中止する必要があります）</p>
+<dl class="simple">
+<dt>フラグ:</dt><dd><ul class="simple">
+<li><dl class="simple">
+<dt>TCMU_MAILBOX_FLAG_CAP_OOOC:</dt><dd><p>アウトオブオーダー完了がサポートされていることを示します。詳細は「コマンドリング」を参照してください。</p>
+</dd>
+</dl>
+</li>
+</ul>
+</dd>
+<dt>cmdr_off</dt><dd><p>メモリ領域の開始位置からのコマンドリングの開始オフセット（メモブックスのサイズを考慮して）</p>
+</dd>
+<dt>cmdr_size</dt><dd><p>コマンドリングのサイズ。これは <em>ではありません</em> 2の累乗である必要はありません。</p>
+</dd>
+<dt>cmd_head</dt><dd><p>カーネルがコマンドがリングに置かれたことを示すために更新されます。</p>
+</dd>
+<dt>cmd_tail</dt><dd><p>ユーザー空間がコマンドの処理を完了したことを示すために更新されます。</p>
+</dd>
+</dl>
+</section>
+<section id="the-command-ring">
+<h3>コマンドリング<a class="headerlink" href="#the-command-ring" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルがコマンドリングにコマンドを置く際には、mailbox.cmd_headをコマンドのサイズ分インクリメントし、cmdr_sizeをモジュロで計算した後、ユーザー空間にシグナルを送信して通知します。 <a class="reference internal" href="../driver-api/infrastructure.html#c.uio_event_notify" title="uio_event_notify"><code class="xref c c-func docutils literal notranslate"><span class="pre">uio_event_notify()</span></code></a>コマンドが完了した後、ユーザースペースはmailbox.cmd_tailを同じように更新し、4バイトのwrite()を介してカーネルに信号を送ります。cmd_headがcmd_tailと等しい場合、リングは空になっており、ユーザースペースが処理待ちしているコマンドはありません。</p>
+<p>TCMUコマンドは8バイトアライメントされています。これらは共通ヘッダで始まり、"len_op"という32ビットの値が長さを格納し、最低未使用ビットにオペコードが含まれます。また、cmd_idとフラグフィールドが含まれており、これらはカーネル(kflags)とユーザースペース(uflags)から設定されます。</p>
+<p>現在はTCMU_OP_CMDとTCMU_OP_PADの2つのオペコードのみが定義されています。</p>
+<p>オペコードがCMDの場合、コマンドリング内のエントリはstruct tcmu_cmd_entryです。ユーザースペースはtcmu_cmd_entry.req.cdb_offを通じてSCSI CDB(コマンドデータブロック)を取得します。cdb_offは全体の共有メモリ領域の開始位置からのオフセットであり、エントリそのものではなく、データの入出力バッファはtht req.iov[]配列を通じてアクセス可能です。iov_cntは、データインまたはデータアウトバッファを記述するために必要なiov[]内のエントリ数を示します。双方向コマンドの場合、iov_cntはデータアウト領域をカバーするiovecエントリ数を指定し、iov_bidi_cntはその直後にデータイン領域をカバーするiovecエントリ数を示します。他のフィールドと同様に、iov.iov_baseは領域の開始位置からのオフセットです。</p>
+<p>コマンドを完了する際、ユーザースペースはrsp.scsi_statusを設定し、必要に応じてrsp.sense_bufferも設定します。その後、mailbox.cmd_tailをentry.hdr.length（cmdr_sizeをモジュロにした値）でインクリメントし、UIOメソッドを介してカーネルに信号を送ります。これはファイルディスクリプタへの4バイトのwrite()です。</p>
+<p>mailbox-&gt;flagsにTCMU_MAILBOX_FLAG_CAP_OOOCが設定されている場合、カーネルは順序を問わない完了処理をサポートしています。この場合、ユーザースペースは元の順序とは異なる順序でコマンドを処理できます。ただし、カーネルはコマンドリング内で出現した順序でコマンドを処理するため、ユーザースペースはコマンドを完了する際にcmd-&gt;idを更新する必要があります（元のコマンドのエントリを「盗む」ことになります）。</p>
+<p>オペコードがPADの場合、ユーザースペースは上記のようにcmd_tailのみを更新します（ノーオペレーションです）。（カーネルはPADエントリを挿入して、コマンドリング内で各CMDエントリが連続していることを保証します。）</p>
+<p>今後、さらに多くのオペコードが追加される可能性があります。ユーザースペースが処理できないオペコードに遭遇した場合、UNKNOWN_OPビット（bit 0）をhdr.uflagsに設定し、cmd_tailを更新した後、追加のコマンドを処理する必要があります。</p>
+</section>
+<section id="the-data-area">
+<h3>データ領域<a class="headerlink" href="#the-data-area" title="この見出しへのパーマリンク">¶</a></h3>
+<p>これはコマンドリングの後に続く共有メモリ領域です。この領域の構造はTCMUインターフェースで定義されていません。ユーザースペースは、保留中のiovによって参照される部分のみにアクセスする必要があります。</p>
+</section>
+<section id="device-discovery">
+<h3>デバイスの検出<a class="headerlink" href="#device-discovery" title="この見出しへのパーマリンク">¶</a></h3>
+<p>他のデバイスもTCMU以外でUIOを使用している可能性があります。関係のないユーザープロセスも、異なるセットのTCMUデバイスを処理しているかもしれません。TCMUユーザースペースプロセスは、sysfs class/uio/uio*/nameをスキャンしてデバイスを検出する必要があります。TCMUデバイスの場合は、これらの名前は次の形式になります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>tcm-user/&lt;hba_num&gt;/&lt;device_name&gt;/&lt;subtype&gt;/&lt;path&gt;
+</pre></div>
+</div>
+<p>ここで「tcm-user」はすべてのTCMUバックエンドUIOデバイスで共通です。&lt;hba_num&gt;と&lt;device_name&gt;は、ユーザースペースがカーネルターゲットのconfigfsツリー内のデバイスのパスを特定するのに役立ちます。通常のマウントポイントを仮定すると、次の場所にあります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/kernel/config/target/core/user_&lt;hba_num&gt;/&lt;device_name&gt;
+</pre></div>
+</div>
+<p>この場所には「hw_block_size」などの属性が含まれており、これらを正しく動作させるためにユーザースペースが知る必要があります。</p>
+<p>&lt;subtype&gt;はユーザープロセス固有の文字列で、TCMUデバイスが特定のハンドラによってバックエンドされるものであることを識別します。&lt;path&gt;はユーザープロセスがデバイスを構成するためにハンドラ固有の文字列です。名前には':'を含んではいけません（LIOの制限のため）。</p>
+<p>すべての検出されたデバイスに対して、ユーザーハンドラは/dev/uioXを開き、mmap()を呼び出します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)
+</pre></div>
+</div>
+<p>sizeは/sys/class/uio/uioX/maps/map0/sizeから読み取った値と等しくなければなりません。</p>
+</section>
+<section id="device-events">
+<h3>デバイスイベント<a class="headerlink" href="#device-events" title="この見出しへのパーマリンク">¶</a></h3>
+<p>新しいデバイスが追加されたり、削除されたりした場合、netlink経由で通知が送信されます。ジェネリックなnetlinkファミリ名は「TCM-USER」、マルチキャストグループ名は「config」です。これには前記のセクションで説明したUIO名とUIOマイナーデバイス番号が含まれます。これにより、ユーザースペースはUIOデバイスとLIOデバイスの両方を特定できるようになり、 subtypeに基づいてデバイスがサポートされていると判断した後、適切なアクションを取ることができます。</p>
+</section>
+<section id="other-contingencies">
+<h3>その他の緊急事態<a class="headerlink" href="#other-contingencies" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ユーザースペースハンドラープロセスがアタッチしない場合：</p>
+<ul class="simple">
+<li><p>TCMUはコマンドをポストし、タイムアウト期間（30秒）後にそれらを中止します。</p></li>
+</ul>
+<p>ユーザースペースハンドラープロセスがキルされた場合：</p>
+<ul class="simple">
+<li><p>TCMUデバイスへの再接続と再起動は可能です。コマンドリングは保持されます。ただし、タイムアウト期間が経過した後、カーネルは保留中のタスクを中止します。</p></li>
+</ul>
+<p>ユーザースペースハンドラープロセスがハングした場合：</p>
+<ul class="simple">
+<li><p>タイムアウト期間が経過した後、カーネルは保留中のタスクを中止します。</p></li>
+</ul>
+<p>ユーザースペースハンドラープロセスがマルウェアである場合：</p>
+<ul class="simple">
+<li><p>プロセスは制御しているデバイスのハンドリングを簡単に破損させることができます。ただし、共有メモリ領域以外のカーネルメモリにアクセスすることはできません。</p></li>
+</ul>
+</section>
+</section>
+<section id="writing-a-user-pass-through-handler-with-example-code">
+<h2>ユーザーパススルーハンドラの作成（例コード付き）<a class="headerlink" href="#writing-a-user-pass-through-handler-with-example-code" title="この見出しへのパーマリンク">¶</a></h2>
+<p>TCMUデバイスをハンドリングするユーザープロセスは以下の機能をサポートしなければなりません：</p>
+<ol class="loweralpha simple">
+<li><p>TCMU uioデバイスの検出と設定</p></li>
+<li><p>デバイス（複数可）でのイベントを待機中</p></li>
+<li><p>コマンドリングの管理：操作とコマンドの解析、必要な作業の実行、応答フィールド（scsi_statusおよびsense_bufferを含む）の設定、cmd_tailの更新、作業完了をカーネルに通知</p></li>
+</ol>
+<p>代わりにtcmu-runner用のプラグインを書くことを検討してください。tcmu-runnerはすべての機能を実装しており、プラグイン開発者向けにより高レベルのAPIを提供しています</p>
+<p>TCMUは、複数の関係のないプロセスがTCMUデバイスを個別に管理できるように設計されています。すべてのハンドラは、既知のサブタイプ文字列に基づいてのみ自身のデバイスを開くようにする必要があります</p>
+<ol class="loweralpha">
+<li><p>TCMU UIOデバイスの発見と設定:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/* error checking omitted for brevity */
+
+int fd, dev_fd;
+char buf[256];
+unsigned long long map_len;
+void *map;
+
+fd = open("/sys/class/uio/uio0/name", O_RDONLY);
+ret = read(fd, buf, sizeof(buf));
+close(fd);
+buf[ret-1] = '\0'; /* null-terminate and chop off the \n */
+
+/* we only want uio devices whose name is a format we expect */
+if (strncmp(buf, "tcm-user", 8))
+  exit(-1);
+
+/* Further checking for subtype also needed here */
+
+fd = open(/sys/class/uio/%s/maps/map0/size, O_RDONLY);
+ret = read(fd, buf, sizeof(buf));
+close(fd);
+str_buf[ret-1] = '\0'; /* null-terminate and chop off the \n */
+
+map_len = strtoull(buf, NULL, 0);
+
+dev_fd = open("/dev/uio0", O_RDWR);
+map = mmap(NULL, map_len, PROT_READ|PROT_WRITE, MAP_SHARED, dev_fd, 0);
+
+
+b) Waiting for events on the device(s)
+
+while (1) {
+  char buf[4];
+
+  int ret = read(dev_fd, buf, 4); /* will block */
+
+  handle_device_events(dev_fd, map);
+}
+</pre></div>
+</div>
+</li>
+</ol>
+<ol class="loweralpha" start="3">
+<li><p>コマンドリングの管理:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/target_core_user.h&gt;
+
+int handle_device_events(int fd, void *map)
+{
+  struct tcmu_mailbox *mb = map;
+  struct tcmu_cmd_entry *ent = (void *) mb + mb-&gt;cmdr_off + mb-&gt;cmd_tail;
+  int did_some_work = 0;
+
+  /* Process events from cmd ring until we catch up with cmd_head */
+  while (ent != (void *)mb + mb-&gt;cmdr_off + mb-&gt;cmd_head) {
+
+    if (tcmu_hdr_get_op(ent-&gt;hdr.len_op) == TCMU_OP_CMD) {
+      uint8_t *cdb = (void *)mb + ent-&gt;req.cdb_off;
+      bool success = true;
+
+      /* Handle command here. */
+      printf("SCSI opcode: 0x%x\n", cdb[0]);
+
+      /* Set response fields */
+      if (success)
+        ent-&gt;rsp.scsi_status = SCSI_NO_SENSE;
+      else {
+        /* Also fill in rsp-&gt;sense_buffer here */
+        ent-&gt;rsp.scsi_status = SCSI_CHECK_CONDITION;
+      }
+    }
+    else if (tcmu_hdr_get_op(ent-&gt;hdr.len_op) != TCMU_OP_PAD) {
+      /* Tell the kernel we didn't handle unknown opcodes */
+      ent-&gt;hdr.uflags |= TCMU_UFLAG_UNKNOWN_OP;
+    }
+    else {
+      /* Do nothing for PAD entries except update cmd_tail */
+    }
+
+    /* update cmd_tail */
+    mb-&gt;cmd_tail = (mb-&gt;cmd_tail + tcmu_hdr_get_len(&amp;ent-&gt;hdr)) % mb-&gt;cmdr_size;
+    ent = (void *) mb + mb-&gt;cmdr_off + mb-&gt;cmd_tail;
+    did_some_work = 1;
+  }
+
+  /* Notify the kernel that work has been finished */
+  if (did_some_work) {
+    uint32_t buf = 0;
+
+    write(fd, &amp;buf, 4);
+  }
+
+  return 0;
+}
+</pre></div>
+</div>
+</li>
+</ol>
+</section>
+<section id="a-final-note">
+<h2>最後に<a class="headerlink" href="#a-final-note" title="この見出しへのパーマリンク">¶</a></h2>
+<p>SCSI仕様で定義された戻りコードを正しく返すように注意してください。これらはscsi/scsi.hインクルードファイルで定義された値とは異なります。たとえば、CHECK CONDITIONのステータスコードは2であり、1ではありません</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">TCM仮想デバイス</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">TCM ユーザースペース設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tcm_mod_builder.html">TCM v4 ファブリックモジュールスクリプトジェネレータ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="scripts.html">TCM mod ビルダースクリプト</a></li>
+<li class="toctree-l2"><a class="reference internal" href="scripts.html#target-export-device-script">ターゲットエクスポートデバイススクリプト</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">TCM仮想デバイス</a><ul>
+<li>前へ: <a href="index.html" title="前章">TCM仮想デバイス</a></li>
+<li>次へ: <a href="tcm_mod_builder.html" title="次章">TCM v4 ファブリックモジュールスクリプトジェネレータ</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/target/tcmu-design.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

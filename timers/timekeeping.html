@@ -1,0 +1,218 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>クロックソース、クロックイベント、sched_clock() および遅延タイマ — Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="timers-howto.html" rel="next" title="delays - 各種カーネルディレイ/スリープメカニズムに関する情報"/>
+<link href="no_hz.html" rel="prev" title="NO_HZ: スケジューリングクロックティックの削減"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="clock-sources-clock-events-sched-clock-and-delay-timers">
+<h1>クロックソース、クロックイベント、sched_clock() およびディレイタイマ<a class="headerlink" href="#clock-sources-clock-events-sched-clock-and-delay-timers" title="この見出しへのパーマリンク">¶</a></h1>
+<p>このドキュメントは、カーネルの時間管理に関する基本的な抽象化について簡潔に説明を試みています。これは通常、カーネルツリー内の drivers/clocksource に含まれるドライバに関連する内容ですが、コードはカーネル全体にわたって分散していることがあります。</p>
+<p>カーネルソースを grep で検索すると、アーキテクチャ固有のクロックソース、クロックイベントの実装や、sched_clock() 関数やいくつかの遅延タイマのアーキテクチャ固有のオーバーライドの実装が見つかります。</p>
+<p>プラットフォームの時間管理を提供するためには、クロックソースが基本的なタイムラインを提供し、クロックイベントはこのタイムラインの特定のポイントで割り込みを発生させ、高解像度タイマなどの機能を提供します。sched_clock() はスケジューリングおよびタイムスタンプの取得に使用され、遅延タイマはハードウェアカウンターを使用して正確な遅延ソースを提供します。</p>
+<section id="clock-sources">
+<h2>クロックソース<a class="headerlink" href="#clock-sources" title="この見出しへのパーマリンク">¶</a></h2>
+<p>クロックソースの目的は、システムのタイムラインを提供し、現在の時間の位置を示すことです。たとえば、Linux システムで 'date' コマンドを実行すると、最終的にクロックソースを読み取って正確な時刻を決定します。</p>
+<p>通常、クロックソースは単調増加で原子的なカウンターであり、n ビットで 0 から (2^n)-1 までカウントアップし、再び 0 に戻ってから繰り返します。システムが稼働している限り、理想的には決して停止しないはずです。ただし、システムのスリープ状態中には停止する可能性があります。</p>
+<p>クロックソースは可能な限り高解像度で、実際の壁時計と比較して安定かつ正確な周波数を提供する必要があります。時間の逆流や周期の欠落を起こさないことが求められます。</p>
+<p>ハードウェアで発生するような、カウンタレジスタがバスの低16ビットと高16ビットを2段階で読み取る場合、カウンタビットが更新される間に値が変化する可能性があるため、カウンタの値が非常に不正確になるリスクがあります。</p>
+<p>クロックソースの壁時計の精度が不十分な場合、時間管理コードにはユーザーが見える時間のRTCクロックとの同期や、NTPを用いたネットワーク時間サーバーとの同期などのさまざまな特殊な処理やレイヤーがありますが、これらは基本的にクロックソースに対するオフセットを更新するだけです。これらの対策はクロックソース自体には影響を与えず、システムをクロックソースの欠点に合わせるだけです。</p>
+<p>クロックソース構造体は、提供されたカウンタを符号なしの64ビット数値（符号なしのロングロング）としてナノ秒値に変換する手段を提供する必要があります。この操作は非常に頻繁に呼び出される可能性があるため、厳密な数学的意味での計算は望ましくありません。代わりに、乗算とシフトという算術操作のみを使用して、ナノ秒値に最も近い値を取得します。そのため、clocksource_cyc2ns()では以下の式が見られます:</p>
+<blockquote>
+<div><p>ns ~= (clocksource * mult) &gt;&gt; shift</p>
+</div></blockquote>
+<p>クロックソースコードには、multとshift値を提供するのに役立つ複数のアシスタント関数が用意されています。例えばclocksource_khz2mult()やclocksource_hz2mult()は、固定されたシフト値からmultファクターを決定するのに役立ち、clocksource_register_hz()とclocksource_register_khz()はクロックソースの周波数を唯一の入力として、シフトとmultファクターの両方を割り当てるのに役立ちます。</p>
+<p>実際には、単純なクロックソースで1つのI/Oメモリ場所からアクセスされる場合でも、clocksource_mmio_init()という関数が用意されており、メモリ場所、ビット幅、レジスタ内のカウンタが増加するか減少するかを示すパラメータ、およびタイマクロックレートを指定することで、必要なすべてのパラメータを自動生成します。</p>
+<p>32ビットのカウンタで100MHzのクロックを使用すると、約43秒後にゼロに戻るため、クロックソースを処理するコードはこれを補正する必要があります。これが、クロックソース構造体に「mask」メンバ変数が含まれる理由です。このメンバ変数により、ソースのどのビットが有効かを示すため、時刻管理コードはカウンタがゼロに戻るタイミングを把握し、その周辺で補正コードを挿入することで、システムのタイムラインが単調増加になるようにします。</p>
+</section>
+<section id="clock-events">
+<h2>クロックイベント<a class="headerlink" href="#clock-events" title="この見出しへのパーマリンク">¶</a></h2>
+<p>クロックイベントは、クロックソースの概念的な逆です。クロックソースはカウンタをナノ秒値に変換するのに対し、クロックイベントは望ましい時間指定値を元に、ハードウェアタイマレジスタに書き込む値を計算します。</p>
+<p>クロックイベントはクロックソースとは独立しています。同じハードウェアとレジスタ範囲をクロックイベントで使用してもよいですが、本質的に異なる概念です。クロックイベントを駆動するハードウェアは割り込みを発生させる必要があります。SMPシステムでは、各CPUコアに割り当てられたタイマを用意するのが理想的で一般的です。これにより、各コアが他のコアに依存せずイベントを独立してトリガーできます。</p>
+<p>時刻イベントデバイスコードでは、カウンターをナノ秒に変換するためのmultとshift算術に基づいた基本的な考え方が採用されており、同様のヘルパーファンクションファミリが値の割り当てに再び見られます。ただし、時刻イベントドライバは「mask」属性を必要としません。システムは時刻イベントの時間ホライズンを超えたイベントを計画しようとはしません。</p>
+</section>
+<section id="sched-clock">
+<h2>sched_clock()<a class="headerlink" href="#sched-clock" title="この見出しへのパーマリンク">¶</a></h2>
+<p>クロックソースとクロックイベントに加えて、カーネルには特別な弱関数sched_clock()が存在します。この関数は、システム起動後からのナノ秒数を返します。アーキテクチャによってはsched_clock()の実装が提供される場合もあれば、されない場合もあります。ローカルの実装が提供されない場合、システムのジッフィーカウンターがsched_clock()として使用されます。</p>
+<p>名前の通り、sched_clock()はシステムのスケジューリングに使用され、たとえばCFSスケジューラにおいて特定のプロセスの絶対タイムスライスを決定します。また、bootchartsなどのタイム情報がprintkに含まれている場合のprintkタイムスタンプにも使用されます。</p>
+<p>クロックソースと比較して、sched_clock()は非常に高速である必要があります。特にスケジューラから頻繁に呼び出されるためです。正確性とクロックソースとのトレードオフが必要な場合、sched_clock()では正確性を犠牲にしても速度を優先することがあります。ただし、クロックソースと同様に単調性（monotonic）という基本的な特性が必要です。</p>
+<p>sched_clock()関数は符号なしのlong long境界、つまり64ビットを超えたときにのみラップします。これはナノ秒値であるため、約585年後にラップします。（ほとんどの実用システムでは「決して」起きません。）</p>
+<p>アーキテクチャがこの関数の実装を提供しない場合、ジッフィーを使用することになります。これにより最大分解能はアーキテクチャのジッフィー周波数の1/HZになります。これによりスケジューリングの正確性に影響を与え、システムベンチマークで顕著に現れる可能性があります。</p>
+<p>sched_clock()を駆動するクロックは、システムのスリープ中に停止したりゼロに戻ったりする可能性があります。これはスケジューリングイベントの処理には影響しませんが、
+<a class="reference internal" href="../core-api/printk-basics.html#c.printk" title="printk"><code class="xref c c-func docutils literal notranslate"><span class="pre">printk()</span></code></a>.</p>
+<p>sched_clock()関数はすべてのコンテキストで呼び出せる必要があります。IRQおよびNMI安全であり、すべてのコンテキストで健全な値を返す必要があります。</p>
+<p>一部のアーキテクチャでは、時間源が限定されたり、64ビットのナノ秒値を導出するための良いカウンターが存在しない場合があります。たとえばARMアーキテクチャでは、16ビットまたは32ビットのカウンターからsched_clock()ナノ秒ベースを提供する特別なヘルパーファンクションが作成されています。また、同じカウンターがクロックソースとして使用される場合でも、この目的で使用されることがあります。</p>
+<p>SMPシステムでは、sched_clock()が各CPUで独立して呼び出され、同期のパフォーマンスへの影響が生じないことがパフォーマンス上極めて重要です。一部のハードウェア（例：x86 TSC）では、システム内のCPU間でsched_clock()関数がずれることになります。その問題を回避するため、カーネルはCONFIG_HAVE_UNSTABLE_SCHED_CLOCKオプションを有効にすることで対処できます。これは、sched_clock()が通常のクロックソースと異なる点のもう一つの側面です。</p>
+</section>
+<section id="delay-timers-some-architectures-only">
+<h2>遅延タイマ（一部のアーキテクチャのみ）<a class="headerlink" href="#delay-timers-some-architectures-only" title="この見出しへのパーマリンク">¶</a></h2>
+<p>CPU周波数が変化するシステムでは、カーネルのさまざまなdelay()関数が時折不正確な挙動を示すことがあります。基本的にこれらの遅延は、ブート時に校正された「lpj」（jiffyごとのループ回数）値を使用したハードループによって、特定のjiffy分数の遅延を実現します。</p>
+<p>この値が校正される際、システムが最大周波数で動作していることを願いたいです。周波数がフル周波数の半分に低下した場合、任意のdelay()は2倍の時間がかかります。通常これは問題になりませんが、遅延をその分量以上要求する場合があります。 <em>またはより長い</em>。ただし、このようなシステムではセマンティクスが非常に予測不能です。</p>
+<p>タイマーベースの遅延が登場します。これにより、ハードコードされたループではなくタイマーリードを使用して、望ましい遅延を提供できます。</p>
+<p>これは、delay_timer構造体を宣言し、そのdelay timerに適した関数ポインタとレート設定を割り当てることで実現されます。</p>
+<p>これはOpenRISCやARMなどの一部のアーキテクチャで利用可能です。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">タイマ</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="highres.html">高解像度タイマーアンドダイナミックティック設計ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hpet.html">Linux用の高精度イベントタイマードライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hrtimers.html">hrtimers - 高解像度カーネルタイマーサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="no_hz.html">NO_HZ: スケジューリングクロックティックの削減</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">クロックソース、クロックイベント、sched_clock() およびディレイタイマ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="timers-howto.html">delays - 各種カーネルディレイ/スリープメカニズムに関する情報</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">タイマ</a><ul>
+<li>前へ: <a href="no_hz.html" title="前章">NO_HZ: スケジューリングクロックティックの削減</a></li>
+<li>次へ: <a href="timers-howto.html" title="次章">delays - 各種カーネルディレイ/スリープメカニズムに関する情報</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/timers/timekeeping.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

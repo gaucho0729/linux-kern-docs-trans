@@ -1,0 +1,324 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>LinuxのLZOデコンプレッサが理解するLZOストリーム形式 — Linux Kernelドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="remoteproc.html" rel="next" title="リモートプロセッサフレームワーク"/>
+<link href="crc32.html" rel="prev" title="CRC計算の簡単なチュートリアル"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="lzo-stream-format-as-understood-by-linux-s-lzo-decompressor">
+<h1>LinuxのLZOデコンプレッサーが理解するLZOストリーム形式<a class="headerlink" href="#lzo-stream-format-as-understood-by-linux-s-lzo-decompressor" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><p>これは仕様ではありません。LZOストリーム形式の仕様は公に公開されていないように見えます。このドキュメントは、Linuxカーネルに実装されたLZOデコンプレッサが理解する入力形式について説明しています。分析対象のファイルはlib/lzo/lzo1x_decompress_safe.cです。圧縮機や他の実装については分析は行われていませんが、形式が標準と一致している可能性が高いと考えられます。このドキュメントの目的は、コードの動作をよりよく理解し、今後のバグレポートに対するより効率的な修正を提案することです。</p>
+</div></blockquote>
+</section>
+<section id="description">
+<h2>説明<a class="headerlink" href="#description" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><p>ストリームは、複数の命令、オペランド、データから構成されています。命令は、オペコードを表す少数のビットと、その命令のオペランドを形成するビットからなり、オペコードや前命令でコピーされたリテラルの数に応じてサイズや位置が異なります。オペランドは以下の情報を示します：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>辞書（過去の出力バッファ）からデータをコピーする際の距離</p></li>
+<li><p>辞書からコピーするバイト数（長さ）</p></li>
+<li><p>コピーするリテラルの数。これは次の命令のために保持される情報として変数「state」に保持されます。</p></li>
+</ul>
+</div></blockquote>
+<p>オペコードとオペランドに応じて、追加データが続くことがあります。これらの追加データは、オペランドの補足（例: 大きな値で符号化された長さまたは距離）であるか、出力バッファにコピーされるリテラルである可能性があります。</p>
+<p>ブロックの最初のバイトは、他のバイトとは異なる符号化方式を使用しており、そのバイト以前には辞書が存在しないため、リテラルの使用に最適化されているように見えます。</p>
+<p>長さは常にオペランド内の少数のビットから始まる可変長で符号化されます。ビット数が長さを表すのに不十分な場合、最大で255の割合で1バイトごとに追加して、最大で255:1の圧縮率を達成できません。#bitsを使用した可変長符号化は常に同じです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>length = byte &amp; ((1 &lt;&lt; #bits) - 1)
+if (!length) {
+        length = ((1 &lt;&lt; #bits) - 1)
+        length += 255*(number of zero bytes)
+        length += first-non-zero-byte
+}
+length += constant (generally 2 or 3)
+</pre></div>
+</div>
+<p>辞書への参照では、距離は出力ポインタに対して相対的です。距離は特定の範囲に属する少数のビットで符号化され、これにより複数のコピー命令が異なる符号化方式を使用するようになります。一部の符号化方式では1つの追加バイトが使用され、他の場合は2つの追加バイトがリトルエンディアン16ビット量を形成します（下記でLE16とマークされます）。</p>
+<p>大文字のコピー以外のすべての指示において、次の指示を開始する前に0、1、2、または3つのリテラルがコピーされます。コピーされたリテラルの数は次の指示の意味や動作に影響を与える可能性があります。実際には、0、4未満、または4以上がコピーされたかを知る必要があるのは1つの指示だけです。これはこの実装における&lt;state&gt;変数に保存されている情報です。このリテラルの数は通常、指令の最後の2ビットに符号化されますが、場合によっては追加のオペランド（例：距離）の最後の2ビットからも取得できます。</p>
+<p>距離0のブロックコピーが見られるとストリームの終わりと宣言されます。この距離（0001HLLL）を符号化する指示は1つだけ存在し、距離には1つのLE16オペランドが必要なので3バイトが必要です。</p>
+<div class="admonition important">
+<p class="admonition-title">重要です。</p>
+<p>コード内では一部の長さのチェックが抜けている場合があります。これは、解析前にすでに確保されているバイト数に基づいて特定の指示が呼び出されるためです。それらは追加のバイトを消費した場合にのみ、このクレジットを補填する必要があります。これはアルゴリズムや符号化とは無関係な実装設計の選択肢です。</p>
+</div>
+</div></blockquote>
+<p>バージョン</p>
+<p>0: オリジナルバージョン 1: LZO-RLE</p>
+<p>LZOバージョン1はゼロの連続をランレングス符号化で符号化する拡張機能を実装しています。これはzramでよく見られるゼロが多いデータの処理速度を向上させます。これは後方互換性を保ちながらビットストリームを変更します（v1はv0で圧縮されたデータを正しく復号化できますが、v0はv1のデータを読み込めません）。</p>
+<p>最大の互換性を確保するため、両方のバージョンは異なる名前（lzoとlzo-rle）で利用可能です。このドキュメントでは、符号化の違いはバージョン1のみなど、例を挙げて記載しています。</p>
+</section>
+<section id="byte-sequences">
+<h2>バイトシーケンス<a class="headerlink" href="#byte-sequences" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><p>最初のバイトの符号化:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>0..16   : follow regular instruction encoding, see below. It is worth
+          noting that code 16 will represent a block copy from the
+          dictionary which is empty, and that it will always be
+          invalid at this place.
+
+17      : bitstream version. If the first byte is 17, and compressed
+          stream length is at least 5 bytes (length of shortest possible
+          versioned bitstream), the next byte gives the bitstream version
+          (version 1 only).
+          Otherwise, the bitstream version is 0.
+
+18..21  : copy 0..3 literals
+          state = (byte - 17) = 0..3  [ copy &lt;state&gt; literals ]
+          skip byte
+
+22..255 : copy literal string
+          length = (byte - 17) = 4..238
+          state = 4 [ don't copy extra literals ]
+          skip byte
+</pre></div>
+</div>
+<p>インストラクションの符号化:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>0 0 0 0 X X X X  (0..15)
+  Depends on the number of literals copied by the last instruction.
+  If last instruction did not copy any literal (state == 0), this
+  encoding will be a copy of 4 or more literal, and must be interpreted
+  like this :
+
+     0 0 0 0 L L L L  (0..15)  : copy long literal string
+     length = 3 + (L ?: 15 + (zero_bytes * 255) + non_zero_byte)
+     state = 4  (no extra literals are copied)
+
+  If last instruction used to copy between 1 to 3 literals (encoded in
+  the instruction's opcode or distance), the instruction is a copy of a
+  2-byte block from the dictionary within a 1kB distance. It is worth
+  noting that this instruction provides little savings since it uses 2
+  bytes to encode a copy of 2 other bytes but it encodes the number of
+  following literals for free. It must be interpreted like this :
+
+     0 0 0 0 D D S S  (0..15)  : copy 2 bytes from &lt;= 1kB distance
+     length = 2
+     state = S (copy S literals after this block)
+   Always followed by exactly one byte : H H H H H H H H
+     distance = (H &lt;&lt; 2) + D + 1
+
+  If last instruction used to copy 4 or more literals (as detected by
+  state == 4), the instruction becomes a copy of a 3-byte block from the
+  dictionary from a 2..3kB distance, and must be interpreted like this :
+
+     0 0 0 0 D D S S  (0..15)  : copy 3 bytes from 2..3 kB distance
+     length = 3
+     state = S (copy S literals after this block)
+   Always followed by exactly one byte : H H H H H H H H
+     distance = (H &lt;&lt; 2) + D + 2049
+
+0 0 0 1 H L L L  (16..31)
+     Copy of a block within 16..48kB distance (preferably less than 10B)
+     length = 2 + (L ?: 7 + (zero_bytes * 255) + non_zero_byte)
+  Always followed by exactly one LE16 :  D D D D D D D D : D D D D D D S S
+     distance = 16384 + (H &lt;&lt; 14) + D
+     state = S (copy S literals after this block)
+     End of stream is reached if distance == 16384
+     In version 1 only, to prevent ambiguity with the RLE case when
+     ((distance &amp; 0x803f) == 0x803f) &amp;&amp; (261 &lt;= length &lt;= 264), the
+     compressor must not emit block copies where distance and length
+     meet these conditions.
+
+  In version 1 only, this instruction is also used to encode a run of
+     zeros if distance = 0xbfff, i.e. H = 1 and the D bits are all 1.
+     In this case, it is followed by a fourth byte, X.
+     run length = ((X &lt;&lt; 3) | (0 0 0 0 0 L L L)) + 4
+
+0 0 1 L L L L L  (32..63)
+     Copy of small block within 16kB distance (preferably less than 34B)
+     length = 2 + (L ?: 31 + (zero_bytes * 255) + non_zero_byte)
+  Always followed by exactly one LE16 :  D D D D D D D D : D D D D D D S S
+     distance = D + 1
+     state = S (copy S literals after this block)
+
+0 1 L D D D S S  (64..127)
+     Copy 3-4 bytes from block within 2kB distance
+     state = S (copy S literals after this block)
+     length = 3 + L
+   Always followed by exactly one byte : H H H H H H H H
+     distance = (H &lt;&lt; 3) + D + 1
+
+1 L L D D D S S  (128..255)
+     Copy 5-8 bytes from block within 2kB distance
+     state = S (copy S literals after this block)
+     length = 5 + L
+   Always followed by exactly one byte : H H H H H H H H
+     distance = (H &lt;&lt; 3) + D + 1
+</pre></div>
+</div>
+</div></blockquote>
+</section>
+<section id="authors">
+<h2>著者<a class="headerlink" href="#authors" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><p>このドキュメントはWilly Tarreau &lt;<a class="reference external" href="mailto:w%401wt.eu">w<span>@</span>1wt<span>.</span>eu</a>&gt; が2014/07/19にLinux 3.16-rc5に含まれる復号化コードを分析中に作成し、Dave Rodgman &lt;<a class="reference external" href="mailto:dave.rodgman%40arm.com">dave<span>.</span>rodgman<span>@</span>arm<span>.</span>com</a>&gt; が2018/10/30にランレングス符号化を導入するために更新しました。コードは複雑で、このドキュメントに誤りがある可能性や一部のエッジケースが見落とされている可能性があります。いずれにしても、疑問点や修正、提案された更新があれば著者に報告してください。</p>
+</div></blockquote>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">未整理のドキュメンテーション</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="crc32.html">CRC計算の簡単なチュートリアル</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">LinuxのLZOデコンプレッサーが理解するLZOストリーム形式</a></li>
+<li class="toctree-l2"><a class="reference internal" href="remoteproc.html">リモートプロセッサフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rpmsg.html">リモートプロセッサメッセージ(rpmsg)フレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="speculation.html">スペキュレーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="speculation.html#mitigating-speculation-side-channels">スペキュレーション側チャネルの緩和</a></li>
+<li class="toctree-l2"><a class="reference internal" href="static-keys.html">スタティックキー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tee.html">TEEサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xz.html">LinuxにおけるXZデータ圧縮</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">未整理のドキュメンテーション</a><ul>
+<li>前へ: <a href="crc32.html" title="前章">CRC計算の簡単なチュートリアル</a></li>
+<li>次へ: <a href="remoteproc.html" title="次章">リモートプロセッサフレームワーク</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/staging/lzo.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

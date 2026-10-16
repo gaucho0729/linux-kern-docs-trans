@@ -1,0 +1,435 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Static Keys — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="tee.html" rel="next" title="TEEサブシステム"/>
+<link href="speculation.html" rel="prev" title="スペキュレーション"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="static-keys">
+<h1>スタティックキー<a class="headerlink" href="#static-keys" title="この見出しへのパーマリンク">¶</a></h1>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p>非推奨のAPI:</p>
+<p>‘struct static_key’の直接的な使用は現在非推奨とされています。また、static_key_{true,false}()も同様に非推奨とされています。つまり、以下のコードは使用しないでください:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct static_key false = STATIC_KEY_INIT_FALSE;
+struct static_key true = STATIC_KEY_INIT_TRUE;
+static_key_true()
+static_key_false()
+</pre></div>
+</div>
+<p>更新されたAPIの置き換えは以下の通りです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>DEFINE_STATIC_KEY_TRUE(key);
+DEFINE_STATIC_KEY_FALSE(key);
+DEFINE_STATIC_KEY_ARRAY_TRUE(keys, count);
+DEFINE_STATIC_KEY_ARRAY_FALSE(keys, count);
+static_branch_likely()
+static_branch_unlikely()
+</pre></div>
+</div>
+</div>
+<section id="abstract">
+<h2>要約<a class="headerlink" href="#abstract" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Static keysは、GCCの機能とコードパッチング技術を活用して、パフォーマンスに敏感な高速パスのカーネルコードにまれに使用される機能を含めることができます。簡単な例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>DEFINE_STATIC_KEY_FALSE(key);
+
+...
+
+if (static_branch_unlikely(&amp;key))
+        do unlikely code
+else
+        do likely code
+
+...
+static_branch_enable(&amp;key);
+...
+static_branch_disable(&amp;key);
+...
+</pre></div>
+</div>
+<p>static_branch_unlikely()ブランチは、likelyなコードパスへの影響をできるだけ最小限に抑えながらコードに生成されます。</p>
+</section>
+<section id="motivation">
+<h2>動機<a class="headerlink" href="#motivation" title="この見出しへのパーマリンク">¶</a></h2>
+<p>現在、トレースポイントは条件分岐を用いて実装されています。条件チェックには各トレースポイントごとにグローバル変数を確認する必要があります。このチェックのオーバーヘッドは小さなものですが、メモリキャッシュが負担を受けると（これらのグローバル変数のメモリキャッシュラインが他のメモリアクセスと共有される可能性があるため）、オーバーヘッドが増加します。カーネル内のトレースポイント数を増やすにつれてこのオーバーヘッドが問題になる可能性があります。さらに、トレースポイントはしばしば非活性（無効）状態であり、直接のカーネル機能を提供しません。そのため、トレースポイントの影響をできるだけ減らすことが極めて望ましいです。トレースポイントがこの作業の元来の動機であるにもかかわらず、他のカーネルコードパスもstatic keysの機能を活用できるようにする必要があります。</p>
+</section>
+<section id="solution">
+<h2>解決策<a class="headerlink" href="#solution" title="この見出しへのパーマリンク">¶</a></h2>
+<p>gcc (v4.5)は新しい‘asm goto’ステートメントを追加し、ラベルへのジャンプを可能にします:</p>
+<p><a class="reference external" href="https://gcc.gnu.org/ml/gcc-patches/2009-07/msg01556.html">https://gcc.gnu.org/ml/gcc-patches/2009-07/msg01556.html</a></p>
+<p>‘asm goto’を用いることで、メモリの確認を必要とせずにデフォルトでジャンプされるか、ジャンプされない分岐を作成できます。その後、実行時において、分岐ポイントをパッチングして分岐方向を変更できます。</p>
+<p>例えば、以下のような単純な分岐があり、デフォルトでは無効になっています:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>if (static_branch_unlikely(&amp;key))
+        printk("I am the true branch\n");
+</pre></div>
+</div>
+<p>そのため、デフォルトでは‘printk’は出力されません。生成されるコードは、ストレートラインコードパスに単一のアトミックな‘no-op’命令（x86では5バイト）が含まれます。分岐が‘flipped’（反転）されると、ストレートラインコードパスの‘no-op’を‘jump’命令に置き換えて、オフラインの真の分岐先にジャンプします。つまり、分岐方向の変更にはコストがかかるものの、分岐選択は基本的に‘無料’です。これがこの最適化の基本的なトレードオフです。</p>
+<p>この低レベルのパッチングメカニズムは‘jump label patching’と呼ばれ、static keysの機能の基盤となります。</p>
+</section>
+<section id="static-key-label-api-usage-and-examples">
+<h2>Static key label API、使用方法および例<a class="headerlink" href="#static-key-label-api-usage-and-examples" title="この見出しへのパーマリンク">¶</a></h2>
+<p>この最適化を活用するにはまずキーパラメータを定義する必要があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>DEFINE_STATIC_KEY_TRUE(key);
+</pre></div>
+</div>
+<p>または:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>DEFINE_STATIC_KEY_FALSE(key);
+</pre></div>
+</div>
+<p>キーパラメータはグローバルでなければなりません。つまり、スタック上に割り当てられたり、実行時において動的に割り当てられたりすることはできません。</p>
+<p>キーパラメータはコード内で以下のように使用されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>if (static_branch_unlikely(&amp;key))
+        do unlikely code
+else
+        do likely code
+</pre></div>
+</div>
+<p>または：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>if (static_branch_likely(&amp;key))
+        do likely code
+else
+        do unlikely code
+</pre></div>
+</div>
+<p>DEFINE_STATIC_KEY_TRUE() または DEFINE_STATIC_KEY_FALSE で定義されたキーは、static_branch_likely() または static_branch_unlikely() のステートメントで使用可能です。</p>
+<p>ブランチは以下の方法で true に設定できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static_branch_enable(&amp;key);
+</pre></div>
+</div>
+<p>または false に設定できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static_branch_disable(&amp;key);
+</pre></div>
+</div>
+<p>その後、参照カウントを介してブランチを切り替えることができます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static_branch_inc(&amp;key);
+...
+static_branch_dec(&amp;key);
+</pre></div>
+</div>
+<p>したがって、「static_branch_inc()」は「ブランチをtrueにする」を、「static_branch_dec()」は「ブランチをfalseにする」を表し、適切な参照カウント管理を行います。例えば、キーが初期化時にtrueの場合、static_branch_dec()はブランチをfalseに切り替え、その後のstatic_branch_inc()は再びtrueに戻します。同様に、キーが初期化時にfalseの場合、static_branch_inc()はブランチをtrueに変更し、その後のstaticのstatic_branch_dec()は再びfalseに戻します。</p>
+<p>ブランチの状態と参照カウントは「static_key_enabled()」および「static_key_count()」で取得可能です。一般的に、これらの関数を使用する際は、有効/無効化や増減操作の関数で使用されるmutexと同じmutexで保護する必要があります。</p>
+<p>ブランチの切り替えはいくつかのロックを取得することを引き起こします。特にCPUホットプラグロック（CPUがカーネルに追加される際の競合を防ぐため）が含まれます。したがって、ホットプラグノティファイア内から静的キーAPIを呼び出すことは確実なデッドロックの原因になります。この機能を依然として使用可能にするため、以下の関数が提供されています:</p>
+<blockquote>
+<div><p>static_key_enable_cpuslocked() static_key_disable_cpuslocked() static_branch_enable_cpuslocked() static_branch_disable_cpuslocked()</p>
+</div></blockquote>
+<p>これらは <em>ではありません</em> 汎用的な関数であり、本当に上記のコンテキスト内でかつ他のコンテキストと競合しない状況でのみ使用すべきです。</p>
+<p>配列形式のキーが必要な場合は、以下のように定義できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>DEFINE_STATIC_KEY_ARRAY_TRUE(keys, count);
+</pre></div>
+</div>
+<p>または:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>DEFINE_STATIC_KEY_ARRAY_FALSE(keys, count);
+</pre></div>
+</div>
+<ol class="arabic simple" start="4">
+<li><p>アーキテクチャレベルのコードパッチングインターフェース、「ジャンプラベル」</p></li>
+</ol>
+<p>この最適化を活用するため、アーキテクチャではいくつかの関数とマクロを実装する必要があります。アーキテクチャサポートがなければ、従来のロード、テスト、ジャンプのシーケンスにフォールバックします。また、struct jump_entryテーブルは少なくとも4バイトアライメントが必要です。これはstatic_key-&gt;entryフィールドが2つの最下位ビットを用いるためです。</p>
+<ul class="simple">
+<li><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">select</span> <span class="pre">HAVE_ARCH_JUMP_LABEL</span></code>,</dt><dd><p>参照: arch/x86/Kconfig</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">#define</span> <span class="pre">JUMP_LABEL_NOP_SIZE</span></code>,</dt><dd><p>参照: arch/x86/include/asm/jump_label.h</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">__always_inline</span> <span class="pre">bool</span> <span class="pre">arch_static_branch(struct</span> <span class="pre">static_key</span> <span class="pre">*key,</span> <span class="pre">bool</span> <span class="pre">branch)</span></code>,</dt><dd><p>参照: arch/x86/include/asm/jump_label.h</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">__always_inline</span> <span class="pre">bool</span> <span class="pre">arch_static_branch_jump(struct</span> <span class="pre">static_key</span> <span class="pre">*key,</span> <span class="pre">bool</span> <span class="pre">branch)</span></code>,</dt><dd><p>参照: arch/x86/include/asm/jump_label.h</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">arch_jump_label_transform(struct</span> <span class="pre">jump_entry</span> <span class="pre">*entry,</span> <span class="pre">enum</span> <span class="pre">jump_label_type</span> <span class="pre">type)</span></code>,</dt><dd><p>参照: arch/x86/kernel/jump_label.c</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">__init_or_module</span> <span class="pre">void</span> <span class="pre">arch_jump_label_transform_static(struct</span> <span class="pre">jump_entry</span> <span class="pre">*entry,</span> <span class="pre">enum</span> <span class="pre">jump_label_type</span> <span class="pre">type)</span></code>,</dt><dd><p>参照: arch/x86/kernel/jump_label.c</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">jump_entry</span></code>,</dt><dd><p>参照: arch/x86/include/asm/jump_label.h</p>
+</dd>
+</dl>
+</li>
+</ul>
+<ol class="arabic simple" start="5">
+<li><p>静的キー / ジャンプラベル分析結果（x86_64）:</p></li>
+</ol>
+<p>例として、getppid()に以下のブランチを追加し、システムコールが以下のようになる場合を考えます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>SYSCALL_DEFINE0(getppid)
+{
+      int pid;
+
++     if (static_branch_unlikely(&amp;key))
++             printk("I am the true branch\n");
+
+      rcu_read_lock();
+      pid = task_tgid_vnr(rcu_dereference(current-&gt;real_parent));
+      rcu_read_unlock();
+
+      return pid;
+}
+</pre></div>
+</div>
+<p>GCCが生成するジャンプラベルによる結果指令は以下の通りです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>ffffffff81044290 &lt;sys_getppid&gt;:
+ffffffff81044290:       55                      push   %rbp
+ffffffff81044291:       48 89 e5                mov    %rsp,%rbp
+ffffffff81044294:       e9 00 00 00 00          jmpq   ffffffff81044299 &lt;sys_getppid+0x9&gt;
+ffffffff81044299:       65 48 8b 04 25 c0 b6    mov    %gs:0xb6c0,%rax
+ffffffff810442a0:       00 00
+ffffffff810442a2:       48 8b 80 80 02 00 00    mov    0x280(%rax),%rax
+ffffffff810442a9:       48 8b 80 b0 02 00 00    mov    0x2b0(%rax),%rax
+ffffffff810442b0:       48 8b b8 e8 02 00 00    mov    0x2e8(%rax),%rdi
+ffffffff810442b7:       e8 f4 d9 00 00          callq  ffffffff81051cb0 &lt;pid_vnr&gt;
+ffffffff810442bc:       5d                      pop    %rbp
+ffffffff810442bd:       48 98                   cltq
+ffffffff810442bf:       c3                      retq
+ffffffff810442c0:       48 c7 c7 e3 54 98 81    mov    $0xffffffff819854e3,%rdi
+ffffffff810442c7:       31 c0                   xor    %eax,%eax
+ffffffff810442c9:       e8 71 13 6d 00          callq  ffffffff8171563f &lt;printk&gt;
+ffffffff810442ce:       eb c9                   jmp    ffffffff81044299 &lt;sys_getppid+0x9&gt;
+</pre></div>
+</div>
+<p>ジャンプラベル最適化を行わない場合の結果は以下の通りです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>ffffffff810441f0 &lt;sys_getppid&gt;:
+ffffffff810441f0:       8b 05 8a 52 d8 00       mov    0xd8528a(%rip),%eax        # ffffffff81dc9480 &lt;key&gt;
+ffffffff810441f6:       55                      push   %rbp
+ffffffff810441f7:       48 89 e5                mov    %rsp,%rbp
+ffffffff810441fa:       85 c0                   test   %eax,%eax
+ffffffff810441fc:       75 27                   jne    ffffffff81044225 &lt;sys_getppid+0x35&gt;
+ffffffff810441fe:       65 48 8b 04 25 c0 b6    mov    %gs:0xb6c0,%rax
+ffffffff81044205:       00 00
+ffffffff81044207:       48 8b 80 80 02 00 00    mov    0x280(%rax),%rax
+ffffffff8104420e:       48 8b 80 b0 02 00 00    mov    0x2b0(%rax),%rax
+ffffffff81044215:       48 8b b8 e8 02 00 00    mov    0x2e8(%rax),%rdi
+ffffffff8104421c:       e8 2f da 00 00          callq  ffffffff81051c50 &lt;pid_vnr&gt;
+ffffffff81044221:       5d                      pop    %rbp
+ffffffff81044222:       48 98                   cltq
+ffffffff81044224:       c3                      retq
+ffffffff81044225:       48 c7 c7 13 53 98 81    mov    $0xffffffff81985313,%rdi
+ffffffff8104422c:       31 c0                   xor    %eax,%eax
+ffffffff8104422e:       e8 60 0f 6d 00          callq  ffffffff81715193 &lt;printk&gt;
+ffffffff81044233:       eb c9                   jmp    ffffffff810441fe &lt;sys_getppid+0xe&gt;
+ffffffff81044235:       66 66 2e 0f 1f 84 00    data32 nopw %cs:0x0(%rax,%rax,1)
+ffffffff8104423c:       00 00 00 00
+</pre></div>
+</div>
+<p>したがって、ジャンプラベル無効のケースでは「mov」「test」「jne」の3つの命令が追加されるのに対し、ジャンプラベル有効のケースでは「no-op（無操作命令）」または「jmp 0（ジャンプ先0）」が使用される。(「jmp 0」は起動時に5バイトのアトミックなno-op命令にパッチされる。) したがって、ジャンプラベル無効のケースでは以下のようになる:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>6 (mov) + 2 (test) + 2 (jne) = 10 - 5 (5 byte jump 0) = 5 addition bytes.
+</pre></div>
+</div>
+<p>パディングバイトを含めると、ジャンプラベルコードはこの小さな関数に対して合計16バイトの指令メモリを節約する。この場合、ジャンプラベルを用いない関数は80バイトの長さであるため、指令フットプリントの20%を節約できた。さらに改善が可能である。なぜなら、5バイトのno-opは2バイトのno-opに実質的に置き換えられるからである。2バイトのjmpで分岐先に到達できるためだ。ただし、現在は最適なno-opサイズの実装がされていない(現在はハードコードされている)。</p>
+<p>スケジューラパスに静的キーアプリケーションAPIが複数存在するため、「pipe-test」(別名「perf bench sched pipe」)はパフォーマンス改善を示すために使用できる。3.3.0-rc2で実施したテスト結果:</p>
+<p>ジャンプラベル無効:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Performance counter stats for 'bash -c /tmp/pipe-test' (50 runs):
+
+       855.700314 task-clock                #    0.534 CPUs utilized            ( +-  0.11% )
+          200,003 context-switches          #    0.234 M/sec                    ( +-  0.00% )
+                0 CPU-migrations            #    0.000 M/sec                    ( +- 39.58% )
+              487 page-faults               #    0.001 M/sec                    ( +-  0.02% )
+    1,474,374,262 cycles                    #    1.723 GHz                      ( +-  0.17% )
+  &lt;not supported&gt; stalled-cycles-frontend
+  &lt;not supported&gt; stalled-cycles-backend
+    1,178,049,567 instructions              #    0.80  insns per cycle          ( +-  0.06% )
+      208,368,926 branches                  #  243.507 M/sec                    ( +-  0.06% )
+        5,569,188 branch-misses             #    2.67% of all branches          ( +-  0.54% )
+
+      1.601607384 seconds time elapsed                                          ( +-  0.07% )
+</pre></div>
+</div>
+<p>ジャンプラベル有効:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Performance counter stats for 'bash -c /tmp/pipe-test' (50 runs):
+
+       841.043185 task-clock                #    0.533 CPUs utilized            ( +-  0.12% )
+          200,004 context-switches          #    0.238 M/sec                    ( +-  0.00% )
+                0 CPU-migrations            #    0.000 M/sec                    ( +- 40.87% )
+              487 page-faults               #    0.001 M/sec                    ( +-  0.05% )
+    1,432,559,428 cycles                    #    1.703 GHz                      ( +-  0.18% )
+  &lt;not supported&gt; stalled-cycles-frontend
+  &lt;not supported&gt; stalled-cycles-backend
+    1,175,363,994 instructions              #    0.82  insns per cycle          ( +-  0.04% )
+      206,859,359 branches                  #  245.956 M/sec                    ( +-  0.04% )
+        4,884,119 branch-misses             #    2.36% of all branches          ( +-  0.85% )
+
+      1.579384366 seconds time elapsed
+</pre></div>
+</div>
+<p>分岐の節約率は0.7%で、分岐ミス（branch-misses）では12%の節約を達成した。これは分岐数を減らすというこの最適化の目的で最も大きな節約を期待できる場所である。さらに、指令では0.2%、サイクルでは2.8%、経過時間では1.4%の節約を達成した。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">未整理のドキュメンテーション</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="crc32.html">CRC計算の簡単なチュートリアル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lzo.html">LinuxのLZOデコンプレッサーが理解するLZOストリーム形式</a></li>
+<li class="toctree-l2"><a class="reference internal" href="remoteproc.html">リモートプロセッサフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rpmsg.html">リモートプロセッサメッセージ(rpmsg)フレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="speculation.html">スペキュレーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="speculation.html#mitigating-speculation-side-channels">スペキュレーション側チャネルの緩和</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">スタティックキー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tee.html">TEEサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xz.html">LinuxにおけるXZデータ圧縮</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">未整理のドキュメンテーション</a><ul>
+<li>前へ: <a href="speculation.html" title="前章">スペキュレーション</a></li>
+<li>次へ: <a href="tee.html" title="次章">TEEサブシステム</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/staging/static-keys.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

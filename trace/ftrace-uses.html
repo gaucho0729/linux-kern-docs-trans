@@ -1,0 +1,343 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>ftraceを使用して関数に接続 — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="kprobes.html" rel="next" title="カーネルプローブ（Kprobes）"/>
+<link href="ftrace.html" rel="prev" title="ftrace - 関数トレーサー"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="using-ftrace-to-hook-to-functions">
+<h1>ftraceを用いた関数へのフック<a class="headerlink" href="#using-ftrace-to-hook-to-functions" title="この見出しへのパーマリンク">¶</a></h1>
+<p>対象バージョン: 4.14</p>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ftraceインフラストラクチャは、カーネルの関数の開始部分にコールバックをアタッチしてフローを記録・トレースするためのものとして最初に作成されました。ただし、関数の開始にコールバックを追加する用途は他にもあります。ライブカーネルパッチングやセキュリティモニタリングなどです。このドキュメントでは、ftraceを使用して独自の関数コールバックを実装する方法について説明します。</p>
+</section>
+<section id="the-ftrace-context">
+<h2>ftraceのコンテキスト<a class="headerlink" href="#the-ftrace-context" title="この見出しへのパーマリンク">¶</a></h2>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p>カーネル内のほぼすべての関数にコールバックを追加できる機能にはリスクがあります。コールバックは、通常コンテキスト、softirq、irq、NMIなど、任意のコンテキストから呼び出される可能性があります。また、アイドル状態に入る直前やCPUの起動・停止中、ユーザースペースに移行する際にも呼び出されることがあります。これにより、コールバック内で実行できる処理には特別な注意が必要です。RCUの保護範囲外で呼び出される可能性があります。</p>
+</div>
+<p>ftraceインフラストラクチャには再帰やRCUに対する保護がありますが、それでもコールバックの使用方法に非常に注意する必要があります。</p>
+</section>
+<section id="the-ftrace-ops-structure">
+<h2>ftrace_ops構造体<a class="headerlink" href="#the-ftrace-ops-structure" title="この見出しへのパーマリンク">¶</a></h2>
+<p>関数コールバックを登録するにはftrace_opsが必要です。この構造体はftraceにどの関数をコールバックとして呼び出すかを伝えるだけでなく、コールバックが実行する保護処理を指定し、ftraceが処理する必要がないことを示します。</p>
+<p>ftrace_opsをftraceに登録する際には、設定する必要があるフィールドは1つだけです:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">struct</span><span class="w"> </span><span class="nc">ftrace_ops</span><span class="w"> </span><span class="n">ops</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">      </span><span class="p">.</span><span class="n">func</span><span class="w">                    </span><span class="o">=</span><span class="w"> </span><span class="n">my_callback_func</span><span class="p">,</span><span class="w"></span>
+<span class="w">      </span><span class="p">.</span><span class="n">flags</span><span class="w">                   </span><span class="o">=</span><span class="w"> </span><span class="n">MY_FTRACE_FLAGS</span><span class="w"></span>
+<span class="w">      </span><span class="p">.</span><span class="n">private</span><span class="w">                 </span><span class="o">=</span><span class="w"> </span><span class="n">any_private_data_structure</span><span class="p">,</span><span class="w"></span>
+<span class="p">};</span><span class="w"></span>
+</pre></div>
+</div>
+<p>.flagsと.privateはどちらもオプションです。.funcのみが必須です。</p>
+<p>トレースを有効にするには以下を呼び出します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>register_ftrace_function(&amp;ops);
+</pre></div>
+</div>
+<p>トレースを無効にするには以下を呼び出します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>unregister_ftrace_function(&amp;ops);
+</pre></div>
+</div>
+<p>上記は以下のヘッダーファイルをインクルードすることで定義されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/ftrace.h&gt;
+</pre></div>
+</div>
+<p>登録されたコールバックはregister_ftrace_function()が呼ばれた後で、その関数が返る前に開始されます。コールバックが開始される正確なタイミングはアーキテクチャとサービスのスケジューリングに依存します。コールバック自体は、正確なタイミングで実行する必要がある場合、同期処理を担当する必要があります。</p>
+<p>unregister_ftrace_function()は、その関数がコールバックを呼び出さなくなることを保証します。注意点として、この保証を実行するためにunregister_ftrace_function()は時間がかかる場合があります。</p>
+</section>
+<section id="the-callback-function">
+<h2>コールバック関数<a class="headerlink" href="#the-callback-function" title="この見出しへのパーマリンク">¶</a></h2>
+<p>コールバック関数のプロトタイプは以下の通りです（v4.14以降）:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="kt">void</span><span class="w"> </span><span class="nf">callback_func</span><span class="p">(</span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">ip</span><span class="p">,</span><span class="w"> </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">parent_ip</span><span class="p">,</span><span class="w"></span>
+<span class="w">                   </span><span class="k">struct</span><span class="w"> </span><span class="nc">ftrace_ops</span><span class="w"> </span><span class="o">*</span><span class="n">op</span><span class="p">,</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">pt_regs</span><span class="w"> </span><span class="o">*</span><span class="n">regs</span><span class="p">);</span><span class="w"></span>
+</pre></div>
+</div>
+<dl class="simple">
+<dt>@ip</dt><dd><p>これはトレース対象の関数のインストラクションポインタです（fentryまたはmcountが含まれる関数内）。</p>
+</dd>
+<dt>@parent_ip</dt><dd><p>これはトレース対象の関数を呼び出した関数のインストラクションポインタです（関数呼び出しが行われた場所）。</p>
+</dd>
+<dt>@op</dt><dd><p>このポインタは、コールバックを登録するために使用されたftrace_opsへのポインタです。このポインタは、コールバックにデータを渡すためにプライベートポインタを通じて使用できます。</p>
+</dd>
+<dt>@regs</dt><dd><p>ftrace_ops構造体にFTRACE_OPS_FL_SAVE_REGSまたはFTRACE_OPS_FL_SAVE_REGS_IF_SUPPORTEDフラグが設定されている場合、これはpt_regs構造体を指すことがあり、関数の開始位置にブレイクポイントが設定されている場合と同じように動作します。それ以外の場合、これは無効な値またはNULLを指しています。</p>
+</dd>
+</dl>
+</section>
+<section id="the-ftrace-flags">
+<h2>ftraceのフラグ<a class="headerlink" href="#the-ftrace-flags" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ftrace_opsフラグはすべてinclude/linux/ftrace.hで定義され、ドキュメントされています。一部のフラグはftraceの内部インフラストラクチャに使用されるものですが、ユーザーが意識すべきフラグは以下の通りです。</p>
+<dl>
+<dt>FTRACE_OPS_FL_SAVE_REGS</dt><dd><p>コールバックがpt_regsを読み取るか変更する必要がある場合、このフラグを設定する必要があります。このフラグを設定してftrace_opsを登録したアーキテクチャがpt_regsをコールバックに渡すことをサポートしない場合、登録は失敗します。</p>
+</dd>
+<dt>FTRACE_OPS_FL_SAVE_REGS_IF_SUPPORTED</dt><dd><p>SAVE_REGSと似ていますが、このフラグを設定した場合、アーキテクチャがregsを渡すことをサポートしない場合でもftrace_opsの登録は失敗しません。ただし、コールバックはregsがNULLかどうかを確認して、アーキテクチャがサポートしているかを判断する必要があります。</p>
+</dd>
+<dt>FTRACE_OPS_FL_RECURSION_SAFE</dt><dd><p>デフォルトでは、コールバックの周りにラッパーが追加され、関数の再帰が発生しないようにします。つまり、コールバックの実行結果として呼び出される関数がトレースされている場合でも、ftraceはコールバックが再度呼び出されることを防ぎます。ただし、このラッパーはオーバーヘッドを追加するため、コールバックが再帰安全である場合、このフラグを設定してftraceの保護を無効にできます。</p>
+<p>注意：このフラグが設定されており、再帰が発生した場合、システムがクラッシュし、三重フェールトにより再起動する可能性があります。</p>
+<p>他のコールバックが再帰安全のコールバックによって呼び出される関数をトレースしても問題ありません。再帰安全なコールバックは、自身またはそのネストされた関数が呼び出す関数をトレースしてはなりません。</p>
+<p>このフラグが設定されている場合、プリエンプションが有効になっている状態でコールバックが呼び出される可能性があります（CONFIG_PREEMPTIONが設定されている場合）。ただし、これは保証されたものではありません。</p>
+</dd>
+<dt>FTRACE_OPS_FL_IPMODIFY</dt><dd><p>FTRACE_OPS_FL_SAVE_REGSを設定する必要があります。コールバックが「トレースされる関数をハッキング」して（トレースされる関数の代わりに別の関数を呼び出す）場合、このフラグを設定する必要があります。これはライブカーネルパッチが使用する仕組みです。このフラグが設定されていない場合、pt_regs-&gt;ipを変更することはできません。</p>
+<p>注意: 1つの関数に対して、FTRACE_OPS_FL_IPMODIFYが設定されたftrace_opsは一度に1つしか登録できません。</p>
+</dd>
+<dt>FTRACE_OPS_FL_RCU</dt><dd><p>このフラグが設定されている場合、コールバックはRCUが「監視中」である関数のみから呼び出されます。コールバック関数がRCUの保護を必要とする処理を実行する場合は、このフラグを設定する必要があります。 <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_read_lock" title="rcu_read_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code></a> operation.</p>
+<p>RCUはシステムがアイドル状態になったとき、CPUが停止して再びオンラインになるとき、およびキーネル空間からユーザースペースへ移行し戻るときに監視を停止します。これらの移行期間中、コールバックが実行される可能性があり、RCUの同期はその保護を提供しません。</p>
+</dd>
+<dt>FTRACE_OPS_FL_PERMANENT</dt><dd><p>このフラグが設定されたftrace_opsがある場合、proc sysctlのftrace_enabledに0を書き込むことでトレースを無効にすることができません。同様に、ftrace_enabledが0の状態でこのフラグを設定したコールバックの登録はできません。</p>
+<p>ライブパッチは関数リダイレクトを失わないように使用するため、システムは常に保護されています。</p>
+</dd>
+</dl>
+</section>
+<section id="filtering-which-functions-to-trace">
+<h2>トレースする関数のフィルタリング<a class="headerlink" href="#filtering-which-functions-to-trace" title="この見出しへのパーマリンク">¶</a></h2>
+<p>コールバックが特定の関数のみから呼び出される場合、フィルタを設定する必要があります。フィルタは関数名で指定するか、IPアドレス（既知の場合）で指定します。</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="kt">int</span><span class="w"> </span><span class="nf">ftrace_set_filter</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">ftrace_ops</span><span class="w"> </span><span class="o">*</span><span class="n">ops</span><span class="p">,</span><span class="w"> </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">buf</span><span class="p">,</span><span class="w"></span>
+<span class="w">                      </span><span class="kt">int</span><span class="w"> </span><span class="n">len</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">reset</span><span class="p">);</span><span class="w"></span>
+</pre></div>
+</div>
+<dl class="simple">
+<dt>@ops</dt><dd><p>フィルタを設定するためのops</p>
+</dd>
+<dt>@buf</dt><dd><p>関数フィルタのテキストを保持する文字列。</p>
+</dd>
+<dt>@len</dt><dd><p>文字列の長さ。</p>
+</dd>
+<dt>@reset</dt><dd><p>フィルタを適用する前にすべてのフィルタをリセットする場合は0以外の値を指定します。</p>
+</dd>
+</dl>
+<p>フィルタはトレースが有効なときにどの関数を有効にするかを指定します。@bufがNULLでresetが設定されている場合、すべての関数がトレース対象になります。</p>
+<p>@bufは特定のパターンにマッチするすべての関数を有効にするグロブ式としても使用できます。</p>
+<p>フィルタコマンドについては <code class="file docutils literal notranslate"><span class="pre">Documentation/trace/ftrace.rst</span></code>.</p>
+<p>schedule関数のみをトレースするには:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="n">ret</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ftrace_set_filter</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ops</span><span class="p">,</span><span class="w"> </span><span class="s">"schedule"</span><span class="p">,</span><span class="w"> </span><span class="n">strlen</span><span class="p">(</span><span class="s">"schedule"</span><span class="p">),</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span><span class="w"></span>
+</pre></div>
+</div>
+<p>追加の関数をトレースする場合は、@resetパラメータを0に設定してftrace_set_filter()を複数回呼び出します。現在のフィルタを削除し、@bufで定義された新しい関数に置き換えるには、@resetを0以外の値に設定します。</p>
+<p>すべてのフィルタされた関数を削除し、すべての関数をトレースするには:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="n">ret</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ftrace_set_filter</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ops</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span><span class="w"></span>
+</pre></div>
+</div>
+<p>複数の関数が同じ名前を持つ場合、特定の関数のみをトレースするにはftrace_set_filter_ip()を使用できます。</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="n">ret</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ftrace_set_filter_ip</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ops</span><span class="p">,</span><span class="w"> </span><span class="n">ip</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span><span class="w"></span>
+</pre></div>
+</div>
+<p>ただし、ipはfentryまたはmcountへの呼び出しのアドレスでなければなりません。この関数はperfやkprobesから使用され、ユーザーがdebug情報から取得したipアドレスを取得します。</p>
+<p>グロブ式でフィルタを設定した場合、関数を「notrace」リストに追加して、これらの関数がコールバックを呼び出さないようにできます。「notrace」リストは「filter」リストよりも優先されます。両方のリストが空でなく同じ関数を含む場合、コールバックはどの関数からも呼び出されません。</p>
+<p>「notrace」リストが空である場合、フィルタで定義されたすべての関数がトレースされることが許可されます。</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="kt">int</span><span class="w"> </span><span class="nf">ftrace_set_notrace</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">ftrace_ops</span><span class="w"> </span><span class="o">*</span><span class="n">ops</span><span class="p">,</span><span class="w"> </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">buf</span><span class="p">,</span><span class="w"></span>
+<span class="w">                       </span><span class="kt">int</span><span class="w"> </span><span class="n">len</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">reset</span><span class="p">);</span><span class="w"></span>
+</pre></div>
+</div>
+<p>これはftrace_set_filter()と同じパラメータを取るが、見つかった関数をトレースしないリストに追加します。これはフィルタリストとは別のリストであり、この関数はフィルタリストを変更しません。</p>
+<p>非ゼロの@resetは、@bufに一致する関数を追加する前に「notrace」リストをクリアします。</p>
+<p>「notrace」リストをクリアすることは、フィルタリストをクリアすることと同様です。</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="n">ret</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ftrace_set_notrace</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ops</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span><span class="w"></span>
+</pre></div>
+</div>
+<p>フィルタとnotraceリストはいつでも変更可能です。特定の関数のみがコールバックを呼び出す必要がある場合、コールバックの登録前にフィルタを設定するのが望ましいです。ただし、コールバックが登録された後でも変更することがあります。</p>
+<p>フィルタが有効な状態で、@resetが非ゼロであり、@bufに関数に一致するグロブが含まれている場合、ftrace_set_filter()呼び出し中に切り替えが行われます。いつでもすべての関数がコールバックを呼び出すことはありません。</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="n">ftrace_set_filter</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ops</span><span class="p">,</span><span class="w"> </span><span class="s">"schedule"</span><span class="p">,</span><span class="w"> </span><span class="n">strlen</span><span class="p">(</span><span class="s">"schedule"</span><span class="p">),</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span><span class="w"></span>
+
+<span class="n">register_ftrace_function</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ops</span><span class="p">);</span><span class="w"></span>
+
+<span class="n">msleep</span><span class="p">(</span><span class="mi">10</span><span class="p">);</span><span class="w"></span>
+
+<span class="n">ftrace_set_filter</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ops</span><span class="p">,</span><span class="w"> </span><span class="s">"try_to_wake_up"</span><span class="p">,</span><span class="w"> </span><span class="n">strlen</span><span class="p">(</span><span class="s">"try_to_wake_up"</span><span class="p">),</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span><span class="w"></span>
+</pre></div>
+</div>
+<p>は同じではありません：</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="n">ftrace_set_filter</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ops</span><span class="p">,</span><span class="w"> </span><span class="s">"schedule"</span><span class="p">,</span><span class="w"> </span><span class="n">strlen</span><span class="p">(</span><span class="s">"schedule"</span><span class="p">),</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span><span class="w"></span>
+
+<span class="n">register_ftrace_function</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ops</span><span class="p">);</span><span class="w"></span>
+
+<span class="n">msleep</span><span class="p">(</span><span class="mi">10</span><span class="p">);</span><span class="w"></span>
+
+<span class="n">ftrace_set_filter</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ops</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span><span class="w"></span>
+
+<span class="n">ftrace_set_filter</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ops</span><span class="p">,</span><span class="w"> </span><span class="s">"try_to_wake_up"</span><span class="p">,</span><span class="w"> </span><span class="n">strlen</span><span class="p">(</span><span class="s">"try_to_wake_up"</span><span class="p">),</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span><span class="w"></span>
+</pre></div>
+</div>
+<p>後者は、リセット時間と新しいフィルタ設定時間の間にすべての関数がコールバックを呼び出す短い期間を持つため、前者とは異なります。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxトレーシング技術</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="ftrace-design.html">関数トレーサー設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tracepoint-analysis.html">イベントとトレースポイントを用いた挙動分析ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ftrace.html">ftrace - 関数トレーサー</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">ftraceを用いた関数へのフック</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kprobes.html">カーネルプローブ（Kprobes）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kprobetrace.html">Kprobesベースのイベントトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="uprobetracer.html">Uprobe-tracer: Uprobeベースのイベントトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tracepoints.html">Linuxカーネルトレースポイントの利用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events.html">イベントトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-kmem.html">サブシステムトレースポイント: kmem</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-power.html">サブシステムトレースポイント: power</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-nmi.html">NMIトレースイベント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-msr.html">MSRトレースイベント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mmiotrace.html">カーネル内メモリマップI/Oトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="histogram.html">イベントヒストグラム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="histogram-design.html">ヒストグラム設計ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="boottime-trace.html">ブートタイムトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hwlat_detector.html">ハードウェアレイテンシ検出器</a></li>
+<li class="toctree-l2"><a class="reference internal" href="intel_th.html">Intel(R)トレースハブ（TH）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ring-buffer-design.html">ロックレスリングバッファ設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="stm.html">システムトレースモジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sys-t.html">MIPI SyS-T over STP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="coresight/index.html">CoreSight - ARMハードウェアトレース</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxトレーシング技術</a><ul>
+<li>前へ: <a href="ftrace.html" title="前章">ftrace - 関数トレーサー</a></li>
+<li>次へ: <a href="kprobes.html" title="次章">カーネルプローブ（Kprobes）</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/trace/ftrace-uses.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

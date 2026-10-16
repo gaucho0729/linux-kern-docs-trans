@@ -1,0 +1,353 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>PXA2xx SPIドライバのHOWTO — The Linux Kernelドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="spi-lm70llp.html" rel="next" title="spi_lm70llp : LM70-LLP parport-to-SPI アダプタ"/>
+<link href="butterfly.html" rel="prev" title="spi_butterfly - parport-to-butterfly アダプタードライバ"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="pxa2xx-spi-on-ssp-driver-howto">
+<h1>PXA2xx SSPドライバでのSPI HOWTO<a class="headerlink" href="#pxa2xx-spi-on-ssp-driver-howto" title="この見出しへのパーマリンク">¶</a></h1>
+<p>これはpxa2xx_spiドライバに関するミニガイドです。このドライバはPXA2xx同期シリアルポートをSPIマスターコントローラーに変換します（参照 <a class="reference internal" href="spi-summary.html"><span class="doc">LinuxカーネルSPIサポートの概要</span></a>）。ドライバは以下の機能を備えています</p>
+<ul class="simple">
+<li><p>任意のPXA2xx SSPのサポート</p></li>
+<li><p>SSP PIOおよびSSP DMAデータ転送</p></li>
+<li><p>外部および内部（SSPFRM）チップセレクト</p></li>
+<li><p>各スレーブデバイス（チップ）の設定</p></li>
+<li><p>フルスリープ、フリーズ、再開のサポート</p></li>
+</ul>
+<p>このドライバは「spi_message」 fifoをワークキューおよびタスクレットでサービスします。ワークキュー「pump_messages」はメッセージfifoを駆動し、タスクレット（pump_transfer）はSPIトランザクションをキューイングし、DMA/割り込み駆動の転送を設定・実行します</p>
+<section id="declaring-pxa2xx-master-controllers">
+<h2>PXA2xxマスターコントローラーの宣言<a class="headerlink" href="#declaring-pxa2xx-master-controllers" title="この見出しへのパーマリンク">¶</a></h2>
+<p>通常、SPIマスターはarch/…/mach-<em>/board-</em>.cで「platform device」として定義されます。マスター設定はinclude/linux/spi/pxa2xx_spi.hに記載されているテーブルを介してドライバに渡されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct pxa2xx_spi_controller {
+      u16 num_chipselect;
+      u8 enable_dma;
+};
+</pre></div>
+</div>
+<p>「pxa2xx_spi_controller.num_chipselect」フィールドは、このSPIマスターに接続されているスレーブデバイス（チップ）の数を決定します</p>
+<p>「pxa2xx_spi_controller.enable_dma」フィールドはドライバにSSP DMAを使用する旨を通知します。これによりドライバはrx_channelおよびtx_channelの2つのDMAチャネルを取得します。rx_channelはtx_channelよりもDMAサービス優先度が高いです。詳しくは「PXA2xx Developer Manual」の「DMA Controller」セクションを参照してください</p>
+</section>
+<section id="nssp-master-sample">
+<h2>NSSPマスターサンプル<a class="headerlink" href="#nssp-master-sample" title="この見出しへのパーマリンク">¶</a></h2>
+<p>以下はPXA255 NSSPを使用したサンプル構成です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static struct resource pxa_spi_nssp_resources[] = {
+      [0] = {
+              .start  = __PREG(SSCR0_P(2)), /* Start address of NSSP */
+              .end    = __PREG(SSCR0_P(2)) + 0x2c, /* Range of registers */
+              .flags  = IORESOURCE_MEM,
+      },
+      [1] = {
+              .start  = IRQ_NSSP, /* NSSP IRQ */
+              .end    = IRQ_NSSP,
+              .flags  = IORESOURCE_IRQ,
+      },
+};
+
+static struct pxa2xx_spi_controller pxa_nssp_master_info = {
+      .num_chipselect = 1, /* Matches the number of chips attached to NSSP */
+      .enable_dma = 1, /* Enables NSSP DMA */
+};
+
+static struct platform_device pxa_spi_nssp = {
+      .name = "pxa2xx-spi", /* MUST BE THIS VALUE, so device match driver */
+      .id = 2, /* Bus number, MUST MATCH SSP number 1..n */
+      .resource = pxa_spi_nssp_resources,
+      .num_resources = ARRAY_SIZE(pxa_spi_nssp_resources),
+      .dev = {
+              .platform_data = &amp;pxa_nssp_master_info, /* Passed to driver */
+      },
+};
+
+static struct platform_device *devices[] __initdata = {
+      &amp;pxa_spi_nssp,
+};
+
+static void __init board_init(void)
+{
+      (void)platform_add_device(devices, ARRAY_SIZE(devices));
+}
+</pre></div>
+</div>
+</section>
+<section id="declaring-slave-devices">
+<h2>スレーブデバイスの宣言<a class="headerlink" href="#declaring-slave-devices" title="この見出しへのパーマリンク">¶</a></h2>
+<p>通常、各SPIスレーブ（チップ）はarch/…/mach-<em>/board-</em>.cで「spi_board_info」構造体（linux/spi/spi.hに記載）を使用して定義されます。詳しくは「<a class="reference internal" href="spi-summary.html"><span class="doc">LinuxカーネルSPIサポートの概要</span></a>」をご参照ください</p>
+<p>PXAに接続された各スレーブデバイスは、include/linux/spi/pxa2xx_spi.hに記載されている「pxa2xx_spi_chip」構造体を介してスレーブ固有の設定情報を提供します。pxa2xx_spiマスターコントローラードライバは、ドライバがスレーブデバイスと通信する際、この設定情報を使用します。すべてのフィールドはオプションです</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct pxa2xx_spi_chip {
+      u8 tx_threshold;
+      u8 rx_threshold;
+      u8 dma_burst_size;
+      u32 timeout;
+      u8 enable_loopback;
+      void (*cs_control)(u32 command);
+};
+</pre></div>
+</div>
+<p>「pxa2xx_spi_chip.tx_threshold」および「pxa2xx_spi_chip.rx_threshold」フィールドはSSPハードウェアFIFOを設定するために使用されます。これらのフィールドはpxa2xx_spiドライバの性能に極めて重要であり、誤設定はrx FIFOのオーバーフロー（特にPIOモード転送では顕著）を引き起こします。適切なデフォルト値は：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>.tx_threshold = 8,
+.rx_threshold = 8,
+</pre></div>
+</div>
+<p>範囲は1〜16で、ゼロは「デフォルトを使用」を意味します</p>
+<p>「pxa2xx_spi_chip.dma_burst_size」フィールドは、PXA2xx DMAエンジンを構成するために使用され、「spi_device.bits_per_word」フィールドに関連しています。PXA2xxの「開発者マニュアル」のDMAコントローラーおよびSSPコントローラーに関するセクションを参照し、正しい値を決定してください。バイト幅で転送が設定されたSSPは、値8を使用します。dma_burst_sizeが0の場合、ドライバは適切なデフォルト値を自動的に設定します。</p>
+<p>「pxa2xx_spi_chip.timeout」フィールドは、SSP受信FIFO内の末尾バイトを効率的に処理するために使用されます。このフィールドの正しい値はSPIバス速度（「spi_board_info.max_speed_hz」）と特定のスレーブデバイスに依存します。注意してください。PXA2xx SSP 1は末尾バイトタイムアウトをサポートしておらず、末尾バイトについてはbusy-wait処理を実行しなければなりません。</p>
+<p>「pxa2xx_spi_chip.enable_loopback」フィールドは、SSPポートを内部ループバックモードに設定するために使用されます。このモードでは、SSPコントローラーが内部的にSSPTXピンをSSPRXピンに接続します。これは初期設定テストに役立ちます。</p>
+<p>「pxa2xx_spi_chip.cs_control」フィールドは、スレーブデバイスのチップセレクトをアサート/デアサートするためのボード固有の関数を指します。このフィールドがNULLの場合、pxa2xx_spiマスターコントローラードライバはSSPポートがSSPFRMを使用していると仮定します。</p>
+<p>注意：SSPFRMを使用する場合、SPIドライバはチップセレクトを制御できません。そのため、各spi_transfer後にチップセレクトが解除されます。ほとんどのデバイスでは、メッセージ全体にわたってチップセレクトがアサートされている必要があります。これらのデバイスには、cs_controlを通じてSSPFRMをGPIOとして使用してください。</p>
+</section>
+<section id="nssp-slave-sample">
+<h2>NSSP スレーブ サンプル<a class="headerlink" href="#nssp-slave-sample" title="この見出しへのパーマリンク">¶</a></h2>
+<p>pxa2xx_spi_chip構造体は、pxa2xx_spiドライバに「spi_board_info.controller_data」フィールドを通じて渡されます。以下はPXA255 NSSPを使用したサンプル構成です。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/* Chip Select control for the CS8415A SPI slave device */
+static void cs8415a_cs_control(u32 command)
+{
+      if (command &amp; PXA2XX_CS_ASSERT)
+              GPCR(2) = GPIO_bit(2);
+      else
+              GPSR(2) = GPIO_bit(2);
+}
+
+/* Chip Select control for the CS8405A SPI slave device */
+static void cs8405a_cs_control(u32 command)
+{
+      if (command &amp; PXA2XX_CS_ASSERT)
+              GPCR(3) = GPIO_bit(3);
+      else
+              GPSR(3) = GPIO_bit(3);
+}
+
+static struct pxa2xx_spi_chip cs8415a_chip_info = {
+      .tx_threshold = 8, /* SSP hardward FIFO threshold */
+      .rx_threshold = 8, /* SSP hardward FIFO threshold */
+      .dma_burst_size = 8, /* Byte wide transfers used so 8 byte bursts */
+      .timeout = 235, /* See Intel documentation */
+      .cs_control = cs8415a_cs_control, /* Use external chip select */
+};
+
+static struct pxa2xx_spi_chip cs8405a_chip_info = {
+      .tx_threshold = 8, /* SSP hardward FIFO threshold */
+      .rx_threshold = 8, /* SSP hardward FIFO threshold */
+      .dma_burst_size = 8, /* Byte wide transfers used so 8 byte bursts */
+      .timeout = 235, /* See Intel documentation */
+      .cs_control = cs8405a_cs_control, /* Use external chip select */
+};
+
+static struct spi_board_info streetracer_spi_board_info[] __initdata = {
+      {
+              .modalias = "cs8415a", /* Name of spi_driver for this device */
+              .max_speed_hz = 3686400, /* Run SSP as fast a possbile */
+              .bus_num = 2, /* Framework bus number */
+              .chip_select = 0, /* Framework chip select */
+              .platform_data = NULL; /* No spi_driver specific config */
+              .controller_data = &amp;cs8415a_chip_info, /* Master chip config */
+              .irq = STREETRACER_APCI_IRQ, /* Slave device interrupt */
+      },
+      {
+              .modalias = "cs8405a", /* Name of spi_driver for this device */
+              .max_speed_hz = 3686400, /* Run SSP as fast a possbile */
+              .bus_num = 2, /* Framework bus number */
+              .chip_select = 1, /* Framework chip select */
+              .controller_data = &amp;cs8405a_chip_info, /* Master chip config */
+              .irq = STREETRACER_APCI_IRQ, /* Slave device interrupt */
+      },
+};
+
+static void __init streetracer_init(void)
+{
+      spi_register_board_info(streetracer_spi_board_info,
+                              ARRAY_SIZE(streetracer_spi_board_info));
+}
+</pre></div>
+</div>
+</section>
+<section id="dma-and-pio-i-o-support">
+<h2>DMA および PIO I/O のサポート<a class="headerlink" href="#dma-and-pio-i-o-support" title="この見出しへのパーマリンク">¶</a></h2>
+<p>pxa2xx_spiドライバはDMAおよび割込み駆動型PIOメッセージ転送の両方をサポートします。ドライバはデフォルトでPIOモードを使用し、DMA転送は「pxa2xx_spi_controller」構造体の「enable_dma」フラグを設定することで有効になります。DMAモードは、コヒーレント型およびストリームベースのDMAマッピングをサポートします。</p>
+<p>各「spi_transfer」ごとに使用するI/Oタイプを決定する論理は以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>if !enable_dma then
+      always use PIO transfers
+
+if spi_message.len &gt; 8191 then
+      print "rate limited" warning
+      use PIO transfers
+
+if spi_message.is_dma_mapped and rx_dma_buf != 0 and tx_dma_buf != 0 then
+      use coherent DMA mode
+
+if rx_buf and tx_buf are aligned on 8 byte boundary then
+      use streaming DMA mode
+
+otherwise
+      use PIO transfer
+</pre></div>
+</div>
+</section>
+<section id="thanks-to">
+<h2>感謝します<a class="headerlink" href="#thanks-to" title="この見出しへのパーマリンク">¶</a></h2>
+<p>David Brownellおよび他氏によるこのドライバの開発指導に感謝します。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">シリアルペリフェラルインターフェース（SPI）</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="spi-summary.html">LinuxカーネルSPIサポートの概要</a></li>
+<li class="toctree-l2"><a class="reference internal" href="spidev.html">SPIユーザースペースAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="butterfly.html">spi_butterfly - parport-to-butterfly アダプタードライバ</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">PXA2xx SSPドライバでのSPI HOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="spi-lm70llp.html">spi_lm70llp : LM70-LLP parport-to-SPI アダプタ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="spi-sc18is602.html">カーネルドライバ spi-sc18is602</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">シリアルペリフェラルインターフェース（SPI）</a><ul>
+<li>前へ: <a href="butterfly.html" title="前章">spi_butterfly - parport-to-butterfly アダプタードライバ</a></li>
+<li>次へ: <a href="spi-lm70llp.html" title="次章">spi_lm70llp : LM70-LLP parport-to-SPI アダプタ</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/spi/pxa2xx.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

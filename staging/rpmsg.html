@@ -1,0 +1,326 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>リモートプロセッサメッセージング（rpmsg）フレームワーク — Linuxカーネルドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="speculation.html" rel="next" title="スペキュレーション"/>
+<link href="remoteproc.html" rel="prev" title="リモートプロセッサフレームワーク"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="remote-processor-messaging-rpmsg-framework">
+<h1>リモートプロセッサメッセージ(rpmsg)フレームワーク<a class="headerlink" href="#remote-processor-messaging-rpmsg-framework" title="この見出しへのパーマリンク">¶</a></h1>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>このドキュメントではrpmsgバスとrpmsgドライバの作成方法について説明します。新しいプラットフォームへのrpmsgサポートの追加方法を学ぶには、remoteproc.txt（Documentation/に含まれています）をご参照ください。</p>
+</div>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>現代のSoCは、非対称マルチプロセッシング（AMP）構成で異質なリモートプロセッサデバイスを採用することが一般的です。これらはLinuxや他のリアルタイムOSのいずれかのインスタンスを実行している可能性があります。</p>
+<p>例えばOMAP4は、双コアCortex-A9、双コアCortex-M3、C64x+ DSPを搭載しています。通常、双コアCortex-A9はSMP構成でLinuxを実行し、他の3つのコア（2つのM3コアとDSP）はそれぞれAMP構成でRTOSのインスタンスを実行しています。</p>
+<p>通常、AMPリモートプロセッサは専用のDSPコーデックとマルチメディアハードウェアアクセラレータを採用しており、主なアプリケーションプロセッサからCPU重いマルチメディアタスクをオフロードするために使用されます。</p>
+<p>これらのリモートプロセッサは、遅延敏感なセンサーの制御、ランダムなハードウェアブロックの駆動、または主なCPUがアイドルしている間のバックグラウンドタスクの実行にも利用できます。</p>
+<p>これらのリモートプロセッサのユーザーは、ユーザーランドアプリケーション（例：マルチメディアフレームワークがリモートOMXコンポーネントと通信する場合）またはカーネルドライバ（リモートプロセッサのみがアクセス可能なハードウェアを制御し、リモートプロセッサの代わってカーネル制御のリソースを確保するなど）です。</p>
+<p>Rpmsgはvirtioベースのメッセージングバスであり、カーネルドライバがシステム上のリモートプロセッサと通信できるようにします。必要に応じて、ドライバは適切なユーザースペースインターフェースを公開できます。</p>
+<p>ユーザーランドにrpmsg通信を公開するドライバを作成する際は、リモートプロセッサがシステムの物理メモリや他のセンシティブなハードウェアリソース（例：OMAP4ではリモートコアやハードウェアアクセラレータが物理メモリ、GPIOバンク、DMAコントローラー、I2Cバス、GPTimers、メモリーメッセージングデバイス、HWSpinlocksなどに直接アクセスできる可能性があります）に直接アクセスできる点を考慮してください。さらに、リモートプロセッサがRTOSを実行している場合、すべてのタスクがプロセッサに露出されたメモリ/デバイス全体にアクセスできる可能性があります。不正な（またはバグのある）ユーザーランドコードがリモートのバグを悪用してシステムを制御するリスクを最小限に抑えるため、ユーザーランドがメッセージを送信できる特定のrpmsgチャネル（以下で定義）に制限し、メッセージコンテンツに対する制御をできるだけ最小限にすることが望ましいです。</p>
+<p>すべてのrpmsgデバイスは、リモートプロセッサと通信するためのチャネルです（したがって、rpmsgデバイスはチャネルと呼ばれます）。チャネルはテキスト名で識別され、ローカル（「ソース」）のrpmsgアドレスと、リモート（「宛先」）のrpmsgアドレスを持ちます。</p>
+<p>ドライバがチャネルでリスニングを開始すると、そのrxコールバックは一意なrpmsgローカルアドレス（32ビット整数）にバインドされます。このようにして、インバウンドメッセージが到着した際、rpmsgコアはその宛先アドレスに基づき適切なドライバにメッセージをディスパッチします（これは、ドライバのrxハンドラをインバウンドメッセージのペイロードとともに呼び出すことで実現されます）。</p>
+</section>
+<section id="user-api">
+<h2>ユーザーAPI<a class="headerlink" href="#user-api" title="この見出しへのパーマリンク">¶</a></h2>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int rpmsg_send(struct rpmsg_channel *rpdev, void *data, int len);
+</pre></div>
+</div>
+<p>指定されたチャネルを介してリモートプロセッサにメッセージを送信します。呼び出し元はチャネル、送信したいデータ、およびデータの長さ（バイト単位）を指定します。メッセージは指定されたチャネルで送信され、そのソースおよび宛先アドレスフィールドがチャネルのsrcとdstアドレスに設定されます。</p>
+<p>TXバッファが利用不可な場合、関数は15秒のタイムアウトが発生するまでブロックします（つまり、リモートプロセッサがTXバッファを消費してvirtioのusedディスクリプタリングに戻すまで待機します）。タイムアウトが発生した場合、-ERESTARTSYSが返されます。</p>
+<p>この関数は現在、プロセスコンテキストからのみ呼び出すことができます。成功時は0を、失敗時は適切なエラーコードを返します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int rpmsg_sendto(struct rpmsg_channel *rpdev, void *data, int len, u32 dst);
+</pre></div>
+</div>
+<p>指定されたチャネルを介してリモートプロセッサにメッセージを送信します。呼び出し元は宛先アドレスを指定する必要があります。</p>
+<p>呼び出し元はチャネル、送信したいデータ、データの長さ（バイト単位）、および明示的な宛先アドレスを指定する必要があります。</p>
+<p>メッセージは、チャネルに属するリモートプロセッサに送信され、チャネルのsrcアドレスとユーザーが提供したdstアドレスを使用します（したがって、チャネルのdstアドレスは無視されます）。</p>
+<p>TXバッファが利用不可な場合、関数は15秒のタイムアウトが発生するまでブロックします（つまり、リモートプロセッサがTXバッファを消費してvirtioのusedディスクリプタリングに戻すまで待機します）。タイムアウトが発生した場合、-ERESTARTSYSが返されます。</p>
+<p>この関数は現在、プロセスコンテキストからのみ呼び出すことができます。成功時は0を、失敗時は適切なエラーコードを返します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int rpmsg_send_offchannel(struct rpmsg_channel *rpdev, u32 src, u32 dst,
+                                                      void *data, int len);
+</pre></div>
+</div>
+<p>ユーザーが提供したsrcおよびdstアドレスを使用して、リモートプロセッサにメッセージを送信します。</p>
+<p>呼び出し元はチャネル、送信したいデータ、データの長さ（バイト単位）、および明示的なソースおよび宛先アドレスを指定する必要があります。メッセージは、チャネルに属するリモートプロセッサに送信されますが、チャネルのsrcおよびdstアドレスは無視され、代わりにユーザーが提供したアドレスが使用されます。</p>
+<p>TXバッファが利用不可な場合、関数は15秒のタイムアウトが発生するまでブロックします（つまり、リモートプロセッサがTXバッファを消費してvirtioのusedディスクリプタリングに戻すまで待機します）。タイムアウトが発生した場合、-ERESTARTSYSが返されます。</p>
+<p>この関数は現在、プロセスコンテキストからのみ呼び出すことができます。成功時は0を、失敗時は適切なエラーコードを返します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int rpmsg_trysend(struct rpmsg_channel *rpdev, void *data, int len);
+</pre></div>
+</div>
+<p>指定されたチャネルを介してリモートプロセッサにメッセージを送信します。呼び出し元はチャネル、送信したいデータ、およびデータの長さ（バイト単位）を指定します。メッセージは指定されたチャネルで送信され、そのソースおよび宛先アドレスフィールドがチャネルのsrcとdstアドレスに設定されます。</p>
+<p>TXバッファが利用不可な場合、関数は15秒待機することなく即座に-ENOMEMを返します。</p>
+<p>この関数は現在、プロセスコンテキストからのみ呼び出すことができます。成功時は0を、失敗時は適切なエラーコードを返します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int rpmsg_trysendto(struct rpmsg_channel *rpdev, void *data, int len, u32 dst)
+</pre></div>
+</div>
+<p>指定されたチャネルを介してリモートプロセッサにメッセージを送信します。呼び出し元はユーザーが提供した宛先アドレスを指定する必要があります。</p>
+<p>ユーザーは、送信したいデータ、その長さ（バイト数）、および明示的な宛先アドレスを指定する必要があります。</p>
+<p>メッセージは、チャネルに属するリモートプロセッサに送信され、チャネルのsrcアドレスとユーザーが提供したdstアドレスを使用します（したがって、チャネルのdstアドレスは無視されます）。</p>
+<p>TXバッファが利用不可な場合、関数は15秒待機することなく即座に-ENOMEMを返します。</p>
+<p>この関数は現在、プロセスコンテキストからのみ呼び出すことができます。成功時は0を、失敗時は適切なエラーコードを返します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int rpmsg_trysend_offchannel(struct rpmsg_channel *rpdev, u32 src, u32 dst,
+                                                      void *data, int len);
+</pre></div>
+</div>
+<p>ユーザーが提供したソースと宛先アドレスを使用して、リモートプロセッサにメッセージを送信します。</p>
+<p>ユーザーは、送信したいデータ、その長さ（バイト数）、および明示的なソースと宛先アドレスを指定する必要があります。このメッセージは、チャネルが属するリモートプロセッサに送信されますが、チャネルのsrcとdstアドレスは無視され（ユーザーが提供したアドレスが代わりに使用されます）。</p>
+<p>TXバッファが利用不可な場合、関数は15秒待機することなく即座に-ENOMEMを返します。</p>
+<p>この関数は現在、プロセスコンテキストからのみ呼び出すことができます。成功時は0を、失敗時は適切なエラーコードを返します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct rpmsg_endpoint *rpmsg_create_ept(struct rpmsg_device *rpdev,
+                                        rpmsg_rx_cb_t cb, void *priv,
+                                        struct rpmsg_channel_info chinfo);
+</pre></div>
+</div>
+<p>システム内のすべてのrpmsgアドレスは、rpmsg_endpoint構造体を介してrxコールバックにバインドされています（インバウンドメッセージが到着した際、rpmsgバスが適切なコールバックハンドラを使用してディスパッチされます）。</p>
+<p>この関数は、ドライバがこのようなエンドポイントを作成し、コールバックをバインドし（必要に応じてプライベートデータも含め）、事前にわかっているrpmsgアドレスまたは動的に割り当てられるアドレスにバインドできるようにします。</p>
+<p>シンプルなrpmsgドライバはrpmsg_create_eptを呼び出す必要がありません。rpmsgバスがドライバをプローブする際に（rpmsgバスに登録したrxコールバックを提供した場合）、すでにエンドポイントが作成されています。</p>
+<p>したがって、シンプルなドライバには問題ありません。すでにエンドポイントが存在し、rxコールバックがrpmsgアドレスにバインドされています。関連するインバウンドメッセージが到着した場合（つまり、メッセージの宛先アドレスがドライバのrpmsgチャネルのソースアドレスと一致する場合）、ドライバのハンドラが呼び出されて処理されます。</p>
+<p>ただし、複雑なドライバは追加のrpmsgアドレスを割り当て、それらを異なるrxコールバックにバインドする必要があります。これを実現するには、この関数を呼び出す必要があります。ドライバはチャネル（新しいエンドポイントが所属するリモートプロセッサにバインドされるように）、rxコールバック関数、オプションのプライベートデータ（rxコールバックが呼び出される際に戻される）、およびバインドしたいアドレスを提供する必要があります。addrがRPMSG_ADDR_ANYの場合、rpmsg_create_eptは動的に利用可能なrpmsgアドレスを割り当てます（ここでは常にRPMSG_ADDR_ANYを使用する理由が明確でなければなりません）。</p>
+<p>成功した場合、エンドポイントへのポインタを返します。エラーの場合、NULLを返します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void rpmsg_destroy_ept(struct rpmsg_endpoint *ept);
+</pre></div>
+</div>
+<p>既存のrpmsgエンドポイントを破壊します。ユーザーは、rpmsg_create_ept()で以前に作成したrpmsgエンドポイントへのポインタを提供する必要があります。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int register_rpmsg_driver(struct rpmsg_driver *rpdrv);
+</pre></div>
+</div>
+<p>rpmsgバスにrpmsgドライバを登録します。ユーザーは、ドライバの-&gt;probe()と-&gt;remove()関数、rxコールバック、およびこのドライバがプローブ対象とするチャネル名を指定するid_tableを持つrpmsg_driver構造体へのポインタを提供する必要があります。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void unregister_rpmsg_driver(struct rpmsg_driver *rpdrv);
+</pre></div>
+</div>
+<p>rpmsgバスからrpmsgドライバを登録解除します。ユーザーは以前に登録したrpmsg_driver構造体へのポインタを提供します。成功時は0を、失敗時は適切なエラーコードを返します。</p>
+</section>
+<section id="typical-usage">
+<h2>典型的な使用法<a class="headerlink" href="#typical-usage" title="この見出しへのパーマリンク">¶</a></h2>
+<p>以下は、probe()時に「hello!」メッセージを送信し、受信メッセージをコンソールに出力するシンプルなrpmsgドライバの例です。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/kernel.h&gt;
+#include &lt;linux/module.h&gt;
+#include &lt;linux/rpmsg.h&gt;
+
+static void rpmsg_sample_cb(struct rpmsg_channel *rpdev, void *data, int len,
+                                              void *priv, u32 src)
+{
+      print_hex_dump(KERN_INFO, "incoming message:", DUMP_PREFIX_NONE,
+                                              16, 1, data, len, true);
+}
+
+static int rpmsg_sample_probe(struct rpmsg_channel *rpdev)
+{
+      int err;
+
+      dev_info(&amp;rpdev-&gt;dev, "chnl: 0x%x -&gt; 0x%x\n", rpdev-&gt;src, rpdev-&gt;dst);
+
+      /* send a message on our channel */
+      err = rpmsg_send(rpdev, "hello!", 6);
+      if (err) {
+              pr_err("rpmsg_send failed: %d\n", err);
+              return err;
+      }
+
+      return 0;
+}
+
+static void rpmsg_sample_remove(struct rpmsg_channel *rpdev)
+{
+      dev_info(&amp;rpdev-&gt;dev, "rpmsg sample client driver is removed\n");
+}
+
+static struct rpmsg_device_id rpmsg_driver_sample_id_table[] = {
+      { .name = "rpmsg-client-sample" },
+      { },
+};
+MODULE_DEVICE_TABLE(rpmsg, rpmsg_driver_sample_id_table);
+
+static struct rpmsg_driver rpmsg_sample_client = {
+      .drv.name       = KBUILD_MODNAME,
+      .id_table       = rpmsg_driver_sample_id_table,
+      .probe          = rpmsg_sample_probe,
+      .callback       = rpmsg_sample_cb,
+      .remove         = rpmsg_sample_remove,
+};
+module_rpmsg_driver(rpmsg_sample_client);
+</pre></div>
+</div>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>同様のサンプルはsamples/rpmsg/に構築・ロード可能なものとして用意されています。</p>
+</div>
+</section>
+<section id="allocations-of-rpmsg-channels">
+<h2>rpmsg チャネルの割当<a class="headerlink" href="#allocations-of-rpmsg-channels" title="この見出しへのパーマリンク">¶</a></h2>
+<p>現在はrpmsgチャネルの動的割当のみをサポートしています。</p>
+<p>これは、VIRTIO_RPMSG_F_NSというvirtioデバイス機能セットを持つリモートプロセッサでのみ可能です。この機能ビットは、リモートプロセッサが動的名前サービスアノンシメントメッセージをサポートすることを示します。</p>
+<p>この機能が有効になると、rpmsgデバイス（つまりチャネル）の作成は完全に動的になります。リモートプロセッサは、名前サービスメッセージ（名前とrpmsgアドレスを含み、struct rpmsg_ns_msgを参照）を送ることで、リモートrpmsgサービスの存在をアノンシメントします。</p>
+<p>このメッセージはrpmsgバスによって処理され、これにより動的にrpmsgチャネルが作成され登録されます（これはリモートサービスを表します）。関連するrpmsgドライバが登録された場合、バスが即座にプローブを行い、リモートサービスへのメッセージ送信を開始できるようになります。</p>
+<p>今後、virtioコンフィギュレーションスペースを介したrpmsgチャネルの静的作成も追加する予定ですが、現時点では実装されていません。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">未整理のドキュメンテーション</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="crc32.html">CRC計算の簡単なチュートリアル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lzo.html">LinuxのLZOデコンプレッサーが理解するLZOストリーム形式</a></li>
+<li class="toctree-l2"><a class="reference internal" href="remoteproc.html">リモートプロセッサフレームワーク</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">リモートプロセッサメッセージ(rpmsg)フレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="speculation.html">スペキュレーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="speculation.html#mitigating-speculation-side-channels">スペキュレーション側チャネルの緩和</a></li>
+<li class="toctree-l2"><a class="reference internal" href="static-keys.html">スタティックキー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tee.html">TEEサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xz.html">LinuxにおけるXZデータ圧縮</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">未整理のドキュメンテーション</a><ul>
+<li>前へ: <a href="remoteproc.html" title="前章">リモートプロセッサフレームワーク</a></li>
+<li>次へ: <a href="speculation.html" title="次章">スペキュレーション</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/staging/rpmsg.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

@@ -1,0 +1,301 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>カーネルセレフプロテクション — The Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="siphash.html" rel="next" title="SipHash - 短い入力のPRF"/>
+<link href="SCTP.html" rel="prev" title="SCTP"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="kernel-self-protection">
+<h1>カーネルセレフプロテクション<a class="headerlink" href="#kernel-self-protection" title="この見出しへのパーマリンク">¶</a></h1>
+<p>カーネルセレフプロテクションとは、Linuxカーネル内部でセキュリティ上の脆弱性からカーネル自身を保護するための設計および実装の仕組みを指します。これは、特定のバグのクラスを完全に除去する、セキュリティ脆弱性の悪用方法をブロックする、攻撃の試みを積極的に検出するなど、幅広い問題をカバーします。本ドキュメントではすべてのトピックを網羅しているわけではありませんが、よくある質問への回答として十分な出発点となるでしょう。(パッチの提出も大歓迎です！)</p>
+<p>最悪のケースを想定すると、権限のないローカルアタッカーがカーネルのメモリに任意の読み込み・書き込みアクセスを持つと仮定します。多くの場合、悪用されるバグはこのレベルのアクセスを提供しないかもしれませんが、最悪のケースを防ぐ仕組みが存在するため、より限定的なケースもカバーします。さらに高い基準として、権限を持つローカルアタッカーに対する保護も重要です。なぜなら、rootユーザーは大幅に広がった攻撃面を持つからです。(特に、任意のカーネルモジュールをロードできる場合にその影響が顕著です。)</p>
+<p>成功したセレフプロテクションシステムの目標は、効果的であること、デフォルトで有効であること、開発者によるオプトイン不要であること、パフォーマンスへの影響がないこと、カーネルデバッグを妨げないこと、テストが存在することです。すべての目標を同時に満たすことはめったにありませんが、これらを明示的に挙げるのは重要です。なぜなら、これらの点は検討・対応・受け入れが必要だからです。</p>
+<section id="attack-surface-reduction">
+<h2>攻撃面の削減<a class="headerlink" href="#attack-surface-reduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>セキュリティ侵害防御の最も基本的な手段は、実行フローを再方向付けできるカーネルの領域を削減することです。これは、ユーザー空間に公開するAPIを制限する、カーネル内部のAPIを誤って使用しにくくする、書き込み可能なカーネルメモリの領域を最小限に抑えるなど、さまざまな対策を含みます。</p>
+<section id="strict-kernel-memory-permissions">
+<h3>厳格なカーネルメモリの権限設定<a class="headerlink" href="#strict-kernel-memory-permissions" title="この見出しへのパーマリンク">¶</a></h3>
+<p>すべてのカーネルメモリが書き込み可能であると、攻撃者が実行フローを再方向付けするのを容易にします。攻撃ターゲットの可用性を減らすためには、カーネルが厳密な権限設定でメモリを保護する必要があります。</p>
+<section id="executable-code-and-read-only-data-must-not-be-writable">
+<h4>実行可能なコードと読み取り専用データは書き込み不可でなければならない<a class="headerlink" href="#executable-code-and-read-only-data-must-not-be-writable" title="この見出しへのパーマリンク">¶</a></h4>
+<p>カーネルの実行可能メモリ領域はすべて読み取り専用でなければならない。これは明らかにカーネルテキスト自体を含むが、カーネルモジュール、JITメモリなどすべての追加領域も考慮する必要がある。(このルールには一時的な例外が存在し、インストラクション代替、ブレイクポイント、kprobesなどの機能をサポートしている。これらの機能がカーネルに存在する場合、更新中にメモリを一時的に書き込み可能にし、その後元の権限に戻す方式で実装される。)</p>
+<p>この原則をサポートするための <code class="docutils literal notranslate"><span class="pre">CONFIG_STRICT_KERNEL_RWX</span></code> および
+<code class="docutils literal notranslate"><span class="pre">CONFIG_STRICT_MODULE_RWX</span></code>が存在し、コードが書き込み可能にならないこと、データが実行可能にならないこと、読み取り専用データが書き込み可能でも実行可能でもないことなどを保証しようとする。</p>
+<p>ほとんどのアーキテクチャではこれらのオプションがデフォルトで有効になっており、ユーザーによる選択肢は提供されていない。armなどのアーキテクチャでユーザーが選択可能にしたい場合、アーキテクチャのKconfigでARCH_OPTIONAL_KERNEL_RWXを有効にし、Kconfigプロンプトを表示するよう設定する。 <code class="docutils literal notranslate"><span class="pre">CONFIG_ARCH_OPTIONAL_KERNEL_RWX_DEFAULT</span></code> がARCH_OPTIONAL_KERNEL_RW、RWXが有効な場合のデフォルト設定を決定する。</p>
+</section>
+<section id="function-pointers-and-sensitive-variables-must-not-be-writable">
+<h4>関数ポインタや敏感な変数は書き込み可能であってはならない<a class="headerlink" href="#function-pointers-and-sensitive-variables-must-not-be-writable" title="この見出しへのパーマリンク">¶</a></h4>
+<p>カーネルメモリの広範な領域には、カーネルが参照して実行を継続するために使用される関数ポインタが含まれている（例：ディスクリプタ/ベクターテーブル、ファイル/ネットワーク/etcの操作構造体など）。このような変数の数は絶対的に最小限に抑える必要がある。</p>
+<p>このような変数は「const」に設定することで読み取り専用となり、カーネルのデータセクションではなく読み取り専用データセクション（.rodata）に配置されるため、上記のカーネルの厳格なメモリ権限の保護を受けることができる。</p>
+<p>初期化が一度行われる <code class="docutils literal notranslate"><span class="pre">__init</span></code> タイミングの変数については、これらを（新規で開発中） <code class="docutils literal notranslate"><span class="pre">__ro_after_init</span></code>
+属性。</p>
+<p>残るはまれに更新される変数（例：GDT）であり、これらはカーネルコードに適用される一時的な例外に類似したインフラストラクチャが必要である（例：更新中にのみCPUスレッドがメモリに非中断的な書き込みアクセスを許可する）。</p>
+</section>
+<section id="segregation-of-kernel-memory-from-userspace-memory">
+<h4>カーネルメモリとユーザースペースメモリの分離<a class="headerlink" href="#segregation-of-kernel-memory-from-userspace-memory" title="この見出しへのパーマリンク">¶</a></h4>
+<p>カーネルは決してユーザー空間のメモリを実行してはいけません。また、明示的な意図がない限りユーザー空間のメモリにアクセスしてはいけません。これらのルールは、ハードウェアベースの制限（x86のSMEP/SMAP、ARMのPXN/PAN）やエミュレーション（ARMのMemory Domains）によって強制できます。このようにユーザー空間のメモリをブロックすることで、簡単に制御可能なユーザー空間メモリに実行やデータ解析を渡すことができず、攻撃は完全にカーネルメモリ内でのみ行われることになります。</p>
+</section>
+</section>
+<section id="reduced-access-to-syscalls">
+<h3>システムコールへのアクセスを制限する<a class="headerlink" href="#reduced-access-to-syscalls" title="この見出しへのパーマリンク">¶</a></h3>
+<p>64ビットシステムにおける多くのシステムコールを削減するための簡単な方法は、不要なものを組み込むことですが、 <code class="docutils literal notranslate"><span class="pre">CONFIG_COMPAT</span></code>しかし、これは現実的なシナリオではほとんどありません。</p>
+<p>seccompシステムは、ユーザー空間に提供されるオプトイン機能を提供し、実行中のプロセスが利用できるカーネルエントリポイントを減らす方法を提供します。これにより、カーネルコードの到達範囲が限定され、特定のバグが攻撃に利用される可能性が低下します。</p>
+<p>改善の余地としては、互換性、ユーザー名前空間、BPFの作成、perfなどの機能へのアクセスを信頼できるプロセスに限定する方法を構築する必要があります。これにより、カーネルエントリポイントのスコープを通常の非特権ユーザーが利用可能なより一般的なセットに制限できます。</p>
+</section>
+<section id="restricting-access-to-kernel-modules">
+<h3>カーネルモジュールへのアクセスを制限する<a class="headerlink" href="#restricting-access-to-kernel-modules" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルは、非特権ユーザーが特定のカーネルモジュールをロードできるようにしてはいけません。なぜなら、これにより予期せぬ攻撃面の拡大が可能になるからです。（事前に定義されたサブシステムを通じたモジュールのオンデマンドロード、例えばMODULE_ALIAS_*はここでは「予期される」扱いですが、これらにも追加の検討が必要です。）例えば、非特権ソケットAPIを通じてファイルシステムモジュールをロードするのは無意味です。ファイルシステムモジュールのロードは、rootまたは物理的にローカルのユーザーだけがトリガーすべきです。（ただし、特定のシナリオではこの点についても議論の余地があるかもしれません。）</p>
+<p>特権ユーザーに対しても保護するため、システムはモジュールロードを完全に無効化する（例：モノリシックカーネルビルドやmodules_disabled sysctl）か、署名されたモジュール（例：
+<code class="docutils literal notranslate"><span class="pre">CONFIG_MODULE_SIG_FORCE</span></code>、またはdm-cryptとLoadPinを組み合わせたもの）を提供する必要があります。これにより、rootがモジュールロー�ーダーインターフェースを通じて任意のカーネルコードをロードすることを防ぎます。</p>
+</section>
+</section>
+<section id="memory-integrity">
+<h2>メモリの整合性<a class="headerlink" href="#memory-integrity" title="この見出しへのパーマリンク">¶</a></h2>
+<p>コアの内部には、攻撃時に実行制御を取得するために頻繁に悪用されるメモリ構造が多数存在します。その中で最もよく理解されているのは、スタック・バッファ・オーバーフローです。これはスタックに保存されている戻り先アドレスが上書きされる仕組みです。このような攻撃の他の例も多数存在し、それらを防御するための保護機能も用意されています。</p>
+<section id="stack-buffer-overflow">
+<h3>スタック・バッファ・オーバーフロー<a class="headerlink" href="#stack-buffer-overflow" title="この見出しへのパーマリンク">¶</a></h3>
+<p>古典的なスタック・バッファ・オーバーフローは、スタックに保存されている変数の予想される終端を超えて書き込み、最終的にスタックフレームの保存された戻り先アドレスに制御可能な値を書き込む仕組みです。最も広く使用されている防御策は、スタック変数と戻り先アドレスの間にスタック・キャンリ（<code class="docutils literal notranslate"><span class="pre">CONFIG_STACKPROTECTOR</span></code>）を配置することです。これは関数が戻る直前に検証されます。他の防御策にはシャドウスタックなどがあります。</p>
+</section>
+<section id="stack-depth-overflow">
+<h3>スタック深さオーバーフロー<a class="headerlink" href="#stack-depth-overflow" title="この見出しへのパーマリンク">¶</a></h3>
+<p>理解が難しい攻撃の一つは、コアが深い関数呼び出しや大規模なスタック割当によってスタックメモリを消費するバグを悪用するものです。この攻撃により、コアの事前に割当されたスタック領域の終端を超えて敏感な構造に書き込むことが可能になります。より良い保護を実現するには、敏感なスレッド情報構造を別の場所に移動し、スタックの底にメモリの穴を設ける必要があります。</p>
+</section>
+<section id="heap-memory-integrity">
+<h3>ヒープメモリの整合性<a class="headerlink" href="#heap-memory-integrity" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ヒープの空きリストを追跡する構造は、割当または解放時に健全性チェックを行い、他のメモリ領域の操作が行われていないことを確認します。</p>
+</section>
+<section id="counter-integrity">
+<h3>カウンタ整合性<a class="headerlink" href="#counter-integrity" title="この見出しへのパーマリンク">¶</a></h3>
+<p>コアの多くの場所では、オブジェクト参照の追跡やライフタイム管理にアトミックカウンタを使用しています。これらのカウンタがラップ（オーバーフローまたはアンダーフロー）すると、通常は使用後解放（use-after-free）の脆弱性を引き起こします。アトミックなラップを検出することで、このクラスのバグは消え去ります。</p>
+</section>
+<section id="size-calculation-overflow-detection">
+<h3>サイズ計算オーバーフロー検出<a class="headerlink" href="#size-calculation-overflow-detection" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カウンタオーバーフローと同様に、整数オーバーフロー（通常はサイズ計算）は実行時に検出されなければなりません。これにより、このクラスのバグを防ぐことができ、通常はコアバッファの終端を超えて書き込むことが可能になります。</p>
+</section>
+</section>
+<section id="probabilistic-defenses">
+<h2>確率的防御<a class="headerlink" href="#probabilistic-defenses" title="この見出しへのパーマリンク">¶</a></h2>
+<p>多くの保護策は決定論的（例：読み取り専用メモリは書き込めない）ですが、一部の保護策は統計的な防御を提供します。これにより、攻撃者が実行中のシステムについて十分な情報を収集して防御を突破する必要があります。完全ではありませんが、意味のある防御を提供します。</p>
+<section id="canaries-blinding-and-other-secrets">
+<h3>キャンリ、ブラインド、その他の秘密情報<a class="headerlink" href="#canaries-blinding-and-other-secrets" title="この見出しへのパーマリンク">¶</a></h3>
+<p>以前に議論したスタック・キャンリ（stack canary）のようなものは、技術的に統計的防御とみなされる。なぜなら、これらは秘密値に依存しており、情報漏洩の脆弱性を通じてこのような値が特定される可能性があるからである。</p>
+<p>JITなどの実行可能なコンテンツがユーザー空間の制御下にある可能性がある場合、リテラル値を盲にする必要がある。</p>
+<p>秘密値として使用される値は、別個（例：スタックごとに異なるキャンリ）で高エントロピー（例：ランダム数生成器は実際に動作しているのか？）であることが重要である。これにより、防御の成功率が最大限に高まる。</p>
+</section>
+<section id="kernel-address-space-layout-randomization-kaslr">
+<h3>カーネルアドレス空間レイアウトランダム化（Kernel Address Space Layout Randomization: KASLR）<a class="headerlink" href="#kernel-address-space-layout-randomization-kaslr" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルメモリの位置は、攻撃の成功にほぼ常に重要であり、その位置が非決定的になることで、悪用の難易度が高くなる。このため、情報漏洩の価値が高くなる（情報漏洩が望ましいメモリ位置を特定するために利用される可能性があるからである）。</p>
+<section id="text-and-module-base">
+<h4>テキストとモジュールベース<a class="headerlink" href="#text-and-module-base" title="この見出しへのパーマリンク">¶</a></h4>
+<p>起動時にカーネルの物理的および仮想ベースアドレスを再配置することで（<code class="docutils literal notranslate"><span class="pre">CONFIG_RANDOMIZE_BASE</span></code>）、カーネルコードを必要とする攻撃が妨げられる。また、モジュールのロードベースアドレスをオフセットすることで、同じモジュールセットを同じ順序で起動するシステムでも、カーネルテキストとの共通ベースアドレスを共有しなくなる。</p>
+</section>
+<section id="stack-base">
+<h4>スタックベース<a class="headerlink" href="#stack-base" title="この見出しへのパーマリンク">¶</a></h4>
+<p>カーネルスタックのベースアドレスがプロセス間で、あるいはシステムコール間で異なる場合、スタックの上または下にあるターゲットの特定が困難になる。</p>
+</section>
+<section id="dynamic-memory-base">
+<h4>動的メモリベース<a class="headerlink" href="#dynamic-memory-base" title="この見出しへのパーマリンク">¶</a></h4>
+<p>カーネルの動的メモリ（例：kmalloc、vmallocなど）は、早期起動初期化の順序により比較的決定的なレイアウトになる。これらの領域のベースアドレスが起動ごとに異なる場合、ターゲットとなるのが困難になり、特定の領域に特化した情報漏洩が必要となる。</p>
+</section>
+<section id="structure-layout">
+<h4>構造体レイアウト<a class="headerlink" href="#structure-layout" title="この見出しへのパーマリンク">¶</a></h4>
+<p>感度の高い構造のレイアウトをビルドごとにランダム化することで、攻撃者は既知のカーネルビルドに合わせて調整するか、構造レイアウトを操作する前に十分なカーネルメモリを漏らす必要がある。</p>
+</section>
+</section>
+</section>
+<section id="preventing-information-exposures">
+<h2>情報漏洩の防止<a class="headerlink" href="#preventing-information-exposures" title="この見出しへのパーマリンク">¶</a></h2>
+<p>感度の高い構造の位置は攻撃の主な対象であり、カーネルメモリアドレスおよびカーネルメモリの内容（これらはカーネルアドレスやその他の感度の高い値（例：キャンリ値）を含む可能性がある）の漏洩を防ぐことが重要である。</p>
+<section id="kernel-addresses">
+<h3>カーネルアドレス<a class="headerlink" href="#kernel-addresses" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルのアドレスをユーザー空間に印刷すると、カーネルメモリのレイアウトに関する機密情報が漏洩します。%px、%p[ad]（および特定の状況下での%p[sSb] [*]）などのrawアドレスを印刷するprintk指定子を使用する際には注意が必要です。これらの指定子を使用して書かれたファイルは、権限のあるプロセスのみが読み取れるようにする必要があります。</p>
+<p>4.14バージョン以前のカーネルでは%pを使用してrawアドレスを印刷していました。4.15-rc1以降では、%p指定子で印刷されるアドレスは印刷前にハッシュ処理されます。</p>
+<p>[*] KALLSYMSが有効でシンボル検索に失敗した場合、rawアドレスが印刷されます。KALLSYMSが無効な場合は、rawアドレスが印刷されます。</p>
+</section>
+<section id="unique-identifiers">
+<h3>一意の識別子<a class="headerlink" href="#unique-identifiers" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルメモリアドレスは、ユーザー空間に露出する識別子として決して使用してはいけません。代わりに、アトミックカウンターやidr、または類似の一意の識別子を使用してください。</p>
+</section>
+<section id="memory-initialization">
+<h3>メモリの初期化<a class="headerlink" href="#memory-initialization" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ユーザー空間にコピーされるメモリは常に完全に初期化する必要があります。明示的に <a class="reference internal" href="../core-api/kernel-api.html#c.memset" title="memset"><code class="xref c c-func docutils literal notranslate"><span class="pre">memset()</span></code></a>しない場合、コンパイラの変更が必要となり、構造体の穴がクリアされるよう保証する必要があります。</p>
+</section>
+<section id="memory-poisoning">
+<h3>メモリの毒化<a class="headerlink" href="#memory-poisoning" title="この見出しへのパーマリンク">¶</a></h3>
+<p>メモリを解放する際には、内容を毒化して、古いメモリ内容に依存した再利用攻撃を防ぐのが望ましいです。例えば、システムコールの戻り時にスタックをクリア（<code class="docutils literal notranslate"><span class="pre">CONFIG_GCC_PLUGIN_STACKLEAK</span></code>）、メモリの解放時にヒープメモリを初期化するなど。これにより、未初期化変数の攻撃、スタック内容の漏洩、ヒープ内容の漏洩、および使用後の解放（use-after-free）攻撃などの多くの攻撃を妨げるのです。</p>
+</section>
+<section id="destination-tracking">
+<h3>宛先の追跡<a class="headerlink" href="#destination-tracking" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルアドレスがユーザー空間に書き込まれる原因となるバグのクラスを減らすために、書き込みの宛先を追跡する必要があります。バッファがユーザー空間宛（例：seq_fileでバックエンドされた <code class="docutils literal notranslate"><span class="pre">/proc</span></code> ファイル）である場合、敏感な値を自動的に隠蔽する必要があります。</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">セキュリティドキュメンテーション</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="credentials.html">Linuxにおけるクレデンシャル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="IMA-templates.html">IMAテンプレート管理メカニズム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="keys/index.html">カーネルキー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lsm.html">Linuxセキュリティモジュール: Linuxの一般的なセキュリティフック</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lsm-development.html">Linuxセキュリティモジュール開発</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sak.html">Linuxセキュアアテンションキー（SAK）処理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SCTP.html">SCTP</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">カーネルセレフプロテクション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="siphash.html">SipHash - 短い入力のPRF</a></li>
+<li class="toctree-l2"><a class="reference internal" href="siphash.html#halfsiphash-siphash-s-insecure-younger-cousin">HalfSipHash - SipHashの不安全な若き従弟</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tpm/index.html">信頼されたプラットフォームモジュールドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="digsig.html">デジタル署名検証API</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">セキュリティドキュメンテーション</a><ul>
+<li>前へ: <a href="SCTP.html" title="前章">SCTP</a></li>
+<li>次へ: <a href="siphash.html" title="次章">SipHash - 短い入力のPRF</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/security/self-protection.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

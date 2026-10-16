@@ -1,0 +1,1257 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>カーネルキー保持サービス — Linux Kernel ドキュメント</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="ecryptfs.html" rel="next" title="eCryptfs ファイルシステム用の暗号化キー"/>
+<link href="index.html" rel="prev" title="カーネルキー"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="kernel-key-retention-service">
+<h1>Kernel Key Retention Service<a class="headerlink" href="#kernel-key-retention-service" title="この見出しへのパーマリンク">¶</a></h1>
+<p>このサービスは、ファイルシステムやその他のカーネルサービスの使用に際して、暗号化キー、認証トークン、クロスドメインユーザーマッピング、など、暗号化キーなどの暗号データをカーネル内でキャッシュする機能を提供します。</p>
+<p>キーリングは許可されています。これは他のキーへのリンクを保持できる特別な種類のキーです。プロセスはそれぞれ、カーネルサービスが関連するキーを検索するための3つの標準的なキーリングサブスクリプションを持っています。</p>
+<p>キーのサービスは、以下の設定を有効にして構成できます:</p>
+<blockquote>
+<div><p>「セキュリティオプション」／「アクセスキー保持サポートを有効にする」(CONFIG_KEYS)</p>
+</div></blockquote>
+<p>このドキュメントには以下のセクションがあります:</p>
+<div class="contents local topic" id="contents">
+<ul class="simple">
+<li><p><a class="reference internal" href="#key-overview" id="id1">キー概要</a></p></li>
+<li><p><a class="reference internal" href="#key-service-overview" id="id2">キーサービス概要</a></p></li>
+<li><p><a class="reference internal" href="#key-access-permissions" id="id3">キーへのアクセス権限</a></p></li>
+<li><p><a class="reference internal" href="#selinux-support" id="id4">SELinuxサポート</a></p></li>
+<li><p><a class="reference internal" href="#new-procfs-files" id="id5">新しいProcFSファイル</a></p></li>
+<li><p><a class="reference internal" href="#userspace-system-call-interface" id="id6">ユーザースペースシステムコールインターフェース</a></p></li>
+<li><p><a class="reference internal" href="#kernel-services" id="id7">カーネルサービス</a></p></li>
+<li><p><a class="reference internal" href="#notes-on-accessing-payload-contents" id="id8">ペイロードコンテンツへのアクセスに関する注意</a></p></li>
+<li><p><a class="reference internal" href="#defining-a-key-type" id="id9">キーのタイプを定義する</a></p></li>
+<li><p><a class="reference internal" href="#request-key-callback-service" id="id10">リクエストキーコールバックサービス</a></p></li>
+<li><p><a class="reference internal" href="#garbage-collection" id="id11">ゴミ収集</a></p></li>
+</ul>
+</div>
+<section id="key-overview">
+<h2><a class="toc-backref" href="#id1">キー概要</a><a class="headerlink" href="#key-overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>この文脈では、キーは暗号データ、認証トークン、キーリングなど、暗号化された単位を表します。これらはカーネル内でstruct keyによって表されます。</p>
+<p>各キーは以下の属性を持ちます:</p>
+<blockquote>
+<div><blockquote>
+<div><ul class="simple">
+<li><p>シリアル番号。</p></li>
+<li><p>タイプ。</p></li>
+<li><p>説明（検索時にキーを一致させるためのもの）。</p></li>
+<li><p>アクセス制御情報。</p></li>
+<li><p>有効期限。</p></li>
+<li><p>ペイロード。</p></li>
+<li><p>状態</p></li>
+</ul>
+</div></blockquote>
+<ul>
+<li><p>各キーは、そのキーの寿命にわたって一意のシリアル番号（key_serial_t型）が割り当てられます。すべてのシリアル番号は正の非ゼロ32ビット整数です。</p>
+<p>ユーザースペースのプログラムは、権限チェックの対象として、キーのシリアル番号を使用してアクセスできます。</p>
+</li>
+<li><p>各キーは定義された「タイプ」を持ちます。タイプは、ファイルシステムなどのカーネルサービスによってカーネル内に登録される必要があります。そのタイプのキーを追加または使用する前に、ユーザースペースのプログラムは新しいタイプを直接定義することはできません。</p>
+<p>キーのタイプは、カーネル内でstruct key_typeによって表されます。これは、そのタイプのキーに対して実行可能な操作を定義します。</p>
+<p>タイプがシステムから削除された場合、そのタイプのすべてのキーは無効になります。</p>
+</li>
+<li><p>各キーには説明が含まれます。これは印刷可能な文字列でなければなりません。キーのタイプは、キーの説明と基準文字列の間で一致を実行する操作を提供します。</p></li>
+<li><p>各キーには所有者ユーザーID、グループID、およびパーミッションマスクがあります。これらは、プロセスがユーザースペースからキーに対して行える操作を制御し、カーネルサービスがキーを検索できるかどうかを決定します。</p></li>
+<li><p>キーのタイプのインスタンス化関数によって、キーは特定の時間に有効期限を設定できます。また、キーは不朽（immortal）でもあります。</p></li>
+<li><p>各キーはペイロードを持つことができます。これは、実際の「キー」を表すデータ量です。キーリングの場合、これはキーリングがリンクしているキーの一覧であり、ユーザー定義のキーの場合、これは任意のバイナリデータの塊です。</p>
+<p>ペイロードを持つことは必須ではありません。実際、ペイロードは構造体key内に保存された値として扱うことができます。</p>
+<p>キーがインスタンス化される際、キーの種別のインスタンス化関数が呼び出され、その関数がバイナリデータをもとにキーのペイロードを生成します。</p>
+<p>同様に、ユーザー空間がキーの内容を読み戻す場合（許可された場合）、別のキー種別の操作関数が呼び出され、キーに添付されたペイロードが再びバイナリデータに変換されます。</p>
+</li>
+<li><p>各キーは以下の基本的な状態のいずれかにあります：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>未インスタンス化。キーは存在しますが、データが添付されていません。ユーザー空間から要求されたキーはこの状態になります。</p></li>
+<li><p>インスタンス化済み。これは通常の状態です。キーは完全に構築され、データが添付されています。</p></li>
+<li><p>否定的。これは一時的な状態です。このキーは、ユーザー空間への前の呼び出しが失敗したことを示すノートとして機能し、キーの検索を制限します。否定的なキーは通常状態に戻すことができます。</p></li>
+<li><p>期限切れ。キーには有効期限を設定できます。有効期限を超えた場合、この状態に移行します。期限切れのキーは通常状態に戻すことができます。</p></li>
+<li><p>取り消された。ユーザー空間の操作によってこの状態に設定されます。検索や操作が行われません（削除を除く）。</p></li>
+<li><p>無効。キーの種類が登録されていないため、キーは現在無効です。</p></li>
+</ul>
+</div></blockquote>
+</li>
+</ul>
+</div></blockquote>
+<p>最後の3つの状態にあるキーはガベージコレクションの対象になります。詳しくは「ガベージコレクション」セクションを参照してください。</p>
+</section>
+<section id="key-service-overview">
+<h2><a class="toc-backref" href="#id2">キーサービス概要</a><a class="headerlink" href="#key-service-overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>キーメンバーはキー以外にもいくつかの機能を提供しています：</p>
+<blockquote>
+<div><ul>
+<li><p>キーメンバーは3種類の特別なキー種別を定義しています：</p>
+<p>(+) 「キーリング」</p>
+<blockquote>
+<div><p>キーリングは他のキーを含む特別なキーです。キーリングのリストはさまざまなシステムコールで変更可能です。キーリングは作成時にペイロードを指定しないでください。</p>
+</div></blockquote>
+<p>(+) 「ユーザー」</p>
+<blockquote>
+<div><p>この種別のキーは、説明とペイロードの両方が任意のバイナリデータの塊です。これらはユーザー空間によって作成、更新、読み取ることができ、カーネルサービスの使用には意図されていません。</p>
+</div></blockquote>
+<p>(+) 「ログオン」</p>
+<blockquote>
+<div><p>「ユーザー」キーと同様に、「ログオン」キーもペイロードとして任意のバイナリデータを持ちます。これはカーネルにアクセス可能だがユーザー空間のプログラムにはアクセスできないシークレットを保存するための場所として意図されています。</p>
+<p>説明は任意ですが、"subclass"というキーを記述する非ゼロ長の文字列で始める必要があります。"subclass"は":"で残りの説明と区切り、"logon"キーはユーザー空間から作成・更新可能ですが、ペイロードはカーネル空間からのみ読み取れます。</p>
+</div></blockquote>
+</li>
+<li><p>各プロセスは3つのキーリングにサブスクライブします：スレッド固有のキーリング、プロセス固有のキーリング、セッション固有のキーリング。</p>
+<p>スレッド固有のキーリングは、クラウン、フォーク、_VFORK、エクスエブなどの操作で子プロセスに破棄され、必要に応じてのみ新しいキーリングが作成されます。</p>
+<p>プロセス固有のキーリングは、クラウン、フォーク、_VFORKで子プロセスに空のキーリングに置き換えられます（CLONE_THREADが指定されている場合は共有されます）。エクスエブでもプロセスのプロセスキーリングは破棄され、新しいキーリングが作成されます。</p>
+<p>セッション固有のキーリングは、クラウン、フォーク、_VFORK、エクスエブを含むすべての操作で永続的です。後述のPR_JOIN_SESSION_KEYRINGを使用することで、プロセスは現在のセッションキーリングを新しいものに置き換えることができます。匿名の新しいキーリングを要求したり、特定の名前のキーリングを作成・参加を試みることも許可されています。</p>
+<p>スレッドの実際のUIDとGIDが変更されると、スレッドキーリングの所有権が変更されます。</p>
+</li>
+<li><p>システム内の各ユーザーIDは、ユーザー固有のキーリングとデフォルトユーザーセッションキーリングという2つの特別なキーリングを持ちます。デフォルトセッションキーリングはユーザー固有のキーリングへのリンクで初期化されます。</p>
+<p>プロセスが実際のUIDを変更した場合、以前セッションキーリングを持っていなかった場合は、新しいUIDのデフォルトセッションキーリングにサブスクライブされます。</p>
+<p>プロセスがセッションキーリングにアクセスしようとしたが持っていない場合、現在のUIDのデフォルトセッションキーリングにサブスクライブされます。</p>
+</li>
+<li><p>各ユーザーは、所有するキーやキーリングの数を制限するクォータと、説明とペイロードの空間を制限するクォータの2つの制限を持っています。</p>
+<p>ユーザーはprocfsファイルを通じてこの統計情報や他の統計情報を確認できます。rootユーザーはsysctlファイルを通じてクォータの制限を変更できます（"New procfs files"セクションを参照）。</p>
+<p>プロセス固有およびスレッド固有のキーリングは、ユーザーのクォータにカウントされません。</p>
+<p>キーやキーリングを変更するシステムコールがユーザーのクォータを超える場合、操作は拒否され、エラーEDQUOTが返されます。</p>
+</li>
+<li><p>ユーザー空間のプログラムがキーやキーリングを作成・操作するためのシステムコールインターフェースがあります。</p></li>
+<li><p>サービスがタイプを登録し、キーを検索できるためのカーネルインターフェースがあります。</p></li>
+<li><p>カーネルからの検索が、プロセスのキーリングに存在しないキーを取得するためユーザースペースにリクエストを戻す方法があります。</p></li>
+<li><p>キーデータベースを表示および操作するためのオプションのファイルシステムが利用可能です。</p></li>
+</ul>
+</div></blockquote>
+</section>
+<section id="key-access-permissions">
+<h2><a class="toc-backref" href="#id3">キーへのアクセス権限</a><a class="headerlink" href="#key-access-permissions" title="この見出しへのパーマリンク">¶</a></h2>
+<p>キーには所有者ユーザーID、グループアクセスID、およびパーミッションマスクがあります。マスクには、保有者、ユーザー、グループ、その他アクセスそれぞれ最大8ビットが割り当てられ、そのうち6ビットが定義されています。これらのパーミッションは以下の通りです：</p>
+<blockquote>
+<div><ul>
+<li><p>表示</p>
+<p>キーまたはキーリングの属性（キーのタイプや説明を含む）を表示することを許可します。</p>
+</li>
+<li><p>を読み、カーネルがプロテクションフォールト（いわゆる「カーネルオプス」）でレジスタ＋スタックダンプを出力するときに、有用な情報をどのように抽出できるか学びましょう。</p>
+<p>キーのペイロードを表示するか、キーリングのリンクされたキーの一覧を表示することを許可します。</p>
+</li>
+<li><p>書込み</p>
+<p>キーのペイロードをインスタンス化または更新するか、キーリングへのリンクを追加または削除することを許可します。</p>
+</li>
+<li><p>検索</p>
+<p>キーリングを検索し、キーを検索することを許可します。検索は、検索許可が設定されたネストされたキーリングにのみ再帰します。</p>
+</li>
+<li><p>リンク</p>
+<p>キーまたはキーリングへのリンクを許可します。キーリングからキーへのリンクを作成するには、プロセスがキーリングに対して書き込み許可を持ち、キーに対してリンク許可を持つ必要があります。</p>
+</li>
+<li><p>属性設定</p>
+<p>キーのUID、GID、およびパーミッションマスクを変更することを許可します。</p>
+</li>
+</ul>
+</div></blockquote>
+<p>所有者であるか、sysadmin能力を持つことで、所有権、グループID、またはパーミッションマスクの変更が可能です。</p>
+</section>
+<section id="selinux-support">
+<h2><a class="toc-backref" href="#id4">SELinuxサポート</a><a class="headerlink" href="#selinux-support" title="この見出しへのパーマリンク">¶</a></h2>
+<p>SELinuxにセキュリティクラス「key」が追加され、さまざまなコンテキスト内で作成されるキーに強制アクセス制御を適用できます。このサポートはプレリリースであり、今後大幅に変更される可能性があります。現在、上述した基本的なすべてのパーミッションがSELinuxでも提供されており、SELinuxは基本的なパーミッションチェックが完了した後のみ呼び出されます。</p>
+<p>ファイル /proc/self/attr/keycreate の値は新規に作成されるキーのラベリングに影響します。このファイルの内容がSELinuxセキュリティコンテキストに一致する場合、キーはそのコンテキストを割り当てられます。そうでない場合、キーはキーベリケーションリクエストを発行したタスクの現在のコンテキストを割り当てられます。タスクは、特定のコンテキストを新規に作成されるキーに割り当てるため、keyセキュリティクラスの「create」許可を明示的に取得する必要があります。</p>
+<p>ユーザーに関連付けられたデフォルトのキーリングは、ログインプログラムがログインプロセス中にkeycreateを適切に初期化するようにインストルメント化されている場合に限り、ユーザーのデフォルトコンテキストでラベル付けされます。それ以外の場合、ログインプログラム自体のコンテキストでラベル付けされます。</p>
+<p>ただし、rootユーザーに関連付けられたデフォルトのキーリングは、rootがログインする機会がある前に起動プロセスの初期段階で作成されるため、デフォルトのカーネルコンテキストでラベル付けされています。</p>
+<p>新しいスレッドに関連付けられたキーリングは、それぞれのスレッドのコンテキストでラベル付けされ、セッションとプロセスのキーリングも同様に処理されます。</p>
+</section>
+<section id="new-procfs-files">
+<h2><a class="toc-backref" href="#id5">新しいProcFSファイル</a><a class="headerlink" href="#new-procfs-files" title="この見出しへのパーマリンク">¶</a></h2>
+<p>管理者がキーメンバーの状態を確認できるよう、procfsに2つのファイルが追加されました:</p>
+<blockquote>
+<div><ul>
+<li><p>/proc/keys</p>
+<p>これは、ファイルを読み込むタスクが現在表示できるキーアクセス情報を示しており、キーペイロードの内容は表示できませんが、一部の情報は提供されることがあります。</p>
+<p>リストに含まれるキーメンバーは、読み込みプロセスがそれらを所有しているかどうかに関わらず、読み込みプロセスにView権限を付与するキーメンバーのみです。注意として、LSMセキュリティチェックが実行され、現在のプロセスが表示を許可されていないキーメンバーはさらにフィルタリングされることがあります。</p>
+<p>このファイルの内容は以下のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>SERIAL   FLAGS  USAGE EXPY PERM     UID   GID   TYPE      DESCRIPTION: SUMMARY
+00000001 I-----    39 perm 1f3f0000     0     0 keyring   _uid_ses.0: 1/4
+00000002 I-----     2 perm 1f3f0000     0     0 keyring   _uid.0: empty
+00000007 I-----     1 perm 1f3f0000     0     0 keyring   _pid.1: empty
+0000018d I-----     1 perm 1f3f0000     0     0 keyring   _pid.412: empty
+000004d2 I--Q--     1 perm 1f3f0000    32    -1 keyring   _uid.32: 1/4
+000004d3 I--Q--     3 perm 1f3f0000    32    -1 keyring   _uid_ses.32: empty
+00000892 I--QU-     1 perm 1f000000     0     0 user      metal:copper: 0
+00000893 I--Q-N     1  35s 1f3f0000     0     0 user      metal:silver: 0
+00000894 I--Q--     1  10h 003f0000     0     0 user      metal:gold: 0
+</pre></div>
+</div>
+<p>フラグは以下の通りです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>I       Instantiated
+R       Revoked
+D       Dead
+Q       Contributes to user's quota
+U       Under construction by callback to userspace
+N       Negative key
+</pre></div>
+</div>
+</li>
+<li><p>/proc/key-users</p>
+<p>これは、システム上に少なくとも1つのキーメンバーを持つユーザーごとのトラッキングデータを表示しており、そのデータにはクォータ情報や統計情報が含まれます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>[root@andromeda root]# cat /proc/key-users
+0:     46 45/45 1/100 13/10000
+29:     2 2/2 2/100 40/10000
+32:     2 2/2 2/100 40/10000
+38:     2 2/2 2/100 40/10000
+</pre></div>
+</div>
+<p>各行のフォーマットは以下の通りです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>&lt;UID&gt;:                  User ID to which this applies
+&lt;usage&gt;                 Structure refcount
+&lt;inst&gt;/&lt;keys&gt;           Total number of keys and number instantiated
+&lt;keys&gt;/&lt;max&gt;            Key count quota
+&lt;bytes&gt;/&lt;max&gt;           Key size quota
+</pre></div>
+</div>
+</li>
+</ul>
+</div></blockquote>
+<p>キーメンバーのクォータ制限を制御するため、4つの新しいsysctlファイルが追加されました:</p>
+<blockquote>
+<div><ul>
+<li><p>/proc/sys/kernel/keys/root_maxkeys /proc/sys/kernel/keys/root_maxbytes</p>
+<p>これらは、rootが保持できるキーメンバーの最大数と、それらのキーメンバーに格納できるデータの最大バイト数を表します。</p>
+</li>
+<li><p>/proc/sys/kernel/keys/maxkeys /proc/sys/kernel/keys/maxbytes</p>
+<p>これらは、各非rootユーザーが保持できるキーメンバーの最大数と、それらのキーメンバーに格納できるデータの最大バイト数を表します。</p>
+</li>
+</ul>
+</div></blockquote>
+<p>rootは、適切なファイルにデシマル数値の文字列を書き込むことで、これらの制限を変更できます。</p>
+</section>
+<section id="userspace-system-call-interface">
+<h2><a class="toc-backref" href="#id6">ユーザースペースシステムコールインターフェース</a><a class="headerlink" href="#userspace-system-call-interface" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ユーザー空間は、add_key、request_key、keyctlという3つの新しいシステムコールを通じてキーメンバーを直接操作できます。後者はキーメンバーの操作に必要な複数の機能を提供します。</p>
+<p>キーリングに直接参照する際、ユーザー空間のプログラムはキーリングのシリアル番号（正の32ビット整数）を使用する必要があります。ただし、呼び出し元のプロセスに関連する特別なキーやキーリングを参照するための特別な値もあります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>CONSTANT                        VALUE   KEY REFERENCED
+==============================  ======  ===========================
+KEY_SPEC_THREAD_KEYRING         -1      thread-specific keyring
+KEY_SPEC_PROCESS_KEYRING        -2      process-specific keyring
+KEY_SPEC_SESSION_KEYRING        -3      session-specific keyring
+KEY_SPEC_USER_KEYRING           -4      UID-specific keyring
+KEY_SPEC_USER_SESSION_KEYRING   -5      UID-session keyring
+KEY_SPEC_GROUP_KEYRING          -6      GID-specific keyring
+KEY_SPEC_REQKEY_AUTH_KEY        -7      assumed request_key()
+                                          authorisation key
+</pre></div>
+</div>
+<p>主なシステムコールは以下の通りです:</p>
+<blockquote>
+<div><ul>
+<li><p>指定されたキーリングに指定されたタイプ、説明、ペイロードを持つ新しいキーオブジェクトを作成し、それをキーリングに追加します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>key_serial_t add_key(const char *type, const char *desc,
+                     const void *payload, size_t plen,
+                     key_serial_t keyring);
+</pre></div>
+</div>
+<p>キーリングに同じタイプかつ同じ説明を持つキーオブジェクトがすでに存在する場合、この関数は指定されたペイロードでそれを更新しようとします。ただし、キーテイプがこの機能をサポートしていない場合は、EEXISTエラーが返されます。また、キーオブジェクトを更新するには、プロセスがそのキーオブジェクトに書き込み権限を持つ必要があります。新しいキーオブジェクトはすべてのユーザー権限を付与され、グループや第三者の権限は付与されません。</p>
+<p>それ以外の場合、指定されたタイプと説明を持つ新しいキーオブジェクトを作成し、指定されたペイロードでインスタンス化し、キーリングにアタッチします。この場合、プロセスがキーリングに書き込み権限を持っていない場合、エラーが発生します。</p>
+<p>キーテイプがサポートする場合、説明がNULLまたは空文字列の場合、キーテイプはペイロードの内容から説明を生成しようとします。</p>
+<p>ペイロードはオプションであり、タイプによってはポインタをNULLに設定できます。ペイロードのサイズはplenで指定され、plenがゼロの場合は空のペイロードとみなします。</p>
+<p>タイプを「keyring」に設定し、キーリング名を説明（またはNULL）として、ペイロードをNULLに設定することで、新しいキーリングを生成できます。</p>
+<p>ユーザー定義のキーオブジェクトはタイプを「user」に指定することで作成できます。ユーザー定義キーオブジェクトの説明には、タイプIDとコロンを接続した形式（例: Kerberos 5チケット許可チケットの場合「krb5tgt:」）を推奨します。</p>
+<p>他のタイプは、カーネルに事前にファイルシステムなどのカーネルサービスによって登録しておく必要があります。</p>
+<p>成功した場合、新しいまたは更新されたキーオブジェクトのIDが返されます。</p>
+</li>
+<li><p>プロセスのキーリングを検索し、必要に応じてユーザー空間でキーオブジェクトを作成します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>key_serial_t request_key(const char *type, const char *description,
+                         const char *callout_info,
+                         key_serial_t dest_keyring);
+</pre></div>
+</div>
+<p>この関数は、スレッド、プロセス、セッションの順にプロセスのすべてのキーリングを検索し、一致するキーオブジェクトを探します。これはKEYCTL_SEARCHと非常に似ており、見つかったキーオブジェクトをキーリングにアタッチするオプションも含みます。</p>
+<p>キーオブジェクトが見つからない場合、callout_infoがNULLでない場合は、/sbin/request-keyが呼び出され、キーオブジェクトを取得しようとします。callout_info文字列は、プログラムに引数として渡されます。</p>
+<p>キーを目的のキーリングにリンクするには、キーが呼び出し元に対してリンク許可を許可し、かつキーリングが書き込み許可を許可する必要があります。</p>
+<p>関連項目 <a class="reference internal" href="request-key.html"><span class="doc">Key Request Service（キーリクエストサービス）</span></a>.</p>
+</li>
+</ul>
+</div></blockquote>
+<p>keyctlシステムコール関数は以下の通りです:</p>
+<blockquote>
+<div><ul>
+<li><p>特殊なキーIDをこのプロセスの実際のキーIDにマッピングします:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>key_serial_t keyctl(KEYCTL_GET_KEYRING_ID, key_serial_t id,
+                    int create);
+</pre></div>
+</div>
+<p>「id」で指定された特殊なキーは検索され（必要に応じて作成される）、存在する場合、そのキーまたはキーリングのIDが返されます。</p>
+<p>キーがまだ存在しない場合、createがゼロでない場合はキーが作成され、ゼロの場合はENOKEYエラーが返されます。</p>
+</li>
+<li><p>このプロセスが属しているセッションキーリングを新しいものに置き換えます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>key_serial_t keyctl(KEYCTL_JOIN_SESSION_KEYRING, const char *name);
+</pre></div>
+</div>
+<p>nameがNULLの場合は、プロセスのセッションキーリングとしてアタッチされる匿名キーリングが作成され、古いセッションキーリングは置き換えられます。</p>
+<p>nameがNULLでない場合、その名前のキーリングが存在する場合は、プロセスがそれをセッションキーリングとしてアタッチしようとし、許可されない場合はエラーを返します。そうでない場合は、その名前の新しいキーリングが作成され、セッションキーリングとしてアタッチされます。</p>
+<p>名前付きキーリングにアタッチするには、プロセスの所有権に対する検索権限が必要です。</p>
+<p>操作成功時に新しいセッションキーリングのIDが返されます。</p>
+</li>
+<li><p>指定されたキーを更新します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_UPDATE, key_serial_t key, const void *payload,
+            size_t plen);
+</pre></div>
+</div>
+<p>指定されたキーを指定されたペイロードで更新しようとしますが、その機能がキーの種類によってサポートされていない場合はEOPNOTSUPPエラーを返します。また、キーを更新するにはプロセスがそのキーへの書き込み許可を持つ必要があります。</p>
+<p>ペイロードの長さはplenであり、add_key()と同様に存在しないか空でも可能です。</p>
+</li>
+<li><p>キーを失効させます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_REVOKE, key_serial_t key);
+</pre></div>
+</div>
+<p>キーを今後の操作で使用できなくします。今後のキーの使用試行はEKEYREVOKEDエラーで拒否され、キーはもはや見つかりません。</p>
+</li>
+<li><p>キーの所有権を変更します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_CHOWN, key_serial_t key, uid_t uid, gid_t gid);
+</pre></div>
+</div>
+<p>キーの所有者とグループIDを変更できます。uidまたはgidのいずれかを-1に設定することでその変更を抑制できます。</p>
+<p>スーパーユーザーのみがキーの所有者を現在の所有者以外に変更できます。同様に、スーパーユーザーのみがキーのグループIDを呼び出し元プロセスのグループIDまたはそのグループリストのメンバー以外に変更できます。</p>
+</li>
+<li><p>キーのアクセス権のマスクを変更します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_SETPERM, key_serial_t key, key_perm_t perm);
+</pre></div>
+</div>
+<p>キーの所有者またはスーパーユーザーのみがキーのアクセス権のマスクを変更できます。</p>
+<p>許可されるビットはのみ許可され、他のビットが設定されている場合はEINVALエラーが返されます。</p>
+</li>
+<li><p>キーを記述します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_DESCRIBE, key_serial_t key, char *buffer,
+            size_t buflen);
+</pre></div>
+</div>
+<p>この関数は、キーの属性（ペイロードデータを除く）の要約を、提供されたバッファに文字列として返します。</p>
+<p>エラーがない限り、常に生成可能なデータ量を返します。ただし、バッファに収まりきらなくても、ユーザー空間にコピーするデータ量は要求された分だけに限ります。バッファポインタがNULLの場合、コピーは行われません。</p>
+<p>この関数が成功するには、プロセスがキーに対して閲覧権限を保有している必要があります。</p>
+<p>成功した場合、バッファに以下の形式で文字列が配置されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>&lt;type&gt;;&lt;uid&gt;;&lt;gid&gt;;&lt;perm&gt;;&lt;description&gt;
+</pre></div>
+</div>
+<p>typeとdescriptionは文字列、uidとgidは十進数、permは十六進数です。バッファが十分大きい場合、文字列の末尾にNULL文字が含まれます。</p>
+<p>これは以下の方法でパースできます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>sscanf(buffer, "%[^;];%d;%d;%o;%s", type, &amp;uid, &amp;gid, &amp;mode, desc);
+</pre></div>
+</div>
+</li>
+<li><p>キーリングをクリアする：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_CLEAR, key_serial_t keyring);
+</pre></div>
+</div>
+<p>この関数はキーリングにアタッチされているキーの一覧をクリアします。呼び出しプロセスがキーリングに書き込み権限を保有し、かつキーリングである必要があります（それ以外の場合、ENOTDIRエラーが発生します）。</p>
+<p>ユーザーがCAP_SYS_ADMINの能力を保有している場合、適切にマークされた特別なカーネルキーリングもこの関数でクリアできます。DNSリゾルバキャッシュキーリングはその例です。</p>
+</li>
+<li><p>キーをキーリングにリンクする：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_LINK, key_serial_t keyring, key_serial_t key);
+</pre></div>
+</div>
+<p>この関数はキーリングからキーへのリンクを作成します。プロセスがキーリングに書き込み権限を保有し、かつキーにリンク権限を保有している必要があります。</p>
+<p>キーリングがキーリングでない場合、ENOTDIRエラーが発生します。キーリングが満杯の場合、ENFILEエラーが発生します。</p>
+<p>リンク処理ではキーリングのネスティングを確認し、ネスティングが深すぎる場合はELOOP、リンクがサイクルを生じる場合はEDEADLKを返します。</p>
+<p>キーリング内に新規キーと同じtypeとdescriptionを持つキーへのリンクは、新規キーが追加される際に削除されます。</p>
+</li>
+<li><p>キーリング間でキーを移動する：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_MOVE,
+            key_serial_t id,
+            key_serial_t from_ring_id,
+            key_serial_t to_ring_id,
+            unsigned int flags);
+</pre></div>
+</div>
+<p>「id」で指定されたキーを「from_ring_id」で指定されたキーリングから「to_ring_id」で指定されたキーリングへ移動します。2つのキーリングが同じ場合、何も処理されません。</p>
+<p>「flags」にKEYCTL_MOVE_EXCLを設定すると、宛先キーリングに同じキーが存在する場合、EEXISTで操作が失敗します。それ以外の場合は、既存のキーが置き換えられます。</p>
+<p>この関数が成功するには、プロセスがキーにリンク権限を保有し、両方のキーリングに書き込み権限を保有する必要があります。KEYCTL_LINKで発生可能なエラーも宛先キーリングで同様に適用されます。</p>
+</li>
+<li><p>キーまたはキーリングを別のキーリングからアンリーナする：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_UNLINK, key_serial_t keyring, key_serial_t key);
+</pre></div>
+</div>
+<p>この関数はキーリング内で指定されたキーへの最初のリンクを検索し、見つかった場合は削除します。以降のリンクは無視されます。プロセスがキーリングに書き込み権限を保有している必要があります。</p>
+<p>keyring でない場合、ENOTDIR エラーが発生します。key が存在しない場合、ENOENT エラーが発生します。</p>
+</li>
+<li><p>keyringツリーを検索してkeyを取得する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>key_serial_t keyctl(KEYCTL_SEARCH, key_serial_t keyring,
+                    const char *type, const char *description,
+                    key_serial_t dest_keyring);
+</pre></div>
+</div>
+<p>指定されたkeyringをルートとして、typeとdescriptionの条件に一致するkeyを検索します。各keyringは子要素に再帰する前に、keyを検査します。</p>
+<p>プロセスがトップレベルのkeyringに対して検索権限を有しない場合、EACCESエラーが発生します。プロセスが検索権限を有するkeyringのみ再帰処理が行われ、プロセスが検索権限を有するkeyとkeyringのみマッチングされます。指定されたkeyringがkeyringでない場合、ENOTDIRエラーが発生します。</p>
+<p>検索が成功した場合、指定された宛先keyring（IDがゼロでない場合）に見つかったkeyをリンクしようとします。この場合もKEYCTL_LINKの制約が適用されます。</p>
+<p>検索が失敗した場合、ENOKEY、EKEYREVOKED、またはEKEYEXPIREDエラーが返されます。成功した場合、結果のkey IDが返されます。</p>
+</li>
+<li><p>keyからペイロードデータを読み込む:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_READ, key_serial_t keyring, char *buffer,
+            size_t buflen);
+</pre></div>
+</div>
+<p>指定されたkeyからペイロードデータをバッファに読み込みます。keyに対して読み取り権限を有しないプロセスでは成功しません。</p>
+<p>返されたデータはkeyの種類によって処理されます。例えば、keyringはそのkeyに登録されているすべてのkeyのkey_serial_tエントリの配列を返します。ユーザー定義のkey種類はデータをそのまま返します。key種類がこの関数を実装していない場合、EOPNOTSUPPエラーが発生します。</p>
+<p>指定されたバッファが小さすぎる場合、必要なバッファサイズが返されます。この場合、バッファの内容は未定義の方法で上書きされる可能性があります。</p>
+<p>成功した場合、バッファにコピーされたデータ量が返されます。</p>
+</li>
+<li><p>部分的に構築されたkeyをインスタンス化する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_INSTANTIATE, key_serial_t key,
+            const void *payload, size_t plen,
+            key_serial_t keyring);
+long keyctl(KEYCTL_INSTANTIATE_IOV, key_serial_t key,
+            const struct iovec *payload_iov, unsigned ioc,
+            key_serial_t keyring);
+</pre></div>
+</div>
+<p>カーネルがユーザースペースにコールバックしてkeyのインスタンス化を完了する場合、ユーザースペースは呼び出されたプロセスが戻る前にkeyのデータを提供する必要があります。それ以外の場合、keyは自動的に負の値でマークされます。</p>
+<p>keyをインスタンス化するには、プロセスがkeyに対して書き込みアクセス権を有し、かつkeyが未インスタンス化である必要があります。</p>
+<p>keyringが指定されている場合（IDがゼロでない場合）、keyはそのkeyringにもリンクされます。この場合もKEYCTL_LINKの制約が適用されます。</p>
+<p>ペイロードとplen引数はadd_key()でペイロードデータを記述するのと同じです。</p>
+<p>payload_iov および ioc 引数は、単一のバッファではなく、iovec 配列でペイロードデータを記述します。</p>
+</li>
+<li><p>部分的に構築されたキーを否定的にインスタンス化する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_NEGATE, key_serial_t key,
+            unsigned timeout, key_serial_t keyring);
+long keyctl(KEYCTL_REJECT, key_serial_t key,
+            unsigned timeout, unsigned error, key_serial_t keyring);
+</pre></div>
+</div>
+<p>カーネルがユーザー空間に呼び出しを戻してキーのインスタンス化を完了させる場合、ユーザー空間は呼び出されたプロセスが要求を満たせない場合、そのプロセスが戻る前にこの呼び出しを使用してキーを否定的にマークする必要があります。</p>
+<p>keyをインスタンス化するには、プロセスがkeyに対して書き込みアクセス権を有し、かつkeyが未インスタンス化である必要があります。</p>
+<p>keyringが指定されている場合（IDがゼロでない場合）、keyはそのkeyringにもリンクされます。この場合もKEYCTL_LINKの制約が適用されます。</p>
+<p>キーが拒否された場合、そのキーの将来の検索は指定されたエラーコードを返します（拒否されたキーが期限切れになるまで）。キーの否定は、ENOKEY エラーコードでキーを拒否することと同等です。</p>
+</li>
+<li><p>デフォルトの request-key 送信先キーリングを設定する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_SET_REQKEY_KEYRING, int reqkey_defl);
+</pre></div>
+</div>
+<p>これは、このスレッドに暗黙的に要求されたキーがどのキーリングに添付されるかのデフォルトを設定します。reqkey_defl は次の定数のいずれかでなければなりません:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>CONSTANT                                VALUE   NEW DEFAULT KEYRING
+======================================  ======  =======================
+KEY_REQKEY_DEFL_NO_CHANGE               -1      No change
+KEY_REQKEY_DEFL_DEFAULT                 0       Default[1]
+KEY_REQKEY_DEFL_THREAD_KEYRING          1       Thread keyring
+KEY_REQKEY_DEFL_PROCESS_KEYRING         2       Process keyring
+KEY_REQKEY_DEFL_SESSION_KEYRING         3       Session keyring
+KEY_REQKEY_DEFL_USER_KEYRING            4       User keyring
+KEY_REQKEY_DEFL_USER_SESSION_KEYRING    5       User session keyring
+KEY_REQKEY_DEFL_GROUP_KEYRING           6       Group keyring
+</pre></div>
+</div>
+<p>成功した場合、古いデフォルトが返され、reqkey_defl が上記のいずれにも該当しない場合、エラー EINVAL が返されます。</p>
+<p>デフォルトのキーリングは、request_key() システムコールに指定されたキーリングによって上書きできます。</p>
+<p>この設定は fork/exec で継承されます。</p>
+<p>[1] デフォルトは: スレッドキーリングが存在する場合、それ以外はプロセスキーリングが存在する場合、それ以外はセッションキーリングが存在する場合、それ以外はユーザーのデフォルトセッションキーリングです。</p>
+</li>
+<li><p>キーにタイムアウトを設定する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_SET_TIMEOUT, key_serial_t key, unsigned timeout);
+</pre></div>
+</div>
+<p>これは、キーのタイムアウトを設定またはクリアします。タイムアウトは 0 でタイムアウトをクリアするか、秒数を指定してそのだけ先の将来の有効期限を設定できます。</p>
+<p>プロセスがキーの属性変更アクセスを持つ必要があります。負の、取り消された、または期限切れのキーにはこの関数でタイムアウトを設定できません。</p>
+</li>
+<li><p>キーのインスタンス化に付与された権限を仮定する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_ASSUME_AUTHORITY, key_serial_t key);
+</pre></div>
+</div>
+<p>これは、指定されたキーのインスタンス化に必要な権限を仮定するか、取り消します。スレッドが指定されたキーに関連する認証キーをキーリングのどこかに持っている場合に限り、権限を仮定できます。</p>
+<p>権限が仮定されると、キーの検索はリクエスターのセキュリティラベル、UID、GID、グループを使用してリクエスターのキーリングも検索します。</p>
+<p>リクエストされた権限が利用できない場合、エラー EPERM が返されます。また、ターゲットキーがすでにインスタンス化されているため権限が取り消された場合も同様です。</p>
+<p>指定されたキーが 0 の場合、仮定されたすべての権限が取り消されます。</p>
+<p>仮定された権限キーは fork および exec で継承されます。</p>
+</li>
+<li><p>キーに添付された LSM セキュリティコンテキストを取得する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_GET_SECURITY, key_serial_t key, char *buffer,
+            size_t buflen)
+</pre></div>
+</div>
+<p>この関数は、バッファに提供されたキーに添付された LSM セキュリティコンテキストを表す文字列を返します。</p>
+<p>エラーがない限り、常に生成可能なデータ量を返します。ただし、バッファに収まりきらなくても、ユーザー空間にコピーするデータ量は要求された分だけに限ります。バッファポインタがNULLの場合、コピーは行われません。</p>
+<p>バッファが十分大きい場合、文字列の末尾にNULL文字が含まれます。これは返却されたカウントに含まれます。LSMが有効でない場合、空文字列が返却されます。</p>
+<p>この関数が成功するには、プロセスがキーに対して閲覧権限を保有している必要があります。</p>
+</li>
+<li><p>呼び出しプロセスのセッションキーリングをその親プロセスにインストールします:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_SESSION_TO_PARENT);
+</pre></div>
+</div>
+<p>この関数は、呼び出しプロセスのセッションキーリングを呼び出しプロセスの親プロセスにインストールし、親プロセスの現在のセッションキーリングを置き換えます。</p>
+<p>呼び出しプロセスは親プロセスと同じ所有権を有し、キーリングは呼び出しプロセスと同じ所有権を有し、呼び出しプロセスがキーリングにLINK許可を有し、アクティブなLSMモジュールが許可を拒否しない場合に限り、成功します。それ以外の場合はエラーEPPERMが返却されます。</p>
+<p>メモリが不足した場合、エラーENOMEMが返却されます。それ以外の場合は0が返却され、成功を示します。</p>
+<p>親プロセスがカーネルから離脱し、ユーザー空間の実行を再開する次回にキーリングが置き換えられます。</p>
+</li>
+<li><p>キーリングを無効化します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_INVALIDATE, key_serial_t key);
+</pre></div>
+</div>
+<p>この関数はキーリングを無効化し、ガベージコレクターを起動します。ガベージコレクターは即座に無効化されたキーリングをすべてのキーリングから削除し、参照カウントがゼロになるときにキーリングを削除します。</p>
+<p>無効化されたキーリングは、削除されるまで通常のキーリング操作には見えなくなります。ただし、/proc/keysには依然として表示され続けます（'i'フラグで識別されます）。</p>
+<p>この関数が成功するには、プロセスがキーリングに検索許可を有する必要があります。</p>
+</li>
+<li><p>ディフィー・ヘルマン共有秘密鍵または公開鍵を計算します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_DH_COMPUTE, struct keyctl_dh_params *params,
+            char *buffer, size_t buflen, struct keyctl_kdf_params *kdf);
+</pre></div>
+</div>
+<p>params構造体には3つの鍵のシリアル番号が含まれています:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>- The prime, p, known to both parties
+- The local private key
+- The base integer, which is either a shared generator or the
+  remote public key
+</pre></div>
+</div>
+<p>計算される値は:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>result = base ^ private (mod prime)
+</pre></div>
+</div>
+<p>ベースが共有ジェネレータの場合、結果はローカルの公開鍵です。ベースがリモートの公開鍵の場合、結果は共有秘密鍵です。</p>
+<p>パラメータkdfがNULLの場合、以下の適用が行われます:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>バッファ長は素数の長さ以上、またはゼロでなければなりません。</p></li>
+<li><p>バッファ長がゼロでない場合、計算が成功したときに結果の長さがバッファにコピーされる際の長さが返却されます。バッファ長がゼロの場合、必要な最小バッファ長が返却されます。</p></li>
+</ul>
+</div></blockquote>
+<p>kdfパラメータは、呼び出し元がディフィー・ヘルマン計算にキーデリバティブ関数（KDF）を適用できるようにします。KDFの結果のみ呼び出し元に返却されます。KDFはkeyctl_kdf_params構造体で以下のように特徴付けられます:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">char</span> <span class="pre">*hashname</span></code> カーネル暗号APIで使用されるハッシュをNULL終端文字列で指定します。KDF実装はSP800-56AおよびSP800-108（カウンタKDF）に準拠しています。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">char</span> <span class="pre">*otherinfo</span></code> SP800-56Aのセクション5.8.1.2に記載されているOtherInfoデータを指定します。バッファの長さはotherinfolenで指定され、OtherInfoの形式は呼び出し元によって定義されます。OtherInfoポインタは、OtherInfoを使用しない場合NULLになる可能性があります。</p></li>
+</ul>
+</div></blockquote>
+<p>この関数は、鍵タイプがサポートされていない場合EOPNOTSUPPエラーを返し、鍵が見つからない場合ENOKEYエラーを返し、呼び出し元が鍵を読み取れない場合EACCESエラーを返します。さらに、kdfがNULLでない場合、バッファ長またはOtherInfo長が許容長を超えるとEMSGSIZEエラーを返します。</p>
+</li>
+<li><p>鍵リングのリンク制限:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_RESTRICT_KEYRING, key_serial_t keyring,
+            const char *type, const char *restriction);
+</pre></div>
+</div>
+<p>既存の鍵リングは、鍵の内容を制限スキーマに従って評価することにより、追加の鍵のリンクを制限できます。</p>
+<p>「keyring」は、制限を適用する既存の鍵リングの鍵IDです。これは空であったり、すでにリンクされている鍵を含んでいたりする場合があります。新しい制限が拒否する場合でも、既存のリンクされた鍵は鍵リングに残ります。</p>
+<p>「type」は登録済みの鍵タイプです。</p>
+<p>「restriction」は、鍵のリンクがどのように制限されるかを記述する文字列です。形式は鍵タイプによって異なり、リクエストされたタイプのlookup_restriction()関数に文字列が渡されます。これは署名検証や鍵ペイロードの制約などの制限方法と関連データを指定する場合があります。リクエストされた鍵タイプが後に登録解除された場合、鍵タイプが削除された後には鍵を追加できません。</p>
+<p>鍵リングの制限を適用するには、プロセスが属性設定の権限を有し、かつ鍵リングが以前に制限されていない必要があります。</p>
+<p>制限された鍵リングの1つのお手本として、非対称鍵タイプを使用してX.509証明書チェーンや個別証明書署名を検証できます。参照: <a class="reference internal" href="../../crypto/asymmetric-keys.html"><span class="doc">非対称/公開鍵暗号 キー タイプ</span></a> 非対称鍵タイプに適用可能な特定の制限についてはこちら。</p>
+</li>
+<li><p>非対称鍵の照会:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_PKEY_QUERY,
+            key_serial_t key_id, unsigned long reserved,
+            const char *params,
+            struct keyctl_pkey_query *info);
+</pre></div>
+</div>
+<p>非対称鍵に関する情報を取得します。特定のアルゴリズムやエンコーディングを照会するには、 <code class="docutils literal notranslate"><span class="pre">params</span></code> 引数を使用します。これは、スペースまたはタブで区切られたキー値ペアの文字列です。現在サポートされているキーには、 <code class="docutils literal notranslate"><span class="pre">enc</span></code> および <code class="docutils literal notranslate"><span class="pre">hash</span></code>含まれます。情報はkeyctl_pkey_query構造体で返されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>__u32   supported_ops;
+__u32   key_size;
+__u16   max_data_size;
+__u16   max_sig_size;
+__u16   max_enc_size;
+__u16   max_dec_size;
+__u32   __spare[10];
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">supported_ops</span></code> はサポートされるオペレーションを示すビットマスクで、以下のビット論理和から構成されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>KEYCTL_SUPPORTS_{ENCRYPT,DECRYPT,SIGN,VERIFY}
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">key_size</span></code> は鍵のサイズをビット単位で示します。</p>
+<p><code class="docutils literal notranslate"><span class="pre">max_*_size</span></code> は署名用データの塊、署名の塊、暗号化用データの塊、復号化用データの塊の最大バイトサイズを示します。</p>
+<p><code class="docutils literal notranslate"><span class="pre">__spare[]</span></code> は0に設定する必要があります。これは将来、鍵をアンロックするために必要なパスフレーズを渡すために予約されています。</p>
+<p>成功した場合、0が返されます。キーが非対称鍵でない場合、EOPNOTSUPPが返されます。</p>
+</li>
+<li><p>非対称鍵を使用してブロブを暗号化、復号、署名または検証します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_PKEY_ENCRYPT,
+            const struct keyctl_pkey_params *params,
+            const char *info,
+            const void *in,
+            void *out);
+
+long keyctl(KEYCTL_PKEY_DECRYPT,
+            const struct keyctl_pkey_params *params,
+            const char *info,
+            const void *in,
+            void *out);
+
+long keyctl(KEYCTL_PKEY_SIGN,
+            const struct keyctl_pkey_params *params,
+            const char *info,
+            const void *in,
+            void *out);
+
+long keyctl(KEYCTL_PKEY_VERIFY,
+            const struct keyctl_pkey_params *params,
+            const char *info,
+            const void *in,
+            const void *in2);
+</pre></div>
+</div>
+<p>非対称鍵を使用して、ブロブのデータに対して公開鍵暗号操作を行います。暗号化および検証では、非対称鍵の公開部分のみが必要ですが、復号および署名では秘密部分も必要です。</p>
+<p>paramsで指されるパラメータブロックには、いくつかの整数値が含まれています:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>__s32           key_id;
+__u32           in_len;
+__u32           out_len;
+__u32           in2_len;
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">key_id</span></code> 使用する非対称鍵のIDです。  <code class="docutils literal notranslate"><span class="pre">in_len</span></code> および
+<code class="docutils literal notranslate"><span class="pre">in2_len</span></code> inおよびin2バッファ内のデータ量を示します。
+<code class="docutils literal notranslate"><span class="pre">out_len</span></code> 上記の操作に適した出力バッファのサイズを示します。</p>
+<p>特定の操作において、inおよびoutバッファは以下のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Operation ID            in,in_len       out,out_len     in2,in2_len
+======================= =============== =============== ===============
+KEYCTL_PKEY_ENCRYPT     Raw data        Encrypted data  -
+KEYCTL_PKEY_DECRYPT     Encrypted data  Raw data        -
+KEYCTL_PKEY_SIGN        Raw data        Signature       -
+KEYCTL_PKEY_VERIFY      Raw data        -               Signature
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">info</span></code> key=value形式の文字列で補足情報が提供されます。これらには、</p>
+<blockquote>
+<div><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">enc=&lt;encoding&gt;</span></code> 暗号化された/署名ブロブのエンコーディングです。これは</dt><dd><p>「pkcs1」でRSASSA-PKCS1-v1.5またはRSAES-PKCS1-v1.5、「pss」でRSASSA-PSS、「oaep」でRSAES-OAEPを表します。省略または「raw」の場合は、暗号化関数の出力結果をそのまま指定します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">hash=&lt;algo&gt;</span></code> データバッファにハッシュ関数の出力が含まれている場合、</dt><dd><p>エンコーディングに使用されたハッシュ関数の種類が示されている場合は、この情報を用いてハッシュ関数を指定できます。例: 「hash=sha256」。</p>
+</dd>
+</dl>
+</div></blockquote>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">__spare[]</span></code> パラメータブロック内のスペースは0に設定する必要があります。これは、鍵をアンロックするためにパスフレーズを渡すことを含む目的があります。</p>
+<p>成功した場合、暗号化、復号および署名は出力バッファに書き込まれたデータ量を返します。検証は成功時に0を返します。</p>
+</li>
+<li><p>キーまたはキーリングの変更を監視します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long keyctl(KEYCTL_WATCH_KEY, key_serial_t key, int queue_fd,
+            const struct watch_notification_filter *filter);
+</pre></div>
+</div>
+<p>指定されたキーまたはキーリングの変更を設定または解除します。</p>
+<p>「key」は監視するキーのIDです。</p>
+<p>「queue_fd」は、通知を届けるバッファを管理するオープンパイプへのファイル記述子です。</p>
+<p>「filter」はNULLを指定してウォッチを解除するか、必要なイベントを示すフィルタ指定です。</p>
+<p>参照 <a class="reference internal" href="../../watch_queue.html"><span class="doc">一般的な通知メカニズム</span></a> 詳しくは</p>
+<p>特定の{ key, queue_fd }組み合わせに対しては、1つのウォッチのみを設定できます。</p>
+<p>通知レコードは以下のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct key_notification {
+        struct watch_notification watch;
+        __u32   key_id;
+        __u32   aux;
+};
+</pre></div>
+</div>
+<p>ここではwatch::typeが「WATCH_TYPE_KEY_NOTIFY」になり、subtypeは次のいずれかです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>NOTIFY_KEY_INSTANTIATED
+NOTIFY_KEY_UPDATED
+NOTIFY_KEY_LINKED
+NOTIFY_KEY_UNLINKED
+NOTIFY_KEY_CLEARED
+NOTIFY_KEY_REVOKED
+NOTIFY_KEY_INVALIDATED
+NOTIFY_KEY_SETATTR
+</pre></div>
+</div>
+<p>これらはキーがインスタンス化/拒否される、更新される、キーリングにリンクが作成される、キーリングからリンクが削除される、キーリングがクリアされる、キーが取り消される、キーが無効化される、またはキーの属性（ユーザー、グループ、権限、タイムアウト、制限）が変更される場合を示します。</p>
+<p>監視されているキーが削除された場合、"type"がWATCH_TYPE_METAに設定され、"subtype"がwatch_meta_removal_notificationに設定された基本的なwatch_notificationが発行されます。watchpoint IDは"info"フィールドに設定されます。</p>
+<p>これを行うには、以下を有効にする必要があります:</p>
+<blockquote>
+<div><p>「キー/キーリング変更通知を提供」(KEY_NOTIFICATIONS)</p>
+</div></blockquote>
+</li>
+</ul>
+</div></blockquote>
+</section>
+<section id="kernel-services">
+<h2><a class="toc-backref" href="#id7">カーネルサービス</a><a class="headerlink" href="#kernel-services" title="この見出しへのパーマリンク">¶</a></h2>
+<p>キーマネジメント用のカーネルサービスは、扱いが比較的簡単です。これらはキーやキーティプの2つの領域に分けることができます。</p>
+<p>キーハンドリングは比較的簡単です。まず、カーネルサービスが自身のティプを登録し、その後そのティプのキーを検索します。必要がある限りキーを保持し、必要なくなったら解放する必要があります。ファイルシステムやデバイスファイルの場合、オープンコール時に検索が行われ、クローズ時にキーが解放されます。2つの異なるユーザーが同じファイルを開いた際に生じるキーの競合については、ファイルシステムの開発者に解決を委ねます。</p>
+<p>キーマネージャーにアクセスするには、以下のヘッダーファイルを#includeする必要があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>&lt;linux/key.h&gt;
+</pre></div>
+</div>
+<p>特定のキーティプについては、include/keys/以下のヘッダーファイルを使用してアクセスします。例えば"user"タイプのキーについては、以下になります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>&lt;keys/user-type.h&gt;
+</pre></div>
+</div>
+<p>キーやキーリングへのポインタには、2種類のポインタがあります:</p>
+<blockquote>
+<div><ul>
+<li><p>struct key *</p>
+<p>これはキーファイル構造体自身を指します。キーファイル構造体は少なくとも4バイトアライメントされます。</p>
+</li>
+<li><p>key_ref_t</p>
+<p>これは <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">key</span> <span class="pre">*</span></code>と同等ですが、呼び出し元が"所有"している場合、最下位ビットが設定されます。"所有"とは、呼び出しプロセスが自身のキーリングからそのキーへの検索可能なリンクを持つことを意味します。これに関する関数は以下の3つがあります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>key_ref_t make_key_ref(const struct key *key, bool possession);
+
+struct key *key_ref_to_ptr(const key_ref_t key_ref);
+
+bool is_key_possessed(const key_ref_t key_ref);
+</pre></div>
+</div>
+<p>最初の関数は、キーポインタと所有情報（真偽値）からキーリファレンスを構築します。</p>
+<p>2番目の関数は、リファレンスからキーポインタを取得し、3番目の関数は所有フラグを取得します。</p>
+</li>
+</ul>
+</div></blockquote>
+<p>キーペイロードコンテンツにアクセスする際には、アクセスと変更の競合を防ぐための注意が必要です。詳しくは「ペイロードコンテンツのアクセスに関する注意事項」セクションをご参照ください。</p>
+<blockquote>
+<div><ul>
+<li><p>キーロックを検索するには、以下を呼び出します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct key *request_key(const struct key_type *type,
+                        const char *description,
+                        const char *callout_info);
+</pre></div>
+</div>
+<p>これは、キーティプのmatch_preparse()メソッドに従って指定された説明と一致するキーやキーリングを要求するために使用されます。これにより、近似したマッチングが可能です。callout_stringがNULLでない場合、/sbin/request-keyが呼び出され、ユーザー空間からキーロックを取得試みされます。その場合、callout_stringがプログラムに引数として渡されます。</p>
+<p>関数がENOKEY、EKEYEXPIRED、またはEKEYREVOKEDエラーで失敗した場合、これらのエラーが返されます。</p>
+<p>成功した場合、キーはKEYCTL_SET_REQKEY_KEYRINGで設定されたデフォルトのキーリングに暗黙的に取得されたrequest-keyキーとしてアタッチされます。</p>
+<p>関連項目 <a class="reference internal" href="request-key.html"><span class="doc">Key Request Service（キーリクエストサービス）</span></a>.</p>
+</li>
+<li><p>特定のドメイン内のキーを検索するには、次の関数を呼び出してください。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct key *request_key_tag(const struct key_type *type,
+                            const char *description,
+                            struct key_tag *domain_tag,
+                            const char *callout_info);
+</pre></div>
+</div>
+<p>これはrequest_key()と同一ですが、ドメインタグを指定することで検索アルゴリズムがそのタグに一致するキーのみをマッチするようになります。ドメインタグはNULLを指定することもでき、その場合、指定されたドメインとは別なグローバルドメインを表します。</p>
+</li>
+<li><p>補助データをアップコールに渡してキーを検索するには、次の関数を呼び出してください。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct key *request_key_with_auxdata(const struct key_type *type,
+                                     const char *description,
+                                     struct key_tag *domain_tag,
+                                     const void *callout_info,
+                                     size_t callout_len,
+                                     void *aux);
+</pre></div>
+</div>
+<p>これはrequest_key_tag()と同一ですが、存在する場合、key_type-&gt;request_key()操作に補助データが渡され、callout_infoはcallout_lenの長さのバイナリデータ（長さが0でも可能）として渡されます。</p>
+</li>
+<li><p>RCU条件でキーを検索するには、次の関数を呼び出してください。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct key *request_key_rcu(const struct key_type *type,
+                            const char *description,
+                            struct key_tag *domain_tag);
+</pre></div>
+</div>
+<p>これはrequest_key_tag()と似ていますが、構築中のキーのチェックを行わず、マッチが見つからない場合でもユーザースペースにコールバックを行いません。</p>
+</li>
+<li><p>必要がなくなった場合は、次の関数を使用してキーを解放してください。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void key_put(struct key *key);
+</pre></div>
+</div>
+<p>または：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void key_ref_put(key_ref_t key_ref);
+</pre></div>
+</div>
+<p>これらは割込みコンテキストから呼び出すことができます。CONFIG_KEYSが設定されていない場合、引数はパースされません。</p>
+</li>
+<li><p>キーへの追加参照は、次の関数のいずれかを呼び出すことで行えます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct key *__key_get(struct key *key);
+struct key *key_get(struct key *key);
+</pre></div>
+</div>
+<p>参照されたキーは、使用が終わったらkey_put()を呼び出して破棄する必要があります。渡されたキーのポインタは返されます。</p>
+<p>key_get()の場合、ポインタがNULLまたはCONFIG_KEYSが設定されていない場合、キーはデリファレンスされず、インクリメントも行われません。</p>
+</li>
+<li><p>キーのシリアル番号は次の関数を呼び出すことで取得できます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>key_serial_t key_serial(struct key *key);
+</pre></div>
+</div>
+<p>キーがNULLまたはCONFIG_KEYSが設定されていない場合、0が返されます（後者の場合は引数をパースしません）。</p>
+</li>
+<li><p>検索中にキーリングが見つかった場合、次の関数でさらに検索できます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>key_ref_t keyring_search(key_ref_t keyring_ref,
+                         const struct key_type *type,
+                         const char *description,
+                         bool recurse)
+</pre></div>
+</div>
+<p>指定されたキーリングのみ（recurse == false）またはキーリングツリー（recurse == true）を検索します。失敗時はENOKEYエラーが返され（IS_ERR/PTR_ERRを使用して判定）、成功時は返されたキーを解放する必要があります。</p>
+<p>キーリング参照からの所有属性は、パーミッションマスクを通じてアクセスを制御し、成功した場合、返されたキー参照ポインタにプロパゲートされます。</p>
+</li>
+<li><p>キーリングは次の関数を使用して作成できます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct key *keyring_alloc(const char *description, uid_t uid, gid_t gid,
+                          const struct cred *cred,
+                          key_perm_t perm,
+                          struct key_restriction *restrict_link,
+                          unsigned long flags,
+                          struct key *dest);
+</pre></div>
+</div>
+<p>指定された属性を持つキーリングを作成し、それを返します。destがNULLでない場合、新しいキーリングはdestが指すキーリングにリンクされます。宛先のキーリングには権限チェックは行われません。</p>
+<p>keyringがクォータを超過した場合、エラーEDQUOTが返されることがあります（keyringがユーザーのクォータに計上されない場合は、flagsにKEY_ALLOC_NOT_IN_QUOTAを指定してください）。エラーENOMEMも返されることがあります。</p>
+<p>restrict_linkがNULLでない場合、そのポインタは新しいkeyringにキーをリンクしようとするたびに呼び出される関数を含む構造体を指す必要があります。この構造体にはまた、keyポインタと関連するkey typeも含まれる場合があります。関数は、キーがkeyringに追加可能かどうかを確認するために呼び出されます。key typeは、指定されたkey typeが登録されていない場合に、この構造体の関数やデータポインタをガベージコレクタがクリーンアップする際に使用されます。カーネル内でkey_create_or_update()を呼び出す場合は、KEY_ALLOC_BYPASS_RESTRICTIONを指定してこのチェックを無効化できます。このような機能の例として、カーネル起動時にセットアップされる暗号化キーのリングを管理する場合があり、ユーザー空間がキーを追加できる場合（カーネルが既存のキーで検証できる場合）があります。</p>
+<p>制限関数が呼び出される際には、追加されるkeyring、key type、追加されるキーのペイロード、制限チェックに使用されるデータが渡されます。注意点として、新しいキーが作成される際には、ペイロードの前解析と実際のキー作成の間にこの関数が呼び出されます。関数は0を返してリンクを許可するか、エラーを返して拒否するかを指定します。</p>
+<p>常に-EPERMを返すための簡易関数restrict_link_rejectが存在します。</p>
+</li>
+<li><p>キーの有効性を確認するには、この関数を呼び出せます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int validate_key(struct key *key);
+</pre></div>
+</div>
+<p>この関数は、キーが期限切れになっていないことや失効していないことを確認します。キーが無効な場合、エラーEKEYEXPIREDまたはEKEYREVOKEDが返されます。キーがNULLの場合、またはCONFIG_KEYSが設定されていない場合は0が返されます（後者の場合、引数の解析は行われません）。</p>
+</li>
+<li><p>キー型を登録するには、次の関数を呼び出してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int register_key_type(struct key_type *type);
+</pre></div>
+</div>
+<p>同じ名前の型がすでに存在する場合、エラーEEXISTが返されます。</p>
+</li>
+<li><p>キー型をアンレジストするには、次の関数を呼び出してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void unregister_key_type(struct key_type *type);
+</pre></div>
+</div>
+</li>
+</ul>
+</div></blockquote>
+<p>特定の状況では、複数のキーを一括して処理することが望まれます。この機能は、このようなキーのバンドルを管理するkeyring型にアクセスするためのものです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct key_type key_type_keyring;
+</pre></div>
+</div>
+<p>これはrequest_key()などの関数と併用して、プロセスのkeyrings内で特定のkeyringを検索するために使用できます。このように見つかったkeyringはkeyring_search()で検索できます。注意点として、request_key()は特定のkeyringを検索するには使用できませんので、このようにkeyringを使用する用途は限定的です。</p>
+</section>
+<section id="notes-on-accessing-payload-contents">
+<h2><a class="toc-backref" href="#id8">ペイロードコンテンツへのアクセスに関する注意</a><a class="headerlink" href="#notes-on-accessing-payload-contents" title="この見出しへのパーマリンク">¶</a></h2>
+<p>最も簡単なペイロードは、key-&gt;payload に直接データを格納するだけです。この場合、ペイロードにアクセスする際にはRCUやロックを使用する必要はありません。</p>
+<p>より複雑なペイロードの内容は、key-&gt;payload.data[]配列に割り当てられ、そのポインタが設定される必要があります。データにアクセスするためには、以下のいずれかの方法を選択する必要があります：</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>変更不可なキー型。</p>
+<p>キー型にmodifyメソッドが存在しない場合、キーのペイロードにアクセスする際にはロックを一切使用しなくてもよいです（ただし、インスタンス化されていることが分かっている必要があります。未インスタンス化のキーは「見つからない」ためです）。</p>
+</li>
+<li><p>キーのセマフォア。</p>
+<p>セマフォアを使用してペイロードへのアクセスを制御し、ペイロードポインタを管理できます。変更時にはセマフォアを書き込みロックし、一般的なアクセス時には読み取りロックする必要があります。この方法の欠点は、アクセッサがスリープを必要とすることがあることです。</p>
+</li>
+<li><p>RCU（Read-Copy-Update）。</p>
+<p>セマフォアがすでに保持されていない場合にRCUを使用する必要があります。セマフォアが保持されている場合は、セマフォアを使用してキーの変更をシリアル化しなければならないため、ペイロードの内容が予期せず変化することはありません。キー管理コードがキー型に対してこれを処理します。</p>
+<p>しかし、これにより以下の操作が必要になります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>rcu_read_lock() ... rcu_dereference() ... rcu_read_unlock()
+</pre></div>
+</div>
+<p>ポインタを読み取るための操作、および：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>rcu_dereference() ... rcu_assign_pointer() ... call_rcu()
+</pre></div>
+</div>
+<p>ポインタを設定し、グレース期間後に古い内容を破棄する操作。注意点として、キー型以外のものは決してキーのペイロードを変更してはいけません。</p>
+<p>さらに、RCU制御されたペイロードは、struct rcu_headを保持する必要があります。 <a class="reference internal" href="../../core-api/kernel-api.html#c.call_rcu" title="call_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">call_rcu()</span></code></a> そして、ペイロードのサイズが可変の場合、ペイロードの長さを指定する必要があります。key-&gt;datalenは、セマフォアが保持されていない場合、参照されたペイロードと整合性を保つことはできません。</p>
+<p>key-&gt;payload.data[0]には、__rcu使用のためにシャドウが作成され、key-&gt;payload.rcu_data0と呼ばれます。以下のアクセッサは、この要素に対するRCU呼び出しをラップしています：</p>
+<ol class="loweralpha">
+<li><p>最初のペイロードポインタを設定または変更する：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>rcu_assign_keypointer(struct key *key, void *data);
+</pre></div>
+</div>
+</li>
+<li><p>セマフォアを保持しつつ、最初のペイロードポインタを読み取る：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>       [const] void *dereference_key_locked([const] struct key *key);
+
+Note that the return value will inherit its constness from the key
+parameter.  Static analysis will give an error if it things the lock
+isn't held.
+</pre></div>
+</div>
+</li>
+<li><p>RCU読み取りロックを保持しつつ、最初のペイロードポインタを読み取る：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>const void *dereference_key_rcu(const struct key *key);
+</pre></div>
+</div>
+</li>
+</ol>
+</li>
+</ol>
+</div></blockquote>
+</section>
+<section id="defining-a-key-type">
+<h2><a class="toc-backref" href="#id9">キーのタイプを定義する</a><a class="headerlink" href="#defining-a-key-type" title="この見出しへのパーマリンク">¶</a></h2>
+<p>カーネルサービスは、独自のキー型を定義したい場合があります。例えば、AFSファイルシステムは、Kerberos 5チケットのキー型を定義したいかもしれません。このような場合、実装者はkey_type構造体を埋め込み、システムに登録します。</p>
+<p>キー型を実装するソースファイルは、次のヘッダーファイルをインクルードする必要があります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>&lt;linux/key-type.h&gt;
+</pre></div>
+</div>
+<p>この構造体には、いくつかのフィールドがあり、一部は必須です：</p>
+<blockquote>
+<div><ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">char</span> <span class="pre">*name</span></code></p>
+<p>キー型の名前。これは、ユーザー空間から提供されたキー型名を、構造体へのポインタに変換するために使用されます。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">size_t</span> <span class="pre">def_datalen</span></code></p>
+<p>これはオプションです。これはクォータに貢献するデフォルトのペイロードデータ長を提供します。もしキーテイプのペイロードが常にまたはほぼ常に同じサイズであれば、これはより効率的な方法です。</p>
+<p>特定のキーデータ長（およびクォータ）は、インスタンス化または更新時に呼び出すことで変更できます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int key_payload_reserve(struct key *key, size_t datalen);
+</pre></div>
+</div>
+<p>データ長を修正した状態で呼び出されます。この操作が実行不可能な場合、エラー EDQUOT が返されます。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">(*vet_description)(const</span> <span class="pre">char</span> <span class="pre">*description);</span></code></p>
+<p>このオプションメソッドはキーディスクリプションを検証するために呼び出されます。キーテイプがキーディスクリプションを承認しない場合、エラーを返す可能性があります。それ以外の場合は 0 を返します。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">(*preparse)(struct</span> <span class="pre">key_preparsed_payload</span> <span class="pre">*prep);</span></code></p>
+<p>このオプションメソッドは、キーテイプがキーパッケージを生成する前にペイロードを解析するのを試みるために呼び出されます（add_key またはキーセマフォを取得する際の更新・インスタンス化）。prep が指す構造体は以下のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct key_preparsed_payload {
+        char            *description;
+        union key_payload payload;
+        const void      *data;
+        size_t          datalen;
+        size_t          quotalen;
+        time_t          expiry;
+};
+</pre></div>
+</div>
+<p>メソッドを呼び出す前には、caller が data と datalen にペイロードのblobパラメータを、quotalen にキーテイプのデフォルトクォータサイズを、expiry に TIME_T_MAX を設定し、残りはクリアします。</p>
+<p>ペイロードの内容からディスクリプションを提案できる場合、それを文字列として description フィールドに添付します。add_key() の呼び出し者が NULL または "" を渡した場合、このディスクリプションが使用されます。</p>
+<p>このメソッドはペイロードに何でも添付できます。これは単に instantiate() または update() 操作に渡されるだけです。設定されている場合、このデータからキーパッケージがインスタンス化される際、有効期限が適用されます。</p>
+<p>成功した場合は 0 を返し、それ以外の場合は負のエラーコードを返す必要があります。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">(*free_preparse)(struct</span> <span class="pre">key_preparsed_payload</span> <span class="pre">*prep);</span></code></p>
+<p>preparse() メソッドが提供されている場合にのみ必要です。それ以外は使用されません。このメソッドは preparse() が成功して返した後、必ず呼び出されます。instantiate() または update() が成功してもかかわらずです。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">(*instantiate)(struct</span> <span class="pre">key</span> <span class="pre">*key,</span> <span class="pre">struct</span> <span class="pre">key_preparsed_payload</span> <span class="pre">*prep);</span></code></p>
+<p>キーパッケージを構築中にペイロードを添付するために呼び出されます。添付されたペイロードは、この関数に渡されたデータとは関係なくできます。</p>
+<p>prep-&gt;data と prep-&gt;datalen フィールドは元のペイロードblobを定義します。preparse() が提供されている場合、他のフィールドも埋め込まれる可能性があります。</p>
+<p>キーパッケージに添付されたデータ量が keytype-&gt;def_datalen のサイズと異なっている場合、key_payload_reserve() を呼び出す必要があります。</p>
+<p>このメソッドは、ペイロードを添付するためにキーパッケージをロックする必要はありません。key-&gt;flags に KEY_FLAG_INSTANTIATED が設定されていないため、他のものがキーパッケージにアクセスすることはできません。</p>
+<p>このメソッドでは安全にスリープできます。</p>
+<p>generic_key_instantiate()は、prep-&gt;payload.data[]からkey-&gt;payload.data[]へデータをコピーするための簡易なメソッドで、最初の要素に対してRCUセーフな割り当てを行います。その後、prep-&gt;payload.data[]をクリアして、free_preparseメソッドがデータを解放しないようにします。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">(*update)(struct</span> <span class="pre">key</span> <span class="pre">*key,</span> <span class="pre">const</span> <span class="pre">void</span> <span class="pre">*data,</span> <span class="pre">size_t</span> <span class="pre">datalen);</span></code></p>
+<p>このタイプのキーが更新可能であれば、このメソッドを提供する必要があります。このメソッドは、提供されたデータのblobからキーのペイロードを更新するために呼び出されます。</p>
+<p>prep-&gt;data と prep-&gt;datalen フィールドは元のペイロードblobを定義します。preparse() が提供されている場合、他のフィールドも埋め込まれる可能性があります。</p>
+<p>データの長さが実際に変更される前にも変更される可能性がある場合、key_payload_reserve()を呼び出す必要があります。このメソッドが成功した場合、キーのタイプが変更されることが確定しており、すでに変更されているため、すべてのメモリの割り当てを行う必要があります。</p>
+<p>このメソッドが呼び出される前に、キーのセマフォが書き込みロックされます。ただし、これは他のライターを妨げるためのものであり、キーのペイロードの変更はRCU条件の下で行われなければなりません、 <a class="reference internal" href="../../core-api/kernel-api.html#c.call_rcu" title="call_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">call_rcu()</span></code></a> 古いペイロードを処理するために使用されます。</p>
+<p>変更が行われる前にkey_payload_reserve()を呼び出す必要がありますが、すべての割り当てとその他の潜在的に失敗する関数呼び出しが完了した後です。</p>
+<p>このメソッドでは安全にスリープできます。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">(*match_preparse)(struct</span> <span class="pre">key_match_data</span> <span class="pre">*match_data);</span></code></p>
+<p>このメソッドはオプションです。キーの検索が行われる直前に呼び出されます。以下のような構造が与えられます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct key_match_data {
+        bool (*cmp)(const struct key *key,
+                    const struct key_match_data *match_data);
+        const void      *raw_data;
+        void            *preparsed;
+        unsigned        lookup_type;
+};
+</pre></div>
+</div>
+<p>入力時に、raw_dataは呼び出し元がキーをマッチングする際に使用する基準を指しており、変更してはいけません。  <code class="docutils literal notranslate"><span class="pre">(*cmp)()</span></code> デフォルトのマッチャー関数（raw_dataに対して正確な説明の一致を試みる）を指し、lookup_typeは直接的な検索を示すように設定されます。</p>
+<p>以下のlookup_type値が利用可能です：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>KEYRING_SEARCH_LOOKUP_DIRECT - 直接的な検索は、タイプと説明をハッシュ化して、検索を少数のキーに絞ります。</p></li>
+<li><p>KEYRING_SEARCH_LOOKUP_ITERATE - 繰り返し検索は、キーリング内のすべてのキーを走査して一致するまで行います。これは、キーの説明に対する単純な直接一致以外のすべての検索に使用する必要があります。</p></li>
+</ul>
+</div></blockquote>
+<p>このメソッドは、cmpを独自のマッチング関数にポインタを指すように設定したり、lookup_typeをKEYRING_SEARCH_LOOKUP_ITERATEに設定したり、preparsedポインタに何かをアタッチして使用するために利用できます、 <code class="docutils literal notranslate"><span class="pre">(*cmp)()</span></code>.
+<code class="docutils literal notranslate"><span class="pre">(*cmp)()</span></code> キーが一致する場合はtrueを返し、それ以外の場合はfalseを返します。</p>
+<p>preparsedが設定されている場合、match_free()メソッドを使用してクリーンアップする必要があります。</p>
+<p>成功した場合は 0 を返し、それ以外の場合は負のエラーコードを返す必要があります。</p>
+<p>このメソッドではスリープすることが許可されていますが、 <code class="docutils literal notranslate"><span class="pre">(*cmp)()</span></code> ロックが保持されているため、スリープできません。</p>
+<p>match_preparse()が提供されていない場合、このタイプのキーは説明に基づいて正確に一致します。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">(*match_free)(struct</span> <span class="pre">key_match_data</span> <span class="pre">*match_data);</span></code></p>
+<p>このメソッドはオプションです。指定された場合、match_preparse()の成功した呼び出し後にmatch_data-&gt;preparsedをクリーンアップするために呼び出されます。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">(*revoke)(struct</span> <span class="pre">key</span> <span class="pre">*key);</span></code></p>
+<p>このメソッドはオプションです。キーが失効した際に、ペイロードデータの一部を破棄するために呼び出されます。呼び出し元はキーセマフォの書き込みロックを保持しています。</p>
+<p>このメソッド内で待機することは安全ですが、キーセマフォに対するデッドロックを避けるためには注意が必要です。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">(*destroy)(struct</span> <span class="pre">key</span> <span class="pre">*key);</span></code></p>
+<p>このメソッドはオプションです。キーが破棄される際に、そのキーに関連するペイロードデータを破棄するために呼び出されます。</p>
+<p>このメソッドはキーをロックすることなくペイロードにアクセスできます。この時点ではキーがアクセス不可能であるとみなすことができます。注意点として、この関数が呼び出される前にキーのタイプが変更されている可能性があります。</p>
+<p>このメソッド内で待機することは安全ではありません。呼び出し元がスピンロックを保持している可能性があります。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">(*describe)(const</span> <span class="pre">struct</span> <span class="pre">key</span> <span class="pre">*key,</span> <span class="pre">struct</span> <span class="pre">seq_file</span> <span class="pre">*p);</span></code></p>
+<p>このメソッドはオプションです。/proc/keysの読み込み中に、キーの説明とペイロードをテキスト形式で要約するために呼び出されます。</p>
+<p>このメソッドはRCU読み取りロックが保持されている状態で呼び出されます。 <a class="reference internal" href="../../core-api/kernel-api.html#c.rcu_dereference" title="rcu_dereference"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_dereference()</span></code></a>
+ペイロードポインタを読み取るために使用すべきです。key-&gt;datalenはペイロードの内容と一致するとは限りません。</p>
+<p>説明は変更されませんが、キーの状態は変化する可能性があります。</p>
+<p>このメソッド内で待機することは安全ではありません。呼び出し元がRCU読み取りロックを保持しています。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">long</span> <span class="pre">(*read)(const</span> <span class="pre">struct</span> <span class="pre">key</span> <span class="pre">*key,</span> <span class="pre">char</span> <span class="pre">__user</span> <span class="pre">*buffer,</span> <span class="pre">size_t</span> <span class="pre">buflen);</span></code></p>
+<p>このメソッドはオプションです。KEYCTL_READによって呼び出され、キーのペイロードをユーザー空間が処理できるデータブロブに変換するために使用されます。理想的には、インスタンス化および更新メソッドに渡された形式と同じフォーマットでブロブを提供すべきです。</p>
+<p>成功した場合、生成可能なブロブのサイズを返す必要があります。コピーされたサイズではなく。</p>
+<p>このメソッドはキーのセマフォが読み取りロックされている状態で呼び出されます。これにより、キーのペイロードが変更されることを防ぎます。キーのペイロードにアクセスする際にはRCUロックを使用する必要はありません。ユーザー空間バッファにアクセスするなど、待機が安全な状況でも問題ありません。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">(*request_key)(struct</span> <span class="pre">key_construction</span> <span class="pre">*cons,</span> <span class="pre">const</span> <span class="pre">char</span> <span class="pre">*op,</span> <span class="pre">void</span> <span class="pre">*aux);</span></code></p>
+<p>このメソッドはオプションです。提供された場合、request_key()および関連する関数はこの関数を呼び出すことにより、このタイプのキーに対して操作を行います。/sbin/request-keyへのアップコールではなく。</p>
+<p>auxパラメータはrequest_key_async_with_auxdata()などに渡されたものと同等で、それ以外の場合はNULLです。また、操作対象のキーの構築レコードと、操作タイプ（現在は「create」のみ）が渡されます。</p>
+<p>このメソッドはアップコールが完了する前に戻ることも許可されていますが、成功または失敗に関わらず、エラーが発生した場合でも必ず次の関数を呼び出す必要があります。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void complete_request_key(struct key_construction *cons, int error);
+</pre></div>
+</div>
+<p>エラー パラメータは成功時は 0、エラー時は負の値になります。この操作により構築中の記録が破棄され、認証キーは失効します。エラーが発生した場合、構築中のキーは既にインスタンス化されていなければ負の値でインスタンス化されます。</p>
+<p>このメソッドがエラーを返す場合、そのエラーは request_key*() の呼び出し元に返されます。complete_request_key() は返す前に必ず呼び出さなければなりません。</p>
+<p>構築中のキーと認証キーは、cons で指される key_construction 構造体に含まれています。</p>
+<blockquote>
+<div><ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">key</span> <span class="pre">*key;</span></code></p>
+<p>構築中のキー。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">key</span> <span class="pre">*authkey;</span></code></p>
+<p>認証キー。</p>
+</li>
+</ul>
+</div></blockquote>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">key_restriction</span> <span class="pre">*(*lookup_restriction)(const</span> <span class="pre">char</span> <span class="pre">*params);</span></code></p>
+<p>このオプションメソッドは、ユーザー空間でのキーリング制限の設定を有効にするために使用されます。制限パラメータ文字列（キーテイプ名を除く）が渡され、このメソッドは key_restriction 構造体へのポインタを返します。この構造体には、各キーリンク操作を評価するための関数とデータが含まれます。一致しない場合は -EINVAL を返します。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">asym_eds_op</span></code> および <code class="docutils literal notranslate"><span class="pre">asym_verify_signature</span></code>:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int (*asym_eds_op)(struct kernel_pkey_params *params,
+                   const void *in, void *out);
+int (*asym_verify_signature)(struct kernel_pkey_params *params,
+                             const void *in, const void *in2);
+</pre></div>
+</div>
+<p>これらのメソッドはオプションです。提供された場合、最初のメソッドはキーリングを暗号化、復号、またはデータのブロブに署名するためのキーを使用を許可し、2番目のメソッドは署名を検証するためのキーを使用を許可します。</p>
+<p>すべての場合において、params ブロックに以下の情報が提供されます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct kernel_pkey_params {
+        struct key      *key;
+        const char      *encoding;
+        const char      *hash_algo;
+        char            *info;
+        __u32           in_len;
+        union {
+                __u32   out_len;
+                __u32   in2_len;
+        };
+        enum kernel_pkey_operation op : 8;
+};
+</pre></div>
+</div>
+<p>これは使用するキー、使用するエンコードの文字列（例: RSA キーでは「pkcs1」を指定して RSASSA-PKCS1-v1.5 または RSAES-PKCS1-v1.5 エンコードを示すか、「raw」を指定してエンコードなしを示す）、署名のためにデータを生成するハッシュアルゴリズムの名前（必要に応じて）、入力と出力（または第二入力）バッファのサイズ、および実行する操作の ID が含まれます。</p>
+<p>特定の操作 ID に対して、入力と出力バッファは以下のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Operation ID            in,in_len       out,out_len     in2,in2_len
+======================= =============== =============== ===============
+kernel_pkey_encrypt     Raw data        Encrypted data  -
+kernel_pkey_decrypt     Encrypted data  Raw data        -
+kernel_pkey_sign        Raw data        Signature       -
+kernel_pkey_verify      Raw data        -               Signature
+</pre></div>
+</div>
+<p>asym_eds_op() は params-&gt;op で指定された暗号化、復号、および署名作成を処理します。注意: params-&gt;op は asym_verify_signature() にも設定されます。</p>
+<p>暗号化と署名作成は、入力バッファに素データを取って出力バッファに暗号化結果を返します。エンコードが設定されている場合、パディングが追加される可能性があります。署名作成の場合、エンコードによって生成されるパディングがディジェストアルゴリズムを示す必要があるため、hash_algo にそのアルゴリズムの名前を指定する必要があります。</p>
+<p>復号は入力バッファに暗号化されたデータを取って、出力バッファに素データを返します。エンコードが設定されている場合、パディングがチェックされ、除去されます。</p>
+<p>検証処理では、入力バッファ内の素データと、第二の入力バッファ内の署名を比較し、一致しているかを確認します。パディングの検証も行われます。エンコード形式に応じて、素データを生成するために使用されたハッシュアルゴリズムをhash_algoパラメータで指定する必要があります。</p>
+<p>成功した場合、asym_eds_op()は出力バッファに書き込まれたバイト数を返し、asym_verify_signature()は0を返します。</p>
+<p>さまざまなエラーが返される可能性があります。操作がサポートされていない場合はEOPNOTSUPP、検証に失敗した場合はEKEYREJECTED、必要な暗号処理が利用できない場合はENOPKGが返されます。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">asym_query</span></code>:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int (*asym_query)(const struct kernel_pkey_params *params,
+                  struct kernel_pkey_query *info);
+</pre></div>
+</div>
+<p>このメソッドはオプションです。提供された場合、keyに保持されている公開鍵または非対称鍵に関する情報を取得できます。</p>
+<p>パラメータブロックはasym_eds_op()と同様ですが、in_lenおよびout_lenは使用されません。エンコードとhash_algoフィールドを使用して、返されるバッファ/データサイズを適切に削減してください。</p>
+<p>成功した場合、以下の情報が埋め込まれます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct kernel_pkey_query {
+        __u32           supported_ops;
+        __u32           key_size;
+        __u16           max_data_size;
+        __u16           max_sig_size;
+        __u16           max_enc_size;
+        __u16           max_dec_size;
+};
+</pre></div>
+</div>
+<p>supported_opsフィールドには、鍵がサポートする操作を示すビットマスクが含まれます。これには、バイナリデータの暗号化、復号化、署名生成、バイナリデータの署名検証が含まれます。以下の定数が定義されています:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>KEYCTL_SUPPORTS_{ENCRYPT,DECRYPT,SIGN,VERIFY}
+</pre></div>
+</div>
+<p>key_sizeフィールドは鍵のビット数を示します。max_data_sizeおよびmax_sig_sizeは、署名の生成および検証に使用される最大の素データおよび署名サイズです。max_enc_sizeおよびmax_dec_sizeは、暗号化および復号化に使用される最大の素データおよび署名サイズです。max_*_sizeフィールドはバイト単位で測定されます。</p>
+<p>成功した場合、0が返されます。鍵がこの操作をサポートしない場合はEOPNOTSUPPが返されます。</p>
+</li>
+</ul>
+</div></blockquote>
+</section>
+<section id="request-key-callback-service">
+<h2><a class="toc-backref" href="#id10">リクエストキーコールバックサービス</a><a class="headerlink" href="#request-key-callback-service" title="この見出しへのパーマリンク">¶</a></h2>
+<p>新しい鍵を作成するには、カーネルが次のコマンドラインを実行しようとします:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sbin/request-key create &lt;key&gt; &lt;uid&gt; &lt;gid&gt; \
+        &lt;threadring&gt; &lt;processring&gt; &lt;sessionring&gt; &lt;callout_info&gt;
+</pre></div>
+</div>
+<p>&lt;key&gt;は構築中の鍵であり、3つのkeyringsは、検索を発行したプロセスのプロセスkeyringsです。これらが含まれる理由は以下の2つです:</p>
+<blockquote>
+<div><dl class="simple">
+<dt>1 一つのkeyringsに認証トークンが含まれている可能性があり、</dt><dd><p>そのトークンを用いて鍵を取得する必要があります。例えば、Kerberos Ticket-Granting Ticketです。</p>
+</dd>
+</dl>
+<p>2 新しい鍵はおそらくこれらのリングの一つにキャッシュされるべきです。</p>
+</div></blockquote>
+<p>このプログラムは、他の鍵に保存されたパス（例えば、KDEデスクトップマネージャーによって保持されたパス）を介して、ユーザー固有のプロセスにリクエストを転達する前に、指定されたUIDとGIDを設定する必要があります。</p>
+<p>プログラム（またはその呼び出し名）は、KEYCTL_INSTANTIATE または KEYCTL_INSTANTIATE_IOV を呼び出してキーの構築を完了させる必要があります。これにより、キーをキーリング（おそらくセッションキーリング）のいずれかにキャッシュしてから戻る操作も可能になります。代替案として、KEYCTL_NEGATE または KEYCTL_REJECT を使ってキーを負の状態にマークすることもでき、これによりキーリングにキーをキャッシュすることが許可されます。</p>
+<p>キーが未構築状態のまま戻る場合、キーは負の状態としてマークされ、セッションキーリングに追加され、キーのリクエスターに対してエラーが返されます。</p>
+<p>このサービスを呼び出した側から補足情報が提供されることがあります。その情報は &lt;callout_info&gt; パラメータとして渡されます。情報が提供されなかった場合は、「-」がこのパラメータとして渡されます。</p>
+<p>同様に、カーネルは期限切れまたは近々期限切れとなるキーを更新するために以下の処理を実行しようとします:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sbin/request-key update &lt;key&gt; &lt;uid&gt; &lt;gid&gt; \
+        &lt;threadring&gt; &lt;processring&gt; &lt;sessionring&gt;
+</pre></div>
+</div>
+<p>この場合、プログラムは実際にキーをリングにアタッチする必要はありません。リングは参照用に提供されています。</p>
+</section>
+<section id="garbage-collection">
+<h2><a class="toc-backref" href="#id11">ゴミ収集</a><a class="headerlink" href="#garbage-collection" title="この見出しへのパーマリンク">¶</a></h2>
+<p>タイプが削除された「死んだキー」は、それらを指しているキーリングから自動的に切断され、バックグラウンドのガベージコレクターが可能な限り速やかに削除されます。</p>
+<p>同様に、取り消されたキーおよび期限切れキーもガベージコレクションの対象になりますが、一定時間が経過した後になります。この時間は、以下の場所に記載された秒数で設定されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/proc/sys/kernel/keys/gc_delay
+</pre></div>
+</div>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">セキュリティドキュメンテーション</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../credentials.html">Linuxにおけるクレデンシャル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../IMA-templates.html">IMAテンプレート管理メカニズム</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">カーネルキー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lsm.html">Linuxセキュリティモジュール: Linuxの一般的なセキュリティフック</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lsm-development.html">Linuxセキュリティモジュール開発</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sak.html">Linuxセキュアアテンションキー（SAK）処理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../SCTP.html">SCTP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../self-protection.html">カーネルセレフプロテクション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../siphash.html">SipHash - 短い入力のPRF</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../siphash.html#halfsiphash-siphash-s-insecure-younger-cousin">HalfSipHash - SipHashの不安全な若き従弟</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tpm/index.html">信頼されたプラットフォームモジュールドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../digsig.html">デジタル署名検証API</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">セキュリティドキュメンテーション</a><ul>
+<li><a href="index.html">カーネルキー</a><ul>
+<li>前へ: <a href="index.html" title="前章">カーネルキー</a></li>
+<li>次へ: <a href="ecryptfs.html" title="次章">eCryptfs ファイルシステム用の暗号化キー</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/security/keys/core.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

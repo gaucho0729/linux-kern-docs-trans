@@ -1,0 +1,498 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>ファンクショントレーサーの設計 — Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="tracepoint-analysis.html" rel="next" title="イベントとトレースポイントを用いた挙動分析ノート"/>
+<link href="index.html" rel="prev" title="Linuxトレーシング技術"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="function-tracer-design">
+<h1>関数トレーサー設計<a class="headerlink" href="#function-tracer-design" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Mike Frysinger</p>
+</dd>
+</dl>
+<div class="admonition caution">
+<p class="admonition-title">注意</p>
+<p>このドキュメントは古くなっています。以下に記載されている説明の一部が現在の実装と一致していない可能性があります。</p>
+</div>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ここでは、一般的なファンクショントレースコードが適切に動作するために依存するアーキテクチャの要素について説明します。複雑さが増す順に解説しているため、まずは簡単な部分から基本的な機能を取得できるようにしています。</p>
+<p>このドキュメントはアーキテクチャの実装詳細にのみ焦点を当てています。共通コードに関する機能の説明が必要な場合は、common ftrace.txt ファイルを参照してください。</p>
+<p>理想的には、トレースをサポートしつつパフォーマンスを維持したい開発者は、動的ftraceサポートまで実装するべきです。</p>
+</section>
+<section id="prerequisites">
+<h2>前提条件<a class="headerlink" href="#prerequisites" title="この見出しへのパーマリンク">¶</a></h2>
+<dl class="simple">
+<dt>Ftraceは以下の機能が実装されることに依存しています:</dt><dd><ul class="simple">
+<li><p>STACKTRACE_SUPPORT - save_stack_trace()を実装する</p></li>
+<li><p>TRACE_IRQFLAGS_SUPPORT - include/asm/irqflags.hを実装する</p></li>
+</ul>
+</dd>
+</dl>
+</section>
+<section id="have-function-tracer">
+<h2>HAVE_FUNCTION_TRACER<a class="headerlink" href="#have-function-tracer" title="この見出しへのパーマリンク">¶</a></h2>
+<p>mcountおよびftrace_stub関数の実装が必要です。</p>
+<p>mcountシンボルの正確な名前はツールチェーンに依存します。一部のツールチェーンでは「mcount」、「_mcount」、または「__mcount」と呼ばれることがあります。以下のようなコマンドを実行することで確認できるでしょう:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ echo 'main(){}' | gcc -x c -S -o - - -pg | grep mcount
+        call    mcount
+</pre></div>
+</div>
+<p>以下では、シンボルが「mcount」として扱うことを前提にします。例を簡潔にするためです。</p>
+<p>mcount関数内で有効なABIは
+<em>高度に</em> アーキテクチャ/ツールチェーンに依存しています。この点についてはお手伝いできませんので、ご了承ください。古いドキュメントを調べたり、より詳しい人に相談したりしてください。通常、レジスタの使用方法（引数/scratch/etc…）がこの時点で大きな問題になります。特に、mcount呼び出しの位置（関数プロローグの前後）に関連しています。また、glibcがあなたのアーキテクチャでmcount関数をどのように実装しているかを確認することも役立つかもしれません。これは（半分ほど）関連性があるかもしれません。</p>
+<p>mcount関数は、関数ポインタftrace_trace_functionがftrace_stubに設定されているかを確認する必要があります。設定されている場合は、何も処理する必要がなく、すぐに返すだけでよいです。設定されていない場合は、mcount関数が通常通り__mcount_internalを呼び出すのと同じ方法でその関数を呼び出します。第一引数は「frompc」、第二引数は「selfpc」（mcount呼び出しのサイズを差し引いた調整済み値）です。</p>
+<p>たとえば、関数foo()がbar()を呼び出し、bar()がmcount()を呼び出す場合、mcount()がトレーサーに渡す引数は以下の通りです:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>「frompc」 - bar()がfoo()に戻るために使用するアドレス</p></li>
+<li><p>「selfpc」 - bar()（mcount()のサイズ調整済み）のアドレス</p></li>
+</ul>
+</div></blockquote>
+<p>このmcount関数が呼び出されることがご注意ください <em>何度も呼ばれるため</em>、トレースが無効な状態でシステムがスムーズに動作するためには、トレース機能が無効なデフォルトケースを最適化することが重要です。したがってmcount関数の開始処理は、戻る前にチェックする最小限の処理にとどまります。これはコードフローが通常直線的になるべきことを意味します（つまり、nopケースではブランチ処理を避けるべきです）。もちろんこれは最適化であり、ハード要件ではありません。</p>
+<p>以下の擬似コードが参考になります（これらの関数は実際にアセンブリで実装する必要があります）：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void ftrace_stub(void)
+{
+        return;
+}
+
+void mcount(void)
+{
+        /* save any bare state needed in order to do initial checking */
+
+        extern void (*ftrace_trace_function)(unsigned long, unsigned long);
+        if (ftrace_trace_function != ftrace_stub)
+                goto do_trace;
+
+        /* restore any bare state */
+
+        return;
+
+do_trace:
+
+        /* save all state needed by the ABI (see paragraph above) */
+
+        unsigned long frompc = ...;
+        unsigned long selfpc = &lt;return address&gt; - MCOUNT_INSN_SIZE;
+        ftrace_trace_function(frompc, selfpc);
+
+        /* restore all state needed by the ABI */
+}
+</pre></div>
+</div>
+<p>モジュールのためにmcountをエクスポートしてください！</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>extern void mcount(void);
+EXPORT_SYMBOL(mcount);
+</pre></div>
+</div>
+</section>
+<section id="have-function-graph-tracer">
+<h2>HAVE_FUNCTION_GRAPH_TRACER<a class="headerlink" href="#have-function-graph-tracer" title="この見出しへのパーマリンク">¶</a></h2>
+<p>深呼吸…実際の作業に入ります。ここではmcount関数を更新し、ftraceグラフ関数ポインタをチェックする必要があります。また、リターンアドレスを保存（ハッキング）し復元するための関数も実装する必要があります。</p>
+<p>mcount関数は、ftrace_graph_return（ftrace_stubと比較）およびftrace_graph_entry（ftrace_graph_entry_stubと比較）の関数ポインタをチェックする必要があります。どちらかのポインタが関連するスタブ関数に設定されていない場合、アーキテクチャ固有の関数ftrace_graph_callerを呼び出します。この関数は順にアーキテクチャ固有のprepare_ftrace_return関数を呼び出します。これらの関数名は厳密には必須ではありませんが、アーキテクチャポート間で一貫性を保つため、これらを使用する必要があります。これにより比較・対照が容易になります。</p>
+<p>prepare_ftrace_return関数の引数はftrace_trace_functionに渡されるものとはやや異なります。2番目の引数「selfpc」は同じですが、1番目の引数は「frompc」へのポインタで、通常スタック上に位置します。これにより、関数は一時的にリターンアドレスをアーキテクチャ固有の関数return_to_handlerに変更し、その関数はcommon ftrace_return_to_handler関数を呼び出します。この関数は元のリターンアドレスを復元し、元の呼び出し先に戻るようになります。</p>
+<p>以下に更新されたmcountの擬似コードを示します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void mcount(void)
+{
+...
+        if (ftrace_trace_function != ftrace_stub)
+                goto do_trace;
+
++#ifdef CONFIG_FUNCTION_GRAPH_TRACER
++       extern void (*ftrace_graph_return)(...);
++       extern void (*ftrace_graph_entry)(...);
++       if (ftrace_graph_return != ftrace_stub ||
++           ftrace_graph_entry != ftrace_graph_entry_stub)
++               ftrace_graph_caller();
++#endif
+
+        /* restore any bare state */
+...
+</pre></div>
+</div>
+<p>以下に新しいftrace_graph_callerアセンブリ関数の擬似コードを示します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#ifdef CONFIG_FUNCTION_GRAPH_TRACER
+void ftrace_graph_caller(void)
+{
+        /* save all state needed by the ABI */
+
+        unsigned long *frompc = &amp;...;
+        unsigned long selfpc = &lt;return address&gt; - MCOUNT_INSN_SIZE;
+        /* passing frame pointer up is optional -- see below */
+        prepare_ftrace_return(frompc, selfpc, frame_pointer);
+
+        /* restore all state needed by the ABI */
+}
+#endif
+</pre></div>
+</div>
+<p>prepare_ftrace_return()の実装方法については、x86版を参照してください（フレームポインタの渡し方はオプションです；次のセクションで詳しく説明します）。この関数のアーキテクチャ固有な部分は、障害回復テーブルの設定（asm(…)コード）のみです。それ以外の部分はアーキテクチャ間で共通しています。</p>
+<p>新しいreturn_to_handlerアセンブリ関数の擬似コードは以下の通りです。注意すべきは、ここに適用されるABIがmcountコードに適用されるABIとは異なっていることです。関数から戻る際（エピローグの後）、通常は返却値を渡すレジスタのみを保存・復元することができるので、他の保存・復元は省略できる可能性があります。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#ifdef CONFIG_FUNCTION_GRAPH_TRACER
+void return_to_handler(void)
+{
+        /* save all state needed by the ABI (see paragraph above) */
+
+        void (*original_return_point)(void) = ftrace_return_to_handler();
+
+        /* restore all state needed by the ABI */
+
+        /* this is usually either a return or a jump */
+        original_return_point();
+}
+#endif
+</pre></div>
+</div>
+</section>
+<section id="have-function-graph-fp-test">
+<h2>HAVE_FUNCTION_GRAPH_FP_TEST<a class="headerlink" href="#have-function-graph-fp-test" title="この見出しへのパーマリンク">¶</a></h2>
+<p>アーキテクチャによっては、関数の呼び出しと戻り時にフレームポインタ（一意の値）を渡すことがあります。戻る際、この値が一致しない場合、カーネルがパニックを起こします。これは主にgccによる不適切なコード生成を検出するための Sanity Check です。あなたのアーキテクチャで gcc が異なる最適化レベルでフレームポインタを適切に更新する場合、このオプションは無視してください。</p>
+<p>ただし、この機能をサポートする追加はそれほど難しくありません。prepare_ftrace_return() を呼び出すアセンブリコードで、フレームポインタを3番目の引数として渡します。その後、その関数のC版ではx86アーキテクチャが行っているように、ftrace_push_return_trace() にこのフレームポインタを渡すようにします（0のスタブ値ではなく）。</p>
+<p>同様に、ftrace_return_to_handler() を呼び出す際には、フレームポインタを渡してください。</p>
+</section>
+<section id="have-function-graph-ret-addr-ptr">
+<h2>HAVE_FUNCTION_GRAPH_RET_ADDR_PTR<a class="headerlink" href="#have-function-graph-ret-addr-ptr" title="この見出しへのパーマリンク">¶</a></h2>
+<p>アーキテクチャによっては、スタック上のリターンアドレスへのポインタを渡すことがあります。これにより、スタックアンワインド（stack unwinding）の問題が発生する際、アンワインダーがret_stackと同期を取れず、ftrace_graph_ret_addr() が誤ったアドレスを報告する問題を防ぎます。</p>
+<p>サポートの追加は簡単です。asm/ftrace.h でマクロを定義し、ftrace_push_return_trace() に'retp'引数としてリターンアドレスポインタを渡すだけです。</p>
+</section>
+<section id="have-syscall-tracepoints">
+<h2>HAVE_SYSCALL_TRACEPOINTS<a class="headerlink" href="#have-syscall-tracepoints" title="この見出しへのパーマリンク">¶</a></h2>
+<p>アーキテクチャでシステムコールのトレースを実装するには、必要な要素は極めて少数量です。</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>HAVE_ARCH_TRACEHOOK（arch/Kconfig を参照）をサポートする必要があります。</p></li>
+<li><p>&lt;asm/unistd.h&gt; に NR_syscalls 変数を定義し、アーキテクチャがサポートするシステムコールの数を提供します。</p></li>
+<li><p>TIF_SYSCALL_TRACEPOINT スレッドフラグをサポートする必要があります。</p></li>
+<li><p>ptrace での trace_sys_enter() と trace_sys_exit() トレースポイント呼び出しを、ptrace システムコールのトレースパスに配置します。</p></li>
+<li><p>このアーキテクチャのシステムコールテーブルが単純なアドレス配列より複雑な場合、arch_syscall_addr を実装して、指定されたシステムコールのアドレスを返します。</p></li>
+<li><p>システムコールのシンボル名がアーキテクチャの関数名と一致しない場合、asm/ftrace.h に ARCH_HAS_SYSCALL_MATCH_SYM_NAME を定義し、arch_syscall_match_sym_name で適切な論理を実装して、関数名がシンボル名と一致する場合に true を返します。</p></li>
+<li><p>このアーキテクチャを HAVE_SYSCALL_TRACEPOINTS としてタグ付けします。</p></li>
+</ul>
+</div></blockquote>
+</section>
+<section id="have-ftrace-mcount-record">
+<h2>HAVE_FTRACE_MCOUNT_RECORD<a class="headerlink" href="#have-ftrace-mcount-record" title="この見出しへのパーマリンク">¶</a></h2>
+<p>詳細についてはscripts/recordmcount.plを参照してください。アーキテクチャ固有の詳細を埋めることで、objdumpを用いてmcount呼び出し先のアドレスを特定する方法を記述してください。このオプションは、動的ftraceを実装しないとあまり意味がありません。</p>
+</section>
+<section id="have-dynamic-ftrace">
+<h2>HAVE_DYNAMIC_FTRACE<a class="headerlink" href="#have-dynamic-ftrace" title="この見出しへのパーマリンク">¶</a></h2>
+<p>まずHAVE_FTRACE_MCOUNT_RECORDとHAVE_FUNCTION_TRACERが必要です。少し過ぎた場合は読み上げる際には上に戻ってください。</p>
+<dl class="simple">
+<dt>それらの処理が済んだら、以下の実装が必要です：</dt><dd><ul class="simple">
+<li><dl class="simple">
+<dt>asm/ftrace.h:</dt><dd><ul>
+<li><p>MCOUNT_ADDR</p></li>
+<li><p>ftrace_call_adjust()</p></li>
+<li><p>struct dyn_arch_ftrace{}</p></li>
+</ul>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>アセンブリコード:</dt><dd><ul>
+<li><p>mcount()（新しいスタブ）</p></li>
+<li><p>ftrace_caller()</p></li>
+<li><p>ftrace_call()</p></li>
+<li><p>ftrace_stub()</p></li>
+</ul>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>Cコード:</dt><dd><ul>
+<li><p>ftrace_dyn_arch_init()</p></li>
+<li><p>ftrace_make_nop()</p></li>
+<li><p>ftrace_make_call()</p></li>
+<li><p>ftrace_update_ftrace_func()</p></li>
+</ul>
+</dd>
+</dl>
+</li>
+</ul>
+</dd>
+</dl>
+<p>まずasm/ftrace.hにアーキテクチャ固有の詳細を記述する必要があります。</p>
+<p>MCOUNT_ADDRをmcountシンボルのアドレスとして定義してください（例：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#define MCOUNT_ADDR ((unsigned long)mcount)
+</pre></div>
+</div>
+<p>この関数の宣言は誰も持たないため、以下のように実装する必要があります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>extern void mcount(void);
+</pre></div>
+</div>
+<p>また、補助関数ftrace_call_adjust()が必要です。ほとんどの場合、以下のようにスタブ化できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static inline unsigned long ftrace_call_adjust(unsigned long addr)
+{
+        return addr;
+}
+</pre></div>
+</div>
+<p>&lt;埋めるべき詳細&gt;</p>
+<p>最後に、カスタムのdyn_arch_ftrace構造体が必要です。ランタイムパッチングで任意の呼び出し先に追加の状態が必要な場合はここに記述してください。現時点では空の構造体を作成してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct dyn_arch_ftrace {
+        /* No extra data needed */
+};
+</pre></div>
+</div>
+<p>ヘッダの処理が済んだら、アセンブリコードを埋め始めましょう。以前にmcount()関数を作成しましたが、動的ftraceはスタブ関数のみを望みます。これはmcount()が起動時のみ使用され、その後すべての参照がパッチングされて戻らないためです。代わりに古いmcount()の本体が使用され、新しいftrace_caller()関数が作成されます。2つを統合するのは難しいため、#ifdefで分離した2つの定義がより簡単です。ftrace_stub()も同様で、これ以降はftrace_caller()内でインライン化されます。</p>
+<p>混乱する前に、以下の擬似コードを確認してください。これによりアセンブリで独自の実装を記述できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void mcount(void)
+{
+        return;
+}
+
+void ftrace_caller(void)
+{
+        /* save all state needed by the ABI (see paragraph above) */
+
+        unsigned long frompc = ...;
+        unsigned long selfpc = &lt;return address&gt; - MCOUNT_INSN_SIZE;
+
+ftrace_call:
+        ftrace_stub(frompc, selfpc);
+
+        /* restore all state needed by the ABI */
+
+ftrace_stub:
+        return;
+}
+</pre></div>
+</div>
+<p>最初は少し不自然に見えるかもしれませんが、ランタイムで複数の処理をパッチングするためです。まず、トレースしたい関数のみがftrace_caller()にパッチングされます。次に、1つのトレーサーのみが有効なため、ftrace_caller()自身をそのトレーサーに呼び出すようにパッチングします。これがftrace_callラベルの役割です。</p>
+<p>この点を踏まえて、実際にランタイムパッチングを行うCコードに移ります。次のセクションを通過するには、アーキテクチャごとのオプコードについての知識が必要です。</p>
+<p>すべてのアーキテクチャには初期化用のコールバック関数があります。初期状態を初期化する必要がある場合は、このタイミングで実行してください。それ以外の場合は、以下のシンプルな関数でほとんどのユーザーが十分に対応できるでしょう:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int __init ftrace_dyn_arch_init(void)
+{
+        return 0;
+}
+</pre></div>
+</div>
+<p>任意の関数のランタイムパッチングを行うための関数は2つあります。1つ目はmcountコールサイトをnop（ノープ）に変換し、トレースしていないときにランタイムパフォーマンスを維持するのに役立ちます。2つ目はmcountコールサイトを任意の場所へのコールに変換します（通常はftracer_caller()になります）。関数の一般的な定義についてはlinux/ftrace.hを参照してください:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>ftrace_make_nop()
+ftrace_make_call()
+</pre></div>
+</div>
+<p>rec-&gt;ip値は、ビルド時にscripts/recordmcount.plによって収集されたmcountコールサイトのアドレスです。</p>
+<p>最後の関数は、アクティブなトレーサーのランタイムパッチングを行います。これはftrace_callシンボル内のftrace_caller()関数の場所のアセンブリコードを変更します。そのため、新しい関数呼び出しを挿入する際には十分なパディングが存在している必要があります。一部のユーザーは「call」タイプの命令を使用し、他は「branch」タイプの命令を使用します。具体的には以下の関数が用意されています:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>ftrace_update_ftrace_func()
+</pre></div>
+</div>
+</section>
+<section id="have-dynamic-ftrace-have-function-graph-tracer">
+<h2>HAVE_DYNAMIC_FTRACE + HAVE_FUNCTION_GRAPH_TRACER<a class="headerlink" href="#have-dynamic-ftrace-have-function-graph-tracer" title="この見出しへのパーマリンク">¶</a></h2>
+<p>関数グラファーは動的ftraceと併用するためいくつかの調整が必要です。基本的に、以下の手順が必要です:</p>
+<blockquote>
+<div><ul class="simple">
+<li><dl class="simple">
+<dt>更新:</dt><dd><ul>
+<li><p>ftrace_caller()</p></li>
+<li><p>ftrace_graph_call()</p></li>
+<li><p>ftrace_graph_caller()</p></li>
+</ul>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>実装:</dt><dd><ul>
+<li><p>ftrace_enable_ftrace_graph_caller()</p></li>
+<li><p>ftrace_disable_ftrace_graph_caller()</p></li>
+</ul>
+</dd>
+</dl>
+</li>
+</ul>
+</div></blockquote>
+<p>&lt;埋めるべき詳細&gt;</p>
+<p>補足:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>ftrace_callの場所にNOPストゥブを追加し、ftrace_graph_caller()へのコールが可能になるようにサイズを確保してください</p></li>
+<li><p>ftrace_graph_caller()を新しいftrace_caller()から呼び出されるように修正し、一部のセマンティクスが変更されている可能性があるため</p></li>
+<li><p>ftrace_enable_ftrace_graph_caller()はftrace_graph_callの場所をランタイムパッチングし、ftrace_graph_caller()へのコールに変換します</p></li>
+<li><p>ftrace_disable_ftrace_graph_caller()はftrace_graph_callの場所をランタイムパッチングし、nopに変換します</p></li>
+</ul>
+</div></blockquote>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxトレーシング技術</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">関数トレーサー設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tracepoint-analysis.html">イベントとトレースポイントを用いた挙動分析ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ftrace.html">ftrace - 関数トレーサー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ftrace-uses.html">ftraceを用いた関数へのフック</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kprobes.html">カーネルプローブ（Kprobes）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kprobetrace.html">Kprobesベースのイベントトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="uprobetracer.html">Uprobe-tracer: Uprobeベースのイベントトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tracepoints.html">Linuxカーネルトレースポイントの利用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events.html">イベントトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-kmem.html">サブシステムトレースポイント: kmem</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-power.html">サブシステムトレースポイント: power</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-nmi.html">NMIトレースイベント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-msr.html">MSRトレースイベント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mmiotrace.html">カーネル内メモリマップI/Oトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="histogram.html">イベントヒストグラム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="histogram-design.html">ヒストグラム設計ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="boottime-trace.html">ブートタイムトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hwlat_detector.html">ハードウェアレイテンシ検出器</a></li>
+<li class="toctree-l2"><a class="reference internal" href="intel_th.html">Intel(R)トレースハブ（TH）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ring-buffer-design.html">ロックレスリングバッファ設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="stm.html">システムトレースモジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sys-t.html">MIPI SyS-T over STP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="coresight/index.html">CoreSight - ARMハードウェアトレース</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxトレーシング技術</a><ul>
+<li>前へ: <a href="index.html" title="前章">Linuxトレーシング技術</a></li>
+<li>次へ: <a href="tracepoint-analysis.html" title="次章">イベントとトレースポイントを用いた挙動分析ノート</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/trace/ftrace-design.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

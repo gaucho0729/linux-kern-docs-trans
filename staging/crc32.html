@@ -1,0 +1,252 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>CRC計算に関する簡単なチュートリアル — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="lzo.html" rel="next" title="LinuxのLZOデコンプレッサーが理解するLZOストリーム形式"/>
+<link href="index.html" rel="prev" title="未整理のドキュメンテーション"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="brief-tutorial-on-crc-computation">
+<h1>CRC計算の簡単なチュートリアル<a class="headerlink" href="#brief-tutorial-on-crc-computation" title="この見出しへのパーマリンク">¶</a></h1>
+<p>CRCは長除法の余りです。メッセージにCRCを追加すると、全体（メッセージ+CRC）は指定されたCRC多項式の倍数になります。CRCを確認するには、再計算された値とCRCが一致することを確認するか、 <em>または</em> メッセージ+CRCを処理した際の余りが0であることを確認できます。この後者のアプローチは多くのハードウェア実装で採用されており、そのため多くのプロトコルがCRCの後にフレーム終端フラグを配置しています。</p>
+<p>これは学校で学ぶ通常の長除法と同じです。ただし、以下の点が異なります：</p>
+<ul class="simple">
+<li><p>2進数で計算するため、桁は0と1のみです。</p></li>
+<li><p>多項式を割る際には繰り上がりはありません。加算と減算ではなく、XORを使用します。そのため、加算と減算の違いについて少し手を抜く傾向があります。</p></li>
+</ul>
+<p>すべての割り算と同じく、余りは常に除数よりも小さくなります。32ビットのCRCを生成するには、除数は実際には33ビットのCRC多項式です。33ビットの長さなので、ビット32は常に設定されています。そのため、通常CRCは16進数で表され、最上位ビットは省略されます。（IEEE 754浮動小数点形式に慣れている場合は、同じ考え方です。）</p>
+<p>注意点として、CRCはビットの文字列に対して計算されますので、 <em>ビット</em>各バイト内のビットのエンドイアンネスを決める必要があります。エラー検出性能を最大にするには、実際に送信された順序と一致させる必要があります。たとえば、標準的なRS-232シリアル通信はリトルエンディアンです。最上位ビット（場合によってはパリティビットとして使用される）が最後に送信されます。CRCワードをメッセージに追加する際には、エンドイアンネスに合った正しい順序で行う必要があります。</p>
+<p>通常の割り算と同様に、1桁（ビット）ずつ処理します。各ステップで、被除数の1つ次の桁（ビット）を取り、現在の余りに追加します。次に、余りを範囲内に戻すための適切な除数の倍数を選び、減算します。2進数では、この倍数は0または1のみで、XORをキャンセルさせるため、余りのビット32をコピーします。</p>
+<p>CRCを計算する際には商は気にしないため、商のビットを無視できます。ただし、多項式の適切な倍数を余りから引くことで、再び最初に戻り、次のビットを処理できる状態になります。</p>
+<p>ビッグエンディアンのCRCはこのようにコードされます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>for (i = 0; i &lt; input_bits; i++) {
+        multiple = remainder &amp; 0x80000000 ? CRCPOLY : 0;
+        remainder = (remainder &lt;&lt; 1 | next_input_bit()) ^ multiple;
+}
+</pre></div>
+</div>
+<p>余りのシフト後のビット32を取得するには、余りのビット31を確認します <em>before</em> シフトします。</p>
+<p>次に、next_input_bit()でシフトするビットが余りに影響を与えるのは32ビット先の処理になってからであることに注意してください。そのため、この処理の最初の32サイクルは非常に退屈です。また、メッセージにCRCを追加するには、最後に32ビットの空き領域が必要なので、各メッセージの末尾にゼロを32ビット分シフトする処理を追加する必要があります。</p>
+<p>これらの詳細から、標準的なテクニックとして、next_input_bit()の統合を必要になるタイミングまで先延ばしにします。これにより、最初の32サイクルは事前に計算しておくことができ、CRCを確保するための最終的な32ビットのゼロの統合処理を完全に省略できます。これによりコードは以下のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>for (i = 0; i &lt; input_bits; i++) {
+        remainder ^= next_input_bit() &lt;&lt; 31;
+        multiple = (remainder &amp; 0x80000000) ? CRCPOLY : 0;
+        remainder = (remainder &lt;&lt; 1) ^ multiple;
+}
+</pre></div>
+</div>
+<p>この最適化により、little-endianのコードは特にシンプルになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>for (i = 0; i &lt; input_bits; i++) {
+        remainder ^= next_input_bit();
+        multiple = (remainder &amp; 1) ? CRCPOLY : 0;
+        remainder = (remainder &gt;&gt; 1) ^ multiple;
+}
+</pre></div>
+</div>
+<p>余り多項式の最上位係数は、二進数の「余り」変数の最下位ビットに格納されています。他のエンディアンに関する詳細はCRCPOLY（ビット逆転を必要とする）とnext_input_bit()に隠されています。</p>
+<p>next_input_bitがビットを合理的な順序で返している限り、
+<em>が</em> 追加ビットを統合するタイミングを最後まで待つ必要はありません。1ビットずつではなく、8ビットずつ処理できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>for (i = 0; i &lt; input_bytes; i++) {
+        remainder ^= next_input_byte() &lt;&lt; 24;
+        for (j = 0; j &lt; 8; j++) {
+                multiple = (remainder &amp; 0x80000000) ? CRCPOLY : 0;
+                remainder = (remainder &lt;&lt; 1) ^ multiple;
+        }
+}
+</pre></div>
+</div>
+<p>あるいはlittle-endianの場合:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>for (i = 0; i &lt; input_bytes; i++) {
+        remainder ^= next_input_byte();
+        for (j = 0; j &lt; 8; j++) {
+                multiple = (remainder &amp; 1) ? CRCPOLY : 0;
+                remainder = (remainder &gt;&gt; 1) ^ multiple;
+        }
+}
+</pre></div>
+</div>
+<p>入力が32ビットの倍数である場合、32ビットワードを1つずつXORで統合し、内側のループ回数を32に増やすこともできます。</p>
+<p>また、2つのループスタイルを組み合わせることも可能です。例えば、メッセージの大部分をバイト単位で処理し、残りの小数点以下のバイトにはビット単位で処理するなど、柔軟に使い分けられます。</p>
+<p>条件分岐の数を減らすために、ソフトウェアでは一般的にDilip V. Sarwate氏が提唱した「バイト単位でのテーブル参照法」が使われます。「Cyclic Redundancy Checksの計算におけるテーブル参照法」、Comm. ACM v.31 no.8 (1998年8月) p.1008-1013。</p>
+<p>ここでは、余りを1ビットずつシフトして正しい倍数を減算するのではなく、1バイトずつシフトします。これにより、40ビット（33ビットではなく）の中間余りが生成され、多項式の正しい倍数を減算するためには、高8ビットをインデックスにした256エントリの参照表を使います。</p>
+<p>(参照表のエントリは、与えられた1バイトメッセージのCRC-32です。)</p>
+<p>スペースが制限されている場合、より小さなテーブルが使われます。例えば、4ビットずつシフトし、その後16エントリのテーブルを参照するなど。</p>
+<p>この技術では、8ビット以上を処理するのは現実的ではありません。なぜなら、256エントリ以上のテーブルはメモリを多く消費し、さらに重要なのはL1キャッシュを多く消費するからです。</p>
+<p>ソフトウェアのパフォーマンスを向上させるには、「スライシング（slicing）」という技術が利用できます。詳しくは「High Octane CRC Generation with the Intel Slicing-by-8 Algorithm」をご覧ください。
+<a class="reference external" href="ftp://download.intel.com/technology/comms/perfnet/download/slicing-by-8.pdf">ftp://download.intel.com/technology/comms/perfnet/download/slicing-by-8.pdf</a></p>
+<p>テーブルの検索回数は変わりませんが、並列性が向上します。伝統的なSarwateアルゴリズムでは、各テーブル検索が完了するまで次のインデックスの計算ができません。</p>
+<p>「スライシング by 2」技術では、余りを16ビットずつシフトして48ビットの中間余りを生成します。65536エントリのテーブルで単一の検索を行う代わりに、2つの256エントリのテーブルで2つの高バイトを検索します。それぞれのテーブルは、対応するバイトをキャンセルする余りを含みます。テーブルは異なるのは、キャンセルする多項式が異なるためです。一方はx^32からx^39の係数が非ゼロで、もう一方はx^40からx^47の係数が非ゼロです。</p>
+<p>現代のプロセッサは多くの並列メモリ操作を処理できるため、単一のテーブル検索にかかる時間とほぼ同じで、基本的なSarwateアルゴリズムのほぼ2倍の速度で動作します。</p>
+<p>これは「スライシング by 4」に拡張可能です。4つの256エントリのテーブルを使用して、各ステップで32ビットのデータをフェッチし、CRCとXORして結果をバイトに分解しテーブルで検索します。32ビットシフトにより中間余りの低オーダービットがゼロになるため、最終的なCRCは4つのテーブル検索結果のXORです。</p>
+<p>しかし、この方法でも順序的な実行を強制しているため、次のグループのテーブル検索が開始されるまで、前のグループの4つの検索が完了する必要があります。そのため、プロセッサのロード/ストアユニットが時折アイドル状態になることがあります。</p>
+<p>プロセッサを最大限に活用するには、「スライシング by 8」が8つの検索を並列に実行します。各ステップで32ビットのCRCを64ビットシフトし、64ビットの入力データとXORします。重要なのは、8つのバイトのうち4つは入力データそのものであり、前のCRCに依存しません。そのため、それらの4つのテーブル検索は前のループイテレーションを待つことなく即座に開始できます。</p>
+<p>現代のスーパースケーラープロセッサは常に4つのロードを処理中にしておくことで、L1キャッシュを十分に活用し、忙しい状態を維持できます。</p>
+<p>実際の世界でのCRC実装に関するもう2点の詳細:</p>
+<p>通常、メッセージが既に多項式の倍数である場合、ゼロビットを追加するとその多項式のより大きな倍数になります。したがって、基本的なCRCは追加されたゼロビット（またはバイト）を検出できません。CRCがこの状態を検出できるようにするため、一般的にCRCを追加する前に反転させます。これにより、メッセージ＋CRCの余りがゼロではなく、固定の非ゼロ値になります。（反転パターンのCRC値は0xffffffffです。）</p>
+<p>ゼロビットがメッセージの先頭に追加される場合にも同様の問題が生じます。類似した解決策が採用されます。CRC計算を開始する際の初期余りを0ではなくすべて1に設定します。復号処理時に同じ方法で開始すれば、違いは生じません。</p>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">未整理のドキュメンテーション</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">CRC計算の簡単なチュートリアル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lzo.html">LinuxのLZOデコンプレッサーが理解するLZOストリーム形式</a></li>
+<li class="toctree-l2"><a class="reference internal" href="remoteproc.html">リモートプロセッサフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rpmsg.html">リモートプロセッサメッセージ(rpmsg)フレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="speculation.html">スペキュレーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="speculation.html#mitigating-speculation-side-channels">スペキュレーション側チャネルの緩和</a></li>
+<li class="toctree-l2"><a class="reference internal" href="static-keys.html">スタティックキー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tee.html">TEEサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xz.html">LinuxにおけるXZデータ圧縮</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">未整理のドキュメンテーション</a><ul>
+<li>前へ: <a href="index.html" title="前章">未整理のドキュメンテーション</a></li>
+<li>次へ: <a href="lzo.html" title="次章">LinuxのLZOデコンプレッサーが理解するLZOストリーム形式</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/staging/crc32.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

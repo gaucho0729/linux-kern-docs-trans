@@ -1,0 +1,229 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>hrtimers - ハイレゾカーネルタイマーサブシステム — Linuxカーネルドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="no_hz.html" rel="next" title="NO_HZ: スケジューリングクロックティックの削減"/>
+<link href="hpet.html" rel="prev" title="Linux用の高精度イベントタイマードライバ"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="hrtimers-subsystem-for-high-resolution-kernel-timers">
+<h1>hrtimers - 高解像度カーネルタイマーサブシステム<a class="headerlink" href="#hrtimers-subsystem-for-high-resolution-kernel-timers" title="この見出しへのパーマリンク">¶</a></h1>
+<p>このパッチは、ハイレゾカーネルタイマーサブシステムを導入します。</p>
+<p>誰もが疑問に思うでしょう：すでにタイマーサブシステム（kernel/timers.c）がありますが、なぜ2つのタイマーサブシステムが必要なのでしょうか？高解像度と高精度の機能を既存のタイマーフレームワークに統合しようと何度もやりとりを重ね、実際の運用でさまざまな高解像度タイマーアプリケーションをテストした結果、タイマーホイールコードはこのようなアプローチに根本的に不向きであると結論付けました。当初はそうとは思っていませんでした（「解決方法はあるはずだ」）。タイマーホイールに統合することを試みるため、相当な労力を費やしましたが、失敗に終わりました。振り返ると、このような統合が困難/不可能な理由はいくつかあります：</p>
+<ul class="simple">
+<li><p>低解像度と高解像度タイマーコードを同じように扱おうとすると、多くの妥協点やマクロマジック、ifdefの混乱が生じます。timers.cコードはjiffiesと32ビット前提に基づいてタイトにコード化されており、数十年にわたり狭い用途（jiffiesの狭いHZ範囲）に特化したマイクロ最適化が施されています。そのため、このコードにわずかな拡張を加えるだけでホイール概念が破綻し、さらに悪い妥協点を生むことになります。タイマーホイールコードは現在の用途では全く問題ありませんが、高解像度タイマーコードの拡張には不向きです。</p></li>
+<li><p>カスケードによる予測不能なO(N)オーバーヘッドは、高解像度タイマーハンドリングの複雑化を必要とし、その結果、信頼性が低下します。このような設計では依然として大きなタイミング誤差が生じます。カスケードはタイマーホイール概念の基本的な性質であり、これを設計から排除しようとすると、タイマーズ.cコードの他の部分が受け入れられないほどに品質が低下します。</p></li>
+<li><p>現在のPOSIXタイマーサブシステムはタイマーホイール上に実装されており、settimeofdayやNTP時間での絶対CLOCK_REALTIMEタイマの再調整処理にすでに複雑な処理が必要となっています。この経験を例に挙げると、タイマーホイールデータ構造は高解像度タイマーコードには柔軟性が欠如していることがわかります。</p></li>
+<li><p>タイマホイールコードは、タイムアウトと識別可能な使用ケースにおいて最も最適です。このようなタイムアウトは、ネットワークやブロックI/OなどのさまざまなI/O経路におけるエラー条件をカバーするために設定されることが一般的です。これらのタイマの多くは、期待される正しいイベントが十分早く到達してタイマホイールから削除されるため、期限切れすることなく、ほとんど再カスケードされることはありません。したがって、これらのタイムアウトのユーザーは、タイマホイールの粒度と精度のトレードオフを受け入れ、タイマサブシステムがほぼゼロのオーバーヘッドを持つことをほぼ期待しています。彼らにとって正確なタイミングは核心的な目的ではありません。実際、使用されるタイムアウト値の多くは適当です。彼らにとって、実際のタイムアウト完了の処理を保証するための必要悪であり、ほとんどのタイムアウトは完了前に削除されるため、これ以上処理を必要としないため、できるだけ安価で侵襲性のないものであるべきです。</p></li>
+</ul>
+<p>高精度タイマの主なユーザーは、ナノスリープ、posixタイマ、itimerインターフェースを使用するユーザー空間アプリケーションです。また、ドライバーやサブシステムなどのカーネル内ユーザーも、正確なタイミングイベントを必要とする場合（例：マルチメディア）に、高精度タイマサブシステムの存在から恩恵を受けます。</p>
+<p>このサブシステムは現在高精度クロックソースを提供していませんが、hrtimerサブシステムは高精度クロック機能を簡単に拡張でき、そのパッチはすでに存在し、急速に成熟しています。リアルタイムおよびマルチメディアアプリケーションに対する需要の増加、および高精度タイマの他の潜在的なユーザーの存在は、『タイムアウト』と『高精度タイマ』サブシステムを分離するもう一つの理由です。</p>
+<p>このような分離の別の利点は、既存のタイマホイールを低精度・低粒度の使用ケースに特化した特殊用途の最適化をさらに進められることです。精度に敏感なAPIがタイマホイールから分離され、hrtimerに移行されると、例えばタイムアウトサブシステムの周波数を250Hzから100Hz（あるいはさらに低く）に減らすことが可能になります。</p>
+<section id="hrtimer-subsystem-implementation-details">
+<h2>hrtimerサブシステムの実装詳細<a class="headerlink" href="#hrtimer-subsystem-implementation-details" title="この見出しへのパーマリンク">¶</a></h2>
+<p>基本的な設計考慮点は以下の通りです：</p>
+<ul class="simple">
+<li><p>簡潔さ</p></li>
+<li><p>データ構造はジャイフスや他の粒度に依存しない。すべてのカーネルロジックは64ビットナノ秒精度で動作する。妥協は一切ない。</p></li>
+<li><p>既存のタイミング関連カーネルコードの簡素化</p></li>
+</ul>
+<p>もう一つの基本的な要件は、アクティベーション時にタイマーの即時エンキューおよび順序付けでした。radix treesやhashesなどの複数の可能解決策を検討した後、我々は赤黒木（red black tree）を基本データ構造として選択しました。rbtreeはカーネル内にライブラリとして提供されており、メモリ管理やファイルシステムなどのパフォーマンスに重要な分野で使用されています。rbtreeは時間順に並べるためのものであり、別途リストを使用して、期限切れコードがrbtreeをたどらずにキューイングされたタイマーアクセスを高速化しています。</p>
+<p>(この別リストは、後述する高精度クロックを導入する際にも有用で、時間順を保持しながら別途待機中と期限切れのキューを分ける必要があるためです。)</p>
+<p>時間順のエンキューは高精度クロックの目的だけではなく、低精度のCLOCK_REALTIMEに基づく絶対タイマーハンドリングを簡略化する目的もあります。既存の実装では、CLOCK_REALTIMEに基づくすべてのアラムされた絶対タイマーアクセスのために追加リストを維持し、複雑なロック処理が必要でした。settimeofdayやNTPの処理では、すべてのタイマーリスト（！）をデキューし、時間変更コードがそれぞれを修正し、再度エンキューする必要がありました。時間順のエンキューと絶対時間単位での期限切れ時間の保存により、POSIXタイマーアプリケーション実装からすべての複雑でスケーラビリティが悪いコードが除去され、クロックはrbtreeを操作することなく単純に設定可能になります。これによりPOSIXタイマーハンドリング全体が簡略化されます。</p>
+<p>hrtimerのロック処理とCPUごとの動作は、既存のタイマーホイールコードから主に取り入れられました。これは成熟した設計で適切なためです。しかし、異なるデータ構造のためコード共有はメリットがありませんでした。また、hrtの関数はより明確な動作と名前を持つようになりました。例えば
+<a class="reference internal" href="../driver-api/basics.html#c.hrtimer_try_to_cancel" title="hrtimer_try_to_cancel"><code class="xref c c-func docutils literal notranslate"><span class="pre">hrtimer_try_to_cancel()</span></code></a> および <a class="reference internal" href="../driver-api/basics.html#c.hrtimer_cancel" title="hrtimer_cancel"><code class="xref c c-func docutils literal notranslate"><span class="pre">hrtimer_cancel()</span></code></a> [これらはほぼ同等の <a class="reference internal" href="../driver-api/basics.html#c.del_timer" title="del_timer"><code class="xref c c-func docutils literal notranslate"><span class="pre">del_timer()</span></code></a> および <a class="reference internal" href="../driver-api/basics.html#c.del_timer_sync" title="del_timer_sync"><code class="xref c c-func docutils literal notranslate"><span class="pre">del_timer_sync()</span></code></a>] - というわけで、アルゴリズムレベルでは1対1のマッピングがなく、コード共有の可能性もまったくありません。</p>
+<p>基本データ型: すべての値、絶対値または相対値を含むが、特殊なナノ秒分解能の型:ktime_tが使用されます。ktime_t値の内蔵表現と操作は、マクロとインライン関数を通じて実装され、コンパイル時に「ハイブリッドユニオン」型と「スカラー」64bitナノ秒表現の2つの形式の切り替えが可能です。ハイブリッドユニオン型は32bitCPUでの時間変換を最適化します。このビルド時に選択可能なktime_tの保存形式は、32bitCPUでの64bit乗算・除算のパフォーマンスへの影響を回避するため実装されました。このような操作は、カーネルとユーザースペースインターフェースが提供する保存形式と内部時間形式の間での変換に頻繁に必要になります。(詳細はinclude/linux/ktime.hを参照してください。)</p>
+</section>
+<section id="hrtimers-rounding-of-timer-values">
+<h2>hrtimers - タイマーバリューの丸め<a class="headerlink" href="#hrtimers-rounding-of-timer-values" title="この見出しへのパーマリンク">¶</a></h2>
+<p>hrtimerコードは、タイマーイベントを低分解能クロックに丸めざるを得ません。それ以外の場合は、あらゆる人工的な丸めを行いません。</p>
+<p>重要なのは、clock_getres()インターフェースがユーザーに返す分解能値は、与えられたクロックが持つ実際の分解能（低解像度、高解像度、または人工的に低解像度）を返すことです。</p>
+</section>
+<section id="hrtimers-testing-and-verification">
+<h2>hrtimers - テストと検証<a class="headerlink" href="#hrtimers-testing-and-verification" title="この見出しへのパーマリンク">¶</a></h2>
+<p>私たちはhrtimers上に高解像度クロックサブシステムを構築し、hrtimerの実装詳細を実際の運用で検証しました。またPOSIXタイマーテストを実行し、仕様準拠を確認しました。低解像度クロックのテストも実施しました。</p>
+<p>hrtimerパッチは以下のカーネル機能をhrtimersに変換しました:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>nanosleep</p></li>
+<li><p>itimers</p></li>
+<li><p>posix-timers</p></li>
+</ul>
+</div></blockquote>
+<p>nanosleepとposix-timersの変換により、nanosleepとclock_nanosleepの統合が可能になりました。</p>
+<p>コードは以下のプラットフォームで成功裏にコンパイルされました:</p>
+<blockquote>
+<div><p>i386, x86_64, ARM, PPC, PPC64, IA64</p>
+</div></blockquote>
+<p>コードは以下のプラットフォームで実行テストされました:</p>
+<blockquote>
+<div><p>i386(UP/SMP), x86_64(UP/SMP), ARM, PPC</p>
+</div></blockquote>
+<p>hrtimersはまた-rtツリーに統合され、hrtimersベースの高解像度クロック実装も導入されました。これにより、hrtimersコードは実際の運用で十分なテストと利用が得られました。</p>
+<blockquote>
+<div><p>Thomas Gleixner, Ingo Molnar</p>
+</div></blockquote>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">タイマ</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="highres.html">高解像度タイマーアンドダイナミックティック設計ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hpet.html">Linux用の高精度イベントタイマードライバ</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">hrtimers - 高解像度カーネルタイマーサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="no_hz.html">NO_HZ: スケジューリングクロックティックの削減</a></li>
+<li class="toctree-l2"><a class="reference internal" href="timekeeping.html">クロックソース、クロックイベント、sched_clock() およびディレイタイマ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="timers-howto.html">delays - 各種カーネルディレイ/スリープメカニズムに関する情報</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">タイマ</a><ul>
+<li>前へ: <a href="hpet.html" title="前章">Linux用の高精度イベントタイマードライバ</a></li>
+<li>次へ: <a href="no_hz.html" title="次章">NO_HZ: スケジューリングクロックティックの削減</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/timers/hrtimers.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

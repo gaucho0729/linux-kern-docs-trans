@@ -1,0 +1,625 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>カーネルプローブ (Kprobes) — The Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="kprobetrace.html" rel="next" title="Kprobesベースのイベントトレース"/>
+<link href="ftrace-uses.html" rel="prev" title="ftraceを用いた関数へのフック"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="kernel-probes-kprobes">
+<h1>カーネルプローブ（Kprobes）<a class="headerlink" href="#kernel-probes-kprobes" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Jim Keniston &lt;<a class="reference external" href="mailto:jkenisto%40us.ibm.com">jkenisto<span>@</span>us<span>.</span>ibm<span>.</span>com</a>&gt;</p>
+</dd>
+<dt class="field-even">著者</dt>
+<dd class="field-even"><p>Prasanna S Panchamukhi &lt;<a class="reference external" href="mailto:prasanna.panchamukhi%40gmail.com">prasanna<span>.</span>panchamukhi<span>@</span>gmail<span>.</span>com</a>&gt;</p>
+</dd>
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Masami Hiramatsu &lt;<a class="reference external" href="mailto:mhiramat%40redhat.com">mhiramat<span>@</span>redhat<span>.</span>com</a>&gt;</p>
+</dd>
+</dl>
+<section id="concepts-kprobes-and-return-probes">
+<h2>概念: Kprobes と Return Probes<a class="headerlink" href="#concepts-kprobes-and-return-probes" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Kprobes は、動的に任意のカーネルルーチンに割り込み、干渉せずにデバッグやパフォーマンス情報を収集できる機能です。ほぼすべてのカーネルコードアドレスでトラップが可能です <a class="footnote-reference brackets" href="#id2" id="id1">1</a>、ブレイクポイントが発生した際に実行されるハンドラールーチンを指定できます。</p>
+<dl class="footnote brackets">
+<dt class="label" id="id2"><span class="brackets"><a class="fn-backref" href="#id1">1</a></span></dt>
+<dd><p>一部のカーネルコードはトラップできません。詳しくは
+<a class="reference internal" href="#kprobes-blacklist"><span class="std std-ref">ブラックリスト</span></a>)</p>
+</dd>
+</dl>
+<p>現在、2種類のプローブがあります: kprobes と kretprobes (リターンプローブとも呼ばれます)。kprobe は、カーネル内のほぼすべてのインストラクションに挿入可能です。リターンプローブは指定された関数が返るときに発火します。</p>
+<p>通常のケースでは、Kprobesベースのインストルメンテーションはカーネルモジュールとしてパッケージされます。モジュールの init 関数は1つ以上のプローブをインストール("登録")し、exit 関数はそれらを解除します。register_kprobe() などの登録関数は、プローブを挿入する位置と、プローブが発生した際に呼び出すハンドラを指定します。</p>
+<p>また、 <code class="docutils literal notranslate"><span class="pre">register_/unregister_*probes()</span></code> 複数のプローブをバッチで登録/解除するための関数 <code class="docutils literal notranslate"><span class="pre">*probes</span></code>。これらの関数は、一度に多数のプローブを解除する際の処理を高速化します。</p>
+<p>次の4つのサブセクションでは、さまざまなプローブの動作方法とジャンプ最適化の仕組みを説明します。Kprobesを最大限に活用するために必要な知識（例: pre_handler と post_handler の違い、kretprobe の maxactive と nmissed フィールドの使い方など）を解説します。ただし、Kprobesの使い方を早速知りたい場合は、 <a class="reference internal" href="#kprobes-archs-supported"><span class="std std-ref">サポートされるアーキテクチャ</span></a>.</p>
+<section id="how-does-a-kprobe-work">
+<h3>Kprobeはどのように動作するか？<a class="headerlink" href="#how-does-a-kprobe-work" title="この見出しへのパーマリンク">¶</a></h3>
+<p>kprobe が登録されると、Kprobes はプローブ対象のインストラクションをコピーし、その最初のバイトをブレイクポイント指令（例: i386 および x86_64 では int3）に置き換えます。</p>
+<p>CPU がブレイクポイント指令にヒットすると、トラップが発生し、CPU のレジスタが保存され、notifier_call_chain メカニズムを通じて Kprobes に制御が移ります。Kprobes は kprobe に関連付けられた "pre_handler" を実行し、ハンドラに kprobe 結構と保存されたレジスタのアドレスを渡します。</p>
+<p>次に、Kprobes はプローブ対象のインストラクションのコピーをシングルステップします。（実際にインストラクションを場所そのままシングルステップする方が簡単ですが、その場合 Kprobes は一時的にブレイクポイント指令を削除しなければならないため、他の CPU がプローブポイントを通り抜ける可能性がある小さな時間窓が生じます。)</p>
+<p>インストラクションがシングルステップされた後、Kprobesは関連するkprobeに関連付けられた「post_handler」（存在する場合）を実行します。その後、プローブポイントの次のインストラクションから実行が続きます。</p>
+</section>
+<section id="changing-execution-path">
+<h3>実行パスの変更<a class="headerlink" href="#changing-execution-path" title="この見出しへのパーマリンク">¶</a></h3>
+<p>Kprobesは実行中のカーネルコードにプローブを実行できるため、レジスタセット（インストラクションポインタを含む）を変更できます。この操作はスタックフレームの保持や実行パスの復元など、最大限の注意が必要です。実行中のカーネルに作用し、コンピュータアーキテクチャや並行処理に関する深い知識が求められるため、足をやけどする可能性があります。</p>
+<p>pre_handlerでインストラクションポインタ（および他の関連レジスタ）を変更した場合、kprobesがシングルステップを停止し、指定されたアドレスに戻るようするために!0を返す必要があります。これにより、post_handlerはもう呼び出されません。</p>
+<p>TOC（コンテントテーブル）を関数呼び出しに使用するアーキテクチャでは、この操作がより困難になる可能性があります。なぜなら、モジュール内で関数用に新しいTOCを設定し、戻る際に古いTOCを復元する必要がありますからです。</p>
+</section>
+<section id="return-probes">
+<h3>リターンプローブ<a class="headerlink" href="#return-probes" title="この見出しへのパーマリンク">¶</a></h3>
+<section id="how-does-a-return-probe-work">
+<h4>リターンプローブはどのように動作するか？<a class="headerlink" href="#how-does-a-return-probe-work" title="この見出しへのパーマリンク">¶</a></h4>
+<p>register_kretprobe()を呼び出すと、Kprobesは関数のエントリポイントにkprobeを設定します。プローブ対象の関数が呼び出され、このプローブがヒットした場合、Kprobesはリターンアドレスのコピーを保存し、リターンアドレスを「トラミプル」のアドレスに置き換えます。トラミプルは任意のコード（通常はNOP命令のみ）です。起動時、Kprobesはトラミプルにkprobeを登録します。</p>
+<p>プローブ対象の関数がリターン命令を実行すると、制御はトラミプルに移り、そのプローブがヒットします。Kprobesのトラミプルハンドラは、kretprobeに関連付けられたユーザー指定のリターンハンドラを呼び出し、保存されたインストラクションポインタを保存されたリターンアドレスに設定します。これにより、トラップからの戻り時に実行が再開します。</p>
+<p>プローブ対象の関数が実行中である間、そのリターンアドレスはkretprobe_instance型のオブジェクトに保存されます。register_kretprobe()を呼び出す前には、ユーザーがkretprobe構造体のmaxactiveフィールドを設定し、指定された関数の同時プローブ可能なインスタンス数を指定します。register_kretprobe()は、指定された数のkretprobe_instanceオブジェクトを事前に割り当てます。</p>
+<p>たとえば、関数が非再帰的であり、スピンロックを保持しながら呼び出される場合、maxactive = 1で十分です。関数が非再帰的であり、CPUを解放することのできない状態（例：セマフォやプリエンプションを通じて）にある場合、NR_CPUSで十分です。maxactive &lt;= 0の場合は、デフォルト値に設定されます。CONFIG_PREEMPTが有効な場合、デフォルト値はmax(10, 2*NR_CPUS)になります。それ以外の場合は、NR_CPUSがデフォルト値です。</p>
+<p>maxactiveを低すぎる値に設定しても大した問題ではありません。その結果、一部のプローブが無視されるだけです。kretprobe構造体のnmissedフィールドは、返却プローブが登録されるときにゼロに初期化され、プローブ対象関数が呼び出され、かつkretprobe_instanceオブジェクトが利用できない場合に毎回インクリメントされます。</p>
+</section>
+<section id="kretprobe-entry-handler">
+<h4>Kretprobeエントリーハンドラ<a class="headerlink" href="#kretprobe-entry-handler" title="この見出しへのパーマリンク">¶</a></h4>
+<p>Kretprobesは、関数のエントリーポイントで実行されるユーザー指定のハンドラをオプションで提供します。このハンドラは、kretprobe構造体のentry_handlerフィールドを設定することで指定されます。kretprobeが関数のエントリーポイントにkprobeを配置した際にそのハンドラが呼び出されます。entry_handlerが0（成功）を返す場合、関数のリターン時に対応するリターンハンドラが確実に呼び出されます。entry_handlerが非ゼロのエラーを返す場合、Kprobesはリターンアドレスを変更せず、kretprobeはその関数インスタンスに対して効果を持たなくなります。</p>
+<p>複数のエントリーハンドラとリターンハンドラの呼び出しは、それらに関連する一意なkretprobe_instanceオブジェクトによって一致されます。さらに、ユーザーは各リターンインスタンスごとのプライベートデータをkretprobe_instanceオブジェクトに含めることが可能です。これは、対応するユーザーのエントリーハンドラとリターンハンドラ間でプライベートデータを共有する場合に特に有用です。各プライベートデータオブジェクトのサイズは、kretprobeの登録時にkretprobe構造体のdata_sizeフィールドを設定することで指定できます。このデータは、各kretprobe_instanceオブジェクトのdataフィールドを通じてアクセス可能です。</p>
+<p>プローブ対象関数が呼び出され、かつkretprobe_instanceオブジェクトが利用できない場合、nmissedカウントをインクリメントするだけでなく、ユーザーのエントリーハンドラの呼び出しもスキップされます。</p>
+</section>
+</section>
+<section id="how-does-jump-optimization-work">
+<span id="kprobes-jump-optimization"></span><h3>ジャンプ最適化はどのように動作するか？<a class="headerlink" href="#how-does-jump-optimization-work" title="この見出しへのパーマリンク">¶</a></h3>
+<p>あなたのカーネルがCONFIG_OPTPROBES=y（現在はx86/x86-64、非プリエンプションカーネルではこのフラグが自動的に'y'に設定される）で構築されており、かつ「debug.kprobes_optimization」カーネルパラメータが1に設定されている場合（sysctl(8)を参照）、Kprobesはプローブポイントごとにブレイクポイント命令ではなくジャンプ命令を使用して、プローブヒットのオーバーヘッドを削減しようとします。</p>
+<section id="init-a-kprobe">
+<h4>Kprobeの初期化<a class="headerlink" href="#init-a-kprobe" title="この見出しへのパーマリンク">¶</a></h4>
+<p>プローブが登録される際、この最適化を試行する前に、Kprobesは指定されたアドレスに通常のブレイクポイントベースのkprobeを挿入します。そのため、この特定のプローブポイントを最適化できない場合でも、その場所にはプローブが存在します。</p>
+</section>
+<section id="safety-check">
+<h4>安全性チェック<a class="headerlink" href="#safety-check" title="この見出しへのパーマリンク">¶</a></h4>
+<p>プローブを最適化する前に、Kprobesは以下の安全性チェックを行います:</p>
+<ul class="simple">
+<li><p>Kprobesは、ジャンプ命令で置き換える領域（「最適化領域」と呼ばれる領域）が1つの関数内に完全に含まれていることを確認します。（ジャンプ命令は複数バイトであり、複数の命令を上書きする可能性があります）</p></li>
+<li><p>Kprobesは関数全体を分析し、最適化領域内にジャンプが行われていないことを確認します。具体的には:</p>
+<ul>
+<li><p>関数に間接ジャンプは含まれていません;</p></li>
+<li><p>関数に例外を引き起こす命令は含まれていません（例外によってトリガーされる修正コードが最適化領域に戻ってジャンプする可能性があるため、Kprobesは例外テーブルを確認してこれを検証します）;</p></li>
+<li><p>最適化領域へのニアジャンプ（最初のバイトを除く）はありません。</p></li>
+</ul>
+</li>
+<li><p>最適化領域内の各命令について、Kprobesはその命令がオフラインで実行可能であることを確認します。</p></li>
+</ul>
+</section>
+<section id="preparing-detour-buffer">
+<h4>デトーリングバッファの準備<a class="headerlink" href="#preparing-detour-buffer" title="この見出しへのパーマリンク">¶</a></h4>
+<p>次に、Kprobesは以下の命令シーケンスを含む「デトーリング」バッファを準備します:</p>
+<ul class="simple">
+<li><p>CPUのレジスタをプッシュするコード（ブレイクポイントトラップをエミュレート）</p></li>
+<li><p>ユーザーのプローブハンドラを呼び出すトランポリンコードへの呼び出し</p></li>
+<li><p>レジスタを復元するコード</p></li>
+<li><p>最適化領域の命令</p></li>
+<li><p>元の実行パスに戻るジャンプ</p></li>
+</ul>
+</section>
+<section id="pre-optimization">
+<h4>最適化前の確認<a class="headerlink" href="#pre-optimization" title="この見出しへのパーマリンク">¶</a></h4>
+<p>デトーリングバッファの準備後、Kprobesは以下の状況が存在しないことを確認します:</p>
+<ul class="simple">
+<li><p>プローブにpost_handlerがあります。</p></li>
+<li><p>最適化領域内の他の命令がプローブされています。</p></li>
+<li><p>プローブが無効化されています。</p></li>
+</ul>
+<p>上記のいずれかの状況がある場合、Kprobesはプローブの最適化を開始しません。これらの状況は一時的なものであるため、状況が変化した場合、Kprobesは再度最適化を試みます。</p>
+<p>kprobeが最適化可能である場合、Kprobesはkprobeを最適化リストに登録し、kprobe-optimizerワークキューを起動して最適化を行います。最適化されるプローブポイントが最適化される前にヒットした場合、KprobesはCPUの指令ポインタをデトーリングバッファ内のコピーされたコードに設定して、元の実行パスに戻します。これにより、少なくとも単一ステップの処理を回避します。</p>
+</section>
+<section id="optimization">
+<h4>最適化<a class="headerlink" href="#optimization" title="この見出しへのパーマリンク">¶</a></h4>
+<p>Kprobe-optimizerはジャンプ命令を即座に挿入しません。むしろ、 <a class="reference internal" href="../core-api/kernel-api.html#c.synchronize_rcu" title="synchronize_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code></a> 安全性を最優先に、なぜならCPUが最適化領域を実行中に中断される可能性があるからです <a class="footnote-reference brackets" href="#id5" id="id3">3</a>. ご存知の通り、 <a class="reference internal" href="../core-api/kernel-api.html#c.synchronize_rcu" title="synchronize_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code></a> 中断が発生していた場合、すべての中断が完了することを保証できますが、これはCONFIG_PREEMPT=nの場合に限ります。 <a class="reference internal" href="../core-api/kernel-api.html#c.synchronize_rcu" title="synchronize_rcu"><code class="xref c c-func docutils literal notranslate"><span class="pre">synchronize_rcu()</span></code></a>
+したがって、このkprobeの最適化バージョンは、CONFIG_PREEMPT=nのカーネルのみをサポートします。 <a class="footnote-reference brackets" href="#id6" id="id4">4</a>.</p>
+<p>その後、Kprobe-optimizerはstop_machine()を呼び出して、最適化された領域をdetourバッファへのジャンプ命令に置き換えるため、text_poke_smp()を使用します。</p>
+</section>
+<section id="unoptimization">
+<h4>アンオプティマイゼーション<a class="headerlink" href="#unoptimization" title="この見出しへのパーマリンク">¶</a></h4>
+<p>最適化されたkprobeがアンレジスタ、無効化、または他のkprobeによってブロックされた場合、アンオプティマイズされます。この処理が最適化が完了する前に行われた場合、kprobeは最適化リストから dequeue されます。最適化が完了している場合は、text_poke_smp()を使用してジャンプ命令を元のコード（最初のバイトのint3ブレイクポイントを除く）に戻します。</p>
+<dl class="footnote brackets">
+<dt class="label" id="id5"><span class="brackets"><a class="fn-backref" href="#id3">3</a></span></dt>
+<dd><p>2番目の命令が中断され、その後オプティマイザが2番目の命令をジャンプ命令に置き換えると想像してください。 <em>アドレス</em>
+割り込みハンドラが実行中である間。割り込みが元のアドレスに戻るとき、有効な命令が存在せず、予期せぬ結果を引き起こします。</p>
+</dd>
+<dt class="label" id="id6"><span class="brackets"><a class="fn-backref" href="#id4">4</a></span></dt>
+<dd><p>この最適化安全性のチェックは、kspliceがCONFIG_PREEMPT=yカーネルをサポートするために使用するstop-machineメソッドで置き換えることができます。</p>
+</dd>
+</dl>
+<p>技術者向けの注意: ジャンプ最適化は、kprobeのpre_handlerの挙動を変更します。最適化されていない場合、pre_handlerはregs-&gt;ipを変更して実行パスを変更し、1を返します。しかし、プローブが最適化されている場合、この変更は無視されます。したがって、カーネルの実行パスを調整したい場合は、以下の技術のいずれかを使用して最適化を抑制する必要があります:</p>
+<ul class="simple">
+<li><p>kprobeのpost_handlerに空の関数を指定します。</p></li>
+</ul>
+<p>または</p>
+<ul class="simple">
+<li><p>sysctl -w debug.kprobes_optimization=nを実行します。</p></li>
+</ul>
+</section>
+</section>
+<section id="blacklist">
+<span id="kprobes-blacklist"></span><h3>ブラックリスト<a class="headerlink" href="#blacklist" title="この見出しへのパーマリンク">¶</a></h3>
+<p>Kprobesは自身を除くカーネルの大部分をプローブできます。これは、一部の関数ではプローブができないためです。このような関数をプローブ（トラップ）すると、再帰的なトラップ（例: ダブルフォールト）や、ネストされたプローブハンドラが呼び出されない可能性があります。Kprobesはこのような関数をブラックリストとして管理しています。ブラックリストに追加したい関数は、(1) linux/kprobes.hをインクルードし、(2) NOKPROBE_SYMBOL()マクロを使用してブラックリスト化する関数を指定します。Kprobesは、指定されたプローブアドレスをブラックリストと照合し、該当する場合に登録を拒否します。</p>
+</section>
+</section>
+<section id="architectures-supported">
+<span id="kprobes-archs-supported"></span><h2>サポートされるアーキテクチャ<a class="headerlink" href="#architectures-supported" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Kprobesおよびreturn probesは以下のアーキテクチャで実装されています:</p>
+<ul class="simple">
+<li><p>i386 (ジャンプ最適化をサポート)</p></li>
+<li><p>x86_64 (AMD-64, EM64T) (ジャンプ最適化をサポート)</p></li>
+<li><p>ppc64</p></li>
+<li><p>ia64 (指令スロット1でのプローブをサポートしていません。)</p></li>
+<li><p>sparc64 (return probesはまだ実装されていません。)</p></li>
+<li><p>arm</p></li>
+<li><p>ppc</p></li>
+<li><p>mips</p></li>
+<li><p>s390</p></li>
+<li><p>parisc</p></li>
+</ul>
+</section>
+<section id="configuring-kprobes">
+<h2>Kprobesの設定<a class="headerlink" href="#configuring-kprobes" title="この見出しへのパーマリンク">¶</a></h2>
+<p>make menuconfig/xconfig/oldconfigを使用してカーネルを構成する際、CONFIG_KPROBESを「y」に設定してください。「General setup」の下で「Kprobes」を探してください。</p>
+<p>Kprobesベースのインストゥルメンテーションモジュールをロードおよびアンロードできるようにするため、「Loadable module support」(CONFIG_MODULES)と「Module unloading」(CONFIG_MODULE_UNLOAD)を「y」に設定してください。</p>
+<p>また、CONFIG_KALLSYMSおよびおそらくCONFIG_KALLSYMS_ALLも「y」に設定してください。kallsyms_lookup_name()は、カーネル内でのkprobeアドレス解決コードで使用されるためです。</p>
+<p>関数の中間でプローブを挿入する必要がある場合、「Compile the kernel with debug info」(CONFIG_DEBUG_INFO)を有効にして、"objdump -d -l vmlinux"を使用してソースコードとオブジェクトコードのマッピングを確認するのに役立ちます。</p>
+</section>
+<section id="api-reference">
+<h2>APIリファレンス<a class="headerlink" href="#api-reference" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Kprobes APIには、各タイプのプローブ用に「register」関数と「unregister」関数が含まれています。また、プローブの配列を登録・解除するための「register_*probes」および「unregister_*probes」関数も含まれています。以下は、これらの関数と関連するプローブハンドラの簡潔なミニマニュアルページ仕様です。例はsamples/kprobes/サブディレクトリ内のファイルを参照してください。</p>
+<section id="register-kprobe">
+<h3>register_kprobe<a class="headerlink" href="#register-kprobe" title="この見出しへのパーマリンク">¶</a></h3>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/kprobes.h&gt;
+int register_kprobe(struct kprobe *kp);
+</pre></div>
+</div>
+<p>kp-&gt;addrアドレスにブレイクポイントを設定します。ブレイクポイントがヒットした際、Kprobesはkp-&gt;pre_handlerを呼び出します。プローブされたインストラクションをシングルステップ実行後、Kprobeはkp-&gt;post_handlerを呼び出します。kp-&gt;pre_handlerまたはkp-&gt;post_handlerの実行中にエラーが発生した場合、またはプローブされたインストラクションのシングルステップ中にエラーが発生した場合、Kprobesはkp-&gt;fault_handlerを呼び出します。すべてのハンドラはNULLにすることができます。kp-&gt;flagsがKPROBE_FLAG_DISABLEDに設定されている場合、そのプローブは登録されますが無効のままとなり、enable_kprobe(kp)を呼び出すまでハンドラが実行されません。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<ol class="arabic">
+<li><p>struct kprobeに「symbol_name」フィールドが導入されたことにより、プローブポイントアドレス解決はカーネルによって自動処理されます。以下のコマンドが動作するようになりました：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>kp.symbol_name = "symbol_name";
+</pre></div>
+</div>
+<p>(64ビットPowerPCの複雑な処理、例えば関数記述子は透明に処理されます)</p>
+</li>
+<li><p>プローブポイントをインストールするためのシンボル内のオフセットがわかっている場合、struct kprobeの「offset」フィールドを使用してください。このフィールドはプローブポイントの計算に使用されます。</p></li>
+<li><p>「symbol_name」か「addr」のいずれかを指定してください。両方を指定した場合、kprobeの登録は-EINVALで失敗します。</p></li>
+<li><p>CISCアーキテクチャ（i386やx86_64など）では、kprobe.addrがインストラクション境界に位置しているかを検証しません。そのため、「offset」の使用には注意が必要です。</p></li>
+</ol>
+</div>
+<p>register_kprobe()は成功時に0を、失敗時には負のエラー番号を返します。</p>
+<p>ユーザーのプリハンドラ（kp-&gt;pre_handler）：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/kprobes.h&gt;
+#include &lt;linux/ptrace.h&gt;
+int pre_handler(struct kprobe *p, struct pt_regs *regs);
+</pre></div>
+</div>
+<p>breakpointに関連付けられたkprobeを指すpと、ブレイクポイントが発生した際に保存されたレジスタを含む構造体を指すregsで呼び出されます。ここでは0を返しますが、Kprobesのエキスパートでない限りは。</p>
+<p>ユーザーのポストハンドラ (kp-&gt;post_handler):</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/kprobes.h&gt;
+#include &lt;linux/ptrace.h&gt;
+void post_handler(struct kprobe *p, struct pt_regs *regs,
+                  unsigned long flags);
+</pre></div>
+</div>
+<p>pとregsはpre_handlerで説明されている通りです。flagsは常にゼロのようです。</p>
+<p>ユーザーのフォールトハンドラ (kp-&gt;fault_handler):</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/kprobes.h&gt;
+#include &lt;linux/ptrace.h&gt;
+int fault_handler(struct kprobe *p, struct pt_regs *regs, int trapnr);
+</pre></div>
+</div>
+<p>pとregsはpre_handlerで説明されている通りです。trapnrは、フォールトに関連するアーキテクチャ固有のトラップ番号です（例: i386では、一般的な保護フォールトには13、ページフォールトには14）。例外を成功裏に処理した場合、1を返します。</p>
+</section>
+<section id="register-kretprobe">
+<h3>register_kretprobe<a class="headerlink" href="#register-kretprobe" title="この見出しへのパーマリンク">¶</a></h3>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/kprobes.h&gt;
+int register_kretprobe(struct kretprobe *rp);
+</pre></div>
+</div>
+<p>関数のアドレスrp-&gt;kp.addrにリターンプローブを設定します。その関数が返るとき、Kprobesはrp-&gt;handlerを呼び出します。register_kretprobe()を呼び出す前に、rp-&gt;maxactiveを適切に設定する必要があります。「リターンプローブの仕組み」を参照してください。</p>
+<p>register_kretprobe()は成功時に0を返し、それ以外の場合は負のerrnoを返します。</p>
+<p>ユーザーのリターンプローブハンドラ (rp-&gt;handler):</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/kprobes.h&gt;
+#include &lt;linux/ptrace.h&gt;
+int kretprobe_handler(struct kretprobe_instance *ri,
+                      struct pt_regs *regs);
+</pre></div>
+</div>
+<p>regsはkprobe.pre_handlerで説明されている通りです。riはkretprobe_instanceオブジェクトを指し、以下のフィールドが関心の対象となる可能性があります:</p>
+<ul class="simple">
+<li><p>ret_addr: 戻り先アドレス</p></li>
+<li><p>rp: 対応するkretprobeオブジェクトを指します</p></li>
+<li><p>task: 対応するタスク構造体を指します</p></li>
+<li><dl class="simple">
+<dt>data: 各リターンインスタンスごとのプライベートデータを指します。「Kretprobe」を参照してください</dt><dd><p>エントリーハンドラの詳細については</p>
+</dd>
+</dl>
+</li>
+</ul>
+<p>regs_return_value(regs)マクロは、アーキテクチャのABIで定義された適切なレジスタから返却値を抽出するための単純な抽象化を提供します。</p>
+<p>ハンドラの返却値は現在無視されています。</p>
+</section>
+<section id="unregister-probe">
+<h3>unregister_*probe<a class="headerlink" href="#unregister-probe" title="この見出しへのパーマリンク">¶</a></h3>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/kprobes.h&gt;
+void unregister_kprobe(struct kprobe *kp);
+void unregister_kretprobe(struct kretprobe *rp);
+</pre></div>
+</div>
+<p>指定されたプローブを削除します。プローブが登録された後であればいつでもunregister関数を呼び出すことができます。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>関数が不正なプローブ（例：未登録のプローブ）を見つけた場合、そのプローブのaddrフィールドをクリアします。</p>
+</div>
+</section>
+<section id="register-probes">
+<h3>register_*probes<a class="headerlink" href="#register-probes" title="この見出しへのパーマリンク">¶</a></h3>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/kprobes.h&gt;
+int register_kprobes(struct kprobe **kps, int num);
+int register_kretprobes(struct kretprobe **rps, int num);
+</pre></div>
+</div>
+<p>指定された配列内のnum個のプローブをそれぞれ登録します。登録中にエラーが発生した場合、配列内のエラー発生したプローブまでのすべてのプローブを安全に解除した後、register_*probes関数が返却します。</p>
+<ul class="simple">
+<li><p>kps/rps: データ構造へのポインタを含む配列 <code class="docutils literal notranslate"><span class="pre">*probe</span></code> data structures</p></li>
+<li><p>num: 配列のエントリ数。</p></li>
+</ul>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>これらの関数を使用する前に、ポインタの配列を確保（または定義）し、すべてのエントリを設定する必要があります。</p>
+</div>
+</section>
+<section id="unregister-probes">
+<h3>unregister_*probes<a class="headerlink" href="#unregister-probes" title="この見出しへのパーマリンク">¶</a></h3>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/kprobes.h&gt;
+void unregister_kprobes(struct kprobe **kps, int num);
+void unregister_kretprobes(struct kretprobe **rps, int num);
+</pre></div>
+</div>
+<p>指定された配列内のnum個のプローブを一度に削除します。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>指定された配列に不正なプローブ（例：登録されていないプローブ）が含まれている場合、関数はその不正なプローブのaddrフィールドをクリアします。ただし、配列内の他のプローブは正しく登録されています。</p>
+</div>
+</section>
+<section id="disable-probe">
+<h3>disable_*probe<a class="headerlink" href="#disable-probe" title="この見出しへのパーマリンク">¶</a></h3>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/kprobes.h&gt;
+int disable_kprobe(struct kprobe *kp);
+int disable_kretprobe(struct kretprobe *rp);
+</pre></div>
+</div>
+<p>指定されたプローブを一時的に無効にします。 <code class="docutils literal notranslate"><span class="pre">*probe</span></code>再度有効にするには、enable_*probe()を使用してください。有効化するプローブはすでに登録されている必要があります。</p>
+</section>
+<section id="enable-probe">
+<h3>enable_*probe<a class="headerlink" href="#enable-probe" title="この見出しへのパーマリンク">¶</a></h3>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/kprobes.h&gt;
+int enable_kprobe(struct kprobe *kp);
+int enable_kretprobe(struct kretprobe *rp);
+</pre></div>
+</div>
+<p>有効にする <code class="docutils literal notranslate"><span class="pre">*probe</span></code> disable_*probe()で無効にされたプローブ。有効化するプローブはすでに登録されている必要があります。</p>
+</section>
+</section>
+<section id="kprobes-features-and-limitations">
+<h2>Kprobesの特徴と制限<a class="headerlink" href="#kprobes-features-and-limitations" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Kprobesは同じアドレスに複数のプローブを許可します。また、ポストハンドラが存在するプローブポイントは最適化されません。したがって、最適化されていないプローブポイントでkprobeをインストールすると、自動的にそのプローブポイントが最適化されません。</p>
+<p>一般的に、カーネルのどこでもプローブをインストールできます。特に、割込みハンドラのプローブも可能です。ただし、このセクションで説明する例外があります。</p>
+<p>register_*probe関数は、Kprobesの実装コード（主にkernel/kprobes.cと、do_page_faultやnotifier_call_chainなどの関数）内でプローブをインストールしようとすると-EINVALを返します。 <code class="docutils literal notranslate"><span class="pre">arch/*/kernel/kprobes.c</span></code>コード内でプローブをインストールしようとすると、register_*probe関数は-EINVALを返します。</p>
+<p>インライン化可能な関数内でプローブをインストールした場合、Kprobesはその関数のすべてのインラインインスタンスを追跡してプローブをインストールしようとしません。gccは要求なく関数をインライン化するため、予期しないプローブヒットが発生する可能性があります。</p>
+<p>プローブハンドラはプローブ対象関数の環境を変更できます（例：カーネルデータ構造を変更する、pt_regs構造体の内容を変更する）。プローブ対象関数が戻るときにレジスタに復元されるため、pt_regs構造体の内容は変更可能です。これにより、例えばバグ修正やテスト用のエラーを注入できます。ただし、Kprobesは意図的に注入されたエラーと誤って発生したエラーを区別できません。飲酒してプローブしないでください。</p>
+<p>Kprobesはプローブハンドラ同士が競合するのを防ぐ試みはしません – 例として、プローブ <a class="reference internal" href="../core-api/printk-basics.html#c.printk" title="printk"><code class="xref c c-func docutils literal notranslate"><span class="pre">printk()</span></code></a> を実行した後、プローブハンドラから <a class="reference internal" href="../core-api/printk-basics.html#c.printk" title="printk"><code class="xref c c-func docutils literal notranslate"><span class="pre">printk()</span></code></a> を呼び出す場合があります。プローブハンドラがプローブにヒットすると、その2番目のプローブのハンドラは実行されず、2番目のプローブのkprobe.nmissedメンバがインクリメントされます。</p>
+<p>Linux v2.6.15-rc1以降、複数のハンドラ（または同じハンドラの複数インスタンス）が異なるCPUで同時に実行されることがあります。</p>
+<p>Kprobesは登録・解除時のみmutexを用いたり、メモリを割り当てたりします。</p>
+<p>プローブハンドラは、アーキテクチャと最適化状態に応じてプリエンプションが無効化されたり割込みが無効化されたりして実行されます。(例: x86/x86-64では、kretprobeハンドラと最適化されたkprobeハンドラは割込み無効化せずに実行されます) いずれにしても、ハンドラはCPUを解放してはいけません(例: セマフォを取得しようとしたり、I/Oを待機したりするなど)</p>
+<p>リターンプローブは、リターンアドレスをトランポールのアドレスに置き換えることで実装されるため、スタックバックトレースや__builtin_return_address()の呼び出しは、kretprobed関数の実際のリターンアドレスではなくトランポールのアドレスを返すことが通常です。(我々が確認した限りでは、__builtin_return_address()はインストルメンテーションやエラー報告の目的でしか使用されていません)</p>
+<p>関数の呼び出し回数とリターン回数が一致しない場合、その関数にリターンプローブを登録すると不望な結果を生じる可能性があります。このような場合、以下のような行が表示されます: "kretprobe BUG!: Processing kretprobe d000000000041aa8 @ c00000000004f48c" この情報から、問題を引き起こした正確なkretprobeのインスタンスを関連付けることが可能です。do_exit()のケースはすでにカバー済みです。do_execve()およびdo_fork()は問題になりません。我々は他の特定のケースでの問題になる可能性について認識していません。</p>
+<p>関数のエントリまたはエクスイット時にCPUが現在タスクのスタック以外のスタック上で実行されている場合、その関数にリターンプローブを登録すると不望な結果を生じる可能性があります。そのため、Kprobesはx86_64版の__switch_to()に対してリターンプローブ(またはkprobes)をサポートしていません。登録関数は-EINVALを返します。</p>
+<p>x86/x86-64では、Kprobesのジャンプ最適化が指令を広範に変更するため、最適化にはいくつかの制限があります。これを説明するために、いくつかの用語を導入します。2バイトの指令が2つと3バイトの指令が1つ含まれる3指令のシーケンスを想像してください。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>        IA
+        |
+[-2][-1][0][1][2][3][4][5][6][7]
+        [ins1][ins2][  ins3 ]
+        [&lt;-     DCR       -&gt;]
+        [&lt;- JTPR -&gt;]
+
+ins1: 1st Instruction
+ins2: 2nd Instruction
+ins3: 3rd Instruction
+IA:  Insertion Address
+JTPR: Jump Target Prohibition Region
+DCR: Detoured Code Region
+</pre></div>
+</div>
+<p>DCR内の指令は、DCR内のバイトが5バイトのジャンプ指令に置き換えられるため、アウトオブラインバッファにコピーされます。そのため、いくつかの制限があります。</p>
+<ol class="loweralpha simple">
+<li><p>DCR内の指令は再配置可能でなければなりません。</p></li>
+<li><p>DCR内の指令にはコール指令を含んではいけません。</p></li>
+<li><p>JTPRはジャンプまたはコール指令の対象にならなければなりません。</p></li>
+<li><p>DCRは関数の境界をまたぐことはできません。</p></li>
+</ol>
+<p>いずれにしても、これらの制限は内蔵の指令デコーダーによってチェックされるため、心配する必要はありません。</p>
+</section>
+<section id="probe-overhead">
+<h2>プローブオーバーヘッド<a class="headerlink" href="#probe-overhead" title="この見出しへのパーマリンク">¶</a></h2>
+<p>2005年に使用されていた典型的なCPUでは、kprobeのヒット処理に0.5〜1.0マイクロ秒かかります。具体的には、同じprobepointを繰り返しヒットし、各ヒットごとに単純なハンドラを実行するベンチマークでは、アーキテクチャによって1〜2百万回のヒットが毎秒報告されます。リターンプローブのヒットは、kprobeのヒットに比べて通常50〜75%長くかかります。関数にリターンプローブを設定している場合、その関数のエントリポイントにkprobeを追加しても、ほぼゼロのオーバーヘッドが生じます。</p>
+<p>以下に、さまざまなアーキテクチャにおけるオーバーヘッドのサンプル値（マイクロ秒単位）を示します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>k = kprobe; r = return probe; kr = kprobe + return probe
+on same function
+
+i386: Intel Pentium M, 1495 MHz, 2957.31 bogomips
+k = 0.57 usec; r = 0.92; kr = 0.99
+
+x86_64: AMD Opteron 246, 1994 MHz, 3971.48 bogomips
+k = 0.49 usec; r = 0.80; kr = 0.82
+
+ppc64: POWER5 (gr), 1656 MHz (SMT disabled, 1 virtual CPU per physical CPU)
+k = 0.77 usec; r = 1.26; kr = 1.45
+</pre></div>
+</div>
+<section id="optimized-probe-overhead">
+<h3>最適化されたプローブのオーバーヘッド<a class="headerlink" href="#optimized-probe-overhead" title="この見出しへのパーマリンク">¶</a></h3>
+<p>通常、最適化されたkprobeのヒット処理に0.07〜0.1マイクロ秒かかります。以下に、x86アーキテクチャにおけるオーバーヘッドのサンプル値（マイクロ秒単位）を示します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>k = unoptimized kprobe, b = boosted (single-step skipped), o = optimized kprobe,
+r = unoptimized kretprobe, rb = boosted kretprobe, ro = optimized kretprobe.
+
+i386: Intel(R) Xeon(R) E5410, 2.33GHz, 4656.90 bogomips
+k = 0.80 usec; b = 0.33; o = 0.05; r = 1.10; rb = 0.61; ro = 0.33
+
+x86-64: Intel(R) Xeon(R) E5410, 2.33GHz, 4656.90 bogomips
+k = 0.99 usec; b = 0.43; o = 0.06; r = 1.24; rb = 0.68; ro = 0.30
+</pre></div>
+</div>
+</section>
+</section>
+<section id="todo">
+<h2>TODO<a class="headerlink" href="#todo" title="この見出しへのパーマリンク">¶</a></h2>
+<ol class="loweralpha simple">
+<li><p>SystemTap (<a class="reference external" href="http://sourceware.org/systemtap">http://sourceware.org/systemtap</a>): プローブベースのインストゥルメンテーション用の簡易なプログラミングインターフェースを提供します。試してみましょう。</p></li>
+<li><p>sparc64用のカーネルリターンプローブ。</p></li>
+<li><p>その他のアーキテクチャへのサポート。</p></li>
+<li><p>ユーザースペースプローブ。</p></li>
+<li><p>データ参照時に発火するウォッチポイントプローブ。</p></li>
+</ol>
+</section>
+<section id="kprobes-example">
+<h2>Kprobesの例<a class="headerlink" href="#kprobes-example" title="この見出しへのパーマリンク">¶</a></h2>
+<p>samples/kprobes/kprobe_example.cを参照してください</p>
+</section>
+<section id="kretprobes-example">
+<h2>Kretprobesの例<a class="headerlink" href="#kretprobes-example" title="この見出しへのパーマリンク">¶</a></h2>
+<p>samples/kprobes/kretprobe_example.cを参照してください</p>
+</section>
+<section id="deprecated-features">
+<h2>非推奨機能<a class="headerlink" href="#deprecated-features" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Jprobesは現在非推奨の機能です。これに依存している場合は、他のトレース機能への移行または古いカーネルを使用することを検討してください。ツールの移行を検討してください。以下のオプションのいずれかを使用してください：</p>
+<ul>
+<li><p>trace-eventを使用してターゲット関数のトレース（引数を含む）。</p>
+<p>trace-eventは、静的に定義されたイベントインターフェースで低オーバーヘッド（オフの場合はほぼ見えないオーバーヘッド）を提供します。新しいイベントを定義し、ftraceや他のトレースツールを介してトレースできます。</p>
+<p>以下のURLを参照してください：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p><a class="reference external" href="https://lwn.net/Articles/379903/">https://lwn.net/Articles/379903/</a></p></li>
+<li><p><a class="reference external" href="https://lwn.net/Articles/381064/">https://lwn.net/Articles/381064/</a></p></li>
+<li><p><a class="reference external" href="https://lwn.net/Articles/383362/">https://lwn.net/Articles/383362/</a></p></li>
+</ul>
+</div></blockquote>
+</li>
+<li><p>perf-probeとftrace動的イベント（kprobeイベント）を使用してトレース。</p>
+<p>カーネルをdebug info（CONFIG_DEBUG_INFO=y）でビルドした場合、perf-probeを使用してどのレジスタ/スタックがどのローカル変数や引数に割り当てられているかを確認し、新しいイベントでトレースを設定できます。</p>
+<p>以下のドキュメントを参照してください：</p>
+<ul class="simple">
+<li><p><a class="reference internal" href="kprobetrace.html"><span class="doc">Kprobesベースのイベントトレース</span></a></p></li>
+<li><p><a class="reference internal" href="events.html"><span class="doc">イベントトレース</span></a></p></li>
+<li><p>tools/perf/Documentation/perf-probe.txt</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="the-kprobes-debugfs-interface">
+<h2>kprobes debugfsインターフェース<a class="headerlink" href="#the-kprobes-debugfs-interface" title="この見出しへのパーマリンク">¶</a></h2>
+<p>最近のカーネル（2.6.20以上）では、/sys/kernel/debug/kprobes/ディレクトリ（debugfsが/sys/kernel/debugにマウントされている前提）に登録されたkprobeの一覧が表示されます。</p>
+<p>/sys/kernel/debug/kprobes/list: システム全体に登録されているプローブの一覧を表示します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>c015d71a  k  vfs_read+0x0
+c03dedc5  r  tcp_v4_rcv+0x0
+</pre></div>
+</div>
+<p>1列目はプローブが挿入されたカーネルアドレスを示し、2列目はプローブの種類（k - kprobe、r - kretprobe）を指定します。3列目はプローブのシンボルオフセットを示します。プローブ対象の関数がモジュールに属する場合、モジュール名も表示されます。続く列はプローブの状態を示します。プローブが有効でなくなった仮想アドレス（モジュール初期セクション、アンロードされたモジュールに該当する仮想アドレスなど）にある場合、[GONE]でマークされます。一時的に無効化されたプローブは[DISABLED]でマークされ、最適化されたプローブは[OPTIMIZED]でマークされます。FTRACEベースのプローブは[FTRACE]でマークされます。</p>
+<p>/sys/kernel/debug/kprobes/enabled: kprobesを強制的にON/OFFします。</p>
+<p>登録されたkprobesをグローバルかつ強制的にONまたはOFFにするためのコントロール手段を提供します。デフォルトではすべてのkprobesが有効になっています。このファイルに"0"をエコーバックすると、すべての登録プローブが無効化され、"1"をエコーバックするまで有効状態のままです。注意点として、このコントロール手段はすべてのkprobesを無効化・有効化するだけで、各プローブの無効化状態を変更しません。つまり、無効化されたkprobes（[DISABLED]でマークされているもの）は、このコントロール手段ですべてのkpro, besをONにしても有効にはなりません。</p>
+</section>
+<section id="the-kprobes-sysctl-interface">
+<h2>kprobes sysctlインターフェース<a class="headerlink" href="#the-kprobes-sysctl-interface" title="この見出しへのパーマリンク">¶</a></h2>
+<p>/proc/sys/debug/kprobes-optimization: kprobesの最適化を有効/無効にします。</p>
+<p>CONFIG_OPTPROBES=yの場合は、このsysctlインターフェースが表示され、ジャンプ最適化（セクション
+<a class="reference internal" href="#kprobes-jump-optimization"><span class="std std-ref">ジャンプ最適化はどのように動作するか？</span></a>)をグローバルかつ強制的に有効/無効にします。デフォルトではジャンプ最適化が有効（ON）になっています。このファイルに"0"をエコーバックするか、sysctl経由で"debug.kprobes_optimization"を0に設定すると、すべての最適化されたプローブが非最適化され、その後に登録される新しいプローブは最適化されなくなります。</p>
+<p>このコントロール手段は <em>に指定する必要があります。</em> 最適化状態を変更します。つまり、最適化されたプローブ（[OPTIMIZED]でマークされているもの）は非最適化され（[OPTIMIZED]のタグが削除されます）。このコントロール手段をONにすると、再び最適化されます。</p>
+</section>
+<section id="references">
+<h2>参考文献<a class="headerlink" href="#references" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Kprobesに関する追加情報については、以下のURLを参照してください：</p>
+<ul class="simple">
+<li><p><a class="reference external" href="https://www.ibm.com/developerworks/library/l-kprobes/index.html">https://www.ibm.com/developerworks/library/l-kprobes/index.html</a></p></li>
+<li><p><a class="reference external" href="https://www.kernel.org/doc/ols/2006/ols2006v2-pages-109-124.pdf">https://www.kernel.org/doc/ols/2006/ols2006v2-pages-109-124.pdf</a></p></li>
+</ul>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxトレーシング技術</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="ftrace-design.html">関数トレーサー設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tracepoint-analysis.html">イベントとトレースポイントを用いた挙動分析ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ftrace.html">ftrace - 関数トレーサー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ftrace-uses.html">ftraceを用いた関数へのフック</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">カーネルプローブ（Kprobes）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kprobetrace.html">Kprobesベースのイベントトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="uprobetracer.html">Uprobe-tracer: Uprobeベースのイベントトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tracepoints.html">Linuxカーネルトレースポイントの利用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events.html">イベントトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-kmem.html">サブシステムトレースポイント: kmem</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-power.html">サブシステムトレースポイント: power</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-nmi.html">NMIトレースイベント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-msr.html">MSRトレースイベント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mmiotrace.html">カーネル内メモリマップI/Oトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="histogram.html">イベントヒストグラム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="histogram-design.html">ヒストグラム設計ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="boottime-trace.html">ブートタイムトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hwlat_detector.html">ハードウェアレイテンシ検出器</a></li>
+<li class="toctree-l2"><a class="reference internal" href="intel_th.html">Intel(R)トレースハブ（TH）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ring-buffer-design.html">ロックレスリングバッファ設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="stm.html">システムトレースモジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sys-t.html">MIPI SyS-T over STP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="coresight/index.html">CoreSight - ARMハードウェアトレース</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxトレーシング技術</a><ul>
+<li>前へ: <a href="ftrace-uses.html" title="前章">ftraceを用いた関数へのフック</a></li>
+<li>次へ: <a href="kprobetrace.html" title="次章">Kprobesベースのイベントトレース</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/trace/kprobes.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

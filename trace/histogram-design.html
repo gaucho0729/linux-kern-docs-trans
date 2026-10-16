@@ -1,0 +1,1875 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>ヒストグラム設計ノート — Linuxカーネルドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="boottime-trace.html" rel="next" title="ブートタイムトレース"/>
+<link href="histogram.html" rel="prev" title="イベントヒストグラム"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="histogram-design-notes">
+<h1>ヒストグラム設計ノート<a class="headerlink" href="#histogram-design-notes" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Tom Zanussi &lt;<a class="reference external" href="mailto:zanussi%40kernel.org">zanussi<span>@</span>kernel<span>.</span>org</a>&gt;</p>
+</dd>
+</dl>
+<p>このドキュメントは、ftraceヒストグラムの動作方法と、trace_events_hist.cおよびtracing_map.cで実装されるデータ構造と個々の要素の関係について説明を試みています。</p>
+<dl>
+<dt>注意: すべてのftraceヒストグラムコマンド例は、作業ディレクトリがftraceの/tracingディレクトリであることを前提としています。例えば:</dt><dd><p>また、これらのコマンドで表示されるヒストグラム出力は一般的に短く表示されます。要点を伝えるだけの分量にとどめられます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># cd /sys/kernel/debug/tracing
+</pre></div>
+</div>
+</dd>
+</dl>
+<p>‘hist_debug’トレースイベントファイル</p>
+<section id="hist-debug-trace-event-files">
+<h2>カーネルがCONFIG_HIST_TRIGGERS_DEBUGが設定されている場合、各イベントのサブディレクトリに名前が‘hist_debug’のイベントファイルが出現します。このファイルはいつでも読み込み可能で、このドキュメントで説明するヒストグラムトリガーの内部情報を表示します。具体的な例と出力については以下のテストケースで説明します。<a class="headerlink" href="#hist-debug-trace-event-files" title="この見出しへのパーマリンク">¶</a></h2>
+<p>基本的なヒストグラム</p>
+</section>
+<section id="basic-histograms">
+<h2>まず、基本的なヒストグラムについて。以下はヒストグラムで行える最も単純な操作の例です。単一イベントに単一のキーを指定してヒストグラムを作成し、出力結果を確認します:<a class="headerlink" href="#basic-histograms" title="この見出しへのパーマリンク">¶</a></h2>
+<p>これは、pidをキーとしてsched_wakingイベントにヒストグラムを作成し、hitcountという単一の値をカウントする動作を行います。この値は明示的に指定しなくても、すべてのヒストグラムに存在します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'hist:keys=pid' &gt;&gt; events/sched/sched_waking/trigger
+
+# cat events/sched/sched_waking/hist
+
+{ pid:      18249 } hitcount:          1
+{ pid:      13399 } hitcount:          1
+{ pid:      17973 } hitcount:          1
+{ pid:      12572 } hitcount:          1
+...
+{ pid:         10 } hitcount:        921
+{ pid:      18255 } hitcount:       1444
+{ pid:      25526 } hitcount:       2055
+{ pid:       5257 } hitcount:       2055
+{ pid:      27367 } hitcount:       2055
+{ pid:       1728 } hitcount:       2161
+
+Totals:
+  Hits: 21305
+  Entries: 183
+  Dropped: 0
+</pre></div>
+</div>
+<p>hitcount値は、指定されたキー（この場合はpid）ごとにバケットごとに自動的にインクリメントされる値です。</p>
+<p>したがって、このヒストグラムでは各pidに対して個別のバケットがあり、各バケットにはそのpidでのsched_waking呼び出し回数をカウントする値が含まれます。</p>
+<p>各ヒストグラムはhist_data構造体で表されます。</p>
+<p>ヒストグラムの各キーおよび値フィールドを追跡するため、hist_dataはこれらのフィールドを格納するfields[]配列を保持します。fields[]配列は、ヒストグラムの各値およびキーをstruct hist_fieldで表現した配列です（変数も含まれますが、後述します）。上述のヒストグラムでは1つのキーと1つの値があり、この値はhitcount値です。すべてのヒストグラムに存在する値であり、このヒストグラムでは明示的に定義されていません。</p>
+<p>hitcount値は、すべてのヒストグラムに存在する値であり、このヒストグラムでは明示的に定義されていません。</p>
+<p>各 struct hist_field は、イベントの trace_event_file から取得した ftrace_event_field へのポインタを含み、その他の情報（サイズ、オフセット、型、および hist_field_fn_t 関数など）も含みます。この関数は、ftrace イベントバッファからフィールドのデータを取得するために使用されます（ほとんどの場合ですが、hitcount などの一部の hist_field はトレースバッファ内のイベントフィールドに直接マッピングしない場合があります。このような場合、関数の実装は別の場所から値を取得します）。flags フィールドは、フィールドの種類（キー、値、変数、変数参照など）を示し、デフォルトは値です。</p>
+<p>フィールド配列 fields[] に加えて、ヒストグラム用に作成された tracing_map インスタンスも重要な hist_data データ構造です。これは .map メンバーに保持されています。tracing_map はヒストグラムを実装するためのロックフリーハッシュテーブルを実装しており（kernel/trace/tracing_map.h で低レベルのデータ構造について詳しく説明されています）、この説明の目的では、tracing_map は複数のバケットを含み、各バケットは特定の tracing_map_elt オブジェクトにハッシュされたヒストグラムキーに対応します。</p>
+<p>以下は、上記のヒストグラムの hist_data および関連するキーと値フィールドを説明するダイアグラムの最初の部分です。ご覧の通り、fields 配列には2つのフィールドがあり、hitcount 用の1つの val フィールドと pid キー用の1つのキー フィールドがあります。</p>
+<p>その下には、特定の実行において tracing_map がどのように見えるかを示す実行時スナップショットのダイアグラムがあります。これは、いくつかの仮定されたキーと値に対して、hist_data フィールドと tracing_map 要素間の関係を示 endeavour しています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+------------------+
+| hist_data        |
++------------------+     +----------------+
+  | .fields[]      |----&gt;| val = hitcount |----------------------------+
+  +----------------+     +----------------+                            |
+  | .map           |       | .size        |                            |
+  +----------------+       +--------------+                            |
+                           | .offset      |                            |
+                           +--------------+                            |
+                           | .fn()        |                            |
+                           +--------------+                            |
+                                 .                                     |
+                                 .                                     |
+                                 .                                     |
+                         +----------------+ &lt;--- n_vals                |
+                         | key = pid      |----------------------------|--+
+                         +----------------+                            |  |
+                           | .size        |                            |  |
+                           +--------------+                            |  |
+                           | .offset      |                            |  |
+                           +--------------+                            |  |
+                           | .fn()        |                            |  |
+                         +----------------+ &lt;--- n_fields              |  |
+                         | unused         |                            |  |
+                         +----------------+                            |  |
+                           |              |                            |  |
+                           +--------------+                            |  |
+                           |              |                            |  |
+                           +--------------+                            |  |
+                           |              |                            |  |
+                           +--------------+                            |  |
+                                          n_keys = n_fields - n_vals   |  |
+</pre></div>
+</div>
+<p>hist_data の n_vals と n_fields は、fields[] 配列の範囲を区切り、後続のコードでキーと値を分離します。</p>
+<p>以下は、ヒストグラムの tracing_map 部分の実行時表現で、fields[] 配列のさまざまな部分から tracing_map の対応する部分へのポインタが示されています。</p>
+<p>tracing_map は tracing_map_entrys の配列と、事前に割り当てられた tracing_map_elts（以下では map_entry および map_elt と略記）のセットから構成されます。hist_data.map 配列内の map_entry の総数 = map-&gt;max_elts（実際には map-&gt;map_size ですが、そのうち max_elts のみが使用されます）。これは map_insert() アルゴリズムが要求するプロパティです。</p>
+<p>map_entryが使用されていない場合、つまりまだどのキーもハッシュされていない状態では、その.| | .key値は0で、.| | .valポインタはNULLです。map_entryが.| | 使われ始めると、.| | .key値にはキーのハッシュ値が格納され、.| | .valメンバはmap_eltを指し、そのmap_eltにはフルなキーと、map_elt.fields[]配列内の各キーまたは値のエントリが含まれます。.| | ヒストグラム内の各hist_fieldに対応するmap_elt.fields[]配列のエントリがあり、.| | これに各ヒストグラム値に対応する継続的に集計される合計値が保持されます。.| |</p>
+<p>この図は、hist_data.fields[]とmap_elt.fields[]の関係性を示 endeavorしています。図間のリンクを描いています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+-----------+                                                          |  |
+| hist_data |                                                          |  |
++-----------+                                                          |  |
+  | .fields |                                                          |  |
+  +---------+     +-----------+                                        |  |
+  | .map    |----&gt;| map_entry |                                        |  |
+  +---------+     +-----------+                                        |  |
+                    | .key    |---&gt; 0                                  |  |
+                    +---------+                                        |  |
+                    | .val    |---&gt; NULL                               |  |
+                  +-----------+                                        |  |
+                  | map_entry |                                        |  |
+                  +-----------+                                        |  |
+                    | .key    |---&gt; pid = 999                          |  |
+                    +---------+    +-----------+                       |  |
+                    | .val    |---&gt;| map_elt   |                       |  |
+                    +---------+    +-----------+                       |  |
+                         .           | .key    |---&gt; full key *        |  |
+                         .           +---------+    +---------------+  |  |
+                         .           | .fields |---&gt;| .sum (val)    |&lt;-+  |
+                  +-----------+      +---------+    | 2345          |  |  |
+                  | map_entry |                     +---------------+  |  |
+                  +-----------+                     | .offset (key) |&lt;----+
+                    | .key    |---&gt; 0               | 0             |  |  |
+                    +---------+                     +---------------+  |  |
+                    | .val    |---&gt; NULL                    .          |  |
+                  +-----------+                             .          |  |
+                  | map_entry |                             .          |  |
+                  +-----------+                     +---------------+  |  |
+                    | .key    |                     | .sum (val) or |  |  |
+                    +---------+    +---------+      | .offset (key) |  |  |
+                    | .val    |---&gt;| map_elt |      +---------------+  |  |
+                  +-----------+    +---------+      | .sum (val) or |  |  |
+                  | map_entry |                     | .offset (key) |  |  |
+                  +-----------+                     +---------------+  |  |
+                    | .key    |---&gt; pid = 4444                         |  |
+                    +---------+    +-----------+                       |  |
+                    | .val    |    | map_elt   |                       |  |
+                    +---------+    +-----------+                       |  |
+                                     | .key    |---&gt; full key *        |  |
+                                     +---------+    +---------------+  |  |
+                                     | .fields |---&gt;| .sum (val)    |&lt;-+  |
+                                     +---------+    | 65523         |     |
+                                                    +---------------+     |
+                                                    | .offset (key) |&lt;----+
+                                                    | 0             |
+                                                    +---------------+
+                                                            .
+                                                            .
+                                                            .
+                                                    +---------------+
+                                                    | .sum (val) or |
+                                                    | .offset (key) |
+                                                    +---------------+
+                                                    | .sum (val) or |
+                                                    | .offset (key) |
+                                                    +---------------+
+</pre></div>
+</div>
+<p>図に使用される略語:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>hist_data = struct hist_trigger_data
+hist_data.fields = struct hist_field
+fn = hist_field_fn_t
+map_entry = struct tracing_map_entry
+map_elt = struct tracing_map_elt
+map_elt.fields = struct tracing_map_field
+</pre></div>
+</div>
+<p>新しいイベントが発生し、そのイベントにヒストグラムトリガーが関連付けられている場合、event_hist_trigger()が呼ばれます。event_hist_trigger()はまずキー処理を行います。キー内の各サブキー（上記の例ではpidに該当するサブキーのみ）について、hist_data.fields[]からそのサブキーを表すhist_fieldを取得し、そのフィールドに関連するhist_field_fn_t型のfn()関数、およびフィールドのサイズとオフセットを使用して、現在のトレースレコードからそのサブキーのデータを取得します。</p>
+<p>完全なキーが取得されると、そのキーをトレースマップで検索します。そのキーに紐づくトレースマップエントリが存在しない場合、空のエントリを確保して新しいキーに追加します。いずれの場合も、そのキーに紐づくトレースマップエントリを返します。</p>
+<p>トレースマップエントリが利用可能になると、hist_trigger_elt_update()が呼ばれます。名称からもわかる通り、この関数はエントリを更新します。これは基本的にエントリのフィールドを更新することを意味します。ヒストグラムの各キーと値にはトレースマップフィールドが対応しており、これらはヒストグラム作成時に作成されたキーと値のhist_fieldと一致します。hist_trigger_elt_update()は各値のhist_fieldを処理し、キー同様にそのhist_fieldのfn()とサイズ、オフセットを使用して、現在のトレースレコードからフィールドの値を取得します。値を取得したら、その値をそのフィールドの継続的に更新されるトレースマップフィールド.sumメンバに加算します。ヒットカウントなどの一部のhist_field fn()はトレースレコードから何も取得しません（ヒットカウントfn()はカウンターサムを1ずつ増やすだけですが）、しかし基本的な考え方は同じです。</p>
+<p>すべての値が更新された後、hist_trigger_elt_update()が実行され、戻ります。注意点として、キー内の各サブキーに対応するtracing_map_fieldsも存在しますが、hist_trigger_elt_update()はそれらを確認したり更新したりしません。これらはただのソート用に存在しており、後述の処理で行われる可能性があります。</p>
+<section id="basic-histogram-test">
+<h3>基本的なヒストグラムテスト<a class="headerlink" href="#basic-histogram-test" title="この見出しへのパーマリンク">¶</a></h3>
+<p>これは良い例です。出力には3つの値フィールドと2つのキーフィールドが生成されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'hist:keys=common_pid,call_site.sym:values=bytes_req,bytes_alloc,hitcount' &gt;&gt; events/kmem/kmalloc/trigger
+</pre></div>
+</div>
+<p>デバッグデータを確認するには、kmem/kmallocの'hist_debug'ファイルをcatコマンドで表示します。これにより、対応するヒストグラムのトリガー情報が表示され、そのヒストグラムに関連するhist_dataのアドレスも表示されます。後述の例で役立つ情報です。さらに、ヒストグラムに関連する全hist_fieldsの数と、そのうちキーと値に該当するものの数も表示されます。</p>
+<p>次に、各フィールドの詳細情報が表示されます。これはフィールドのフラグや、hist_dataのfields[]配列内のフィールド位置を含み、内部的に正しいかを確認する際に有用です。また、後述の例でさらに有用になります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># cat events/kmem/kmalloc/hist_debug
+
+# event histogram
+#
+# trigger info: hist:keys=common_pid,call_site.sym:vals=hitcount,bytes_req,bytes_alloc:sort=hitcount:size=2048 [active]
+#
+
+hist_data: 000000005e48c9a5
+
+n_vals: 3
+n_keys: 2
+n_fields: 5
+
+val fields:
+
+  hist_data-&gt;fields[0]:
+    flags:
+      VAL: HIST_FIELD_FL_HITCOUNT
+    type: u64
+    size: 8
+    is_signed: 0
+
+  hist_data-&gt;fields[1]:
+    flags:
+      VAL: normal u64 value
+    ftrace_event_field name: bytes_req
+    type: size_t
+    size: 8
+    is_signed: 0
+
+  hist_data-&gt;fields[2]:
+    flags:
+      VAL: normal u64 value
+    ftrace_event_field name: bytes_alloc
+    type: size_t
+    size: 8
+    is_signed: 0
+
+key fields:
+
+  hist_data-&gt;fields[3]:
+    flags:
+      HIST_FIELD_FL_KEY
+    ftrace_event_field name: common_pid
+    type: int
+    size: 8
+    is_signed: 1
+
+  hist_data-&gt;fields[4]:
+    flags:
+      HIST_FIELD_FL_KEY
+    ftrace_event_field name: call_site
+    type: unsigned long
+    size: 8
+    is_signed: 0
+</pre></div>
+</div>
+<p>次のテストのために環境を整えるには、以下のコマンドを使用できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo '!hist:keys=common_pid,call_site.sym:values=bytes_req,bytes_alloc,hitcount' &gt;&gt; events/kmem/kmalloc/trigger
+</pre></div>
+</div>
+</section>
+</section>
+<section id="variables">
+<h2>変数<a class="headerlink" href="#variables" title="この見出しへのパーマリンク">¶</a></h2>
+<p>変数は、1つのヒストグラムトリガーからデータを保存し、別のヒストグラムトリガーから取得する機能を提供します。たとえば、sched_wakingイベントのトリガーで特定のpidのタイムスタンプを取得し、後続のsched_switchイベントでそのpidに切り替わった際にタイムスタンプを取得して、2つのイベント間の時間差を計算できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'hist:keys=pid:ts0=common_timestamp.usecs' &gt;&gt;
+        events/sched/sched_waking/trigger
+
+# echo 'hist:keys=next_pid:wakeup_lat=common_timestamp.usecs-$ts0' &gt;&gt;
+        events/sched/sched_switch/trigger
+</pre></div>
+</div>
+<p>ヒストグラムデータ構造において、変数は別の種類のhist_fieldとして実装され、ヒストグラムトリガーごとにhist_data.fields[]配列のすべてのvalフィールドの後に追加されます。既存のキーとvalフィールドと区別するために、新しいフラグタイプHIST_FIELD_FL_VAR（略称FL_VAR）が割り当てられ、struct hist_fieldに新たに.var.idxフィールドメンバが追加され、変数値を格納・取得するためのmap_elt.vars[]配列がmap_eltに追加されました。下図はこれらの新要素を示し、sched_wakingトリガー上のts0変数に対応する新しい変数エントリts0を追加しています。</p>
+<p>sched_wakingヒストグラム ———————-:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+------------------+
+| hist_data        |&lt;-------------------------------------------------------+
++------------------+   +-------------------+                                |
+  | .fields[]      |--&gt;| val = hitcount    |                                |
+  +----------------+   +-------------------+                                |
+  | .map           |     | .size           |                                |
+  +----------------+     +-----------------+                                |
+                         | .offset         |                                |
+                         +-----------------+                                |
+                         | .fn()           |                                |
+                         +-----------------+                                |
+                         | .flags          |                                |
+                         +-----------------+                                |
+                         | .var.idx        |                                |
+                       +-------------------+                                |
+                       | var = ts0         |                                |
+                       +-------------------+                                |
+                         | .size           |                                |
+                         +-----------------+                                |
+                         | .offset         |                                |
+                         +-----------------+                                |
+                         | .fn()           |                                |
+                         +-----------------+                                |
+                         | .flags &amp; FL_VAR |                                |
+                         +-----------------+                                |
+                         | .var.idx        |----------------------------+-+ |
+                         +-----------------+                            | | |
+                                  .                                     | | |
+                                  .                                     | | |
+                                  .                                     | | |
+                       +-------------------+ &lt;--- n_vals                | | |
+                       | key = pid         |                            | | |
+                       +-------------------+                            | | |
+                         | .size           |                            | | |
+                         +-----------------+                            | | |
+                         | .offset         |                            | | |
+                         +-----------------+                            | | |
+                         | .fn()           |                            | | |
+                         +-----------------+                            | | |
+                         | .flags &amp; FL_KEY |                            | | |
+                         +-----------------+                            | | |
+                         | .var.idx        |                            | | |
+                       +-------------------+ &lt;--- n_fields              | | |
+                       | unused            |                            | | |
+                       +-------------------+                            | | |
+                         |                 |                            | | |
+                         +-----------------+                            | | |
+                         |                 |                            | | |
+                         +-----------------+                            | | |
+                         |                 |                            | | |
+                         +-----------------+                            | | |
+                         |                 |                            | | |
+                         +-----------------+                            | | |
+                         |                 |                            | | |
+                         +-----------------+                            | | |
+                                           n_keys = n_fields - n_vals   | | |
+                                                                        | | |
+</pre></div>
+</div>
+<p>これは基本的なケースと非常に似ています。上記のダイアグラムでは、struct hist_field に .flags メンバーが新たに追加され、hist_data.fields に ts0 変数を表す新しいエントリが追加されていることが確認できます。通常の val hist_field では .flags は単に 0（modifier flags を除く）ですが、値が変数として定義されている場合、.flags には FL_VAR ビットが設定されます。</p>
+<p>ご覧の通り、ts0 エントリの .var.idx メンバーには、tracing_map_elts の .vars[] 配列に格納されている変数値のインデックスが含まれています。この idx は変数の値が設定されるか読取されるたびに使用されます。map_elt.vars の idx は create_tracing_map_fields() が tracing_map_add_var() を呼び出した後、.var.idx に割り当てられ保存されます。</p>
+<p>以下に、実行時におけるヒストグラムの表現を示します。これには、上記の hist_data および hist_field データ構造と対応するマッピングも含まれています。</p>
+<p>このダイアグラムでは、hist_data.fields[] と map_elt.fields[]、map_elt.vars[] との関係を示 endeavor しています。ダイアグラム間のリンクとして描かれています。各 map_elts に対して、.fields[] メンバーがキーまたは val の .sum または .offset を指し、.vars[] メンバーが変数の値を指しています。2つのダイアグラム間の矢印は、それらの tracing_map メンバーと対応する hist_data fields[] メンバーのフィールド定義とのリンクを示しています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+-----------+                                                           | | |
+| hist_data |                                                           | | |
++-----------+                                                           | | |
+  | .fields |                                                           | | |
+  +---------+     +-----------+                                         | | |
+  | .map    |----&gt;| map_entry |                                         | | |
+  +---------+     +-----------+                                         | | |
+                    | .key    |---&gt; 0                                   | | |
+                    +---------+                                         | | |
+                    | .val    |---&gt; NULL                                | | |
+                  +-----------+                                         | | |
+                  | map_entry |                                         | | |
+                  +-----------+                                         | | |
+                    | .key    |---&gt; pid = 999                           | | |
+                    +---------+    +-----------+                        | | |
+                    | .val    |---&gt;| map_elt   |                        | | |
+                    +---------+    +-----------+                        | | |
+                         .           | .key    |---&gt; full key *         | | |
+                         .           +---------+    +---------------+   | | |
+                         .           | .fields |---&gt;| .sum (val)    |   | | |
+                         .           +---------+    | 2345          |   | | |
+                         .        +--| .vars   |    +---------------+   | | |
+                         .        |  +---------+    | .offset (key) |   | | |
+                         .        |                 | 0             |   | | |
+                         .        |                 +---------------+   | | |
+                         .        |                         .           | | |
+                         .        |                         .           | | |
+                         .        |                         .           | | |
+                         .        |                 +---------------+   | | |
+                         .        |                 | .sum (val) or |   | | |
+                         .        |                 | .offset (key) |   | | |
+                         .        |                 +---------------+   | | |
+                         .        |                 | .sum (val) or |   | | |
+                         .        |                 | .offset (key) |   | | |
+                         .        |                 +---------------+   | | |
+                         .        |                                     | | |
+                         .        +----------------&gt;+---------------+   | | |
+                         .                          | ts0           |&lt;--+ | |
+                         .                          | 113345679876  |   | | |
+                         .                          +---------------+   | | |
+                         .                          | unused        |   | | |
+                         .                          |               |   | | |
+                         .                          +---------------+   | | |
+                         .                                  .           | | |
+                         .                                  .           | | |
+                         .                                  .           | | |
+                         .                          +---------------+   | | |
+                         .                          | unused        |   | | |
+                         .                          |               |   | | |
+                         .                          +---------------+   | | |
+                         .                          | unused        |   | | |
+                         .                          |               |   | | |
+                         .                          +---------------+   | | |
+                         .                                              | | |
+                  +-----------+                                         | | |
+                  | map_entry |                                         | | |
+                  +-----------+                                         | | |
+                    | .key    |---&gt; pid = 4444                          | | |
+                    +---------+    +-----------+                        | | |
+                    | .val    |---&gt;| map_elt   |                        | | |
+                    +---------+    +-----------+                        | | |
+                         .           | .key    |---&gt; full key *         | | |
+                         .           +---------+    +---------------+   | | |
+                         .           | .fields |---&gt;| .sum (val)    |   | | |
+                                     +---------+    | 2345          |   | | |
+                                  +--| .vars   |    +---------------+   | | |
+                                  |  +---------+    | .offset (key) |   | | |
+                                  |                 | 0             |   | | |
+                                  |                 +---------------+   | | |
+                                  |                         .           | | |
+                                  |                         .           | | |
+                                  |                         .           | | |
+                                  |                 +---------------+   | | |
+                                  |                 | .sum (val) or |   | | |
+                                  |                 | .offset (key) |   | | |
+                                  |                 +---------------+   | | |
+                                  |                 | .sum (val) or |   | | |
+                                  |                 | .offset (key) |   | | |
+                                  |                 +---------------+   | | |
+                                  |                                     | | |
+                                  |                 +---------------+   | | |
+                                  +----------------&gt;| ts0           |&lt;--+ | |
+                                                    | 213499240729  |     | |
+                                                    +---------------+     | |
+                                                    | unused        |     | |
+                                                    |               |     | |
+                                                    +---------------+     | |
+                                                            .             | |
+                                                            .             | |
+                                                            .             | |
+                                                    +---------------+     | |
+                                                    | unused        |     | |
+                                                    |               |     | |
+                                                    +---------------+     | |
+                                                    | unused        |     | |
+                                                    |               |     | |
+                                                    +---------------+     | |
+</pre></div>
+</div>
+<p>各使用中の map エントリに対して、map_elt がそのヒストグラムエントリに関連する変数の現在値を含む .vars 配列を指しています。上記では、pid 999 に関連するタイムスタンプは 113645679876 で、pid 4444 の .var.idx に含まれるタイムスタンプ変数は 213499240729 です。</p>
+<p>sched_switch ヒストグラム</p>
+<p>上記の sched_waking ヒストグラムとペアリングされている sched_switch ヒストグラムを以下に示します。sched_switch ヒストグラムの最も重要な点は、上記の sched_waking ヒストグラムに参照されている変数があることです。</p>
+<p>このヒストグラムダイアグラムはこれまでに表示されたものと非常に似ていますが、変数参照を追加しています。通常のヒットカウントとキーフィールドに加えて、sched_waking ts0 変数と同じように実装された新しい wakeup_lat 変数が追加されています。さらに、新しい FL_VAR_REF（HIST_FIELD_FL_VAR_REF の略）フラグを持つエントリも含まれています。</p>
+<p>新しいvar refフィールドに関連する新しいhist_fieldメンバはvar.hist_dataとvar_ref_idxです。変数参照の場合、var.hist_dataはvar.idxと組み合わせて、特定のヒストグラム上の特定の変数を一意に特定します。var_ref_idxは、ヒストグラムトリガーが更新されるたびにキャッシュされる変数値を参照するvar_ref_vals[]配列のインデックスです。その結果得られた値は、traceアクションコードなどの他のコードがvar_ref_idxの値を使用してパラメータ値を割り当てる際に最終的に参照されます。</p>
+<p>以下の図は、以前に説明したsched_switchヒストグラムの状況を示しています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span> # echo 'hist:keys=next_pid:wakeup_lat=common_timestamp.usecs-$ts0' &gt;&gt;     | |
+         events/sched/sched_switch/trigger                                 | |
+                                                                           | |
+ +------------------+                                                      | |
+ | hist_data        |                                                      | |
+ +------------------+   +-----------------------+                          | |
+   | .fields[]      |--&gt;| val = hitcount        |                          | |
+   +----------------+   +-----------------------+                          | |
+   | .map           |     | .size               |                          | |
+   +----------------+     +---------------------+                          | |
++--| .var_refs[]    |     | .offset             |                          | |
+|  +----------------+     +---------------------+                          | |
+|                         | .fn()               |                          | |
+|   var_ref_vals[]        +---------------------+                          | |
+|  +-------------+        | .flags              |                          | |
+|  | $ts0        |&lt;---+   +---------------------+                          | |
+|  +-------------+    |   | .var.idx            |                          | |
+|  |             |    |   +---------------------+                          | |
+|  +-------------+    |   | .var.hist_data      |                          | |
+|  |             |    |   +---------------------+                          | |
+|  +-------------+    |   | .var_ref_idx        |                          | |
+|  |             |    | +-----------------------+                          | |
+|  +-------------+    | | var = wakeup_lat      |                          | |
+|         .           | +-----------------------+                          | |
+|         .           |   | .size               |                          | |
+|         .           |   +---------------------+                          | |
+|  +-------------+    |   | .offset             |                          | |
+|  |             |    |   +---------------------+                          | |
+|  +-------------+    |   | .fn()               |                          | |
+|  |             |    |   +---------------------+                          | |
+|  +-------------+    |   | .flags &amp; FL_VAR     |                          | |
+|                     |   +---------------------+                          | |
+|                     |   | .var.idx            |                          | |
+|                     |   +---------------------+                          | |
+|                     |   | .var.hist_data      |                          | |
+|                     |   +---------------------+                          | |
+|                     |   | .var_ref_idx        |                          | |
+|                     |   +---------------------+                          | |
+|                     |             .                                      | |
+|                     |             .                                      | |
+|                     |             .                                      | |
+|                     | +-----------------------+ &lt;--- n_vals              | |
+|                     | | key = pid             |                          | |
+|                     | +-----------------------+                          | |
+|                     |   | .size               |                          | |
+|                     |   +---------------------+                          | |
+|                     |   | .offset             |                          | |
+|                     |   +---------------------+                          | |
+|                     |   | .fn()               |                          | |
+|                     |   +---------------------+                          | |
+|                     |   | .flags              |                          | |
+|                     |   +---------------------+                          | |
+|                     |   | .var.idx            |                          | |
+|                     | +-----------------------+ &lt;--- n_fields            | |
+|                     | | unused                |                          | |
+|                     | +-----------------------+                          | |
+|                     |   |                     |                          | |
+|                     |   +---------------------+                          | |
+|                     |   |                     |                          | |
+|                     |   +---------------------+                          | |
+|                     |   |                     |                          | |
+|                     |   +---------------------+                          | |
+|                     |   |                     |                          | |
+|                     |   +---------------------+                          | |
+|                     |   |                     |                          | |
+|                     |   +---------------------+                          | |
+|                     |                         n_keys = n_fields - n_vals | |
+|                     |                                                    | |
+|                     |                                                    | |
+|                     | +-----------------------+                          | |
++----------------------&gt;| var_ref = $ts0        |                          | |
+                      | +-----------------------+                          | |
+                      |   | .size               |                          | |
+                      |   +---------------------+                          | |
+                      |   | .offset             |                          | |
+                      |   +---------------------+                          | |
+                      |   | .fn()               |                          | |
+                      |   +---------------------+                          | |
+                      |   | .flags &amp; FL_VAR_REF |                          | |
+                      |   +---------------------+                          | |
+                      |   | .var.idx            |--------------------------+ |
+                      |   +---------------------+                            |
+                      |   | .var.hist_data      |----------------------------+
+                      |   +---------------------+
+                      +---| .var_ref_idx        |
+                          +---------------------+
+</pre></div>
+</div>
+<p>図に使用される略語:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>hist_data = struct hist_trigger_data
+hist_data.fields = struct hist_field
+fn = hist_field_fn_t
+FL_KEY = HIST_FIELD_FL_KEY
+FL_VAR = HIST_FIELD_FL_VAR
+FL_VAR_REF = HIST_FIELD_FL_VAR_REF
+</pre></div>
+</div>
+<p>ヒストグラムトリガーが変数を使用する場合、フラグHIST_FIELD_FL_VAR_REFを持つ新しいhist_fieldが作成されます。VAR_REFフィールドでは、var.idxとvar.hist_dataは参照されている変数と同じ値を取り、参照変数のサイズ、型、is_signedの値も同じになります。VAR_REFフィールドの.nameは参照している変数の名前になります。変数参照が明示的なsystem.event.$var_ref記法で作成された場合、hist_fieldのsystemとevent_name変数も設定されます。</p>
+<p>したがって、sched_switchヒストグラムのイベントを処理するには、他のヒストグラム上の変数への参照をまず解決する必要があります。これはevent_hist_trigger()から呼び出されるresolve_var_refs()関数で実行されます。この関数は、sched_switchヒストグラムを表すhist_dataからvar_refs[]配列を取得し、それぞれの参照変数のvar.hist_dataと現在のキーを使用して、そのヒストグラム内の対応するtracing_map_eltを検索します。見つかった後、参照変数のvar.idxを使用してtracing_map_read_var(elt, var.idx)で変数値を取得します。これは上記の例ではts0の値になります。注意点として、変数と変数参照を表すhist_fieldのvar.idxは同じため、この処理はシンプルです。</p>
+<section id="variable-and-variable-reference-test">
+<h3>変数と変数参照のテスト<a class="headerlink" href="#variable-and-variable-reference-test" title="この見出しへのパーマリンク">¶</a></h3>
+<p>この例では、sched_wakingイベントのts0という変数を作成し、sched_switchトリガーで使用しています。sched_switchトリガーは自身の変数wakeup_latも作成しますが、まだ使用されていません。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'hist:keys=pid:ts0=common_timestamp.usecs' &gt;&gt; events/sched/sched_waking/trigger
+
+# echo 'hist:keys=next_pid:wakeup_lat=common_timestamp.usecs-$ts0' &gt;&gt; events/sched/sched_switch/trigger
+</pre></div>
+</div>
+<p>sched_wakingの'hist_debug'出力を見てみると、通常のkeyとvalueのhist_fieldsに加えて、valフィールドセクションでHIST_FIELD_FL_VARフラグを持つフィールドが見られます。これはそのフィールドが変数を表していることを示しています。注意点として、変数名はvar.nameフィールドに含まれる一方、var.idxは実際に変数が存在するtracing_map_elt.vars[]配列のインデックスを示します。また、出力では変数が通常の値と同じhist_data-&gt;fields[]配列の一部に存在していることが確認できます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># cat events/sched/sched_waking/hist_debug
+
+# event histogram
+#
+# trigger info: hist:keys=pid:vals=hitcount:ts0=common_timestamp.usecs:sort=hitcount:size=2048:clock=global [active]
+#
+
+hist_data: 000000009536f554
+
+n_vals: 2
+n_keys: 1
+n_fields: 3
+
+val fields:
+
+  hist_data-&gt;fields[0]:
+    flags:
+      VAL: HIST_FIELD_FL_HITCOUNT
+    type: u64
+    size: 8
+    is_signed: 0
+
+  hist_data-&gt;fields[1]:
+    flags:
+      HIST_FIELD_FL_VAR
+    var.name: ts0
+    var.idx (into tracing_map_elt.vars[]): 0
+    type: u64
+    size: 8
+    is_signed: 0
+
+key fields:
+
+  hist_data-&gt;fields[2]:
+    flags:
+      HIST_FIELD_FL_KEY
+    ftrace_event_field name: pid
+    type: pid_t
+    size: 8
+    is_signed: 1
+</pre></div>
+</div>
+<p>次にsched_switchトリガーのhist_debug出力に移ります。無効なwakeup_lat変数に加えて、新しいセクションで変数参照が表示されています。変数参照は変数や値とは論理的に分離されているため、別セクションで表示されています。実際には変数や値とは別のhist_data配列、var_refs[]に存在しているからです。</p>
+<p>この例では、sched_switchトリガーがsched_wakingトリガーの変数$ts0を参照しています。詳細を見てみると、参照している変数のvar.hist_data値が以前に表示したsched_wakingトリガーと一致し、var.idx値も以前に表示したvar.idx値と一致しています。また、この変数参照のvar_ref_idx値が表示されており、これはトリガーが実行される際に変数値をキャッシュする場所です。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># cat events/sched/sched_switch/hist_debug
+
+# event histogram
+#
+# trigger info: hist:keys=next_pid:vals=hitcount:wakeup_lat=common_timestamp.usecs-$ts0:sort=hitcount:size=2048:clock=global [active]
+#
+
+hist_data: 00000000f4ee8006
+
+n_vals: 2
+n_keys: 1
+n_fields: 3
+
+val fields:
+
+  hist_data-&gt;fields[0]:
+    flags:
+      VAL: HIST_FIELD_FL_HITCOUNT
+    type: u64
+    size: 8
+    is_signed: 0
+
+  hist_data-&gt;fields[1]:
+    flags:
+      HIST_FIELD_FL_VAR
+    var.name: wakeup_lat
+    var.idx (into tracing_map_elt.vars[]): 0
+    type: u64
+    size: 0
+    is_signed: 0
+
+key fields:
+
+  hist_data-&gt;fields[2]:
+    flags:
+      HIST_FIELD_FL_KEY
+    ftrace_event_field name: next_pid
+    type: pid_t
+    size: 8
+    is_signed: 1
+
+variable reference fields:
+
+  hist_data-&gt;var_refs[0]:
+    flags:
+      HIST_FIELD_FL_VAR_REF
+    name: ts0
+    var.idx (into tracing_map_elt.vars[]): 0
+    var.hist_data: 000000009536f554
+    var_ref_idx (into hist_data-&gt;var_refs[]): 0
+    type: u64
+    size: 8
+    is_signed: 0
+</pre></div>
+</div>
+<p>次のテストのために環境を整えるには、以下のコマンドを使用できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo '!hist:keys=next_pid:wakeup_lat=common_timestamp.usecs-$ts0' &gt;&gt; events/sched/sched_switch/trigger
+
+# echo '!hist:keys=pid:ts0=common_timestamp.usecs' &gt;&gt; events/sched/sched_waking/trigger
+</pre></div>
+</div>
+</section>
+</section>
+<section id="actions-and-handlers">
+<h2>アクションとハンドラ<a class="headerlink" href="#actions-and-handlers" title="この見出しへのパーマリンク">¶</a></h2>
+<p>前の例を拡張して、wakeup_lat変数を実際に利用してみます。具体的には、この変数と他のフィールドを合成イベントとして送信します。</p>
+<p>以下のonmatch()アクションは、sched_switchイベントが発生した際に、それにマッチするsched_wakingイベントがある場合（この例ではsched_wakingヒストグラムのpidがこのsched_switchイベントのnext_pidフィールドと一致する場合）、wakeup_latency()トレースアクションで指定された変数を取得し、新しいwakeup_latencyイベントをトレースストリームに生成します。</p>
+<p>wakeup_latency()などのトレースハンドラの実装方法に注意してください（これはtrace(wakeup_latency,$wakeup_lat,next_pid)と同等ですが）。トレースハンドラに指定されるパラメータは変数でなければなりません。この場合、$wakeup_latは明らかに変数ですが、next_pidはsched_switchトレースイベントのフィールドを参照しているだけなので変数ではありません。このような処理はほぼすべてのtrace()およびsave()アクションで行われるため、フィールド名を直接使用できる特別なショートカットが実装されています。その仕組みは、内部的に名前を指定したフィールドに一時変数を作成し、この変数が実際にトレースハンドラに渡される仕組みです。コードやドキュメンテーションではこのような変数を「フィールド変数」と呼びます。</p>
+<p>他のトレースイベントのヒストグラムのフィールドも使用可能です。その場合、新しいヒストグラムと、不適切な名前がついた「synthetic_field」（ここでのsyntheticはsyntheticイベントとは関係ありません）を生成し、この特別なヒストグラムフィールドを変数として使用します。</p>
+<p>以下の図は、sched_switchヒストグラムをonmatch()ハンドラとtrace()アクションを使用した文脈で、上で説明した新しい要素を示しています。</p>
+<p>まず、wakeup_latencyのsyntheticイベントを定義します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'wakeup_latency u64 lat; pid_t pid' &gt;&gt; synthetic_events
+</pre></div>
+</div>
+<p>次に、以前と同様にsched_wakingのhistトリガーを設定します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'hist:keys=pid:ts0=common_timestamp.usecs' &gt;&gt;
+        events/sched/sched_waking/trigger
+</pre></div>
+</div>
+<p>最後に、sched_switchイベントに対してhistトリガーを作成し、wakeup_latency()トレースイベントを生成します。この場合、next_pidをwakeup_latencyのsyntheticイベント呼び出しに渡すため、自動的にフィールド変数に変換されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'hist:keys=next_pid:wakeup_lat=common_timestamp.usecs-$ts0: \
+        onmatch(sched.sched_waking).wakeup_latency($wakeup_lat,next_pid)' &gt;&gt;
+        /sys/kernel/debug/tracing/events/sched/sched_switch/trigger
+</pre></div>
+</div>
+<p>sched_switchイベントの図は以前の例と似ていますが、hist_dataの追加のfield_vars[]配列を示し、フィールド変数と変数、参照の関連性を示しています。詳細は以下の通りです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>  +------------------+
+  | hist_data        |
+  +------------------+   +-----------------------+
+    | .fields[]      |--&gt;| val = hitcount        |
+    +----------------+   +-----------------------+
+    | .map           |     | .size               |
+    +----------------+     +---------------------+
++---| .field_vars[]  |     | .offset             |
+|   +----------------+     +---------------------+
+|+--| .var_refs[]    |     | .offset             |
+||  +----------------+     +---------------------+
+||                         | .fn()               |
+||   var_ref_vals[]        +---------------------+
+||  +-------------+        | .flags              |
+||  | $ts0        |&lt;---+   +---------------------+
+||  +-------------+    |   | .var.idx            |
+||  | $next_pid   |&lt;-+ |   +---------------------+
+||  +-------------+  | |   | .var.hist_data      |
+||+&gt;| $wakeup_lat |  | |   +---------------------+
+||| +-------------+  | |   | .var_ref_idx        |
+||| |             |  | | +-----------------------+
+||| +-------------+  | | | var = wakeup_lat      |
+|||        .         | | +-----------------------+
+|||        .         | |   | .size               |
+|||        .         | |   +---------------------+
+||| +-------------+  | |   | .offset             |
+||| |             |  | |   +---------------------+
+||| +-------------+  | |   | .fn()               |
+||| |             |  | |   +---------------------+
+||| +-------------+  | |   | .flags &amp; FL_VAR     |
+|||                  | |   +---------------------+
+|||                  | |   | .var.idx            |
+|||                  | |   +---------------------+
+|||                  | |   | .var.hist_data      |
+|||                  | |   +---------------------+
+|||                  | |   | .var_ref_idx        |
+|||                  | |   +---------------------+
+|||                  | |              .
+|||                  | |              .
+|||                  | |              .
+|||                  | |              .
+||| +--------------+ | |              .
++--&gt;| field_var    | | |              .
+ || +--------------+ | |              .
+ ||   | var        | | |              .
+ ||   +------------+ | |              .
+ ||   | val        | | |              .
+ || +--------------+ | |              .
+ || | field_var    | | |              .
+ || +--------------+ | |              .
+ ||   | var        | | |              .
+ ||   +------------+ | |              .
+ ||   | val        | | |              .
+ ||   +------------+ | |              .
+ ||         .        | |              .
+ ||         .        | |              .
+ ||         .        | | +-----------------------+ &lt;--- n_vals
+ || +--------------+ | | | key = pid             |
+ || | field_var    | | | +-----------------------+
+ || +--------------+ | |   | .size               |
+ ||   | var        |--+|   +---------------------+
+ ||   +------------+ |||   | .offset             |
+ ||   | val        |-+||   +---------------------+
+ ||   +------------+ |||   | .fn()               |
+ ||                  |||   +---------------------+
+ ||                  |||   | .flags              |
+ ||                  |||   +---------------------+
+ ||                  |||   | .var.idx            |
+ ||                  |||   +---------------------+ &lt;--- n_fields
+ ||                  |||
+ ||                  |||                           n_keys = n_fields - n_vals
+ ||                  ||| +-----------------------+
+ ||                  |+-&gt;| var = next_pid        |
+ ||                  | | +-----------------------+
+ ||                  | |   | .size               |
+ ||                  | |   +---------------------+
+ ||                  | |   | .offset             |
+ ||                  | |   +---------------------+
+ ||                  | |   | .flags &amp; FL_VAR     |
+ ||                  | |   +---------------------+
+ ||                  | |   | .var.idx            |
+ ||                  | |   +---------------------+
+ ||                  | |   | .var.hist_data      |
+ ||                  | | +-----------------------+
+ ||                  +--&gt;| val for next_pid      |
+ ||                  | | +-----------------------+
+ ||                  | |   | .size               |
+ ||                  | |   +---------------------+
+ ||                  | |   | .offset             |
+ ||                  | |   +---------------------+
+ ||                  | |   | .fn()               |
+ ||                  | |   +---------------------+
+ ||                  | |   | .flags              |
+ ||                  | |   +---------------------+
+ ||                  | |   |                     |
+ ||                  | |   +---------------------+
+ ||                  | |
+ ||                  | |
+ ||                  | | +-----------------------+
+ +|------------------|-|&gt;| var_ref = $ts0        |
+  |                  | | +-----------------------+
+  |                  | |   | .size               |
+  |                  | |   +---------------------+
+  |                  | |   | .offset             |
+  |                  | |   +---------------------+
+  |                  | |   | .fn()               |
+  |                  | |   +---------------------+
+  |                  | |   | .flags &amp; FL_VAR_REF |
+  |                  | |   +---------------------+
+  |                  | +---| .var_ref_idx        |
+  |                  |   +-----------------------+
+  |                  |   | var_ref = $next_pid   |
+  |                  |   +-----------------------+
+  |                  |     | .size               |
+  |                  |     +---------------------+
+  |                  |     | .offset             |
+  |                  |     +---------------------+
+  |                  |     | .fn()               |
+  |                  |     +---------------------+
+  |                  |     | .flags &amp; FL_VAR_REF |
+  |                  |     +---------------------+
+  |                  +-----| .var_ref_idx        |
+  |                      +-----------------------+
+  |                      | var_ref = $wakeup_lat |
+  |                      +-----------------------+
+  |                        | .size               |
+  |                        +---------------------+
+  |                        | .offset             |
+  |                        +---------------------+
+  |                        | .fn()               |
+  |                        +---------------------+
+  |                        | .flags &amp; FL_VAR_REF |
+  |                        +---------------------+
+  +------------------------| .var_ref_idx        |
+                           +---------------------+
+</pre></div>
+</div>
+<p>ご覧のように、フィールド変数には2つのhist_fieldが作成されます。1つは変数自体を表し（この例ではnext_pid）、もう1つはトレースストリームからフィールドの値を取得するためのものです（通常のvalフィールドと同じように）。これらは通常の変数作成とは別に作成され、hist_data-&gt;field_vars[]配列に保存されます。以下でこれらの使用方法を説明します。さらに、フィールド変数（例：$next_pid）をtrace()アクションで参照するために必要な参照用hist_fieldも作成されます。</p>
+<p>wakeup_lat は変数参照であり、common_timestamp-$ts0 の式の値を参照しており、そのためこの参照を表す hist フィールド項目も作成する必要があります。</p>
+<p>hist_trigger_elt_update() が呼ばれて通常のキーおよび値フィールドを取得する際、update_field_vars() も呼び出されます。この関数はヒストグラム用に作成された各 field_var を順に処理し、hist_data-&gt;field_vars から取得した field_var に対して val-&gt;fn() を呼び出して現在のトレースレコードからデータを取得し、その後、変数の var.idx を使用して tracing_map_elt の変数の var.idx オフセット位置に変数を設定します。</p>
+<p>すべての変数が更新された後、event_hist_trigger() から resolve_var_refs() を呼び出すことができます。この時点で $ts0 および $next_pid の参照だけでなく、$wakeup_lat の参照も解決でき、trace() アクションは var_ref_vals[] 配列に組み込まれた値を参照してトレースイベントを生成できます。</p>
+<p>save() アクションに関連するフィールド変数にも同様の処理が行われます。</p>
+<p>図に使用されている略語:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>hist_data = struct hist_trigger_data
+hist_data.fields = struct hist_field
+field_var = struct field_var
+fn = hist_field_fn_t
+FL_KEY = HIST_FIELD_FL_KEY
+FL_VAR = HIST_FIELD_FL_VAR
+FL_VAR_REF = HIST_FIELD_FL_VAR_REF
+</pre></div>
+</div>
+<section id="trace-action-field-variable-test">
+<h3>trace() アクションのフィールド変数テスト<a class="headerlink" href="#trace-action-field-variable-test" title="この見出しへのパーマリンク">¶</a></h3>
+<p>この例では以前のテスト例に加えて、ついに wakeup_lat 変数を実際に使用していますが、さらにいくつかのフィールド変数も作成し、これらをすべて onmatch() ハンドラを通じて wakeup_latency() トレースアクションに渡しています。</p>
+<p>まず、wakeup_latency 合成イベントを作成します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'wakeup_latency u64 lat; pid_t pid; char comm[16]' &gt;&gt; synthetic_events
+</pre></div>
+</div>
+<p>次に、以前の例から取り出した sched_waking トリガー:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'hist:keys=pid:ts0=common_timestamp.usecs' &gt;&gt; events/sched/sched_waking/trigger
+</pre></div>
+</div>
+<p>最後に、以前のテスト例と同様に、sched_waking トリガーの $ts0 参照を wakeup_lat 変数に計算して割り当て、その後、この変数を next_pid および next_comm という sched_switch イベントのフィールドと併せて wakeup_latency トレースイベントを生成します。next_pid および next_comm イベントフィールドは自動的にフィールド変数に変換されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'hist:keys=next_pid:wakeup_lat=common_timestamp.usecs-$ts0:onmatch(sched.sched_waking).wakeup_latency($wakeup_lat,next_pid,next_comm)' &gt;&gt; /sys/kernel/debug/tracing/events/sched/sched_switch/trigger
+</pre></div>
+</div>
+<p>sched_waking の hist_debug 出力は以前のテスト例と同じデータを表示しています:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># cat events/sched/sched_waking/hist_debug
+
+# event histogram
+#
+# trigger info: hist:keys=pid:vals=hitcount:ts0=common_timestamp.usecs:sort=hitcount:size=2048:clock=global [active]
+#
+
+hist_data: 00000000d60ff61f
+
+n_vals: 2
+n_keys: 1
+n_fields: 3
+
+val fields:
+
+  hist_data-&gt;fields[0]:
+    flags:
+      VAL: HIST_FIELD_FL_HITCOUNT
+    type: u64
+    size: 8
+    is_signed: 0
+
+  hist_data-&gt;fields[1]:
+    flags:
+      HIST_FIELD_FL_VAR
+    var.name: ts0
+    var.idx (into tracing_map_elt.vars[]): 0
+    type: u64
+    size: 8
+    is_signed: 0
+
+key fields:
+
+  hist_data-&gt;fields[2]:
+    flags:
+      HIST_FIELD_FL_KEY
+    ftrace_event_field name: pid
+    type: pid_t
+    size: 8
+    is_signed: 1
+</pre></div>
+</div>
+<p>sched_switch hist_debug出力は、前のテスト例と同じキーフィールドと値フィールドを表示しています。注意すべきは、wakeup_latが依然としてvalフィールドセクションに含まれていることですが、新しいフィールド変数は含まれていません。フィールド変数は変数ですが、hist_dataのfield_vars[]配列で別途保持されています。フィールド変数と通常の変数は別々の場所に配置されていますが、トレースマップ_elt.vars[]におけるそれらの変数の実際の変数位置は、予想通りにインデックスが増加しています。wakeup_latはvar.idx = 0の位置を取得し、next_pidとnext_commのフィールド変数はvar.idx = 1およびvar.idx = 2を取得します。また、それらの変数に該当する変数参照フィールドセクションで表示される値も同じです。2つのトリガーがあるため2つのhist_dataアドレスがあり、マッチングを行う際にはそれらのアドレスも考慮する必要があります。最初の変数は前のhistトリガーの0番目のvar.idxを参照しており（そのトリガーに関連するhist_dataアドレスを参照してください）、2番目の変数はsched_switch histトリガーの0番目のvar.idxを参照し、残りの変数参照も同様です。</p>
+<p>最後に、アクショントラッキング変数セクションはonmatch()ハンドラのシステム名とイベント名を表示しています:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># cat events/sched/sched_switch/hist_debug
+
+# event histogram
+#
+# trigger info: hist:keys=next_pid:vals=hitcount:wakeup_lat=common_timestamp.usecs-$ts0:sort=hitcount:size=2048:clock=global:onmatch(sched.sched_waking).wakeup_latency($wakeup_lat,next_pid,next_comm) [active]
+#
+
+hist_data: 0000000008f551b7
+
+n_vals: 2
+n_keys: 1
+n_fields: 3
+
+val fields:
+
+  hist_data-&gt;fields[0]:
+    flags:
+      VAL: HIST_FIELD_FL_HITCOUNT
+    type: u64
+    size: 8
+    is_signed: 0
+
+  hist_data-&gt;fields[1]:
+    flags:
+      HIST_FIELD_FL_VAR
+    var.name: wakeup_lat
+    var.idx (into tracing_map_elt.vars[]): 0
+    type: u64
+    size: 0
+    is_signed: 0
+
+key fields:
+
+  hist_data-&gt;fields[2]:
+    flags:
+      HIST_FIELD_FL_KEY
+    ftrace_event_field name: next_pid
+    type: pid_t
+    size: 8
+    is_signed: 1
+
+variable reference fields:
+
+  hist_data-&gt;var_refs[0]:
+    flags:
+      HIST_FIELD_FL_VAR_REF
+    name: ts0
+    var.idx (into tracing_map_elt.vars[]): 0
+    var.hist_data: 00000000d60ff61f
+    var_ref_idx (into hist_data-&gt;var_refs[]): 0
+    type: u64
+    size: 8
+    is_signed: 0
+
+  hist_data-&gt;var_refs[1]:
+    flags:
+      HIST_FIELD_FL_VAR_REF
+    name: wakeup_lat
+    var.idx (into tracing_map_elt.vars[]): 0
+    var.hist_data: 0000000008f551b7
+    var_ref_idx (into hist_data-&gt;var_refs[]): 1
+    type: u64
+    size: 0
+    is_signed: 0
+
+  hist_data-&gt;var_refs[2]:
+    flags:
+      HIST_FIELD_FL_VAR_REF
+    name: next_pid
+    var.idx (into tracing_map_elt.vars[]): 1
+    var.hist_data: 0000000008f551b7
+    var_ref_idx (into hist_data-&gt;var_refs[]): 2
+    type: pid_t
+    size: 4
+    is_signed: 0
+
+  hist_data-&gt;var_refs[3]:
+    flags:
+      HIST_FIELD_FL_VAR_REF
+    name: next_comm
+    var.idx (into tracing_map_elt.vars[]): 2
+    var.hist_data: 0000000008f551b7
+    var_ref_idx (into hist_data-&gt;var_refs[]): 3
+    type: char[16]
+    size: 256
+    is_signed: 0
+
+field variables:
+
+  hist_data-&gt;field_vars[0]:
+
+    field_vars[0].var:
+    flags:
+      HIST_FIELD_FL_VAR
+    var.name: next_pid
+    var.idx (into tracing_map_elt.vars[]): 1
+
+    field_vars[0].val:
+    ftrace_event_field name: next_pid
+    type: pid_t
+    size: 4
+    is_signed: 1
+
+  hist_data-&gt;field_vars[1]:
+
+    field_vars[1].var:
+    flags:
+      HIST_FIELD_FL_VAR
+    var.name: next_comm
+    var.idx (into tracing_map_elt.vars[]): 2
+
+    field_vars[1].val:
+    ftrace_event_field name: next_comm
+    type: char[16]
+    size: 256
+    is_signed: 0
+
+action tracking variables (for onmax()/onchange()/onmatch()):
+
+  hist_data-&gt;actions[0].match_data.event_system: sched
+  hist_data-&gt;actions[0].match_data.event: sched_waking
+</pre></div>
+</div>
+<p>次のテストのために環境を整えるには、以下のコマンドを使用できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo '!hist:keys=next_pid:wakeup_lat=common_timestamp.usecs-$ts0:onmatch(sched.sched_waking).wakeup_latency($wakeup_lat,next_pid,next_comm)' &gt;&gt; /sys/kernel/debug/tracing/events/sched/sched_switch/trigger
+
+# echo '!hist:keys=pid:ts0=common_timestamp.usecs' &gt;&gt; events/sched/sched_waking/trigger
+
+# echo '!wakeup_latency u64 lat; pid_t pid; char comm[16]' &gt;&gt; synthetic_events
+</pre></div>
+</div>
+</section>
+<section id="action-data-and-the-trace-action">
+<h3>action_dataとtrace()アクション<a class="headerlink" href="#action-data-and-the-trace-action" title="この見出しへのパーマリンク">¶</a></h3>
+<p>上記のように、trace()アクションが合成イベントを生成する際、合成イベントのすべてのパラメータはすでに変数か、フィールド変数を通じて変数に変換され、最終的にそれらの変数値はvar_ref_vals[]配列に参照して収集されます。</p>
+<p>var_ref_vals[]配列の値は、合成イベントパラメータと同一の順序を必ずしも追わないことがあります。これを解決するため、struct action_dataにはtraceアクションパラメータをvar_ref_vals[]値にマッピングする別の配列var_ref_idx[]が含まれています。以下に、wakeup_latency()合成イベントにおけるこのマッピングを示す図があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+------------------+     wakeup_latency()
+| action_data      |       event params               var_ref_vals[]
++------------------+    +-----------------+        +-----------------+
+  | .var_ref_idx[] |---&gt;| $wakeup_lat idx |---+    |                 |
+  +----------------+    +-----------------+   |    +-----------------+
+  | .synth_event   |    | $next_pid idx   |---|-+  | $wakeup_lat val |
+  +----------------+    +-----------------+   | |  +-----------------+
+                                 .            | +-&gt;| $next_pid val   |
+                                 .            |    +-----------------+
+                                 .            |           .
+                        +-----------------+   |           .
+                        |                 |   |           .
+                        +-----------------+   |    +-----------------+
+                                              +---&gt;| $wakeup_lat val |
+                                                   +-----------------+
+</pre></div>
+</div>
+<p>基本的に、この合成イベントプローブ関数trace_event_raw_event_synth()内でどのように使用されるかは以下の通りです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>for each field i in .synth_event
+  val_idx = .var_ref_idx[i]
+  val = var_ref_vals[val_idx]
+</pre></div>
+</div>
+</section>
+<section id="action-data-and-the-onxxx-handlers">
+<h3>action_dataとonXXX()ハンドラ<a class="headerlink" href="#action-data-and-the-onxxx-handlers" title="この見出しへのパーマリンク">¶</a></h3>
+<p>onmatch()以外のhistトリガーonXXX()アクション（例: onmax()およびonchange()）も隠し変数を内部的に作成して使用します。この情報はaction_data.track_data構造体に含まれており、以下の例で説明する通り、hist_debug出力にも表示されます。</p>
+<p>通常、onmax()またはonchange()ハンドラはsave()およびsnapshot()アクションと併用されます。例えば：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'hist:keys=next_pid:wakeup_lat=common_timestamp.usecs-$ts0: \
+        onmax($wakeup_lat).save(next_comm,prev_pid,prev_prio,prev_comm)' &gt;&gt;
+        /sys/kernel/debug/tracing/events/sched/sched_switch/trigger
+</pre></div>
+</div>
+<p>または:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'hist:keys=next_pid:wakeup_lat=common_timestamp.usecs-$ts0: \
+        onmax($wakeup_lat).snapshot()' &gt;&gt;
+        /sys/kernel/debug/tracing/events/sched/sched_switch/trigger
+</pre></div>
+</div>
+</section>
+<section id="save-action-field-variable-test">
+<h3>save()アクション フィールド変数テスト<a class="headerlink" href="#save-action-field-variable-test" title="この見出しへのパーマリンク">¶</a></h3>
+<p>この例では、合成イベントを生成する代わりに、onmax()ハンドラが新しい最大ラテンシーを検出するたびにsave()アクションを使用してフィールド値を保存します。前の例と同様に、保存される値はフィールド値ですが、今回は別途用意されたhist_data配列のsave_vars[]に保持されます。</p>
+<p>前のテスト例と同様に、sched_wakingトリガーを設定します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'hist:keys=pid:ts0=common_timestamp.usecs' &gt;&gt; events/sched/sched_waking/trigger
+</pre></div>
+</div>
+<p>この場合、sched_switchトリガーを設定して、新しい最大ラテンシーを検出するたびにsched_switchフィールド値を保存します。onmax()ハンドラおよびsave()アクションの両方で変数が作成され、hist_debugファイルを使用して確認できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'hist:keys=next_pid:wakeup_lat=common_timestamp.usecs-$ts0:onmax($wakeup_lat).save(next_comm,prev_pid,prev_prio,prev_comm)' &gt;&gt; events/sched/sched_switch/trigger
+</pre></div>
+</div>
+<p>sched_waking hist_debug出力は前のテスト例と同様のデータを示しています：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># cat events/sched/sched_waking/hist_debug
+
+#
+# trigger info: hist:keys=pid:vals=hitcount:ts0=common_timestamp.usecs:sort=hitcount:size=2048:clock=global [active]
+#
+
+hist_data: 00000000e6290f48
+
+n_vals: 2
+n_keys: 1
+n_fields: 3
+
+val fields:
+
+  hist_data-&gt;fields[0]:
+    flags:
+      VAL: HIST_FIELD_FL_HITCOUNT
+    type: u64
+    size: 8
+    is_signed: 0
+
+  hist_data-&gt;fields[1]:
+    flags:
+      HIST_FIELD_FL_VAR
+    var.name: ts0
+    var.idx (into tracing_map_elt.vars[]): 0
+    type: u64
+    size: 8
+    is_signed: 0
+
+key fields:
+
+  hist_data-&gt;fields[2]:
+    flags:
+      HIST_FIELD_FL_KEY
+    ftrace_event_field name: pid
+    type: pid_t
+    size: 8
+    is_signed: 1
+</pre></div>
+</div>
+<p>sched_switchトリガーの出力は以前と同様のvalおよびkey値を示しますが、いくつか新しいセクションも表示されます。</p>
+<p>まず、アクション追跡変数セクションでは、actions[].track_data情報が表示され、この場合のランニング最大値を追跡するための特別な追跡変数と参照が記述されています。actions[].track_data.var_refメンバには、追跡されている変数への参照（この場合$wakeup_lat変数）が含まれます。onmax()ハンドラ機能を実行するには、新しい最大値が検出されるたびに更新される変数で現在の最大値を追跡する必要があります。この場合、自動生成された変数名' __max'が作成され、actions[].track_data.track_var変数で確認できます。</p>
+<p>最後に、新しい'saveアクション変数'セクションでは、save()関数の4つのパラメータにより、最大値が検出されるときに指定されたフィールドの値を保存するための4つのフィールド変数が作成されていることが確認できます。これらの変数はhist_dataから分離されたsave_vars[]配列に保持されるため、別セクションで表示されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># cat events/sched/sched_switch/hist_debug
+
+# event histogram
+#
+# trigger info: hist:keys=next_pid:vals=hitcount:wakeup_lat=common_timestamp.usecs-$ts0:sort=hitcount:size=2048:clock=global:onmax($wakeup_lat).save(next_comm,prev_pid,prev_prio,prev_comm) [active]
+#
+
+hist_data: 0000000057bcd28d
+
+n_vals: 2
+n_keys: 1
+n_fields: 3
+
+val fields:
+
+  hist_data-&gt;fields[0]:
+    flags:
+      VAL: HIST_FIELD_FL_HITCOUNT
+    type: u64
+    size: 8
+    is_signed: 0
+
+  hist_data-&gt;fields[1]:
+    flags:
+      HIST_FIELD_FL_VAR
+    var.name: wakeup_lat
+    var.idx (into tracing_map_elt.vars[]): 0
+    type: u64
+    size: 0
+    is_signed: 0
+
+key fields:
+
+  hist_data-&gt;fields[2]:
+    flags:
+      HIST_FIELD_FL_KEY
+    ftrace_event_field name: next_pid
+    type: pid_t
+    size: 8
+    is_signed: 1
+
+variable reference fields:
+
+  hist_data-&gt;var_refs[0]:
+    flags:
+      HIST_FIELD_FL_VAR_REF
+    name: ts0
+    var.idx (into tracing_map_elt.vars[]): 0
+    var.hist_data: 00000000e6290f48
+    var_ref_idx (into hist_data-&gt;var_refs[]): 0
+    type: u64
+    size: 8
+    is_signed: 0
+
+  hist_data-&gt;var_refs[1]:
+    flags:
+      HIST_FIELD_FL_VAR_REF
+    name: wakeup_lat
+    var.idx (into tracing_map_elt.vars[]): 0
+    var.hist_data: 0000000057bcd28d
+    var_ref_idx (into hist_data-&gt;var_refs[]): 1
+    type: u64
+    size: 0
+    is_signed: 0
+
+action tracking variables (for onmax()/onchange()/onmatch()):
+
+  hist_data-&gt;actions[0].track_data.var_ref:
+    flags:
+      HIST_FIELD_FL_VAR_REF
+    name: wakeup_lat
+    var.idx (into tracing_map_elt.vars[]): 0
+    var.hist_data: 0000000057bcd28d
+    var_ref_idx (into hist_data-&gt;var_refs[]): 1
+    type: u64
+    size: 0
+    is_signed: 0
+
+  hist_data-&gt;actions[0].track_data.track_var:
+    flags:
+      HIST_FIELD_FL_VAR
+    var.name: __max
+    var.idx (into tracing_map_elt.vars[]): 1
+    type: u64
+    size: 8
+    is_signed: 0
+
+save action variables (save() params):
+
+  hist_data-&gt;save_vars[0]:
+
+    save_vars[0].var:
+    flags:
+      HIST_FIELD_FL_VAR
+    var.name: next_comm
+    var.idx (into tracing_map_elt.vars[]): 2
+
+    save_vars[0].val:
+    ftrace_event_field name: next_comm
+    type: char[16]
+    size: 256
+    is_signed: 0
+
+  hist_data-&gt;save_vars[1]:
+
+    save_vars[1].var:
+    flags:
+      HIST_FIELD_FL_VAR
+    var.name: prev_pid
+    var.idx (into tracing_map_elt.vars[]): 3
+
+    save_vars[1].val:
+    ftrace_event_field name: prev_pid
+    type: pid_t
+    size: 4
+    is_signed: 1
+
+  hist_data-&gt;save_vars[2]:
+
+    save_vars[2].var:
+    flags:
+      HIST_FIELD_FL_VAR
+    var.name: prev_prio
+    var.idx (into tracing_map_elt.vars[]): 4
+
+    save_vars[2].val:
+    ftrace_event_field name: prev_prio
+    type: int
+    size: 4
+    is_signed: 1
+
+  hist_data-&gt;save_vars[3]:
+
+    save_vars[3].var:
+    flags:
+      HIST_FIELD_FL_VAR
+    var.name: prev_comm
+    var.idx (into tracing_map_elt.vars[]): 5
+
+    save_vars[3].val:
+    ftrace_event_field name: prev_comm
+    type: char[16]
+    size: 256
+    is_signed: 0
+</pre></div>
+</div>
+<p>次のテストのために環境を整えるには、以下のコマンドを使用できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo '!hist:keys=next_pid:wakeup_lat=common_timestamp.usecs-$ts0:onmax($wakeup_lat).save(next_comm,prev_pid,prev_prio,prev_comm)' &gt;&gt; events/sched/sched_switch/trigger
+
+# echo '!hist:keys=pid:ts0=common_timestamp.usecs' &gt;&gt; events/sched/sched_waking/trigger
+</pre></div>
+</div>
+</section>
+</section>
+<section id="a-couple-special-cases">
+<h2>いくつかの特別なケース<a class="headerlink" href="#a-couple-special-cases" title="この見出しへのパーマリンク">¶</a></h2>
+<p>上記はヒストグラム内部の基本的な内容ですが、いくつかの特別なケースについて説明する必要があります。これらは通常、さらに混乱を招くためです。それらは、他のヒストグラム上のフィールド変数およびエイリアスであり、以下にhist_debugファイルを使用した例を通じて説明します。</p>
+<section id="test-of-field-variables-on-other-histograms">
+<h3>他のヒストグラム上のフィールド変数のテスト<a class="headerlink" href="#test-of-field-variables-on-other-histograms" title="この見出しへのパーマリンク">¶</a></h3>
+<p>この例は前の例と似ていますが、この場合はsched_switchトリガーが別のイベント（sched_wakingイベント）のヒストグラムトリガーのフィールドを参照しています。これを実現するには、他のイベント用のフィールド変数を作成する必要がありますが、既存のヒストグラムは変更不可能なため、新しいヒストグラムを作成し、それに一致する変数を追加して使用します。以下のhist_debug出力でその点が反映されています。</p>
+<p>まず、wakeup_latencyという合成イベントを作成します。注意すべきはprioフィールドの追加です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'wakeup_latency u64 lat; pid_t pid; int prio' &gt;&gt; synthetic_events
+</pre></div>
+</div>
+<p>前のテスト例と同様に、sched_wakingトリガーを設定します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'hist:keys=pid:ts0=common_timestamp.usecs' &gt;&gt; events/sched/sched_waking/trigger
+</pre></div>
+</div>
+<p>ここでは、sched_switchにヒストグラムトリガーを設定し、onmatchハンドラを使用してsched_wakingイベントをwakeup_latencyイベントとして送信しています。注意すべきはwakeup_latency()に渡される第3パラメータがprioであり、これはフィールド変数を作成する必要があるフィールド名です。ただし、sched_switchイベントにはprioフィールドが存在しないため、このフィールド変数を作成できないように見えます。一方、マッチするsched_wakingイベントにはprioフィールドがあるため、この目的に利用できる可能性があります。問題は、既存のヒストグラムに新しい変数を定義することはできないため、既存のsched_wakingヒストグラムに新しいprioフィールド変数を追加することはできません。ただし、同じイベントに対して追加の新しい「マッチング」sched_wakingヒストグラムを作成することで、同じキーとフィルタを用いて、そのヒストグラムに新しいprioフィールド変数を定義できます。</p>
+<p>ここにsched_switchトリガーの例です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'hist:keys=next_pid:wakeup_lat=common_timestamp.usecs-$ts0:onmatch(sched.sched_waking).wakeup_latency($wakeup_lat,next_pid,prio)' &gt;&gt; events/sched/sched_switch/trigger
+</pre></div>
+</div>
+<p>ここにsched_wakingヒストグラムトリガーのhist_debug情報の出力です。出力には2つのヒストグラムが表示されており、1つ目は以前の例で見た通常のsched_wakingヒストグラムで、2つ目は新しいprioフィールド変数を提供するために作成した特別なヒストグラムです。</p>
+<p>下記の2番目のヒストグラムを見てみると、名前がsynthetic_prioの変数があります。これは、そのsched_wakingヒストグラムのprioフィールド用に作成されたフィールド変数です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># cat events/sched/sched_waking/hist_debug
+
+# event histogram
+#
+# trigger info: hist:keys=pid:vals=hitcount:ts0=common_timestamp.usecs:sort=hitcount:size=2048:clock=global [active]
+#
+
+hist_data: 00000000349570e4
+
+n_vals: 2
+n_keys: 1
+n_fields: 3
+
+val fields:
+
+  hist_data-&gt;fields[0]:
+    flags:
+      VAL: HIST_FIELD_FL_HITCOUNT
+    type: u64
+    size: 8
+    is_signed: 0
+
+  hist_data-&gt;fields[1]:
+    flags:
+      HIST_FIELD_FL_VAR
+    var.name: ts0
+    var.idx (into tracing_map_elt.vars[]): 0
+    type: u64
+    size: 8
+    is_signed: 0
+
+key fields:
+
+  hist_data-&gt;fields[2]:
+    flags:
+      HIST_FIELD_FL_KEY
+    ftrace_event_field name: pid
+    type: pid_t
+    size: 8
+    is_signed: 1
+
+
+# event histogram
+#
+# trigger info: hist:keys=pid:vals=hitcount:synthetic_prio=prio:sort=hitcount:size=2048 [active]
+#
+
+hist_data: 000000006920cf38
+
+n_vals: 2
+n_keys: 1
+n_fields: 3
+
+val fields:
+
+  hist_data-&gt;fields[0]:
+    flags:
+      VAL: HIST_FIELD_FL_HITCOUNT
+    type: u64
+    size: 8
+    is_signed: 0
+
+  hist_data-&gt;fields[1]:
+    flags:
+      HIST_FIELD_FL_VAR
+    ftrace_event_field name: prio
+    var.name: synthetic_prio
+    var.idx (into tracing_map_elt.vars[]): 0
+    type: int
+    size: 4
+    is_signed: 1
+
+key fields:
+
+  hist_data-&gt;fields[2]:
+    flags:
+      HIST_FIELD_FL_KEY
+    ftrace_event_field name: pid
+    type: pid_t
+    size: 8
+    is_signed: 1
+</pre></div>
+</div>
+<p>下記のsched_switchヒストグラムを見てみると、sched_wakingのsynthetic_prio変数への参照が確認できます。関連するhist_dataアドレスを確認すると、実際に新しいヒストグラムと関連付けられています。また、他の参照は通常の変数wakeup_latと通常のフィールド変数next_pidであり、その詳細はフィールド変数セクションに記載されています：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># cat events/sched/sched_switch/hist_debug
+
+# event histogram
+#
+# trigger info: hist:keys=next_pid:vals=hitcount:wakeup_lat=common_timestamp.usecs-$ts0:sort=hitcount:size=2048:clock=global:onmatch(sched.sched_waking).wakeup_latency($wakeup_lat,next_pid,prio) [active]
+#
+
+hist_data: 00000000a73b67df
+
+n_vals: 2
+n_keys: 1
+n_fields: 3
+
+val fields:
+
+  hist_data-&gt;fields[0]:
+    flags:
+      VAL: HIST_FIELD_FL_HITCOUNT
+    type: u64
+    size: 8
+    is_signed: 0
+
+  hist_data-&gt;fields[1]:
+    flags:
+      HIST_FIELD_FL_VAR
+    var.name: wakeup_lat
+    var.idx (into tracing_map_elt.vars[]): 0
+    type: u64
+    size: 0
+    is_signed: 0
+
+key fields:
+
+  hist_data-&gt;fields[2]:
+    flags:
+      HIST_FIELD_FL_KEY
+    ftrace_event_field name: next_pid
+    type: pid_t
+    size: 8
+    is_signed: 1
+
+variable reference fields:
+
+  hist_data-&gt;var_refs[0]:
+    flags:
+      HIST_FIELD_FL_VAR_REF
+    name: ts0
+    var.idx (into tracing_map_elt.vars[]): 0
+    var.hist_data: 00000000349570e4
+    var_ref_idx (into hist_data-&gt;var_refs[]): 0
+    type: u64
+    size: 8
+    is_signed: 0
+
+  hist_data-&gt;var_refs[1]:
+    flags:
+      HIST_FIELD_FL_VAR_REF
+    name: wakeup_lat
+    var.idx (into tracing_map_elt.vars[]): 0
+    var.hist_data: 00000000a73b67df
+    var_ref_idx (into hist_data-&gt;var_refs[]): 1
+    type: u64
+    size: 0
+    is_signed: 0
+
+  hist_data-&gt;var_refs[2]:
+    flags:
+      HIST_FIELD_FL_VAR_REF
+    name: next_pid
+    var.idx (into tracing_map_elt.vars[]): 1
+    var.hist_data: 00000000a73b67df
+    var_ref_idx (into hist_data-&gt;var_refs[]): 2
+    type: pid_t
+    size: 4
+    is_signed: 0
+
+  hist_data-&gt;var_refs[3]:
+    flags:
+      HIST_FIELD_FL_VAR_REF
+    name: synthetic_prio
+    var.idx (into tracing_map_elt.vars[]): 0
+    var.hist_data: 000000006920cf38
+    var_ref_idx (into hist_data-&gt;var_refs[]): 3
+    type: int
+    size: 4
+    is_signed: 1
+
+field variables:
+
+  hist_data-&gt;field_vars[0]:
+
+    field_vars[0].var:
+    flags:
+      HIST_FIELD_FL_VAR
+    var.name: next_pid
+    var.idx (into tracing_map_elt.vars[]): 1
+
+    field_vars[0].val:
+    ftrace_event_field name: next_pid
+    type: pid_t
+    size: 4
+    is_signed: 1
+
+action tracking variables (for onmax()/onchange()/onmatch()):
+
+  hist_data-&gt;actions[0].match_data.event_system: sched
+  hist_data-&gt;actions[0].match_data.event: sched_waking
+</pre></div>
+</div>
+<p>次のテストのために環境を整えるには、以下のコマンドを使用できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo '!hist:keys=next_pid:wakeup_lat=common_timestamp.usecs-$ts0:onmatch(sched.sched_waking).wakeup_latency($wakeup_lat,next_pid,prio)' &gt;&gt; events/sched/sched_switch/trigger
+
+# echo '!hist:keys=pid:ts0=common_timestamp.usecs' &gt;&gt; events/sched/sched_waking/trigger
+
+# echo '!wakeup_latency u64 lat; pid_t pid; int prio' &gt;&gt; synthetic_events
+</pre></div>
+</div>
+</section>
+<section id="alias-test">
+<h3>Alias test<a class="headerlink" href="#alias-test" title="この見出しへのパーマリンク">¶</a></h3>
+<p>この例は前の例と非常に似ていますが、alias flagを示しています。</p>
+<p>まず、wakeup_latency 合成イベントを作成します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'wakeup_latency u64 lat; pid_t pid; char comm[16]' &gt;&gt; synthetic_events
+</pre></div>
+</div>
+<p>次に、前の例と同様のsched_wakingトリガーを作成しますが、この場合はwaking_pid変数にpidを保存します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'hist:keys=pid:waking_pid=pid:ts0=common_timestamp.usecs' &gt;&gt; events/sched/sched_waking/trigger
+</pre></div>
+</div>
+<p>sched_switchトリガーでは、wakeup_latency合成イベントの呼び出しで$waking_pidを直接使用する代わりに、$waking_pidのaliasとして$woken_pidという名前を付けて、そのaliasを使用します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo 'hist:keys=next_pid:woken_pid=$waking_pid:wakeup_lat=common_timestamp.usecs-$ts0:onmatch(sched.sched_waking).wakeup_latency($wakeup_lat,$woken_pid,next_comm)' &gt;&gt; events/sched/sched_switch/trigger
+</pre></div>
+</div>
+<p>sched_waking hist_debugの出力を見てみると、通常のフィールドに加えてwaking_pid変数が表示されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># cat events/sched/sched_waking/hist_debug
+
+# event histogram
+#
+# trigger info: hist:keys=pid:vals=hitcount:waking_pid=pid,ts0=common_timestamp.usecs:sort=hitcount:size=2048:clock=global [active]
+#
+
+hist_data: 00000000a250528c
+
+n_vals: 3
+n_keys: 1
+n_fields: 4
+
+val fields:
+
+  hist_data-&gt;fields[0]:
+    flags:
+      VAL: HIST_FIELD_FL_HITCOUNT
+    type: u64
+    size: 8
+    is_signed: 0
+
+  hist_data-&gt;fields[1]:
+    flags:
+      HIST_FIELD_FL_VAR
+    ftrace_event_field name: pid
+    var.name: waking_pid
+    var.idx (into tracing_map_elt.vars[]): 0
+    type: pid_t
+    size: 4
+    is_signed: 1
+
+  hist_data-&gt;fields[2]:
+    flags:
+      HIST_FIELD_FL_VAR
+    var.name: ts0
+    var.idx (into tracing_map_elt.vars[]): 1
+    type: u64
+    size: 8
+    is_signed: 0
+
+key fields:
+
+  hist_data-&gt;fields[3]:
+    flags:
+      HIST_FIELD_FL_KEY
+    ftrace_event_field name: pid
+    type: pid_t
+    size: 8
+    is_signed: 1
+</pre></div>
+</div>
+<p>sched_switch hist_debugの出力では、woken_pidという名前の変数が作成され、HIST_FIELD_FL_ALIASフラグが設定されていることがわかります。また、HIST_FIELD_FL_VARフラグも設定されているため、valフィールドセクションに表示されます。</p>
+<p>この実装の詳細にもかかわらず、alias変数は実際には変数参照に似ています。正確には、参照の参照と考えることができます。実装では、参照されている変数参照のvar_ref-&gt;fn()をコピーします。この場合、waking_pidのfn()はhist_field_var_ref()であり、これがaliasのfn()になります。hist_field_var_ref() fn()は使用している変数参照のvar_ref_idxを必要とするため、waking_pidのvar_ref_idxもaliasにコピーされます。結果として、aliasの値を取得する際には、元の参照が行っていた操作と同じを行い、var_ref_vals[]配列から同じ値を取得します。出力で確認できます。aliasのvar_ref_idx（この場合woken_pid）は、変数参照フィールドセクションの参照（waking_pid）のvar_ref_idxと同じです。</p>
+<p>さらに、その値を取得した後、これは変数であるため、その値をvar.idxに保存します。したがって、woken_pid aliasのvar.idxは0で、fn()が呼ばれて自身を更新する際、var_ref_idx 0の値を0番のvar.idxに埋め込みます。変数refsセクションにはwoken_pid var_refが存在することに気づくでしょう。これはwoken_pid alias変数への参照であり、この参照はwoken_pid aliasと同じvar.idx（0）から値を取得し、その後、自身のvar_ref_idxスロット（3）にその値を保存します。この位置の値が、トレースイベント呼び出しの$woken_pidスロットに最終的に割り当てられます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># cat events/sched/sched_switch/hist_debug
+
+# event histogram
+#
+# trigger info: hist:keys=next_pid:vals=hitcount:woken_pid=$waking_pid,wakeup_lat=common_timestamp.usecs-$ts0:sort=hitcount:size=2048:clock=global:onmatch(sched.sched_waking).wakeup_latency($wakeup_lat,$woken_pid,next_comm) [active]
+#
+
+hist_data: 0000000055d65ed0
+
+n_vals: 3
+n_keys: 1
+n_fields: 4
+
+val fields:
+
+  hist_data-&gt;fields[0]:
+    flags:
+      VAL: HIST_FIELD_FL_HITCOUNT
+    type: u64
+    size: 8
+    is_signed: 0
+
+  hist_data-&gt;fields[1]:
+    flags:
+      HIST_FIELD_FL_VAR
+      HIST_FIELD_FL_ALIAS
+    var.name: woken_pid
+    var.idx (into tracing_map_elt.vars[]): 0
+    var_ref_idx (into hist_data-&gt;var_refs[]): 0
+    type: pid_t
+    size: 4
+    is_signed: 1
+
+  hist_data-&gt;fields[2]:
+    flags:
+      HIST_FIELD_FL_VAR
+    var.name: wakeup_lat
+    var.idx (into tracing_map_elt.vars[]): 1
+    type: u64
+    size: 0
+    is_signed: 0
+
+key fields:
+
+  hist_data-&gt;fields[3]:
+    flags:
+      HIST_FIELD_FL_KEY
+    ftrace_event_field name: next_pid
+    type: pid_t
+    size: 8
+    is_signed: 1
+
+variable reference fields:
+
+  hist_data-&gt;var_refs[0]:
+    flags:
+      HIST_FIELD_FL_VAR_REF
+    name: waking_pid
+    var.idx (into tracing_map_elt.vars[]): 0
+    var.hist_data: 00000000a250528c
+    var_ref_idx (into hist_data-&gt;var_refs[]): 0
+    type: pid_t
+    size: 4
+    is_signed: 1
+
+  hist_data-&gt;var_refs[1]:
+    flags:
+      HIST_FIELD_FL_VAR_REF
+    name: ts0
+    var.idx (into tracing_map_elt.vars[]): 1
+    var.hist_data: 00000000a250528c
+    var_ref_idx (into hist_data-&gt;var_refs[]): 1
+    type: u64
+    size: 8
+    is_signed: 0
+
+  hist_data-&gt;var_refs[2]:
+    flags:
+      HIST_FIELD_FL_VAR_REF
+    name: wakeup_lat
+    var.idx (into tracing_map_elt.vars[]): 1
+    var.hist_data: 0000000055d65ed0
+    var_ref_idx (into hist_data-&gt;var_refs[]): 2
+    type: u64
+    size: 0
+    is_signed: 0
+
+  hist_data-&gt;var_refs[3]:
+    flags:
+      HIST_FIELD_FL_VAR_REF
+    name: woken_pid
+    var.idx (into tracing_map_elt.vars[]): 0
+    var.hist_data: 0000000055d65ed0
+    var_ref_idx (into hist_data-&gt;var_refs[]): 3
+    type: pid_t
+    size: 4
+    is_signed: 1
+
+  hist_data-&gt;var_refs[4]:
+    flags:
+      HIST_FIELD_FL_VAR_REF
+    name: next_comm
+    var.idx (into tracing_map_elt.vars[]): 2
+    var.hist_data: 0000000055d65ed0
+    var_ref_idx (into hist_data-&gt;var_refs[]): 4
+    type: char[16]
+    size: 256
+    is_signed: 0
+
+field variables:
+
+  hist_data-&gt;field_vars[0]:
+
+    field_vars[0].var:
+    flags:
+      HIST_FIELD_FL_VAR
+    var.name: next_comm
+    var.idx (into tracing_map_elt.vars[]): 2
+
+    field_vars[0].val:
+    ftrace_event_field name: next_comm
+    type: char[16]
+    size: 256
+    is_signed: 0
+
+action tracking variables (for onmax()/onchange()/onmatch()):
+
+  hist_data-&gt;actions[0].match_data.event_system: sched
+  hist_data-&gt;actions[0].match_data.event: sched_waking
+</pre></div>
+</div>
+<p>次のテストのために環境を整えるには、以下のコマンドを使用できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># echo '!hist:keys=next_pid:woken_pid=$waking_pid:wakeup_lat=common_timestamp.usecs-$ts0:onmatch(sched.sched_waking).wakeup_latency($wakeup_lat,$woken_pid,next_comm)' &gt;&gt; events/sched/sched_switch/trigger
+
+# echo '!hist:keys=pid:ts0=common_timestamp.usecs' &gt;&gt; events/sched/sched_waking/trigger
+
+# echo '!wakeup_latency u64 lat; pid_t pid; char comm[16]' &gt;&gt; synthetic_events
+</pre></div>
+</div>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxトレーシング技術</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="ftrace-design.html">関数トレーサー設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tracepoint-analysis.html">イベントとトレースポイントを用いた挙動分析ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ftrace.html">ftrace - 関数トレーサー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ftrace-uses.html">ftraceを用いた関数へのフック</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kprobes.html">カーネルプローブ（Kprobes）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kprobetrace.html">Kprobesベースのイベントトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="uprobetracer.html">Uprobe-tracer: Uprobeベースのイベントトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tracepoints.html">Linuxカーネルトレースポイントの利用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events.html">イベントトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-kmem.html">サブシステムトレースポイント: kmem</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-power.html">サブシステムトレースポイント: power</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-nmi.html">NMIトレースイベント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="events-msr.html">MSRトレースイベント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mmiotrace.html">カーネル内メモリマップI/Oトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="histogram.html">イベントヒストグラム</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">ヒストグラム設計ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="boottime-trace.html">ブートタイムトレース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hwlat_detector.html">ハードウェアレイテンシ検出器</a></li>
+<li class="toctree-l2"><a class="reference internal" href="intel_th.html">Intel(R)トレースハブ（TH）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ring-buffer-design.html">ロックレスリングバッファ設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="stm.html">システムトレースモジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sys-t.html">MIPI SyS-T over STP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="coresight/index.html">CoreSight - ARMハードウェアトレース</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxトレーシング技術</a><ul>
+<li>前へ: <a href="histogram.html" title="前章">イベントヒストグラム</a></li>
+<li>次へ: <a href="boottime-trace.html" title="次章">ブートタイムトレース</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/trace/histogram-design.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

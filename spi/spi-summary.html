@@ -1,0 +1,515 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>LinuxカーネルのSPIサポート概要 — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="spidev.html" rel="next" title="SPIユーザースペースAPI"/>
+<link href="index.html" rel="prev" title="シリアルペリフェラルインターフェース（SPI）"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="overview-of-linux-kernel-spi-support">
+<h1>LinuxカーネルSPIサポートの概要<a class="headerlink" href="#overview-of-linux-kernel-spi-support" title="この見出しへのパーマリンク">¶</a></h1>
+<p>2012年2月2日</p>
+<section id="what-is-spi">
+<h2>SPIとは何か？<a class="headerlink" href="#what-is-spi" title="この見出しへのパーマリンク">¶</a></h2>
+<p>「シリアルペリフェラルインターフェース」（SPI）は、マイクロコントローラーをセンサー、メモリ、ペリフェラルに接続するための同期型4ワイヤーのシリアルリンクです。これはシンプルな「事実上の標準」であり、標準化機関に登録するほど複雑ではありません。SPIはマスターアンドスレーブの構成を採用しています。</p>
+<p>3つの信号線にはクロック（SCK、通常10MHz程度）、および「マスターオアチップ、スレーブイン」（MOSI）または「マスターアイン、スレーブアウト」（MISO）の並列データラインが含まれます。（他の名称も使われます。）データのやり取りには4つのクロックモードがあり、モード0とモード3が最も一般的です。各クロックサイクルでデータが送信され、受信されます。クロックはデータビットをシフトする際以外はサイクルを繰り返しません。ただし、すべてのデータビットが使用されるわけではなく、すべてのプロトコルがフル duplexの機能を活用しているわけではありません。</p>
+<p>SPIマスタは4番目の「チップセレクト」ラインを使用して特定のSPIスレーブデバイスをアクティブにします。そのため、これらの3つの信号線は複数のチップに並列で接続されることがあります。すべてのSPIスレーブはチップセレクトをサポートしており、通常はアクティブロー信号で、スレーブ「x」にラベルnCSx（例：nCS0）で表示されます。一部のデバイスには他の信号があり、マスタへの割り込み信号が含まれる場合もあります。</p>
+<p>USBやSMBusなどのシリアルバスとは異なり、SPIスレーブ機能の低レベルプロトコルはベンダー間で通常は互換性がありません（例外はSPIメモリチップなどの汎用品です）。</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>SPIはタッチスクリーンセンサーなどのデバイスプロトコルのリクエスト/レスポンス形式にも利用されます。</p></li>
+<li><p>また、データの片方向（半二重）でのストリーム送信や、両方向同時に（全二重）送信にも利用されます。</p></li>
+<li><p>一部のデバイスでは8ビットのワードが使用されることがあります。他には12ビットや20ビットのデジタルサンプルストリームなど、異なるワード長が使用される場合もあります。</p></li>
+<li><p>ワードは通常、最高位ビット（MSB）から送信されますが、場合によっては最低位ビット（LSB）から送信されることがあります。</p></li>
+<li><p>SPIはシフトレジスタなど、デバイスをダイズーチェーン接続する際にも使用されることがあります。</p></li>
+</ul>
+</div></blockquote>
+<p>同様に、SPIスレーブは自動発見/エナメレーションプロトコルをサポートするケースはめったにありません。あるSPIマスタからアクセス可能なスレーブデバイスの木構造は通常、手動で設定し、コンフィギュレーションテーブルで構成されます。</p>
+<p>SPIはこのような4ワイヤープロトコルの一つの名称であり、ほとんどのコントローラーは「マイクロワイヤー」（リクエスト/レスポンスプロトコル用の半二重SPIと考えてください）や「SSP（同期シリアルプロトコル）」、「PSP（プログラマブルシリアルプロトコル）」、その他の関連プロトコルを処理できます。</p>
+<p>一部のチップはMOSIとMISOを統合して信号ラインを削減し、ハードウェアレベルでハーフドップルに限定されています。実際、一部のSPIチップではこの信号モードをストラッピングオプションとして提供しています。これらはSPIの同じプログラミングインターフェースでアクセス可能ですが、もちろんフルドップルの転送は処理できません。このようなチップは「スリーワイヤー」シグナルとして説明されることがあります：SCK、データ、nCSx。（このデータラインは時としてMOMIまたはSISOと呼ばれます。）</p>
+<p>マイクロコントローラーは通常、SPIプロトコルのマスターおよびスレーブ側の両方をサポートしています。このドキュメント（およびLinux）はSPIインタラクションのマスターおよびスレーブ側の両方をサポートしています。</p>
+</section>
+<section id="who-uses-it-on-what-kinds-of-systems">
+<h2>誰が使用するのか？どの種類のシステムで使用されるのか？<a class="headerlink" href="#who-uses-it-on-what-kinds-of-systems" title="この見出しへのパーマリンク">¶</a></h2>
+<p>LinuxでSPIを使用する開発者はおそらく埋め込みシステムボード用のデバイスドライバを書いているでしょう。SPIは外部チップを制御するために使用され、またすべてのMMCまたはSDメモリカードがサポートするプロトコルでもあります。（古い「DataFlash」カードはMMCカードよりも前の時代に登場しましたが、同じコネクタとカード形状を使用しており、SPIのみをサポートしています。）一部のPCハードウェアではBIOSコードにSPIフラッシュを使用しています。</p>
+<p>SPIスレーブチップはアナログセンサーやコーデック用のデジタル/アナログコンバーターから、メモリ、USBコントローラーやイーサネットアダプタなどのペリフェラルに至るまで幅広い用途があります。</p>
+<p>SPIを使用するシステムでは、メインボードにいくつかのデバイスが統合されるのが一般的です。一部のシステムでは拡張コネクタにSPIリンクを提供しており、専用のSPIコントローラーが存在しない場合、GPIOピンを使用して低速の「ビットバッキング」アダプターを作成できます。SPIコントローラーを「ホットプラグ」するシステムは非常に少なく、SPIを使用する理由は低コストとシンプルな操作に焦点を当てており、動的リコンフィギュレーションが重要であればUSBがより適切な低ピンカウントのペリフェラルバスです。</p>
+<p>Linuxを実行可能なマイクロコントローラーは通常、SPIモードを持つ1つ以上のI/Oインターフェースを統合しています。SPIサポートがあれば、専用のMMC/SD/SDIOコントローラーを必要とせずにMMCまたはSDカードを使用できます。</p>
+</section>
+<section id="i-m-confused-what-are-these-four-spi-clock-modes">
+<h2>混乱しています。これら4つのSPI「クロックモード」は何ですか？<a class="headerlink" href="#i-m-confused-what-are-these-four-spi-clock-modes" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ここでは混乱しやすいため、見つかるベンダーのドキュメンテーションは必ずしも役立ちません。4つのモードは2つのモードビットを組み合わせたものです：</p>
+<blockquote>
+<div><ul>
+<li><p>CPOLは初期クロック極性を示します。CPOL=0はクロックが低電圧で始まり、最初の（リードイン）エッジが上昇、次の（リードアウト）エッジが下降することを意味します。CPOL=1はクロックが高電圧で始まり、最初の（リードイン）エッジが下降することを意味します。</p></li>
+<li><p>CPHAはデータをサンプリングするクロックフェーズを示します。CPHA=0はリードインエッジでサンプリングすることを意味し、CPHA=1はリードアウトエッジでサンプリングすることを意味します。</p>
+<p>信号がサンプリングされる前に安定する必要がありますが、CPHA=0は、データが最初のクロックエッジの半分前に書き込まれることを意味します。チップセレクトによってそのデータが利用可能になった可能性があります。</p>
+</li>
+</ul>
+</div></blockquote>
+<p>チップの仕様書では「SPIモードXを使用する」という表現は必ずしも使われませんが、タイミングチャートによってCPOLおよびCPHAのモードが明確になります。</p>
+<p>SPIモード番号ではCPOLが高位ビット、CPHAが低位ビットです。チップのタイミングチャートがクロックが低レベルから始まり（CPOL=0）、データが後半のクロックエッジで安定してサンプリングされる（CPHA=1）場合、それはSPIモード1です。</p>
+<p>クロックモードはチップセレクトがアクティブになる直後に重要になります。マスターはスレーブを選択する前にクロックを非アクティブに設定しなければなりません。スレーブは自身のセレクトラインがアクティブになるときにクロックレベルをサンプリングして選んだ極性を判別します。これが多くのデバイスがモード0とモード3の両方をサポートする理由です。極性に興味はなく、常にクロックの上昇エッジでデータをクロックイン/アウトするからです。</p>
+</section>
+<section id="how-do-these-driver-programming-interfaces-work">
+<h2>ドライバプログラミングインターフェースはどのように動作するのでしょうか？<a class="headerlink" href="#how-do-these-driver-programming-interfaces-work" title="この見出しへのパーマリンク">¶</a></h2>
+<p>&lt;linux/spi/spi.h&gt;ヘッダーファイルおよびメインソースコードはどちらもkerneldocを含んでおり、カーネルAPIドキュメントのこの章を必ず読みましょう。これは概要であり、詳細な情報よりも全体像を把握するためのものです。</p>
+<p>SPIリクエストは常にI/Oキューに投入されます。特定のSPIデバイスのリクエストは常にFIFO順序で実行され、完了コールバックを通じて非同期的に完了します。また、これらの呼び出しには簡単な同期処理のラッパーも含まれており、コマンドを送信してその応答を読み取るなどの一般的なトランザクションタイプにも対応しています。</p>
+<p>SPIドライバには2つのタイプがあります。ここでは以下のように呼びます：</p>
+<blockquote>
+<div><dl class="simple">
+<dt>コントローラードライバ …</dt><dd><p>コントローラーはシステムオンチッププロセッサに組み込まれることがあり、多くの場合マスターおよびスレーブの両方の役割をサポートします。これらのドライバはハードウェアレジスタにアクセスし、DMAを用いることも可能です。あるいは、GPIOピンのみで動作するPIOビットバンガーや、PIOビットバンガーとして動作するものもあります。</p>
+</dd>
+<dt>プロトコルドライバ …</dt><dd><p>これらはコントローラードライバを通じてメッセージを送り、SPIリンクの他端にあるスレーブまたはマスター機器と通信します。</p>
+</dd>
+</dl>
+</div></blockquote>
+<p>たとえば、1つのプロトコルドライバはMTDレイヤーを通じてDataFlashなどのSPIフラッシュメモリに保存されたファイルシステムへのデータをエクスポートするかもしれません。また、他のドライバはオーディオインターフェースを制御したり、タッチスクリーンセンサーを入力インターフェースとして提示したり、産業プロセス中の温度や電圧レベルを監視したりするかもしれません。これらはすべて同じコントローラードライバを共有しているかもしれません。</p>
+<p>A “<a class="reference internal" href="../driver-api/spi.html#c.spi_device" title="spi_device"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">spi_device</span></code></a>「」はこの2種類のドライバ間のコントローラー側のインターフェースをまとめています。</p>
+<p>SPIプログラミングインターフェースの最小限のコアがあり、ドライバーモデルを使用してコントローラーとプロトコルドライバを接続するためのデバイステーブルをボード固有の初期化コードが提供することに焦点を当てています。SPIはsysfsにおいて複数の場所に表示されます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/devices/.../CTLR ... physical node for a given SPI controller
+
+/sys/devices/.../CTLR/spiB.C ... spi_device on bus "B",
+     chipselect C, accessed through CTLR.
+
+/sys/bus/spi/devices/spiB.C ... symlink to that physical
+     .../CTLR/spiB.C device
+
+/sys/devices/.../CTLR/spiB.C/modalias ... identifies the driver
+     that should be used with this device (for hotplug/coldplug)
+
+/sys/bus/spi/drivers/D ... driver for one or more spi*.* devices
+
+/sys/class/spi_master/spiB ... symlink (or actual device node) to
+     a logical node which could hold class related state for the SPI
+     master controller managing bus "B".  All spiB.* devices share one
+     physical SPI bus segment, with SCLK, MOSI, and MISO.
+
+/sys/devices/.../CTLR/slave ... virtual file for (un)registering the
+     slave device for an SPI slave controller.
+     Writing the driver name of an SPI slave handler to this file
+     registers the slave device; writing "(null)" unregisters the slave
+     device.
+     Reading from this file shows the name of the slave device ("(null)"
+     if not registered).
+
+/sys/class/spi_slave/spiB ... symlink (or actual device node) to
+     a logical node which could hold class related state for the SPI
+     slave controller on bus "B".  When registered, a single spiB.*
+     device is present here, possible sharing the physical SPI bus
+     segment with other SPI slave devices.
+</pre></div>
+</div>
+<p>コントローラーのクラス状態の実際の場所は、CONFIG_SYSFS_DEPRECATEDが有効になっているかどうかにより異なります。現在、クラス固有の状態はバス番号（「B」が「spiB」の「B」）のみであり、そのため/sys/classのエントリはバスを素早く特定するためのものです。</p>
+</section>
+<section id="how-does-board-specific-init-code-declare-spi-devices">
+<h2>ボード固有の初期化コードがSPIデバイスを宣言する方法は？<a class="headerlink" href="#how-does-board-specific-init-code-declare-spi-devices" title="この見出しへのパーマリンク">¶</a></h2>
+<p>LinuxはSPIデバイスを正しく構成するためにいくつかの情報が必要です。通常、その情報はボード固有のコードによって提供され、一部の自動検出/列挙をサポートするチップであっても同様です。</p>
+<section id="declare-controllers">
+<h3>コントローラーの宣言<a class="headerlink" href="#declare-controllers" title="この見出しへのパーマリンク">¶</a></h3>
+<p>最初の情報は、存在するSPIコントローラーの一覧です。SoC（システムオンチップ）ベースのボードでは、これらは通常プラットフォームデバイスであり、コントローラーは正しく動作するためにいくつかのプラットフォームデータが必要になる場合があります。"struct platform_device"には、コントローラーの最初のレジスタの物理アドレスやIRQなどのリソースが含まれます。</p>
+<p>プラットフォームではしばしば"register SPI controller"操作を抽象化し、ピン設定の初期化コードと結合するため、arch/…/mach-<em>/board-</em>.cファイルで複数のボードが同じ基本的なコントローラー設定コードを共有できます。これは、ほとんどのSoCが複数のSPI対応コントローラーを備えているためで、実際に使用可能なコントローラーのみが設定および登録されるべきです。</p>
+<p>したがって、例としてarch/…/mach-<em>/board-</em>.cファイルには次のようなコードが含まれるかもしれません：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;mach/spi.h&gt;   /* for mysoc_spi_data */
+
+/* if your mach-* infrastructure doesn't support kernels that can
+ * run on multiple boards, pdata wouldn't benefit from "__init".
+ */
+static struct mysoc_spi_data pdata __initdata = { ... };
+
+static __init board_init(void)
+{
+        ...
+        /* this board only uses SPI controller #2 */
+        mysoc_register_spi(2, &amp;pdata);
+        ...
+}
+</pre></div>
+</div>
+<p>そしてSoC固有のユーティリティコードは次のようになるかもしれません：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;mach/spi.h&gt;
+
+static struct platform_device spi2 = { ... };
+
+void mysoc_register_spi(unsigned n, struct mysoc_spi_data *pdata)
+{
+        struct mysoc_spi_data *pdata2;
+
+        pdata2 = kmalloc(sizeof *pdata2, GFP_KERNEL);
+        *pdata2 = pdata;
+        ...
+        if (n == 2) {
+                spi2-&gt;dev.platform_data = pdata2;
+                register_platform_device(&amp;spi2);
+
+                /* also: set up pin modes so the spi2 signals are
+                 * visible on the relevant pins ... bootloaders on
+                 * production boards may already have done this, but
+                 * developer boards will often need Linux to do it.
+                 */
+        }
+        ...
+}
+</pre></div>
+</div>
+<p>ボードごとのplatform_dataが異なることに注意してください。たとえば、1つのボードではSPIが外部クロックを使用し、他のボードではマスタクロックの現在の設定からSPIクロックを導出する場合があります。</p>
+</section>
+<section id="declare-slave-devices">
+<h3>スレーブデバイスの宣言<a class="headerlink" href="#declare-slave-devices" title="この見出しへのパーマリンク">¶</a></h3>
+<p>2番目の情報は、ターゲットボード上の存在するSPIスレーブデバイスの一覧で、ドライバが正しく動作するためにボード固有のデータが含まれていることが通常です。</p>
+<p>通常、arch/…/mach-<em>/board-</em>.cファイルは各ボードのSPIデバイスをリストする小さなテーブルを提供します。(これは通常非常に少数です。) それは次のようになるかもしれません：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static struct ads7846_platform_data ads_info = {
+        .vref_delay_usecs       = 100,
+        .x_plate_ohms           = 580,
+        .y_plate_ohms           = 410,
+};
+
+static struct spi_board_info spi_board_info[] __initdata = {
+{
+        .modalias       = "ads7846",
+        .platform_data  = &amp;ads_info,
+        .mode           = SPI_MODE_0,
+        .irq            = GPIO_IRQ(31),
+        .max_speed_hz   = 120000 /* max sample rate at 3V */ * 16,
+        .bus_num        = 1,
+        .chip_select    = 0,
+},
+};
+</pre></div>
+</div>
+<p>また、ボード固有の情報が提供されていることに注意してください。チップごとに複数の種類が必要な場合があります。この例では、ボード電圧に依存する最高速SPIクロックや、IRQピンの配線方法などの汎用的な制約、またはチップ固有の制約（あるピンのキャパシタンスによって変化する重要な遅延など）が示されています。</p>
+<p>(「controller_data」という情報もあります。これはコントローラードライバーにとって有用な情報です。例えば、ペリフェラル固有のDMAチューニングデータやチップセレクトコールバックなどが該当します。これは後述のspi_deviceに保存されます。)</p>
+<p>board_infoは、チップのドライバーがロードされる前でもシステムが動作するための十分な情報を提供する必要があります。その中で最も問題になるのは、spi_device.modeフィールド内のSPI_CS_HIGHビットです。なぜなら、バスを共有するデバイスがチップセレクトを「逆に」解釈する場合、インフラストラクチャがチップセレクトを解除する方法を知るまでは動作が不可能だからです。</p>
+<p>その後、ボード初期化コードではこのテーブルをSPIインフラストラクチャに登録し、SPIマスターコントローラードライバーが登録されるときに利用できるようにします。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>spi_register_board_info(spi_board_info, ARRAY_SIZE(spi_board_info));
+</pre></div>
+</div>
+<p>他の静的ボード固有の設定と同様に、これらはアンレジスタリングしません。</p>
+<p>広く利用されている「カードスタイル」のコンピュータは、メモリ、CPU、それ以外の部品をほぼ30平方センチメートルのカードに集約しています。このようなシステムでは、あなたの <code class="docutils literal notranslate"><span class="pre">arch/.../mach-.../board-*.c</span></code> ファイルは、このようなカードが挿さるメインボード上のデバイスに関する情報を主に提供します。これはSPIデバイスがカードコネクタを通じて接続されている場合も当然含まれます。</p>
+</section>
+<section id="non-static-configurations">
+<h3>非静的な設定<a class="headerlink" href="#non-static-configurations" title="この見出しへのパーマリンク">¶</a></h3>
+<p>開発ボードは製品ボードと異なるルールに従うことが多く、ホットプラグ可能なSPIデバイスおよび/またはコントローラーが必要な場合があります。</p>
+<p>そのようなケースでは、 <a class="reference internal" href="../driver-api/spi.html#c.spi_busnum_to_master" title="spi_busnum_to_master"><code class="xref c c-func docutils literal notranslate"><span class="pre">spi_busnum_to_master()</span></code></a> を用いてspiバスマスターを検索し、おそらく <a class="reference internal" href="../driver-api/spi.html#c.spi_new_device" title="spi_new_device"><code class="xref c c-func docutils literal notranslate"><span class="pre">spi_new_device()</span></code></a> を用いてホットプラグされたボードに基づいたボード情報の提供が必要です。もちろん、そのボードが除去された後には少なくとも <a class="reference internal" href="../driver-api/spi.html#c.spi_unregister_device" title="spi_unregister_device"><code class="xref c c-func docutils literal notranslate"><span class="pre">spi_unregister_device()</span></code></a> を呼び出します。</p>
+<p>LinuxがSPIを通じてMMC/SD/SDIO/DataFlashカードのサポートを含む場合、これらの設定も動的になります。幸いなことに、このようなデバイスはすべて基本的なデバイス識別プローブをサポートしているため、ホットプラグが通常通り動作するはずです。</p>
+</section>
+</section>
+<section id="how-do-i-write-an-spi-protocol-driver">
+<h2>私はどのように「SPIプロトコルドライバー」を書くべきですか？<a class="headerlink" href="#how-do-i-write-an-spi-protocol-driver" title="この見出しへのパーマリンク">¶</a></h2>
+<p>現在、ほとんどのSPIドライバーはカーネルドライバーですが、ユーザー空間ドライバーのサポートもあります。ここではカーネルドライバーについてのみ説明します。</p>
+<p>SPIプロトコルドライバーはプラットフォームデバイスドライバーに若干似ています：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static struct spi_driver CHIP_driver = {
+        .driver = {
+                .name           = "CHIP",
+                .owner          = THIS_MODULE,
+                .pm             = &amp;CHIP_pm_ops,
+        },
+
+        .probe          = CHIP_probe,
+        .remove         = CHIP_remove,
+};
+</pre></div>
+</div>
+<p>ドライバコアは、ボード情報(board_info)が「CHIP」というmodaliasを指定したSPIデバイスに自動的にこのドライバをバインドしようとします。probe()関数のコードは、バスを管理しているデバイスを除いて、このように見えるでしょう。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static int CHIP_probe(struct spi_device *spi)
+{
+        struct CHIP                     *chip;
+        struct CHIP_platform_data       *pdata;
+
+        /* assuming the driver requires board-specific data: */
+        pdata = &amp;spi-&gt;dev.platform_data;
+        if (!pdata)
+                return -ENODEV;
+
+        /* get memory for driver's per-chip state */
+        chip = kzalloc(sizeof *chip, GFP_KERNEL);
+        if (!chip)
+                return -ENOMEM;
+        spi_set_drvdata(spi, chip);
+
+        ... etc
+        return 0;
+}
+</pre></div>
+</div>
+<p>probe()関数に入った瞬間、ドライバはSPIデバイスに対してI/Oリクエストを送信できます。『<a class="reference internal" href="../driver-api/spi.html#c.spi_message" title="spi_message"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">spi_message</span></code></a>』を使用します。remove()関数が返るか、probe()関数が失敗した後、ドライバはこのようなメッセージをもう送信しなくなります。</p>
+<blockquote>
+<div><ul>
+<li><p>spi_messageは、プロトコル操作のシーケンスで、1つのアトミックなシーケンスとして実行されます。SPIドライバの制御には以下の項目があります：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>双方向の読み書きが開始するタイミング…spi_transferリクエストのシーケンスがどのように配置されるかによって決まります；</p></li>
+<li><p>どのI/Oバッファが使用されるか…各spi_transferは、送信方向と受信方向それぞれにバッファをラップし、フルダプル（2つのポインタ、両方で同じポインタを用いる場合もあり）およびハーフダプル（1つのポインタがNULL）の転送をサポートします；</p></li>
+<li><p>転送後に短い遅延をオプションで定義…spi_transfer.delay_usecs設定を使用します（バッファ長がゼロの場合、この遅延がプロトコルの唯一の効果となることがあります）；</p></li>
+<li><p>転送後にチップセレクトが無効になるかどうかおよびその遅延…spi_transfer.cs_changeフラグを使用します；</p></li>
+<li><p>次のメッセージが同じデバイスに送られる可能性があるかどうかのヒント…そのアトミックなグループの最後の転送でspi_transfer.cs_changeフラグを使用し、チップのディセレクトおよびセレクト操作のコストを節約する可能性があります。</p></li>
+</ul>
+</div></blockquote>
+</li>
+<li><p>標準のカーネルルールに従い、メッセージにDMAセーフなバッファを提供してください。これにより、DMAを使用するコントローラードライバは、ハードウェアが要求する場合を除き、余分なコピーを強制されません（例：ハードウェアのエラーラタを回避するためのバウンスバッファの使用を強制する場合）。</p>
+<p>標準のdma_map_single()処理がこれらのバッファに不適切な場合、spi_message.is_dma_mappedを使用してコントローラードライバに、関連するDMAアドレスをすでに提供したことを通知できます。</p>
+</li>
+<li><p>基本的なI/Oの原始操作は <a class="reference internal" href="../driver-api/spi.html#c.spi_async" title="spi_async"><code class="xref c c-func docutils literal notranslate"><span class="pre">spi_async()</span></code></a>です。非同期リクエストは、任意のコンテキスト（割込みハンドラ、タスクなど）で発行でき、完了はメッセージとともに提供されるコールバックで報告されます。検出されたエラー後、チップはディセレクトされ、そのspi_messageの処理は中止されます。</p></li>
+<li><p>同期的なラッパーもあります、例えば <a class="reference internal" href="../driver-api/spi.html#c.spi_sync" title="spi_sync"><code class="xref c c-func docutils literal notranslate"><span class="pre">spi_sync()</span></code></a>、およびラッパーもあります、例えば <a class="reference internal" href="../driver-api/spi.html#c.spi_read" title="spi_read"><code class="xref c c-func docutils literal notranslate"><span class="pre">spi_read()</span></code></a>, <a class="reference internal" href="../driver-api/spi.html#c.spi_write" title="spi_write"><code class="xref c c-func docutils literal notranslate"><span class="pre">spi_write()</span></code></a>, and <a class="reference internal" href="../driver-api/spi.html#c.spi_write_then_read" title="spi_write_then_read"><code class="xref c c-func docutils literal notranslate"><span class="pre">spi_write_then_read()</span></code></a>。これらは、スリープ可能なコンテキストでのみ発行でき、すべてがクリーン（かつ小型で、「オプション」的な）レイヤーです。 <a class="reference internal" href="../driver-api/spi.html#c.spi_async" title="spi_async"><code class="xref c c-func docutils literal notranslate"><span class="pre">spi_async()</span></code></a>.</p></li>
+<li><p>以下の <a class="reference internal" href="../driver-api/spi.html#c.spi_write_then_read" title="spi_write_then_read"><code class="xref c c-func docutils literal notranslate"><span class="pre">spi_write_then_read()</span></code></a> call, and convenience wrappers around it, should only be used with small amounts of data where the cost of an extra copy may be ignored. It’s designed to support common RPC-style requests, such as writing an eight bit command and reading a sixteen bit response – <a class="reference internal" href="../driver-api/spi.html#c.spi_w8r16" title="spi_w8r16"><code class="xref c c-func docutils literal notranslate"><span class="pre">spi_w8r16()</span></code></a> being one of its wrappers, doing exactly that.</p></li>
+</ul>
+</div></blockquote>
+<p>Some drivers may need to modify spi_device characteristics like the transfer mode, wordsize, or clock rate. This is done with <a class="reference internal" href="../driver-api/spi.html#c.spi_setup" title="spi_setup"><code class="xref c c-func docutils literal notranslate"><span class="pre">spi_setup()</span></code></a>, which would normally be called from probe() before the first I/O is done to the device. However, that can also be called at any time that no message is pending for that device.</p>
+<p>While “spi_device” would be the bottom boundary of the driver, the upper boundaries might include sysfs (especially for sensor readings), the input layer, ALSA, networking, MTD, the character device framework, or other Linux subsystems.</p>
+<p>Note that there are two types of memory your driver must manage as part of interacting with SPI devices.</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>I/O buffers use the usual Linux rules, and must be DMA-safe. You’d normally allocate them from the heap or free page pool. Don’t use the stack, or anything that’s declared “static”.</p></li>
+<li><p>The spi_message and spi_transfer metadata used to glue those I/O buffers into a group of protocol transactions. These can be allocated anywhere it’s convenient, including as part of other allocate-once driver data structures. Zero-init these.</p></li>
+</ul>
+</div></blockquote>
+<p>If you like, spi_message_alloc() and spi_message_free() convenience routines are available to allocate and zero-initialize an spi_message with several transfers.</p>
+</section>
+<section id="how-do-i-write-an-spi-master-controller-driver">
+<h2>How do I write an “SPI Master Controller Driver”?<a class="headerlink" href="#how-do-i-write-an-spi-master-controller-driver" title="この見出しへのパーマリンク">¶</a></h2>
+<p>An SPI controller will probably be registered on the platform_bus; write a driver to bind to the device, whichever bus is involved.</p>
+<p>The main task of this type of driver is to provide an “spi_master”. Use spi_alloc_master() to allocate the master, and spi_master_get_devdata() to get the driver-private data allocated for that device.</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct spi_master       *master;
+struct CONTROLLER       *c;
+
+master = spi_alloc_master(dev, sizeof *c);
+if (!master)
+        return -ENODEV;
+
+c = spi_master_get_devdata(master);
+</pre></div>
+</div>
+<p>The driver will initialize the fields of that spi_master, including the bus number (maybe the same as the platform device ID) and three methods used to interact with the SPI core and SPI protocol drivers. It will also initialize its own internal state. (See below about bus numbering and those methods.)</p>
+<p>After you initialize the spi_master, then use spi_register_master() to publish it to the rest of the system. At that time, device nodes for the controller and any predeclared spi devices will be made available, and the driver model core will take care of binding them to drivers.</p>
+<p>SPIコントローラードライバーを削除する必要がある場合、spi_unregister_master()はspi_register_master()の効果を逆にする。</p>
+<section id="bus-numbering">
+<h3>バス番号付け<a class="headerlink" href="#bus-numbering" title="この見出しへのパーマリンク">¶</a></h3>
+<p>バス番号付けは重要です。これはLinuxが特定のSPIバス（共有SCK、MOSI、MISO）を識別する方法です。有効なバス番号はゼロから始まります。SoCシステムでは、バス番号はチップメーカーが定義した番号と一致させる必要があります。たとえば、ハードウェアコントローラーSPI2はバス番号2に、それに接続されたデバイスのspi_board_infoはこの番号を使用します。</p>
+<p>ハードウェア割り当てられたバス番号を持っていない場合、または何らかの理由で番号を割り当てられない場合は、負のバス番号を提供してください。これにより、動的に割り当てられた番号に置き換えられます。この場合、非静的構成として扱う必要があります（上記参照）。</p>
+</section>
+<section id="spi-master-methods">
+<h3>SPIマスターメソッド<a class="headerlink" href="#spi-master-methods" title="この見出しへのパーマリンク">¶</a></h3>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">master-&gt;setup(struct</span> <span class="pre">spi_device</span> <span class="pre">*spi)</span></code></dt><dd><p>この機能はデバイスのクロック周波数、SPIモード、ワードサイズを設定します。ドライバーはboard_infoで提供されるデフォルトを変更し、spi_setup(spi)を呼び出してこの手順を実行できます。この関数はスリープする可能性があります。</p>
+<p>各SPIスレーブが独自の設定レジスタを持つ場合でない限り、すぐに変更しないでください…それ以外にドライバーが他のSPIデバイスの進行中のI/Oを破損させる可能性があります。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>BUGアラート：多くのspi_masterドライバーの最初のバージョンはなぜかこの処理を誤って実行しているようです。setup()をコードする際、コントローラーが他のデバイスの転送を処理中であると仮定してください。</p>
+</div>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">master-&gt;cleanup(struct</span> <span class="pre">spi_device</span> <span class="pre">*spi)</span></code></dt><dd><p>コントローラードライバーはspi_device.controller_stateを使用して、そのデバイスに動的に関連付ける状態を保持できます。このような場合、状態を解放するcleanup()メソッドを提供する必要があります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">master-&gt;prepare_transfer_hardware(struct</span> <span class="pre">spi_master</span> <span class="pre">*master)</span></code></dt><dd><p>キュー機構がドライバーにメッセージが間もなく到着するという信号を送るため呼び出されます。この呼び出しにより、サブシステムがドライバーに転送ハードウェアの準備を求めるため、この関数を実行します。この関数はスリープする可能性があります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">master-&gt;unprepare_transfer_hardware(struct</span> <span class="pre">spi_master</span> <span class="pre">*master)</span></code></dt><dd><p>キュー機構がドライバーにキューに待機中のメッセージがなくなったことを通知するため呼び出されます。これにより、ドライバーはハードウェアをリラックスさせる（例：電源管理呼び出し）ことができます。この関数はスリープする可能性があります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">master-&gt;transfer_one_message(struct</span> <span class="pre">spi_master</span> <span class="pre">*master,</span> <span class="pre">struct</span> <span class="pre">spi_message</span> <span class="pre">*mesg)</span></code></dt><dd><p>サブシステムは、同時に到着する転送をキューに積みながら、単一のメッセージをドライバーに転送します。ドライバーがこのメッセージを完了した後、
+<a class="reference internal" href="../driver-api/spi.html#c.spi_finalize_current_message" title="spi_finalize_current_message"><code class="xref c c-func docutils literal notranslate"><span class="pre">spi_finalize_current_message()</span></code></a> サブシステムが次のメッセージを送信できるようにするため、この関数を呼び出す必要があります。この関数はスリープする可能性があります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">master-&gt;transfer_one(struct</span> <span class="pre">spi_master</span> <span class="pre">*master,</span> <span class="pre">struct</span> <span class="pre">spi_device</span> <span class="pre">*spi,</span> <span class="pre">struct</span> <span class="pre">spi_transfer</span> <span class="pre">*transfer)</span></code></dt><dd><p>サブシステムは、同時に到着する転送をキューに積みながら、単一の転送をドライバーに転送します。ドライバーがこの転送を完了した後、
+<a class="reference internal" href="../driver-api/spi.html#c.spi_finalize_current_transfer" title="spi_finalize_current_transfer"><code class="xref c c-func docutils literal notranslate"><span class="pre">spi_finalize_current_transfer()</span></code></a> したがってサブシステムは次のトランスファーを実行できます。これは待機する可能性があります。注意: transfer_one と transfer_one_message は排他的に使用され、両方が設定されている場合、汎用サブシステムは transfer_one コールバックを呼びません。</p>
+<p>戻り値:</p>
+<ul class="simple">
+<li><p>負の errno: エラー</p></li>
+<li><p>0: トランスファーが完了しました</p></li>
+<li><p>1: トランスファーが進行中です</p></li>
+</ul>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">master-&gt;set_cs_timing(struct</span> <span class="pre">spi_device</span> <span class="pre">*spi,</span> <span class="pre">u8</span> <span class="pre">setup_clk_cycles,</span> <span class="pre">u8</span> <span class="pre">hold_clk_cycles,</span> <span class="pre">u8</span> <span class="pre">inactive_clk_cycles)</span></code></dt><dd><p>このメソッドは、SPI クライアントドライバが SPI マスターコントローラーにデバイス固有の CS セットアップ、ホルド、非アクティブタイミングの要件を設定するようリクエストできます。</p>
+</dd>
+</dl>
+</section>
+<section id="deprecated-methods">
+<h3>非推奨のメソッド<a class="headerlink" href="#deprecated-methods" title="この見出しへのパーマリンク">¶</a></h3>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">master-&gt;transfer(struct</span> <span class="pre">spi_device</span> <span class="pre">*spi,</span> <span class="pre">struct</span> <span class="pre">spi_message</span> <span class="pre">*message)</span></code></dt><dd><p>このメソッドは待機してはいけません。責任はトランスファーが実行され、complete() コールバックが発行されるようにすることです。通常、他のトランスファーが完了した後、またはコントローラーがアイドル状態であればキックスタートが必要です。このメソッドはキューイングされたコントローラーでは使用されず、transfer_one_message() および (un)prepare_transfer_hardware() が実装されている場合は NULL でなければなりません。</p>
+</dd>
+</dl>
+</section>
+<section id="spi-message-queue">
+<h3>SPI メッセージキュー<a class="headerlink" href="#spi-message-queue" title="この見出しへのパーマリンク">¶</a></h3>
+<p>SPI サブシステムが提供する標準的なキューイングメカニズムに満足している場合は、上記のキューイングメソッドを実装するだけでよいです。メッセージキューを使用すると、多くのコードを集中化し、純粋なプロセスコンテキストでのメソッド実行が可能になります。また、高優先度の SPI 通信ではメッセージキューをリアルタイム優先度に昇格させることも可能です。</p>
+<p>SPI サブシステムのキューイングメカニズムが選択されていない場合、ドライバの大部分は現在非推奨の関数 transfer() で供給される I/O キューを管理することになります。</p>
+<p>そのキューは純粋に概念的かもしれません。たとえば、低周波数センサーへのアクセス専用のドライバであれば、同期 PIO を使用しても問題ありません。</p>
+<p>しかし、キューはおそらく現実的であり、message-&gt;queue、PIO、DMA（特にルートファイルシステムが SPI フラッシュメモリにある場合）、IRQ ハンドラ、タスケット、ワークキュー（keventd など）などの実行コンテキストを使用します。ドライバは必要に応じて複雑でも単純でも構いません。このような transfer() メソッドは通常、メッセージをキューに追加し、その後非同期トランスファーエンジンを開始します（既に実行中であれば除きます）。</p>
+</section>
+</section>
+<section id="thanks-to">
+<h2>感謝します<a class="headerlink" href="#thanks-to" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Linux-SPI ディスカッションに貢献した人物（アルファベット順、姓で並べた）:</p>
+<ul class="simple">
+<li><p>Mark Brown</p></li>
+<li><p>David Brownell</p></li>
+<li><p>Russell King</p></li>
+<li><p>Grant Likely</p></li>
+<li><p>Dmitry Pervushin</p></li>
+<li><p>Stephen Street</p></li>
+<li><p>Mark Underwood</p></li>
+<li><p>Andrew Victor</p></li>
+<li><p>リンス・ウォレイ</p></li>
+<li><p>Vitaly Wool</p></li>
+</ul>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">シリアルペリフェラルインターフェース（SPI）</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">LinuxカーネルSPIサポートの概要</a></li>
+<li class="toctree-l2"><a class="reference internal" href="spidev.html">SPIユーザースペースAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="butterfly.html">spi_butterfly - parport-to-butterfly アダプタードライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pxa2xx.html">PXA2xx SSPドライバでのSPI HOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="spi-lm70llp.html">spi_lm70llp : LM70-LLP parport-to-SPI アダプタ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="spi-sc18is602.html">カーネルドライバ spi-sc18is602</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">シリアルペリフェラルインターフェース（SPI）</a><ul>
+<li>前へ: <a href="index.html" title="前章">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li>次へ: <a href="spidev.html" title="次章">SPIユーザースペースAPI</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/spi/spi-summary.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

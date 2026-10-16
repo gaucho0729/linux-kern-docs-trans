@@ -1,0 +1,259 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>NO_HZ: スケジューリングクロックティックの削減 — Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="timekeeping.html" rel="next" title="クロックソース、クロックイベント、sched_clock() およびディレイタイマ"/>
+<link href="hrtimers.html" rel="prev" title="hrtimers - 高解像度カーネルタイマーサブシステム"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="no-hz-reducing-scheduling-clock-ticks">
+<h1>NO_HZ: スケジューリングクロックティックの削減<a class="headerlink" href="#no-hz-reducing-scheduling-clock-ticks" title="この見出しへのパーマリンク">¶</a></h1>
+<p>このドキュメントは、スケジューリングクロック割込みの数を減らすために使用可能なKconfigオプションとブートパラメータについて説明しています。これによりエネルギー効率が向上し、OSのジャイター（不規則なタイミング）が軽減されます。OSのジャイターを軽減することは、計算量が大きい高性能コンピューティング（HPC）アプリケーションやリアルタイムアプリケーションにおいて特に重要です。</p>
+<p>スケジューリングクロック割込み（「スケジューリングクロックティック」または単に「ティック」とも呼ばれる）の管理には以下の3つの主な方法があります：</p>
+<ol class="arabic simple">
+<li><p>スケジューリングクロックティックを常に省略しない（CONFIG_HZ_PERIODIC=y または古いカーネル用の CONFIG_NO_HZ=n）。通常はこのオプションを選択したくありません。</p></li>
+<li><p>アイドル状態のCPUでスケジューリングクロックティックを省略する（CONFIG_NO_HZ_IDLE=y または古いカーネル用の CONFIG_NO_Z=y）。これは最も一般的なアプローチであり、デフォルトで選択すべきです。</p></li>
+<li><p>アイドル状態または1つの実行可能タスクのみを持つCPUでスケジューリングクロックティックを省略する（CONFIG_NO_HZ_FULL=y）。リアルタイムアプリケーションや特定のHPCワークロードを実行していない限り、通常はこのオプションを選択したくありません。</p></li>
+</ol>
+<p>これらの3つのケースについては以下の3つのセクションで説明し、その後にRCU（Read-Copy-Update）に特有の考慮点、テストに関するセクション、最後に既知の問題一覧のセクションが続きます。</p>
+<section id="never-omit-scheduling-clock-ticks">
+<h2>スケジューリングクロックティックの省略を行わない<a class="headerlink" href="#never-omit-scheduling-clock-ticks" title="この見出しへのパーマリンク">¶</a></h2>
+<p>1990年代および2000年代前半の非常に古いLinuxバージョンはスケジューリングクロックティックの省略が不可能です。この古いアプローチが依然として適切な場合があります。たとえば、多数のタスクが短いCPU使用量で動作し、非常に頻繁なアイドル期間があるが、これらのアイドル期間が数十マイクロ秒から数百マイクロ秒程度しかない重いワークロードでは、スケジューリングクロック割込みが通常自動的に送信されます。このようなケースでは、スケジューリングクロック割込みをオフにしても、アイドル状態への切り替えやユーザーモードとカーネルモードの切り替えのオーバーヘッドを増やすだけです。</p>
+<p>この動作モードはCONFIG_HZ_PERIODIC=y（または古いカーネル用のCONFIG_NO_HZ=n）で選択できます。</p>
+<p>ただし、長時間アイドル状態になる軽い負荷のワークロードを実行している場合、スケジューリングクロック割込みを省略しないと過剰な電力消費が発生します。これは特にバッテリー駆動のデバイスでは、極めて短いバッテリー寿命をもたらします。軽いワークロードを実行している場合は、以下のセクションを読むべきです。</p>
+<p>さらに、リアルタイムワークロードまたは短いイテレーションを持つHPCワークロードを実行している場合、スケジューリングクロック割込みはアプリケーションのパフォーマンスを低下させる可能性があります。このようなワークロードを実行している場合は、以下の2つのセクションを読むべきです。</p>
+</section>
+<section id="omit-scheduling-clock-ticks-for-idle-cpus">
+<h2>アイドルCPU向けスケジューリングクロックティックの省略<a class="headerlink" href="#omit-scheduling-clock-ticks-for-idle-cpus" title="この見出しへのパーマリンク">¶</a></h2>
+<p>CPUがアイドル状態にある場合、スケジューリングクロック割込みを送る意味はありません。畢竟、スケジューリングクロック割込みの主な目的は、忙しいCPUが複数のタスクに注意を移すことを強制することであり、アイドル状態のCPUには移すタスクがありません。</p>
+<p>CONFIG_NO_HZ_IDLE=yというKconfigオプションは、アイドル状態のCPUにスケジューリングクロック割込みを送らないようにカーネルを動作させ、これはバッテリー駆動デバイスや高密度仮想化されたメインフレームにとって極めて重要です。CONFIG_HZ_PERIODIC=yのカーネルを実行するバッテリー駆動デバイスは、CONFIG_NO_HZ_IDLE=yのカーネルを実行する同様のデバイスに比べて、バッテリーを極めて速く消費します。たとえば、1,500個のOSインスタンスを実行するメインフレームでは、不要なスケジューリングクロック割込みによってCPU時間の半分が消費される可能性があります。このような状況では、アイドルCPUにスケジューリングクロック割込みを送らないことが強く推奨されます。ただし、dyntick-idleモードにはコストがあります：</p>
+<ol class="arabic simple">
+<li><p>アイドルループへの移動経路で実行されるインストラクション数が増加します。</p></li>
+<li><p>多くのアーキテクチャでは、dyntick-idleモードは高コストなクロック再設定操作の数も増加させます。</p></li>
+</ol>
+<p>そのため、厳しいリアルタイム応答制約を持つシステムでは、CONFIG_HZ_PERIODIC=yのカーネル（または古いカーネルではCONFIG_NO_HZ=n）を実行して、アイドルからの遷移遅延を低下させることが一般的です。</p>
+<p>スケジューリングクロック割込みを受けていないアイドルCPUは、「dyntick-idle」「dyntick-idleモード」「nohzモード」、「tickless（チックレス）」と呼ばれます。このドキュメントでは「dyntick-idleモード」を使用します。</p>
+<p>また、「nohz=」というブートパラメータがあり、CONFIG_NO_HZ_IDLE=yのカーネルでdyntick-idleモードを無効化できます。指定方法は「nohz=off」です。デフォルトでは、CONFIG_NO_HZ_IDLE=yのカーネルは「nohz=on」で起動し、dyntick-idleモードを有効にします。</p>
+</section>
+<section id="omit-scheduling-clock-ticks-for-cpus-with-only-one-runnable-task">
+<h2>1つの実行可能なタスクのみを持つCPUにおけるスケジューリングクロックティックを省略する<a class="headerlink" href="#omit-scheduling-clock-ticks-for-cpus-with-only-one-runnable-task" title="この見出しへのパーマリンク">¶</a></h2>
+<p>1つの実行可能なタスクのみを持つCPUには、他のタスクに切り替わる必要がないため、スケジューリングクロック割込みを送信する意義は小さいです。注意点として、1つの実行可能なタスクを持つCPUにおけるスケジューリングクロックティックの省略は、アイドル状態のCPUにも同様に適用されます。</p>
+<p>CONFIG_NO_HZ_FULL=yというKconfigオプションは、単一の実行可能なタスクを持つCPUにスケジューリングクロック割込みを送信しないようにカーネルを動作させます。このようなCPUは「アダプティブティックCPU」と呼ばれます。これは、厳しいリアルタイム応答制約を持つアプリケーションにとって重要です。なぜなら、スケジューリングクロック割込みの最大の期間を最悪応答時間を改善できるからです。また、計算負荷が高い短いイテレーションワークロードにおいても重要です。あるCPUが特定のイテレーション中に遅延した場合、他のすべてのCPUはその遅延CPUが完了するまでアイドル状態で待機せざるを得ません。このため、遅延はCPUの数より1少ない倍になるため、このような状況では再びスケジューリングクロック割込みを送信しないことが強く推奨されます。</p>
+<p>デフォルトでは、どのCPUもアダプティブティックCPUではありません。『nohz_full=』というブートパラメータはアダプティブティックCPUを指定します。例えば『nohz_full=1,6-8』はCPU 1、6、7、8をアダプティブティックCPUとします。注意点として、すべてのCPUをアダプティブティックCPUにすることはできません。時刻保持タスクを処理するために少なくとも1つの非アダプティブティックCPUがオンラインで動作している必要があります。これにより、gettimeofday()などのシステムコールがアダプティブティックCPUで正確な値を返すことが保証されます。(これはCONFIG_NO_HZ_IDLE=yの場合には問題ではありません。なぜなら、実行中のユーザープロセスがなく、時計速度のわずかなずれを観測する必要がないからです。)そのため、ブートCPUはアダプットティックモードに入ることはできません。『nohz_full=』マスクにブートCPUを含めると、ブート時のエラーメッセージが表示され、ブートCPUはマスクから削除されます。このため、CONFIG_NO_HZ_FULL=yが有効になるにはシステムに少なくとも2つのCPUが必要です。</p>
+<p>最後に、アダプティブティックCPUはRCUコールバックをオフロードする必要があります。これは以下の「RCUの影響」セクションで説明します。</p>
+<p>通常、CPUはアダプティブティックモードを可能な限り維持します。特に、カーネルモードへの移行は自動的にモードを変更しません。CPUは必要がある場合にのみアダプティブティックモードから退出します。たとえば、そのCPUがRCUコールバックをキューイングした場合です。</p>
+<p>dyntick-idleモードと同様に、適応ティックモードの恩恵は無料ではありません:</p>
+<ol class="arabic simple">
+<li><p>CONFIG_NO_HZ_FULLはCONFIG_NO_HZ_COMMONを選択するため、適応ティックを実行するには同時にdyntick-idleも実行する必要があります。この依存関係は実装にも及ぶため、CONFIG_NO_HZ_IDLEのすべてのコストがCONFIG_NO_HZ_FULLにも発生します。</p></li>
+<li><p>ユーザー/カーネルの遷移は、カーネルサブシステム（例：RCU）にモード変更を通知する必要があるため、やや高コストになります。</p></li>
+<li><p>POSIX CPUタイマはCPUが適応ティックモードに入るのを防ぎます。CPU時間の消費に基づいて動作するリアルタイムアプリケーションは、他の方法を使用する必要があります。</p></li>
+<li><p>ハードウェアが処理可能な待機中のperfイベントがより多くある場合、通常はラウンドロビン方式ですべてを収集します。適応ティックモードはこのラウンドロビンを防ぐ可能性があります。この問題は、大量のperfイベントを待機中のCPUが適応ティックモードに入らないようにすることで修正されるでしょう。</p></li>
+<li><p>適応ティックCPUのスケジューラ統計は、非適応ティックCPUとはやや異なります。これにより、リアルタイムタスクのロードバランシングに影響を与える可能性があります。</p></li>
+</ol>
+<p>改善は時間とともに進むと予想されていますが、リアルタイムおよび計算密集型アプリケーションには非常に有用です。しかし、上記の欠点があるため、適応ティックはまだデフォルトで有効にするべきではありません。</p>
+</section>
+<section id="rcu-implications">
+<h2>RCUの影響<a class="headerlink" href="#rcu-implications" title="この見出しへのパーマリンク">¶</a></h2>
+<p>アイドルCPUがdyntick-idleモードまたは適応ティックモードに入るのを許可できない状況があります。最も一般的なのは、そのCPUにRCUコールバックが待機している場合です。</p>
+<p>CONFIG_RCU_FAST_NO_HZ=y Kconfigオプションを使用すると、このようなCPUがdyntick-idleモードまたは適応ティックモードに入るよう強制されます。この場合、これらのCPUは4jiffiesごとにタイマで起動され、RCUコールバックがタイムリーに処理されるようにします。</p>
+<p>別のアプローチは、CONFIG_RCU_NOCB_CPU=y Kconfigオプションを使用してRCUコールバック処理を「rcuo」kthreadにオフロードすることです。オフロードするCPUは「rcu_nocbs=」カーネル起動パラメータで指定します。これはコンマ区切りのCPU番号や範囲（例：「1,3-5」はCPU1、3、4、5）を指定します。</p>
+<p>オフロードされたCPUはRCUコールバックをキューに入れることはありません。したがって、RCUはオフロードされたCPUがdyntick-idleモードまたはadaptive-tickモードに移行することを防ぐことはありません。ただし、ユーザー空間で「rcuo」kthreadを特定のCPUに固定する必要がある場合があります。それ以外の場合は、スケジューラがそれらを実行する場所を決定しますが、それが望む場所であるかどうかは不明です。</p>
+</section>
+<section id="testing">
+<h2>テスト<a class="headerlink" href="#testing" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このドキュメントで説明したすべてのOSジャイター機能を有効にしても、ワークロードの動作に変化が見られない場合があります。これは、ワークロードがOSジャイターにどれほど影響されるかという点では、それほど影響を受けない可能性があるからです。あるいは、他の何かが原因かもしれません。このセクションでは、OSジャイターの有無を評価するための簡単なテストスイートを提供し、以下のgitアーカイブのmasterブランチで入手できます：</p>
+<p>git://git.kernel.org/pub/scm/linux/kernel/git/frederic/dynticks-testing.git</p>
+<p>このアーカイブをクローンし、READMEファイルの指示に従ってください。このテスト手順により生成されるトレースは、OSジャイターをシステムから完全に除去したかどうかを評価するのに役立ちます。このトレースがOSジャイターを可能な限り除去したことを示す場合、ワークロードがOSジャイターに対してそれほど敏感でないことを結論付けることができます。</p>
+<p>注意：このテストでは、システムに少なくとも2つのCPUが必要です。シングルCPUシステムからOSジャイターを除去する方法は現時点では十分にありません。</p>
+</section>
+<section id="known-issues">
+<h2>既知の問題<a class="headerlink" href="#known-issues" title="この見出しへのパーマリンク">¶</a></h2>
+<ul>
+<li><p>dyntick-idleモードは、アイドル状態への移行をやや遅くします。実際には、最も積極的なリアルタイムワークロード以外では問題になりません。これらのワークロードは、dyntick-idleモードを無効にするオプションがありますが、ほとんどの場合そのオプションを採用しています。ただし、一部のワークロードは、スケジューリングクロック割り込み遅延を削除するためにアダプティブティックを使用したいと考えるでしょう。以下に、これらのワークロード向けのオプションを示します：</p>
+<ol class="loweralpha simple">
+<li><p>ユーザー空間からPMQOSを使用して、遅延要件をカーネルに通知してください（推奨）。</p></li>
+<li><p>x86システムでは、「idle=mwait」ブートパラメータを使用してください。</p></li>
+</ol>
+<p>c. x86システムでは、「intel_idle.max_cstate=」を使用して、最大C状態の深さを制限してください。</p>
+<ol class="loweralpha simple" start="4">
+<li><p>x86システムでは、「idle=poll」ブートパラメータを使用してください。ただし、このパラメータを使用するとCPUが過熱する可能性があり、これにより熱的制限が遅延を悪化させることがあります。この悪化はdyntick-idleよりもさらに深刻になる可能性があります。さらに、このパラメータはIntel CPUのTurboモードを有効にしないので、最大性能が大幅に低下する可能性があります。</p></li>
+</ol>
+</li>
+<li><p>アダプティブ・ティックスはユーザー/カーネルの遷移をやや遅くします。計算負荷の高いワークロードではこのような遷移が少ないため、問題にはならないと予想されます。他のワークロードがこの効果にどの程度影響されるかを正確に評価するには、慎重なベンチマークが求められます。</p></li>
+<li><p>アダプティブ・ティックスは、特定のCPUに対して実行可能なタスクが1つだけの場合に限り動作します。ただし、スケジューリングクロックの使用が不要な状況は他にもいくつかあります。たとえば、あるCPUが1つの実行可能な高優先度SCHED_FIFOタスクと任意の数の低優先度SCHED_OTHERタスクを持つ場合を考えてみましょう。この場合、CPUはSCHED_FIFOタスクをブロックするか、他の高優先度タスクがこのCPUにアタッチされるまで実行し続ける必要があります。したがって、このCPUにスケジューリングクロック割り込みを送る必要はありません。しかし、現在の実装では、単一の実行可能なSCHED_FIFOタスクと複数の実行可能なSCHED_OTHERタスクを持つCPUに対して依然としてスケジューリングクロック割り込みを送っています。これらは不要な割り込みです。</p>
+<p>また、特定のCPUに複数の実行可能なタスクがある場合でも、現在実行中のタスクのタイムスライスが期限切れするまでCPUを割り込みで中断する意義はほとんどありません。タイムスライスは通常、次のスケジューリングクロック割り込みよりもはるかに長く続きます。</p>
+<p>このような状況の処理改善は今後の課題です。</p>
+</li>
+<li><p>アダプティブアイドルとRCUコールバックオフローディングの再構成には再起動が必要です。必要に応じてランタイムでの再構成が提供されるかもしれませんが、RCUをランタイムで再構成する複雑さのため、地動的な理由が必要です。特に、すべてのCPUからRCUコールバックをオフロードし、いつでも好きなタイミングで指定した場所にピン止めするという単純なオプションがあります。</p></li>
+<li><p>OSのジャイター（ノイズ）の他の原因、例えば割り込みやシステムユーティリティタスク・プロセスを処理するには追加の設定が必要です。通常、これは割り込みやタスクを特定のCPUにバインドする設定を含みます。</p></li>
+<li><p>現在、OSのジャイターの一部の原因はワークロードを制限することによってのみ解消可能です。例えば、グローバルTLBショットダウンによるOSのジャイターを解消する唯一の方法は、その原因となるマッピング解除操作（カーネルモジュールのアンロード操作など）を避けることです。また、ページフォルトやTLBミスは、ヒューゲページを使用したり、アプリケーションが使用するメモリ量を制限することで減少（一部のケースでは完全に解消）させることができます。ワーキングセットのプリフォルトも有効ですが、特にmlock()やmlockall()システムコールと組み合わせて使用する場合に効果的です。</p></li>
+<li><p>すべてのCPUがアイドル状態でない限り、少なくとも1つのCPUがスケジューリングクロック割込みを維持して正確な時刻保持をサポートする必要があります。</p></li>
+<li><p>アダプティブティックスCPUが存在する可能性がある場合でも、すべてのCPUがアイドル状態であっても、少なくとも1つのCPUがスケジューリングクロック割込みを維持します。</p>
+<p>この状況の処理改善は進行中です。</p>
+</li>
+<li><p>一部のプロセス処理操作は、スケジューリングクロックティックを定期的に発生させる必要があります。このような操作には、CPU負荷の計算、スケジューリング平均の維持、CFSエンティティのvruntime計算、avenrunの計算、ロードバランシングの実行が含まれます。これらは現在、1秒ごとにスケジューリングクロックティックを発生させることで対応しています。進行中の作業により、これらの偶発的なスケジューリングクロックティックの必要性も解消される予定です。</p></li>
+</ul>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">タイマ</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="highres.html">高解像度タイマーアンドダイナミックティック設計ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hpet.html">Linux用の高精度イベントタイマードライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hrtimers.html">hrtimers - 高解像度カーネルタイマーサブシステム</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">NO_HZ: スケジューリングクロックティックの削減</a></li>
+<li class="toctree-l2"><a class="reference internal" href="timekeeping.html">クロックソース、クロックイベント、sched_clock() およびディレイタイマ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="timers-howto.html">delays - 各種カーネルディレイ/スリープメカニズムに関する情報</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">タイマ</a><ul>
+<li>前へ: <a href="hrtimers.html" title="前章">hrtimers - 高解像度カーネルタイマーサブシステム</a></li>
+<li>次へ: <a href="timekeeping.html" title="次章">クロックソース、クロックイベント、sched_clock() およびディレイタイマ</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/timers/no_hz.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>
