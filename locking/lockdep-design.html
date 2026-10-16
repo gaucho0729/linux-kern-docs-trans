@@ -1,0 +1,585 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>ランタイムロックの正しさ検証器 — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="lockstat.html" rel="next" title="ロック統計"/>
+<link href="locktypes.html" rel="prev" title="ロックの種類とそのルール"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="runtime-locking-correctness-validator">
+<h1>ランタイムロックの正しさを検証するツール<a class="headerlink" href="#runtime-locking-correctness-validator" title="この見出しへのパーマリンク">¶</a></h1>
+<p>Ingo Molnar により開始 &lt;<a class="reference external" href="mailto:mingo%40redhat.com">mingo<span>@</span>redhat<span>.</span>com</a>&gt;</p>
+<p>Arjan van de Ven &lt;<a class="reference external" href="mailto:arjan%40linux.intel.com">arjan<span>@</span>linux<span>.</span>intel<span>.</span>com</a>&gt;</p>
+<section id="lock-class">
+<h2>ロッククラス<a class="headerlink" href="#lock-class" title="この見出しへのパーマリンク">¶</a></h2>
+<p>検証器が操作する基本的なオブジェクトは、「ロックのクラス」です。</p>
+<p>ロックのクラスとは、ロックの取得ルールに関して論理的に同じであるグループのロックを指します。ロックは複数（数十万もの）インスタンスを持つ可能性がありますが、これらは論理的に同じクラスに属します。たとえば、inode構造体内のロックは1つのクラスに属し、各inodeはそのロッククラスのインスタンスを持ちます。</p>
+<p>検証器はロッククラスの「使用状態」を追跡し、異なるロッククラス間の依存関係も追跡します。ロックの使用状態は、IRQコンテキストにおけるロックの使用方法を示し、ロック依存関係はロックの順序を意味します（L1 -&gt; L2は、L1を保持しつつL2を取得しようとしているタスクを示します）。lockdepの観点では、これらの2つのロック（L1とL2）は必ずしも関連しているとは限りませんが、その依存関係は過去に発生した順序を示します。検証器は常にロックの使用状態と依存関係が正しいことを証明しようとする努力を続け、誤った場合にsplatを出力します。</p>
+<p>ロッククラスの挙動は、そのインスタンス全体で構成されます。起動後に最初のロッククラスのインスタンスが使用されると、クラスが登録され、その後のすべてのインスタンスはそのクラスにマッピングされます。したがって、その使用状態や依存関係はクラス全体に貢献します。ロックインスタンスが削除されてもロッククラスは消えませんが、ロッククラスのメモリ領域（静的または動的）が回収されると、クラスは削除されることがあります（たとえば、モジュールがロード解除されたり、ワークキューが破壊されたりする場合）。</p>
+</section>
+<section id="state">
+<h2>状態<a class="headerlink" href="#state" title="この見出しへのパーマリンク">¶</a></h2>
+<p>検証器はロッククラスの使用履歴を追跡し、これを（4つの使用状態 × n STATEs + 1）のカテゴリに分類します。</p>
+<p>ここで、4つの使用状態は以下の通りです：</p>
+<ul class="simple">
+<li><p>「STATEコンテキストで常に保持されていた」</p></li>
+<li><p>「STATEコンテキストで常に読み込みロックとして保持されていた」</p></li>
+<li><p>「STATEコンテキストで常に有効な状態で保持されていた」</p></li>
+<li><p>「STATEコンテキストで常に読み込みロックとして有効な状態で保持されていた」</p></li>
+</ul>
+<p>ここで、n STATEsはkernel/locking/lockdep_states.hに記述されており、現在は以下の通りです：</p>
+<ul class="simple">
+<li><p>hardirq</p></li>
+<li><p>softirq</p></li>
+</ul>
+<p>最後の1つのカテゴリは以下の通りです：</p>
+<ul class="simple">
+<li><p>「常に使用されていた」[ == !unused]</p></li>
+</ul>
+<p>ロックルールが違反された場合、これらの使用状態ビットはロックエラーのメッセージ内でカッコ内に表示され、合計で2 × n STATEsビットが表示されます。例を挙げると：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>modprobe/2287 is trying to acquire lock:
+ (&amp;sio_locks[i].lock){-.-.}, at: [&lt;c02867fd&gt;] mutex_lock+0x21/0x24
+
+but task is already holding lock:
+ (&amp;sio_locks[i].lock){-.-.}, at: [&lt;c02867fd&gt;] mutex_lock+0x21/0x24
+</pre></div>
+</div>
+<p>あるロックに対して、左から右へ順にビット位置は、上記のn STATEsごとにロックと読み込みロック（存在する場合）の使用状態を示し、各ビット位置に表示される文字は以下の通りです：</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 6%"/>
+<col style="width: 94%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>‘.’</p></td>
+<td><p>IRQが無効な状態で取得され、IRQコンテキストにない</p></td>
+</tr>
+<tr class="row-even"><td><p>‘-’</p></td>
+<td><p>割り込みコンテキストで取得された</p></td>
+</tr>
+<tr class="row-odd"><td><p>‘+’</p></td>
+<td><p>割り込みが有効な状態で取得された</p></td>
+</tr>
+<tr class="row-even"><td><p>‘?’</p></td>
+<td><p>割り込みコンテキストで取得され、割り込みが有効な状態で取得された。</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>ビットは以下の例で説明されています:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(&amp;sio_locks[i].lock){-.-.}, at: [&lt;c02867fd&gt;] mutex_lock+0x21/0x24
+                     ||||
+                     ||| \-&gt; softirq disabled and not in softirq context
+                     || \--&gt; acquired in softirq context
+                     | \---&gt; hardirq disabled and not in hardirq context
+                      \----&gt; acquired in hardirq context
+</pre></div>
+</div>
+<p>特定のSTATEにおいて、ロックがそのSTATEコンテキストで取得される可能性があるか、そのSTATEが有効であるかによって、以下の表に示す4つのケースが生じます。ビットは、レポート時点でのロックの正確なケースを示すことができます。</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 34%"/>
+<col style="width: 32%"/>
+<col style="width: 34%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td></td>
+<td><p>割り込みが有効</p></td>
+<td><p>割り込みが無効</p></td>
+</tr>
+<tr class="row-even"><td><p>常に割り込み中</p></td>
+<td><p>‘?’</p></td>
+<td><p>‘-’</p></td>
+</tr>
+<tr class="row-odd"><td><p>常に割り込み中ではない</p></td>
+<td><p>‘+’</p></td>
+<td><p>‘.’</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>文字‘-’は割り込みが無効であることを示します。そうでなければ‘?’が表示されるはずです。同様に‘+’についても同様の推論が適用されます。</p>
+<p>未使用のロック（例：ミューテックス）はエラーの原因にはなりません。</p>
+</section>
+<section id="single-lock-state-rules">
+<h2>単一ロックの状態規則:<a class="headerlink" href="#single-lock-state-rules" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ロックが割り込み安全（irq-safe）であるとは、そのロックが割り込みコンテキストで使用されたことがあることを意味します。ロックが割り込み非安全（irq-unsafe）であるとは、そのロックが割り込みが有効な状態で取得されたことがあることを意味します。</p>
+<p>ソフト割り込み非安全（softirq-unsafe）なロッククラスは自動的にハード割り込み非安全（hardirq-unsafe）にもなります。以下の状態は排他的でなければなりません：どのロッククラスも、その使用状況に基づいてこれらの状態のうち1つだけが設定される必要があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>&lt;hardirq-safe&gt; or &lt;hardirq-unsafe&gt;
+&lt;softirq-safe&gt; or &lt;softirq-unsafe&gt;
+</pre></div>
+</div>
+<p>これは、ロックが割り込みコンテキストで使用可能（irq-safe）である場合、割り込みが有効な状態で取得されることはない（irq-unsafe）からです。そうでない場合、デッドロックが発生する可能性があります。例えば、このロックが取得された後、解放される前に関数が中断されると、このロックが2回取得されるようになり、デッドロック（ロック再帰デッドロック）が発生します。</p>
+<p>検証器は、これらの単一ロック状態規則を違反するロックの使用を検出し、レポートします。</p>
+</section>
+<section id="multi-lock-dependency-rules">
+<h2>複数ロックの依存規則:<a class="headerlink" href="#multi-lock-dependency-rules" title="この見出しへのパーマリンク">¶</a></h2>
+<p>同じロッククラスが2回取得されることを防ぐ必要があります。これはロック再帰デッドロックを引き起こす可能性があるからです。</p>
+<p>さらに、2つのロックが逆順で取得されることも許されません:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>&lt;L1&gt; -&gt; &lt;L2&gt;
+&lt;L2&gt; -&gt; &lt;L1&gt;
+</pre></div>
+</div>
+<p>これは、2つのロックの取得が循環してしまい、お互いに待機し続けるデッドロック（ロック逆転デッドロック）を引き起こす可能性があるからです。検証器は、任意の複雑さを持つ依存関係の循環を検出します。つまり、取得操作の間に他のロックの取得順序が存在しても、検証器はこれらのロックが循環的に取得可能かどうかを判定します。</p>
+<p>さらに、以下の使用に基づくロックの依存関係は、どの2つのロッククラス間でも許されません:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>&lt;hardirq-safe&gt;   -&gt;  &lt;hardirq-unsafe&gt;
+&lt;softirq-safe&gt;   -&gt;  &lt;softirq-unsafe&gt;
+</pre></div>
+</div>
+<p>最初のルールは、ハードIRQセーフなロックがハードIRQコンテキストによって取得され、ハードIRQアンセーフなロックを中断してしまう可能性があるためです。これにより、ロック逆転のデッドロックが発生する可能性があります。同様に、ソフトIRQセーフなロックはソフトIRQコンテキストによって取得され、ソフトIRQアンセーフなロックを中断してしまうため、同様の問題が生じます。</p>
+<p>上記のルールは、カーネル内で発生するすべてのロックの順序に適用されます。新しいロックを取得する際、検証器は新しいロックと保持しているすべてのロックの間でルール違反がないかを確認します。</p>
+<p>ロッククラスの状態が変化した場合、以下の依存関係ルールが強制されます：</p>
+<ul class="simple">
+<li><p>新しいハードIRQセーフなロックが発見された場合、過去にハードIRQアンセーフなロックを取得したかを確認します。</p></li>
+<li><p>新しいソフトIRQセーフなロックが発見された場合、過去にソフトIRQアンセーフなロックを取得したかを確認します。</p></li>
+<li><p>新しいハードIRQアンセーフなロックが発見された場合、過去にハードIRQセーフなロックがそのロックを取得したかを確認します。</p></li>
+<li><p>新しいソフトIRQアンセーフなロックが発見された場合、過去にソフトIRQセーフなロックがそのロックを取得したかを確認します。</p></li>
+</ul>
+<p>(再度、中断コンテキストが_IRQアンセーフなロックまたはハードIRQアンセーフなロックのいずれかを中断する可能性があるため、これらのチェックを行います。これにより、ロック逆転のデッドロックが発生する可能性があります—even if そのロックシナリオは実際にはまだ発生していません。)</p>
+</section>
+<section id="exception-nested-data-dependencies-leading-to-nested-locking">
+<h2>例外：ネストされたデータ依存関係によるネストされたロック<a class="headerlink" href="#exception-nested-data-dependencies-leading-to-nested-locking" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Linuxカーネルが同じロッククラスの複数インスタンスを取得するケースはいくつかあります。このようなケースは、同じタイプのオブジェクト内で階層構造が存在する場合に通常発生します。このような場合、2つのオブジェクト間には階層の性質によって定義される「自然な」順序があり、カーネルは各オブジェクトに対してこの固定順序でロックを取得します。</p>
+<p>「全体ディスク」ブロックデバイスオブジェクトと「パーティション」ブロックデバイスオブジェクトの階層構造は、このような「ネストされたロック」を生じる例です。パーティションは全体ディスクの一部であり、常に全体ディスクロックをパーティションロックよりも高いロックとして取得する限り、ロックの順序は完全に正しいです。検証器はこの自然な順序を自動的に検出しません。なぜなら、この順序の背後にあるロックルールは静的ではないからです。</p>
+<p>検証器にこの正しい使用モデルを教えるために、さまざまなロックプリミティブの新しいバージョンが追加されました。これにより、ネストレベルを指定することが可能です。ブロックデバイスミューテックスの例として、以下のような呼び出しが行われます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>enum bdev_bd_mutex_lock_class
+{
+     BD_MUTEX_NORMAL,
+     BD_MUTEX_WHOLE,
+     BD_MUTEX_PARTITION
+};
+
+mutex_lock_nested(&amp;bdev-&gt;bd_contains-&gt;bd_mutex, BD_MUTEX_PARTITION);
+</pre></div>
+</div>
+<p>この場合、パーティションとして知られているbdevオブジェクトに対してロックが取得されます。</p>
+<p>検証器は、このようなネストされた形で取得されたロックを、検証の目的で別の（サブ）クラスとして扱います。</p>
+<p>注意: コードを _nested() プリミティブを使用して変更する際は、階層が正しくマッピングされているかを慎重に確認してください。そうでない場合、偽陽性または偽陰性が発生する可能性があります。</p>
+</section>
+<section id="annotations">
+<h2>アノテーション<a class="headerlink" href="#annotations" title="この見出しへのパーマリンク">¶</a></h2>
+<p>特定のロックが保持されている場所や条件をアノテーションし、確認するためには、lockdep_assert_held*(&amp;lock) と lockdep_*pin_lock(&amp;lock) の2つの構文を使用できます。</p>
+<p>名前のとおり、lockdep_assert_held* マクロファミリは、特定のロックが特定のタイミングで保持されていることをアサートします（保持されていない場合は WARN() を生成します）。このアノテーションは、カーネル全体で広く使用されており、例えば kernel/sched/core.c などです。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void update_rq_clock(struct rq *rq)
+{
+      s64 delta;
+
+      lockdep_assert_held(&amp;rq-&gt;lock);
+      [...]
+}
+</pre></div>
+</div>
+<p>rq-&gt;lock の保持が、rq のクロックを安全に更新するために必要です。</p>
+<p>もう一つのマクロファミリは lockdep_*pin_lock() で、現時点では rq-&gt;lock にのみ使用されています。これらのアノテーションは採用範囲が限られているにもかかわらず、関心のあるロックが「誤って」アンロックされた場合に WARN() を生成します。これは、上位レイヤーがロックが保持されていると想定しているが、下位レイヤーがロックを解放して再取得できるかもしれないと誤って考える場合（意図せずにレース条件を導入する場合）に特に役立ちます。lockdep_pin_lock() は 'struct pin_cookie' を返し、lockdep_unpin_lock() でロックが改ざんされていないかを確認します。例えば kernel/sched/sched.h などです。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static inline void rq_pin_lock(struct rq *rq, struct rq_flags *rf)
+{
+      rf-&gt;cookie = lockdep_pin_lock(&amp;rq-&gt;lock);
+      [...]
+}
+
+static inline void rq_unpin_lock(struct rq *rq, struct rq_flags *rf)
+{
+      [...]
+      lockdep_unpin_lock(&amp;rq-&gt;lock, rf-&gt;cookie);
+}
+</pre></div>
+</div>
+<p>ロックの要件に関するコメントは有用な情報を提供するかもしれませんが、アノテーションによって行われる実行時チェックはロックの問題をデバッグする際に非常に重要です。コードを検証する際の詳細度も同様です。疑問があるときは常にアノテーションを優先してください！</p>
+</section>
+<section id="proof-of-100-correctness">
+<h2>100%の正しさの証明:<a class="headerlink" href="#proof-of-100-correctness" title="この見出しへのパーマリンク">¶</a></h2>
+<p>検証器は、カーネルの寿命中に少なくとも1回発生したすべての単純な、独立した単一タスクのロックシーケンスについて、数学的な「クロージャー」（ロックの正しさの証明）を達成します。つまり、これらのロックシーケンスの組み合わせやタイミングによって、どの種類のロック関連デッドロックも発生しないことを100%の確信で証明します。 <a class="footnote-reference brackets" href="#id2" id="id1">1</a></p>
+<p>つまり、デッドロックを証明するには、複雑なマルチCPU・マルチタスクのロックシナリオが実際に発生する必要はなく、単純な「コンポーネント」ロックチェーンが少なくとも一度（いつでも、どのタスク/コンテキストでも）発生すればよい。たとえば、通常は3つのCPU以上と非常にまれなタスク、IRQコンテキスト、タイミングの組み合わせが必要な複雑なデッドロックも、単純で負荷の低いシングルCPUシステムでも検出可能である。</p>
+<p>これにより、ロック関連のQA（品質保証）の複雑さが劇的に低下する。QAで行うべきことは、ロックの正しさを証明するために、カーネル内で可能な限り多くの「単純な」単一タスクのロック依存関係を少なくとも一度はトリガーすることである。これに対し、CPU間のすべてのロック相互作用の組み合わせと、ハードIRQおよびソフトIRQのネストシナリオをすべて検証する必要はなく（実際には不可能である）。</p>
+<dl class="footnote brackets">
+<dt class="label" id="id2"><span class="brackets"><a class="fn-backref" href="#id1">1</a></span></dt>
+<dd><p>検証器自身が100%正しいと仮定し、システムの他の部分が検証器の状態を一切破壊しないという前提も置く。また、すべてのNMI/SMMパス（ハードIRQ無効化コードパスを中断する可能性のあるもの）も正しいものとし、検証器に干渉しないと仮定する。さらに、システム内のすべてのロックチェーンに64ビットの「チェーンハッシュ」値が一意であるとし、ロック再帰は20を超えないものと仮定する。</p>
+</dd>
+</dl>
+</section>
+<section id="performance">
+<h2>パフォーマンス:<a class="headerlink" href="#performance" title="この見出しへのパーマリンク">¶</a></h2>
+<p>上記のルールは <strong>大量のランタイムチェックを必要とする。</strong> もしすべてのロック取得やIRQ有効化イベントに対してこれを実行すれば、システムは実用上遅すぎて使用不可になる。チェックの複雑度はO(N^2)であり、たとえ数百のロッククラスしかない場合でも、イベントごとに数万のチェックを実行しなければならない。</p>
+<p>この問題は、任意の「ロックシナリオ」（連続して取得されるロックの一連のシーケンス）を一度だけチェックすることで解決する。保持中のロックのスタックを簡易に維持し、そのロックチェーンに一意な64ビットのハッシュ値を計算する。このハッシュ値は、チェーンが初めて検証されるときにハッシュテーブルに保存され、このハッシュテーブルはロックフリーモードで検証可能である。その後、同じロックチェーンが再度発生した場合、ハッシュテーブルがそのチェーンを再度検証する必要がないことを示してくれる。</p>
+</section>
+<section id="troubleshooting">
+<h2>トラブルシューティング:<a class="headerlink" href="#troubleshooting" title="この見出しへのパーマリンク">¶</a></h2>
+<p>検証器は最大MAX_LOCKDEP_KEYS個のロッククラスを追跡する。この数を超えると、以下のlockdep警告が発生する：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(DEBUG_LOCKS_WARN_ON(id &gt;= MAX_LOCKDEP_KEYS))
+</pre></div>
+</div>
+<p>デフォルトでは、MAX_LOCKDEP_KEYS は現在 8191 に設定されており、典型的なデスクトップシステムではロッククラスが 1,000 を超えないため、この警告は通常ロッククラスのリークやロックの適切な初期化が行われていないことにより発生します。これらの2つの問題は以下に示します。</p>
+<ol class="arabic">
+<li><p>検証器を実行中にモジュールの繰り返しのロードとアンロードはロッククラスのリークを引き起こします。問題は、モジュールごとに新しいロッククラスが作成される一方で、モジュールアンロードでは古いクラスが削除されないためです（ロッククラスの再利用に関する以下の議論を参照）。したがって、そのモジュールが繰り返しロード・アンロードされる場合、ロッククラスの数は最終的に最大値に達します。</p></li>
+<li><p>配列などの構造体で大量のロックが含まれており、明示的に初期化されていない場合があります。例えば、8192 個のバケットを持つハッシュテーブルで、各バケットに spinlock_t が存在する場合、8192 個のロッククラスが消費されます（ただし、各 spinlock が実行時において明示的に初期化される場合を除く）。実行時に spin_lock_init() を使用して各 spinlock を初期化しないと、ロッククラスのオーバーフローが発生します。一方で、ループで各ロックに spin_lock_init() を呼び出すと、すべての 8192 個のロックが1つのロッククラスに配置されます。</p>
+<p>この物語の教訓は、常に明示的にロックを初期化するべきです。</p>
+</li>
+</ol>
+<p>有人が検証器を修正してロッククラスの再利用を許可すべきだと主張するかもしれません。しかし、そのような変更を検討する前に、コードを確認し、必要な変更を検討してください。削除するロッククラスはロック依存グラフにリンクされている可能性があるため、実際には言うより実装するのが難しいです。</p>
+<p>もちろん、ロッククラスが不足した場合は、まず問題のロッククラスを特定する必要があります。まず、以下のコマンドで現在使用中のロッククラス数と最大値を確認できます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>grep "lock-classes" /proc/lockdep_stats
+</pre></div>
+</div>
+<p>このコマンドは、標準的なシステムでは以下の出力結果を生成します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>lock-classes:                          748 [max: 8191]
+</pre></div>
+</div>
+<p>割り当てられた数（上記の748）が時間とともに継続的に増加する場合、リークの可能性があります。以下のコマンドを使用してリークしているロッククラスを特定できます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>grep "BD" /proc/lockdep
+</pre></div>
+</div>
+<p>コマンドを実行し、出力を保存した後、このコマンドを後で実行した出力と比較することでリーク元を特定できます。この出力は、実行時ロック初期化が省略されている状況も特定するのに役立ちます。</p>
+</section>
+<section id="recursive-read-locks">
+<h2>再帰的な読み込みロック:<a class="headerlink" href="#recursive-read-locks" title="この見出しへのパーマリンク">¶</a></h2>
+<p>残りのドキュメント全体は、特定の種類のサイクルがデッドロックの可能性と等価であることを証明しようとしています。</p>
+<p>ロックの種類は3つあります：ライター（つまり、排他ロック、spin_lock()やwrite_lock()のような）、非再帰リーダー（つまり、共有ロック、down_read()のような）および再帰リーダー（再帰的な共有ロック、例えば <a class="reference internal" href="../core-api/kernel-api.html#c.rcu_read_lock" title="rcu_read_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">rcu_read_lock()</span></code></a>)。そして、この後ろのドキュメントでは、これらのロックを以下の表記で使用します：</p>
+<blockquote>
+<div><p>WまたはE：ライター（排他ロック）を表します。r：非再帰リーダーを表します。R：再帰リーダーを表します。S：すべてのリーダー（非再帰＋再帰）を表し、どちらも共有ロックです。N：ライターと非再帰リーダーを表し、どちらも非再帰です。</p>
+</div></blockquote>
+<p>明らかに、Nは「rまたはW」で、Sは「rまたはR」です。</p>
+<p>再帰リーダーは、その名前が示すように、同じロックインスタンスのリーダーのクリティカルセクション内でも取得可能であり、つまり、一つのロックインスタンスの読み込み側のクリティカルセクションをネストして実行できるロックです。</p>
+<p>非再帰リーダーは、同じロックインスタンスのリーダーのクリティカルセクション内で取得しようとすると、自己デッドロックを引き起こします。</p>
+<p>再帰リーダーと非再帰リーダーの違いは、再帰リーダーは書き込みロックのみでブロックされるのに対し、 <em>holder</em>非再帰リーダーは書き込みロックでもブロックされるからです。 <em>待機中のプロセス</em>以下の例を考慮してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>TASK A:                 TASK B:
+
+read_lock(X);
+                        write_lock(X);
+read_lock_2(X);
+</pre></div>
+</div>
+<p>タスクAがread_lock()でロックXを取得します（再帰的でも非再帰でもかまいません）。そして、タスクBがロックXのライターを取得しようとすると、ブロックされ、ロックXのライター待機者になります。このとき、read_lock_2()が再帰リーダーであれば、タスクAは進展し、ライター待機者が再帰リーダーをブロックしないのでデッドロックは発生しません。しかし、read_lock_2()が非再帰リーダーであれば、ライター待機者Bによってブロックされ、自己デッドロックを引き起こします。</p>
+</section>
+<section id="block-conditions-on-readers-writers-of-the-same-lock-instance">
+<h2>同じロックインスタンスのリーダー/ライター間のブロック条件：<a class="headerlink" href="#block-conditions-on-readers-writers-of-the-same-lock-instance" title="この見出しへのパーマリンク">¶</a></h2>
+<p>単純に4つのブロック条件があります：</p>
+<ol class="arabic simple">
+<li><p>ライターは他のライターをブロックします。</p></li>
+<li><p>リーダーはライターをブロックします。</p></li>
+<li><p>ライターは再帰リーダーおよび非再帰リーダーをブロックします。</p></li>
+<li><p>リーダー（再帰的でも非再帰でも）は他の再帰リーダーをブロックしませんが、非再帰リーダーをブロックする可能性があります（書き込み待機者が共存するため）。</p></li>
+</ol>
+<p>ブロック条件マトリクス、Yは行が列をブロックし、Nはそれ以外です。</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 25%"/>
+<col style="width: 25%"/>
+<col style="width: 25%"/>
+<col style="width: 25%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td></td>
+<td><p>E</p></td>
+<td><p>r</p></td>
+<td><p>R</p></td>
+</tr>
+<tr class="row-even"><td><p>E</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+</tr>
+<tr class="row-odd"><td><p>r</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+<td><p>N</p></td>
+</tr>
+<tr class="row-even"><td><p>R</p></td>
+<td><p>Y</p></td>
+<td><p>Y</p></td>
+<td><p>N</p></td>
+</tr>
+</tbody>
+</table>
+<p>(W:ライター、r:非再帰リーダー、R:再帰リーダー)</p>
+</div></blockquote>
+<p>再帰的に取得されます。非再帰的な読み込みロックとは異なり、再帰的な読み込みロックは現在の書き込みロックのみでブロックされます <em>保持者</em> 他の書き込みロック
+<em>待機者</em>たとえば:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>TASK A:                 TASK B:
+
+read_lock(X);
+
+                        write_lock(X);
+
+read_lock(X);
+</pre></div>
+</div>
+<p>これは再帰的な読み込みロックのデッドロックではありません。タスクBがロックXを待っている間、第二のread_lock()は再帰的な読み込みロックのため待機する必要がありません。しかし、read_lock()が非再帰的な読み込みロックである場合、上記のケースはデッドロックになります。なぜなら、タスクBのwrite_lock()がロックを取得できない場合でも、タスクAの第二のread_lock()がブロックされるからです。</p>
+<p>ロックは、取得時に使用されるロック操作（特にlock_acquire()の「read」パラメータの値）によって、書き込みロック（排他ロック）、非再帰的な読み込みロック（非再帰的な共有ロック）、または再帰的な読み込みロック（再帰的な共有ロック）のいずれかになります。言い換えれば、単一のロックインスタンスは、取得関数によって3つの種類の取得方法を持ちます：排他、非再帰的な読み込み、再帰的な読み込み。</p>
+<p>簡潔にまとめると、書き込みロックと非再帰的な読み込みロックを「非再帰的なロック」と呼び、再帰的な読み込みロックを「再帰的なロック」と呼びます。</p>
+<p>再帰的なロックはお互いにブロックしませんが、非再帰的なロックはブロックします（これは2つの非再帰的な読み込みロックでも同様です）。非再帰的なロックは対応する再帰的なロックをブロックし、逆もしかりです。</p>
+<p>再帰的なロックを含むデッドロックのケースは以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>TASK A:                 TASK B:
+
+read_lock(X);
+                        read_lock(Y);
+write_lock(Y);
+                        write_lock(X);
+</pre></div>
+</div>
+<p>タスクAはタスクBがYをread_unlock()するのを待っており、タスクBはタスクAがXをread_unlock()するのを待っています。</p>
+</section>
+<section id="dependency-types-and-strong-dependency-paths">
+<h2>依存関係の種類と強い依存関係のパス：<a class="headerlink" href="#dependency-types-and-strong-dependency-paths" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ロック依存関係は2つのロックの取得順序を記録し、ロックの種類が3つあるため理論上9種類のロック依存関係が存在しますが、デッドロック検出には4種類のロック依存関係で十分です。</p>
+<p>各ロック依存関係について：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>L1 -&gt; L2
+</pre></div>
+</div>
+<p>これは、ランタイムで同じコンテキストでL1が保持された後にL2が保持されたことをlockdepが観測したことを意味します。デッドロック検出では、L1を保持している状態でL2にブロックされる可能性があるかどうか（つまり、L1がブロックするロックL3があり、L2がL3によってブロックされるかどうか）を確認します。したがって、我々が気にするのは1) L1がブロックするものと2) L2がブロックされるものです。その結果、L1の再帰的リーダーと非再帰的リーダーを統合（彼らが同じタイプをブロックするため）し、L2のライターや非再帰的リーダーを統合（彼らが同じタイプによってブロックされるため）できます。</p>
+<p>上記の簡略化の組み合わせにより、lockdepグラフには4種類の依存関係エッジがあります：</p>
+<ol class="arabic simple">
+<li><dl class="simple">
+<dt>-(ER)-&gt;:</dt><dd><p>排他ライターから再帰的リーダーへの依存関係、「X -(ER)-&gt; Y」はX -&gt; Yであり、XがライターでYが再帰的リーダーであることを意味します。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>-(EN)-&gt;:</dt><dd><p>排他ライターと非再帰ロック依存関係、"X -(EN)-&gt; Y" は X -&gt; Y であり、X がライターで Y がライターまたは非再帰リーダーであることを意味します。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>-(SR)-&gt;:</dt><dd><p>共有リーダーと再帰リーダーの依存関係、"X -(SR)-&gt; Y" は X -&gt; Y であり、X がリーダー（再帰的でも非再帰的でも）で Y が再帰リーダーであることを意味します。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>-(SN)-&gt;:</dt><dd><p>共有リーダーと非再帰ロックの依存関係、"X -(SN)-&gt; Y" は X -&gt; Y であり、X がリーダー（再帰的でも非再帰的でも）で Y がライターまたは非再帰リーダーであることを意味します。</p>
+</dd>
+</dl>
+</li>
+</ol>
+<p>2つのロックが存在する場合、それらの間に複数の依存関係がある可能性があります。例えば：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>TASK A:
+
+read_lock(X);
+write_lock(Y);
+...
+
+TASK B:
+
+write_lock(X);
+write_lock(Y);
+</pre></div>
+</div>
+<p>、依存関係グラフには X -(SN)-&gt; Y と X -(EN)-&gt; Y の両方が存在します。</p>
+<p>-(xN)-&gt; は -(EN)-&gt; または -(SN)-&gt; のエッジを表し、-(Ex)-&gt;、-(xR)-&gt;、-(Sx)-&gt; についても同様です。</p>
+<p>「パス」はグラフ内の結合された依存関係のエッジの連続です。「強い」パスは、パス内の各依存関係において強い依存関係が存在することを示し、-(xR)-&gt; と -(Sx)-&gt; の2つの結合エッジを含まないパスとして定義されます。言い換えれば、「強い」パスはロック間の依存関係を通じて別のロックへと移動するパスであり、X -&gt; Y -&gt; Z（X、Y、Z はロック）がパスに含まれる場合、X から Y への移動が -(SR)-&gt; または -(ER)-&gt; の依存関係を通じたものであれば、Y から Z への移動は -(SN)-&gt; または -(SR)-&gt; の依存関係を通じたものであってはなりません。</p>
+<p>次のセクションでなぜこのパスが「強い」と呼ばれるのかを確認できます。</p>
+</section>
+<section id="recursive-read-deadlock-detection">
+<h2>再帰的リードロック検出:<a class="headerlink" href="#recursive-read-deadlock-detection" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ここで2つのことを証明します:</p>
+<p>補題1:</p>
+<p>閉じた強いパス（つまり強いループ）が存在する場合、ロックの組み合わせによってデッドロックが発生することを示します。つまり、強いループはデッドロック検出の十分条件です。</p>
+<p>補題2:</p>
+<p>閉じた強いパス（つまり強いループ）が存在しない場合、ロックの組み合わせによってデッドロックが発生しないことを示します。つまり、強いループはデッドロック検出の必要条件です。</p>
+<p>これらの2つの補題により、閉じた強いパスはデッドロックの十分条件かつ必要条件であり、したがって閉じた強いパスはデッドロックの可能性と等価です。閉じた強いパスはデッドロックを引き起こす可能性のある依存関係の連鎖を表すため、「強い」と呼ばれます。これは、依存関係のループであってもデッドロックを引き起こさない可能性があるためです。</p>
+<p>十分性の証明（補題1）:</p>
+<p>強いループがあると仮定します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>L1 -&gt; L2 ... -&gt; Ln -&gt; L1
+</pre></div>
+</div>
+<p>、これは以下の依存関係を持つことを意味します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>L1 -&gt; L2
+L2 -&gt; L3
+...
+Ln-1 -&gt; Ln
+Ln -&gt; L1
+</pre></div>
+</div>
+<p>ここで、デッドロックを引き起こすロックの組み合わせを構築できます：</p>
+<p>まず、1つのCPU/タスクがL1 -&gt; L2でL1を取得し、次に別のCPU/タスクがL2 -&gt; L3でL2を取得し、このように順に進めていきます。その後、すべてのLx（Lx -&gt; Lx+1）は異なるCPU/タスクによって保持されます。</p>
+<p>次に、L1 -&gt; L2があるため、L1を保持しているCPU/タスクがL2を取得しようとしますが、L2は別のCPU/タスクによって保持されており、さらにL1 -&gt; L2とL2 -&gt; L3は-(xR)-&gt;と-(Sx)-&gt;の組み合わせではなく（強さの定義）、つまりL1 -&gt; L2におけるL2は非再帰的なロック（誰かによってブロックされる）か、L2 -&gt; L3におけるL2はライタ（誰かをブロックする）であるため、L1を保持しているCPU/タスクはL2を取得できず、L2の保持者から解放されるのを待つ必要があります。</p>
+<p>さらに、L2の保持者にも同様の結論が成り立ち、L3の保持者から解放されるのを待つ必要があります。このようにして、Lxの保持者はLx+1の保持者から解放されるのを待つことになり、Ln+1がL1であるため、循環的な待機状態が生じ、誰も進展できず、デッドロックが発生します。</p>
+<p>必要性の証明（補題2）:</p>
+<p>補題2は以下の通りです：デッドロック状態が発生している場合、依存グラフに強さを持つ循環が存在する必要があります。</p>
+<p>ウィキペディア[1]によると、デッドロックが発生している場合、循環的な待機状態が存在するため、N個のCPU/タスクがあり、CPU/タスクP1がP2が保持しているロックを待っている、P2がP3が保持しているロックを待っている、…、PnがP1が保持しているロックを待っている状態です。ここで、Pxが待っているロックをLxと名付けると、P1がL1を待っている一方でLnを保持しているため、依存グラフにはLn -&gt; L1が存在します。同様に、L1 -&gt; L2、L2 -&gt; L3、…、Ln-1 -&gt; Lnが依存グラフに存在し、これにより循環が成立します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Ln -&gt; L1 -&gt; L2 -&gt; ... -&gt; Ln
+</pre></div>
+</div>
+<p>そして、この循環が強さを持つことを証明します:</p>
+<p>ロックLxに対して、PxがLx-1 -&gt; Lxの依存を提供し、Px+1がLx -&gt; Lx+1の依存を提供します。PxがPx+1からLxを解放されるのを待っているため、LxがPx+1でライダーであり、LxがPxで再帰的なライダーであることは不可能です（ライダー（再帰的であれなかれ）は再帰的なライダーをブロックしません）。したがって、Lx-1 -&gt; LxとLx -&gt; Lx+1は-(xR)-&gt; -(Sx)-&gt;のペアにはなり得ず、これは循環内のすべてのロックに当てはまります。したがって、この循環は強さを持ちます。</p>
+</section>
+<section id="references">
+<h2>参照:<a class="headerlink" href="#references" title="この見出しへのパーマリンク">¶</a></h2>
+<p>[1]: <a class="reference external" href="https://en.wikipedia.org/wiki/Deadlock">https://en.wikipedia.org/wiki/Deadlock</a>
+[2]: Shibu, K. (2009). Intro To Embedded Systems (1st ed.). Tata McGraw-Hill</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">ロック</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="locktypes.html">ロックの種類とそのルール</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">ランタイムロックの正しさを検証するツール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lockstat.html">ロック統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="locktorture.html">カーネルロックのトラウトテスト操作</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mutex-design.html">ジェネリックミューテックスサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rt-mutex-design.html">RTミューテックスの実装設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rt-mutex.html">PIサポート付きRTミューテックスサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="seqlock.html">シーケンスカウンタとシーケンシャルロック</a></li>
+<li class="toctree-l2"><a class="reference internal" href="spinlocks.html">ロックの教訓</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ww-mutex-design.html">Wound/Wait Deadlock-Proof Mutex Design</a></li>
+<li class="toctree-l2"><a class="reference internal" href="preempt-locking.html">プリエンプティブカーネルでの適切なロック: カーネルコードのプリエンプ安全性を保つ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pi-futex.html">軽量PIフェイクス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="futex-requeue-pi.html">フェイクス再配置PI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hwspinlock.html">ハードウェアスピンロックフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="percpu-rw-semaphore.html">ペルCPU読み取り専用セマフォ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="robust-futexes.html">ロバストフェイクスの説明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="robust-futex-ABI.html">The robust futex ABI</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">ロック</a><ul>
+<li>前へ: <a href="locktypes.html" title="前章">ロックの種類とそのルール</a></li>
+<li>次へ: <a href="lockstat.html" title="次章">ロック統計</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/locking/lockdep-design.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

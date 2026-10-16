@@ -1,0 +1,325 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>PCI Express I/O Virtualization Resource on Powerenv — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="pmu-ebb.html" rel="next" title="PMU イベントベースのブランチ"/>
+<link href="papr_hcalls.html" rel="prev" title="ハイパーコール操作コード (hcalls)"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="pci-express-i-o-virtualization-resource-on-powerenv">
+<h1>Powerenv 上の PCI Express I/O ビジュー化リソース<a class="headerlink" href="#pci-express-i-o-virtualization-resource-on-powerenv" title="この見出しへのパーマリンク">¶</a></h1>
+<p>Wei Yang &lt;<a class="reference external" href="mailto:weiyang%40linux.vnet.ibm.com">weiyang<span>@</span>linux<span>.</span>vnet<span>.</span>ibm<span>.</span>com</a>&gt;</p>
+<p>Benjamin Herrenschmidt &lt;<a class="reference external" href="mailto:benh%40au1.ibm.com">benh<span>@</span>au1<span>.</span>ibm<span>.</span>com</a>&gt;</p>
+<p>Bjorn Helgaas &lt;<a class="reference external" href="mailto:bhelgaas%40google.com">bhelgaas<span>@</span>google<span>.</span>com</a>&gt;</p>
+<p>26 Aug 2014</p>
+<p>このドキュメントでは、PowerKVMにおけるPCI MMIOリソースのサイズ指定と割り当てに必要なハードウェアの要件と、汎用PCIコードがこの要件をどのように処理するかについて説明します。最初の2節では、Partitionable Endpoint（PE）の概念とP8（IODA2）での実装について説明します。次の2節では、IODA2でSRIOVを有効化する際の考慮点について述べます。</p>
+<section id="introduction-to-partitionable-endpoints">
+<h2>1. Partitionable Endpointの導入<a class="headerlink" href="#introduction-to-partitionable-endpoints" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Partitionable Endpoint（PE）は、デバイスまたは複数のデバイスに関連する各種リソースをグループ化して、パーティション間の隔離（DMAやMSIなどのフィルタリング）を提供し、エラーを引き起こしているデバイスを凍結して悪影響の拡散を制限するメカニズムを提供する方法です。</p>
+<p>ハードウェアでは、PEの状態を表すテーブルがあり、各PEに対して「凍結」状態ビット（MMIO用とDMA用のペア、設定は同時にされますが個別にクリア可能です）が含まれています。</p>
+<p>PEが凍結すると、すべてのストア（任意の方向）が無視され、すべてのロードはすべて1の値を返します。MSIもブロックされます。エラーの詳細などの追加状態が含まれますが、これは重要ではありません。</p>
+<p>注目すべき点は、さまざまなPCIeトランザクション（MMIO、DMAなど）がそれぞれのPEにどのようにマッチされるかです。</p>
+<p>次の節ではP8（IODA2）における概要を説明します。注意点として、これはすべてPHB（PCIホストブリッジ）ごとの情報です。各PHBは完全に独立したハードウェアエンティティであり、すべての論理を複製するため、独自のPEセットなどを保有します。</p>
+</section>
+<section id="implementation-of-partitionable-endpoints-on-p8-ioda2">
+<h2>2. P8（IODA2）におけるPartitionable Endpointの実装<a class="headerlink" href="#implementation-of-partitionable-endpoints-on-p8-ioda2" title="この見出しへのパーマリンク">¶</a></h2>
+<p>P8は各PHBあたり最大256のPartitionable Endpointをサポートします。</p>
+<blockquote>
+<div><ul>
+<li><p>Inbound</p>
+<p>DMA、MSI、およびInbound PCIeエラーメッセージについては、メモリ内に保存されながらチップによってアクセスされるテーブルがあり、PCIe RID（バス/デバイス/ファンクション）とPE番号の直接的な対応関係を提供します。これをRTTと呼びます。</p>
+<ul class="simple">
+<li><p>DMAについては、各PEに対して完全なアドレス空間を提供し、PCIアドレスビット59の値に応じて2つの「ウィンドウ」を含めることができます。各ウィンドウは「TCEテーブル」（IOMMU翻訳テーブル）を介してリマップ可能であり、ここでは説明しない複数の設定可能な特性を持ちます。</p></li>
+<li><p>MSIについては、アドレス空間内に2つのウィンドウ（32ビット空間の上部と、それよりはるかに高い位置）があり、アドレスとMSI値の組み合わせによって、ブリッジごとに2048つの割込みのうちの1つがトリガーされます。また、割込み制御デスクリプターテーブルにもPE#（プロセッサエンティティ番号）が含まれており、RTTから取得したPE#と比較することで、デバイスが特定の割込みを発生させることが「認可」されます。</p></li>
+<li><p>エラーメッセージはRTTのみを使用します。</p></li>
+</ul>
+</li>
+<li><p>アウトバウンド。これは複雑な部分です。</p>
+<p>他のPCIホストブリッジと同様に、Power8 IODA2 PHBもCPUアドレス空間からPCIアドレス空間への「ウィンドウ」をサポートしています。1つのM32ウィンドウと16つのM64ウィンドウがあります。これらは異なる特徴を持ちますが、共通点もあります。まず共通点について説明します：CPUアドレス空間の設定可能な一部をPCIeバスに転送し、サイズは自然数の2の累乗でなければならないという点です。それ以外の違いは以下の通りです：</p>
+<ul class="simple">
+<li><p>M32ウィンドウ：</p>
+<ul>
+<li><p>サイズは4GBに制限されています。</p></li>
+<li><p>アドレスの上位ビット（サイズを超えた部分）を切り捨て、設定可能な値に置き換えます。これは通常、32ビットのPCIeアクセスを生成するために使用されます。このウィンドウはブート時にFWで設定し、Linuxでは変更しません。通常はCPUアドレス空間の2GB部分をPCIe 0x8000_0000..0xffff_ffffに転送するように設定されています。（注：上位64KBは実際にはMSI用に予約されていますが、この時点では問題ではありません。Linuxがその領域に割り当てないことを確認するだけで十分です。M32論理はその領域を無視し、必要に応じてその空間に転送します）</p></li>
+<li><p>このウィンドウは256セグメントに均等に分割されます。チップ内のテーブルは各セグメントをPE#にマッピングします。これにより、MMIO空間の一部をセグメント単位でPEに割り当てることができます。2GBのウィンドウの場合、セグメント granularity は2GB/256 = 8MBです。</p></li>
+</ul>
+</li>
+</ul>
+<p>これは現在Linuxで使用している「主な」ウィンドウです（SR-IOVを除く）。基本的にブリッジMMIOウィンドウをセグメントアライメント/ granularity に強制的に配置することで、ブリッジの後方の空間をPEに割り当てています。</p>
+<p>理想的にはPE内の個々のファンクションを割り当てたいですが、これには個々のファンクションBARを「1つまたは複数のセグメントに収められるようにグループ化」する新しいアドレス割り当てスキームが必要になります。</p>
+<ul class="simple">
+<li><p>M64ウィンドウ：</p>
+<ul>
+<li><p>サイズは少なくとも256MB以上でなければなりません。</p></li>
+<li><p>アドレスは変換されません（PCIe上のアドレスはPowerBus上のアドレスと同じです）。PowerBusで伝達されない上位14ビットを設定することもできますが、これを使用していません。</p></li>
+<li><p>セグメント化することができる。セグメント化されていない場合、全体のウィンドウに対してPE#を指定することが可能である。セグメント化されている場合、ウィンドウは256セグメントを持つが、セグメントとPE#のマッピングを行うテーブルは存在しない。セグメント番号 <em>通常のRCU読み込み側クリティカルセクションは、条件付きでスリープロックを取得することが許容されます（例として</em> のPE#。</p></li>
+<li><p>重複をサポートする。あるアドレスが複数のウィンドウによってカバーされている場合、どのウィンドウが適用されるかの定義された順序がある。</p></li>
+</ul>
+</li>
+</ul>
+<p>我々は、64ビット空間における大容量BAR（Base Address Register）を扱うために、M32のものと比較して比較的新しいコードを用意している：</p>
+<p>FWがPHB（Physical Host Bridge）に割り当てたアドレス空間全体（約64GB、M32の空間は無視し、別の「reserve」から取得する）をカバーするM64ウィンドウを設定する。このウィンドウはセグメント化されている。</p>
+<p>次に、M32と同じようにブリッジアライメントのトリックを用いて、それらの大容量セグメントにマッチングする。</p>
+<p>再マッピングができないため、追加の制約条件が2つある：</p>
+<ul class="simple">
+<li><p>PE#の割り当てを行う <em>RCU保護データ構造からデータ要素を削除した後、</em> 64ビット空間が割り当てられたのは、使用するアドレスが直接PE#を決定するためである。その後、32ビットと64ビット空間の両方を用いるデバイスのM32 PE#を更新するか、残りのPE#を32ビット専用デバイスに割り当てる。</p></li>
+<li><p>ハードウェアでセグメントを「グループ化」することはできないため、デバイスが複数のセグメントを使用する場合、複数のPE#が発生する。ハードウェアでは、フリーズ状態が「コンパニオン」PEに連鎖するメカニズムがあるが、これはPCIeエラー通知（通常はスイッチをフリーズするとそのすべての子もフリーズするようにするため）にのみ適用される。そのため、ソフトウェアで実装する。この場合、EEHの効果がやや低下するが、これ以上ないという結論に至った。したがって、どのPEがフリーズしても、その「ドメイン」内の他のPEもフリーズする。このため、「マスターペ」としてDMAやMSIなどに使用されるPEと、「セカンダリPE」として残りのM64セグメントに使用されるPEの概念を導入した。</p></li>
+</ul>
+<p>さらに、特定のBAR（Base Address Register）にオーバーレイする形で、複数のM64ウィンドウを「単一PEモード」で使用して、一部の問題を回避する方法を検討したい。例えば、非常に大容量のBARを持つデバイス（例：GPU）に対して有効だが、まだ実装していない。</p>
+</li>
+</ul>
+</div></blockquote>
+</section>
+<section id="considerations-for-sr-iov-on-powerkvm">
+<h2>3. PowerKVMにおけるSR-IOVに関する考慮事項<a class="headerlink" href="#considerations-for-sr-iov-on-powerkvm" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><ul>
+<li><p>SR-IOVの背景</p>
+<p>PCIe SR-IOV機能は、1つの物理関数（PF）が複数の仮想関数（VF）をサポートできるようにする。PFのSR-IOV能力レジスタは、VFの数とVFが有効かどうかを制御する。</p>
+<p>VFが有効になると、通常のPCIデバイスのように構成空間に表示されます。ただし、VFの構成空間ヘッダー内のBAR（Base Address Register）は特殊です。非VFデバイスの場合、ソフトウェアは構成空間ヘッダー内のBARを使用してBARのサイズを検出し、アドレスを割り当てます。VFデバイスでは、ソフトウェアはPFのSR-IOV Capability内のVF BARレジスタを使用してサイズを検出し、アドレスを割り当てます。VFの構成空間ヘッダー内のBARは読み取り専用のゼロです。 <em>PF</em> SR-IOV Capabilityを用いてサイズを検出・アドレスを割り当てます。VFの構成空間ヘッダー内のBARは読み取り専用のゼロです。</p>
+<p>PFのSR-IOV CapabilityにVF BARをプログラミングすると、すべての対応するVF(n) BARのベースアドレスを設定します。たとえば、PFのSR-IOV Capabilityが8つのVFを有効にするように設定され、1MBのVF BAR0を有する場合、そのVF BAR内のアドレスは8MB領域のベースを設定します。この領域は8つの連続する1MBの領域に分割され、それぞれが1つのVFのBAR0になります。注意点として、VF BARが8MBの領域を記述しているにもかかわらず、アライメント要件は単一のVF（この例では1MB）に適用されます。</p>
+</li>
+</ul>
+<p>PE内でVFを分離するための戦略はいくつかあります：</p>
+<ul class="simple">
+<li><p>M32ウィンドウ：1つのM32ウィンドウがあり、256つの等しいサイズのセグメントに分割されます。最も細かい粒度は256MBのウィンドウで1MBのセグメントです。1MB以上のVF BARはこのウィンドウ内で別のPEにマッピングできます。各セグメントは検索テーブルを介して個別にPEにマッピング可能なので、柔軟性がありますが、すべてのVF BARが同じサイズである場合に最適です。サイズが異なる場合、全体のウィンドウは最小のVF BARのセグメントサイズに合わせて小さくする必要があります。つまり、大きなVF BARは複数のセグメントをカバーします。</p></li>
+<li><p>非セグメント化されたM64ウィンドウ：非セグメント化されたM64ウィンドウは1つのPEに完全にマッピングされるため、1つのVFのみを分離できます。</p></li>
+<li><p>単一セグメント化されたM64ウィンドウ：セグメント化されたM64ウィンドウはM32ウィンドウと同様に使用できますが、セグメントは個別にPEにマッピングできません（セグメント番号がPE番号になります）。柔軟性が低いため、複数のBARを持つVFは複数のPEの「ドメイン」に配置する必要がありますが、単一のPEに比べて分離度が低くなります。</p></li>
+<li><p>複数セグメント化されたM64ウィンドウ：通常通り、各ウィンドウは256つの等しいサイズのセグメントに分割され、セグメント番号がPE番号になります。ただし、複数のM64ウィンドウを使用する場合、それぞれのベースアドレスとセグメントサイズを異なる値に設定できます。VFがそれぞれ1MBのBARと32MBのBARを持つ場合、1つのM64ウィンドウで1MBのセグメントを割り当て、別のM64ウィンドウで32MBのセグメントを割り当てることができます。</p></li>
+</ul>
+<p>最後に、次の2つのセクションでより詳しく説明するM64ウィンドウをSR-IOVに利用する計画について述べます。あるVF BARに対して、全体の256セグメント（256 * VF BARサイズ）を効果的に確保し、そのM64ウィンドウ内の空きセグメント/PEの開始位置にVF BARを配置する必要があります。</p>
+<p>目標は、もちろん各VFに個別のPEを割り当てるということです。</p>
+<p>IODA2プラットフォームは16つのM64ウィンドウを持ち、これらはMMIO範囲をPE#にマッピングするために使用されます。各M64ウィンドウは1つのMMIO範囲を定義し、この範囲は256セグメントに分割され、それぞれのセグメントは1つのPEに対応します。</p>
+<p>SR-IOV VF BARはすべて同じサイズであるため、このM64ウィンドウを個々のPEにVFをマッピングするために活用することにしました。</p>
+<p>しかし、この方法には別の問題が生じます：total_VFsは通常M64ウィンドウセグメントの数より小さいため、1つのVF BARを1つのM64ウィンドウに直接マッピングすると、他のデバイスのMMIO範囲に一部のM64ウィンドウがマッピングしてしまう可能性があります。</p>
+<p>IODAは256つのPEをサポートしており、セグメントされたウィンドウは256セグメントを持ちます。そのため、total_VFsが256未満の場合、図1.0のようにM64ウィンドウのセグメント[total_VFs, 255]が他のデバイスのMMIO範囲にマッピングされる状況が生じます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>0      1                     total_VFs - 1
++------+------+-     -+------+------+
+|      |      |  ...  |      |      |
++------+------+-     -+------+------+
+
+                      VF(n) BAR space
+
+0      1                     total_VFs - 1                255
++------+------+-     -+------+------+-      -+------+------+
+|      |      |  ...  |      |      |   ...  |      |      |
++------+------+-     -+------+------+-      -+------+------+
+
+                      M64 window
+
+           Figure 1.0 Direct map VF(n) BAR space
+</pre></div>
+</div>
+<p>現在の解決策は、VF(n) BAR領域がそれほど必要でなくても256セグメントを確保することです（図1.1を参照）：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>0      1                     total_VFs - 1                255
++------+------+-     -+------+------+-      -+------+------+
+|      |      |  ...  |      |      |   ...  |      |      |
++------+------+-     -+------+------+-      -+------+------+
+
+                      VF(n) BAR space + extra
+
+0      1                     total_VFs - 1                255
++------+------+-     -+------+------+-      -+------+------+
+|      |      |  ...  |      |      |   ...  |      |      |
++------+------+-     -+------+------+-      -+------+------+
+
+                      M64 window
+
+           Figure 1.1 Map VF(n) BAR space + extra
+</pre></div>
+</div>
+<p>余分な領域を確保することで、M64ウィンドウ全体がこのSR-IOVデバイスに割り当てられ、他のデバイスが利用可能な領域は一切ありません。注意点として、この拡張はソフトウェアで確保される領域に限られ、ハードウェアではセグメント[total_VFs, 255]は応答しません。実際には、total_VFsのVFのみがセグメント[0, total_VFs - 1]に応答します。</p>
+</div></blockquote>
+</section>
+<section id="implications-for-the-generic-pci-code">
+<h2>4. ジェネリックPCIコードへの影響<a class="headerlink" href="#implications-for-the-generic-pci-code" title="この見出しへのパーマリンク">¶</a></h2>
+<p>PCIe SR-IOV仕様では、VF(n) BAR領域のベースアドレスが個々のVF BARのサイズに合わせてアライメントされる必要があります。</p>
+<p>IODA2では、MMIOアドレスがPE#を決定します。アドレスがM32ウィンドウ内にある場合、セグメントをPE#に変換するテーブルを更新することでPE#を設定できます。同様に、アドレスが未セグメント化されたM64ウィンドウ内にある場合、ウィンドウのPE#を設定できます。ただし、セグメント化されたM64ウィンドウ内にある場合、セグメント番号そのものがPE#になります。</p>
+<p>したがって、VFのPE#を制御する唯一の方法は、VF(n) BAR領域のベースアドレスを変更することです。PCIコアがVF(n) BAR領域に必要な正確なサイズを割り当てれば、VF BARの値は固定され変更できません。</p>
+<p>一方、PCIコアが追加の領域を割り当てた場合、VF BAR値を変更できるのは、全体のVF(n) BAR領域がコアによって割り当てられた領域内に収まっている限りです。</p>
+<p>理想的にはセグメントサイズが個々のVF BARサイズと同じになります。この場合、各VFはそれぞれのPEに配置されます。VF BAR（したがってPE#）は連続します。VF0がPE(x)に配置されている場合、VF(n)はPE(x+n)に配置されます。256セグメントを割り当てた場合、VF0のPE#の選択肢は(256 - numVFs)個になります。</p>
+<p>セグメントサイズがVF BARサイズより小さい場合、1つのVF BARをカバーするには複数のセグメントが必要となり、VFは複数のPEにまたがって配置されます。これは可能ですが、分離性が低下し、VF(n) BAR領域が(numVFs * n)セグメントを消費するため、PE#の選択肢が減少します。これにより、VF(n) BAR領域のベース調整に使えるセグメント数が少なくなります。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">powerpc</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="booting.html">デバイスツリー起動</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bootwrapper.html">PowerPC ブート Wrapper</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cpu_families.html">CPU ファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cpu_features.html">CPU フィーチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cxl.html">コヒーレントアクセラレータインターフェース (CXL)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cxlflash.html">コヒーレントアクセラレータ (CXL) フラッシュ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dawr-power9.html">POWER9 上の DAWR に関する問題</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dscr.html">DSCR (データストリーム制御レジスタ)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="eeh-pci-error-recovery.html">PCIバスEEHエラー回復</a></li>
+<li class="toctree-l2"><a class="reference internal" href="elfnote.html">ELF ノート PowerPC ネームスペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="firmware-assisted-dump.html">ファームウェア支援ダンプ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hvcs.html">HVCS IBM 「ハイパーザーチャー仮想コンソールサーバー」インストールガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="imc.html">IMC (インメモリコレクションカウンタ)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="isa-versions.html">CPU と ISA バージョンマッピング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kaslr-booke32.html">Freescale BookE32 用 KASLR</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mpc52xx.html">Linux 2.6.x における MPC52xx ファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="papr_hcalls.html">ハイパーコール操作コード (hcalls)</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Powerenv 上の PCI Express I/O ビジュー化リソース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pmu-ebb.html">PMU イベントベースのブランチ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ptrace.html">Ptrace</a></li>
+<li class="toctree-l2"><a class="reference internal" href="qe_firmware.html">Freescale QUICC エンジンファームウェアのアップロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="syscall64-abi.html">Power Architecture 64 ビット Linux システムコール ABI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="transactional_memory.html">トランザクショナルメモリのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ultravisor.html">保護実行ファシリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vas-api.html">仮想アクセラレータスイッチボード (VAS) ユーザースペース API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vcpudispatch_stats.html">VCPU ディスパッチ統計</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">powerpc</a><ul>
+<li>前へ: <a href="papr_hcalls.html" title="前章">ハイパーコール操作コード (hcalls)</a></li>
+<li>次へ: <a href="pmu-ebb.html" title="次章">PMU イベントベースのブランチ</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/powerpc/pci_iov_resource_on_powernv.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

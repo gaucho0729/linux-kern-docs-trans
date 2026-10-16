@@ -1,0 +1,336 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Livepatch — Linuxカーネルドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="callbacks.html" rel="next" title="(Un)パッチングコールバック"/>
+<link href="index.html" rel="prev" title="カーネルライブパッチ"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="livepatch">
+<h1>Livepatch<a class="headerlink" href="#livepatch" title="この見出しへのパーマリンク">¶</a></h1>
+<p>このドキュメントでは、カーネルのライブパッチングに関する基本的な情報を説明します。</p>
+<section id="motivation">
+<h2>1. 動機<a class="headerlink" href="#motivation" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ユーザーがシステムの再起動をためらう状況は多くあります。システムが複雑な科学計算を実行中であったり、ピーク利用時の重負荷下にある場合などがその例です。システムを稼働させ続けるだけでなく、安定かつセキュアな環境を維持したいというユーザーの要望に応えるため、ライブパッチングはシステム再起動をせずに機能呼び出しを再配向することで、重要な機能の修正を実現します。</p>
+</section>
+<section id="kprobes-ftrace-livepatching">
+<h2>2. Kprobes、Ftrace、Livepatching<a class="headerlink" href="#kprobes-ftrace-livepatching" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Linuxカーネルには、コードの実行を再配向するための複数のメカニズムがあります。具体的には、カーネルプローブ、関数トレース、ライブパッチングです：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>カーネルプローブは最も汎用性が高いメカニズムです。任意のインストラクションをブレイクポイント指令に置き換えることでコードの再配向が可能です。</p></li>
+<li><p>関数トレーサーは、関数エントリポイントに近い予め定義された場所からコードを呼び出します。この場所はコンパイラが'-pg' gccオプションを使用して生成します。</p></li>
+<li><p>ライブパッチングでは、関数パラメータやスタックが何らかの形で変更される前、関数エントリの非常に初期段階でコードを再配向する必要があります。</p></li>
+</ul>
+</div></blockquote>
+<p>これら3つのアプローチはすべて、実行時において既存のコードを変更する必要があります。そのため、お互いの領域を侵さないよう注意を払う必要があります。これらの問題の多くは、動的ftraceフレームワークをベースに解決されています。関数エントリをプローブする際、Kprobeはftraceハンドラとして登録されます（CONFIG_KPROBES_ON_FTRACEを参照）。また、ライブパッチから代替関数を呼び出す際には、カスタムのftraceハンドラを使用します。ただし、いくつかの制限があります（以下を参照）。</p>
+</section>
+<section id="consistency-model">
+<h2>3. 一貫性モデル<a class="headerlink" href="#consistency-model" title="この見出しへのパーマリンク">¶</a></h2>
+<p>関数はその理由があって存在します。入力パラメータを受け取り、ロックを取得または解放し、データを特定の方法で読み込み・処理・書き込みし、返却値を返します。言い換えれば、各関数には定義されたセマンティクスがあります。</p>
+<p>多くの修正は、修正された関数のセマンティクスを変更しません。たとえば、NULLポインタや境界チェックを追加する、レース条件を修正するためのメモリバリアを追加する、またはクリティカルセクションをロックで囲むなどです。このような変更は大半が自立しており、関数はシステムの他の部分に対して同じように振る舞います。このような場合、関数は個別に更新することが可能です。</p>
+<p>しかし、より複雑な修正方法もあります。たとえば、パッチは複数の関数におけるロックの順序を同時に変更する場合があります。あるいは、パッチはいくつかの一時的な構造体の意味を交換し、関連するすべての関数を更新する場合もあります。このような場合、影響を受けるユニット（スレッド、全体のカーネル）は、すべての新しい関数バージョンを同時に使用する必要があります。また、切り替えは安全なタイミングに限って行われるべきです。たとえば、影響を受けるロックが解放されたとき、または修正された構造体にデータが現在保存されていないときに限ります。</p>
+<p>安全に関数を適用する方法に関する理論は比較的複雑です。目標は、いわゆる整合性モデルを定義することです。このモデルは、新しい実装がシステムの整合性を維持しながら使用できる条件を定義しようとするものです。</p>
+<p>Livepatchは、kGraftとkpatchのハイブリッド型の整合性モデルを使用しています。これは、kGraftのタスクごとの整合性とシステムコールバリアの切り替えを組み合わせ、kpatchのスタックトレース切り替えを採用しています。また、いくつかのフォールバックオプションが用意されており、非常に柔軟性があります。</p>
+<p>パッチは、タスクが安全に切り替わる deemed なタイミングで、タスク単位で適用されます。パッチが有効になると、livepatchはタスクがパッチ済み状態に収束する移行状態に入ります。通常、この移行状態は数秒で完了します。パッチが無効化されるときにも同様のシーケンスが発生しますが、タスクはパッチ済み状態から未パッチ状態に収束します。</p>
+<p>割り込みハンドラは、割り込まれたタスクのパッチ済み状態を継承します。フォークされたタスク（子プロセス）についても同様に、親プロセスのパッチ済み状態を継承します。</p>
+<p>Livepatchは、タスクをパッチするタイミングを判断するため、いくつかの補完的なアプローチを使用しています。</p>
+<ol class="arabic">
+<li><p>最も効果的なアプローチは、スリープ中のタスクのスタックチェックです。あるタスクのスタックに影響を受ける関数がなければ、そのタスクをパッチします。ほとんどの場合、最初の試行でほとんどのタスクまたはすべてのタスクをパッチできます。そうでない場合は、定期的に再試行します。このオプションは、アーキテクチャが信頼できるスタック（HAVE_RELIABLE_STACKTRACE）を持つ場合にのみ利用可能です。</p></li>
+<li><p>必要に応じて使用される2番目のアプローチは、カーネルの終了切り替えです。タスクは、システムコールからユーザースペースに戻るとき、ユーザースペースのIRQ、またはシグナルのとき、切り替えられます。以下のケースで特に有用です：</p>
+<ol class="loweralpha simple">
+<li><p>影響を受ける関数に待機しているI/Oバウンドのユーザータスクをパッチする場合。この場合、SIGSTOPとSIGCONTを送信して、タスクをカーネルから強制的に抜けさせ、パッチを適用する必要があります。</p></li>
+<li><p>CPU負荷が高いユーザーのタスクをパッチングします。タスクが非常にCPU負荷が高い場合、IRQによって中断された次の機会にパッチングされます。</p></li>
+</ol>
+</li>
+<li><p>アイドル状態の「swapper」タスクについては、これらは常にカーネル内に留まるため、アイドルループ内でklp_update_patch_state()関数を呼び出すことで、CPUがアイドル状態に入る前にパッチングされます。</p>
+<p>(注意: kthreadsについてはこのようなアプローチはまだ実装されていません。)</p>
+</li>
+</ol>
+<p>HAVE_RELIABLE_STACKTRACEをサポートしていないアーキテクチャは、この2番目のアプローチにのみ依存します。関数の古いバージョンがまだ実行中のタスクが存在する可能性があり、その関数が返るまでパッチングが完了しない場合があります。このような場合はタスクにシグナルを送信する必要があります。これは特にkthreadsに適用されます。これらは起動されない可能性があり、強制的に起動させる必要があります。詳細については下記を参照してください。</p>
+<p>kthreadsを別の方法でパッチングする方法が見つからない限り、HAVE_RELIABLE_STACKTRACEをサポートしていないアーキテクチャは、カーネルライブパッチングによって完全にサポートされていないとみなされます。</p>
+<p>/sys/kernel/livepatch/&lt;patch&gt;/transitionファイルは、パッチが遷移状態にあるかどうかを示します。一度に1つのみパッチが遷移状態にあることができます。タスクが初期パッチ状態にとどまっている場合、遷移状態は無限に続く可能性があります。</p>
+<p>遷移状態中に、/sys/kernel/livepatch/&lt;patch&gt;/enabledファイルに逆の値を書き込むことで、遷移を逆転させ効果的にキャンセルできます。これにより、すべてのタスクが元のパッチ状態に戻るよう試みます。</p>
+<p>また、/proc/&lt;pid&gt;/patch_stateファイルを使用して、パッチング操作を妨げるタスクを特定できます。パッチが遷移状態にある場合、このファイルはタスクが未パッチ状態（0）かパッチ済み状態（1）かを示します。パッチが遷移状態でない場合は-1を表示します。遷移を妨げるタスクはSIGSTOPとSIGCONTシグナルで強制的に状態を変更させることができます。ただし、システムに悪影響を及ぼす可能性があります。代替案として、残りの妨害タスクに偽のシグナルを送信する方法があります。実際にはシグナルが届くことはなく（シグナル待機構造にデータは存在しません）、タスクは中断されたり起動されたりして、パッチ状態を変更させられます。偽のシグナルは自動的に15秒ごとに送信されます。</p>
+<p>管理者は、/sys/kernel/livepatch/&lt;patch&gt;/force属性を通じてトランジションを影響させることもできます。この属性に1を書き込むと、すべてのタスクのTIF_PATCH_PENDINGフラグをクリアし、タスクをパッチ済み状態に強制的に移行させます。重要な注意点！force属性は、ブロッキングタスクにより長時間トランジションが停止している場合にのみ使用する意図です。管理者は、必要なデータ（ブロッキングタスクのスタックトレースなど）を収集し、パッチ配布元から強制移行の承認を求める必要があります。未承認での使用はシステムに損害を及ぼす可能性があります。パッチの性質により、どの関数が（非）パッチされるか、ブロッキングタスクがスリープしている関数がどれか（/proc/&lt;pid&gt;/stackがここに役立ちます）によって、どの機能が影響を受けるか異なります。force機能が使用されている場合、パッチモジュールの削除（rmmod）は永久に無効化されます。このようなモジュール内にスリープしているタスクが存在する可能性があるため、保証できません。パッチモジュールがループで無効化・有効化される場合、参照カウントが無限に増える可能性があります。</p>
+<p>さらに、forceの使用は今後のライブパッチの適用にも影響を及ぼし、システムにさらなる損害を引き起こす可能性があります。管理者はまず、単純にトランジションをキャンセルする（上記を参照）ことを検討すべきです。forceを使用する場合は、再起動を計画し、今後はライブパッチの適用を行わないべきです。</p>
+<section id="adding-consistency-model-support-to-new-architectures">
+<h3>3.1 新しいアーキテクチャへの整合性モデルのサポートの追加<a class="headerlink" href="#adding-consistency-model-support-to-new-architectures" title="この見出しへのパーマリンク">¶</a></h3>
+<p>新しいアーキテクチャに整合性モデルのサポートを追加するには、いくつかのオプションがあります：</p>
+<ol class="arabic">
+<li><p>CONFIG_HAVE_RELIABLE_STACKTRACEを追加します。これはobjtoolの移植を意味し、非DWARFアンワインドラーを使用する場合、スタックトレースコードがスタック内の割り込みを検出できるようにするため、スタックトレースコードが割り込みを検出できるようにするための方法が存在することを確認する必要があります。</p></li>
+<li><p>代わりに、すべてのkthreadが安全な場所でklp_update_patch_state()を呼び出すことを確保します。kthreadは通常、繰り返し実行する無限ループにあり、安全な場所はループ内でロックを取得していない状態で、すべてのデータ構造が明確な状態にある場所です。</p>
+<p>ワークキューまたはkthreadワーカーAPIを使用している場合、場所は明確です。これらのkthreadは一般的なループ内で独立したアクションを処理します。</p>
+<p>カスタムループを持つkthreadの場合、場所はケースバイケースで慎重に選択する必要があります。</p>
+<p>その場合、HAVE_RELIABLE_STACKTRACEを持たないアーキテクチャでも、整合性モデルのスタックチェックを行わない部分を依然として利用できます：</p>
+<ol class="loweralpha simple">
+<li><p>カーネル/ユーザースペース境界を越えたユーザータスクのパッチング；および</p></li>
+<li><p>指定されたパッチポイントでキーテッドとアイドルタスクのパッチング。</p></li>
+</ol>
+<p>このオプションはオプション1より劣ります。なぜなら、ユーザーのタスクを通知し、kthreadsを起こしてパッチを適用する必要があるからです。ただし、まだ信頼できるスタックトレースが提供されていないアーキテクチャでは、このオプションがバックアップとして依然として有効かもしれません。</p>
+</li>
+</ol>
+</section>
+</section>
+<section id="livepatch-module">
+<h2>4. ライブパッチモジュール<a class="headerlink" href="#livepatch-module" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ライブパッチはカーネルモジュールを使用して配布されます。サンプルはsamples/livepatch/livepatch-sample.cを参照してください。</p>
+<p>このモジュールには、置き換える関数の新しい実装が含まれています。さらに、元の実装と新しい実装の関係を記述する構造体が定義されています。その後、ライブパッチモジュールがロードされるとカーネルが新しいコードを使用を開始するコード、およびライブパッチモジュールが削除される前にクリーンアップを行うコードが含まれています。これらについては次のセクションで詳しく説明します。</p>
+<section id="new-functions">
+<h3>4.1. 新しい関数<a class="headerlink" href="#new-functions" title="この見出しへのパーマリンク">¶</a></h3>
+<p>新しい関数のバージョンは通常、元のソースからコピーされます。良い実践としては、関数名にプレフィックスを付けて元の関数と区別するため、例えばバックトレースで識別できるようにする方法があります。また、これらは直接呼び出されず、グローバルな可視性を必要としないため、staticとして宣言することもできます。</p>
+<p>パッチには実際に変更された関数のみが含まれます。ただし、元のソースファイルから関数やデータへのアクセスが必要な場合がありますが、これらはローカルにのみアクセス可能である可能性があります。このような場合、生成されたライブパッチモジュールに特別なリロケーションセクションを設けることで解決できます。詳しくは
+<a class="reference internal" href="module-elf-format.html"><span class="doc">ライブパッチモジュールELF形式</span></a> 詳細についてはこちら。</p>
+</section>
+<section id="metadata">
+<h3>4.2. メタデータ<a class="headerlink" href="#metadata" title="この見出しへのパーマリンク">¶</a></h3>
+<p>パッチはいくつかの構造体によって記述され、情報を3つのレベルに分割しています。</p>
+<blockquote>
+<div><ul>
+<li><p>struct klp_funcはそれぞれのパッチされた関数に対して定義されます。これは元の関数と新しい実装の関係を記述します。</p>
+<p>この構造体には、元の関数の名前（文字列として）が含まれます。関数アドレスは実行時にkallsymsを介して取得されます。</p>
+<p>次に、新しい関数のアドレスが含まれます。これは関数ポインタを直接割り当てることで定義されます。注意点として、新しい関数は通常同じソースファイル内で定義されます。</p>
+<p>オプションのパラメータとして、kallsymsデータベース内のシンボルの位置を使用して、同じ名前の関数を区別できます。これはデータベース内の絶対的な位置ではなく、特定のオブジェクト（vmlinuxまたはカーネルモジュール）で見つかった順序を指します。注意点として、kallsymsはオブジェクト名に基づいてシンボルを検索できます。</p>
+</li>
+<li><p>struct klp_objectは同じオブジェクト内のパッチされた関数（struct klp_func）の配列を定義します。オブジェクトはvmlinux（NULL）かモジュール名です。</p>
+<p>この構造体は、各オブジェクトの関数をグループ化して処理するのに役立ちます。注意点として、パッチされたモジュールがパッチ自体よりも後でロードされる可能性があり、関連する関数は利用可能になったタイミングでのみパッチされることがあります。</p>
+</li>
+<li><p>struct klp_patch はパッチされたオブジェクト（struct klp_object）の配列を定義します。</p>
+<p>この構造体はすべてのパッチされた関数を一貫して処理し、最終的に同期的に適用されます。すべてのパッチされたシンボルが見つかるまで全体のパッチは適用されません。例外は、まだロードされていないオブジェクト（カーネルモジュール）からのシンボルです。</p>
+<p>パッチがタスクごとに適用される仕組みについての詳細は、「一貫性モデル」セクションをご参照ください。</p>
+</li>
+</ul>
+</div></blockquote>
+</section>
+</section>
+<section id="livepatch-life-cycle">
+<h2>5. Livepatch ライフサイクル<a class="headerlink" href="#livepatch-life-cycle" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Livepatching はロード、有効化、置き換え、無効化、削除の5つの基本的な操作で説明できます。</p>
+<p>置き換えと無効化の操作は排他的です。特定のパッチに対しては同じ結果をもたらしますが、システム全体では異なる結果をもたらします。</p>
+<section id="loading">
+<h3>5.1. ロード<a class="headerlink" href="#loading" title="この見出しへのパーマリンク">¶</a></h3>
+<p>合理的な方法は、Livepatch カーネルモジュールがロードされるときにパッチを有効化することです。そのため、klp_enable_patch() は callback 内で呼び出さなければなりません。 <a class="reference internal" href="../driver-api/basics.html#c.module_init" title="module_init"><code class="xref c c-func docutils literal notranslate"><span class="pre">module_init()</span></code></a> callback. その主な理由は以下の通りです：</p>
+<p>まず、モジュールは関連する struct klp_patch に簡単にアクセスできます。</p>
+<p>第二に、エラーコードは、パッチが有効にならない場合にモジュールのロードを拒否するために使用される可能性があります。</p>
+</section>
+<section id="enabling">
+<h3>5.2. 有効化<a class="headerlink" href="#enabling" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ライブパッチは、コールバックから klp_enable_patch() を呼び出すことで有効になります。この段階で、システムはパッチされた関数の新しい実装を開始して使用します。 <a class="reference internal" href="../driver-api/basics.html#c.module_init" title="module_init"><code class="xref c c-func docutils literal notranslate"><span class="pre">module_init()</span></code></a> この段階で、システムはパッチされた関数の新しい実装を開始して使用します。</p>
+<p>まず、パッチされた関数のアドレスは関数名に基づいて検出されます。セクション「New functions」で説明されている特別なリロケーションが適用されます。関連するエントリは /sys/kernel/livepatch/&lt;name&gt; の下に作成されます。上述のどの操作も失敗した場合、パッチは拒否されます。</p>
+<p>第二に、ライブパッチは、タスクがパッチされた状態に収束する遷移状態に入ります。オリジナルの関数が初めてパッチされる場合、関数固有の struct klp_ops が作成され、汎用的な ftrace ハンドラが登録されます。<a class="footnote-reference brackets" href="#id2" id="id1">1</a>. この段階は、/sys/kernel/livepatch/&lt;name&gt;/transition に '1' の値があることで示されます。このプロセスについての詳細情報は、「Consistency model」セクションを参照してください。</p>
+<p>最後に、すべてのタスクがパッチされると、'transition' の値が '0' に変わります。</p>
+<dl class="footnote brackets">
+<dt class="label" id="id2"><span class="brackets"><a class="fn-backref" href="#id1">1</a></span></dt>
+<dd><p>関数が複数回パッチされる可能性があることに注意してください。特定の関数に対して ftrace ハンドラは一度しか登録されません。追加のパッチはリストにエントリを追加するだけです（フィールド <cite>func_stack</cite>) of the struct klp_ops. The right implementation is selected by the ftrace handler, see the “Consistency model” section.</p>
+<p>That said, it is highly recommended to use cumulative livepatches because they help keeping the consistency of all changes. In this case, functions might be patched two times only during the transition period.</p>
+</dd>
+</dl>
+</section>
+<section id="replacing">
+<h3>5.3. 置き換え<a class="headerlink" href="#replacing" title="この見出しへのパーマリンク">¶</a></h3>
+<p>All enabled patches might get replaced by a cumulative patch that has the .replace flag set.</p>
+<p>Once the new patch is enabled and the ‘transition’ finishes then all the functions (struct klp_func) associated with the replaced patches are removed from the corresponding struct klp_ops. Also the ftrace handler is unregistered and the struct klp_ops is freed when the related function is not modified by the new patch and func_stack list becomes empty.</p>
+<p>参照 <a class="reference internal" href="cumulative-patches.html"><span class="doc">アトミック置換と累積パッチ</span></a> 詳細についてはこちら。</p>
+</section>
+<section id="disabling">
+<h3>5.4. 無効化<a class="headerlink" href="#disabling" title="この見出しへのパーマリンク">¶</a></h3>
+<p>Enabled patches might get disabled by writing ‘0’ to /sys/kernel/livepatch/&lt;name&gt;/enabled.</p>
+<p>First, livepatch enters into a transition state where tasks are converging to the unpatched state. The system starts using either the code from the previously enabled patch or even the original one. This stage is indicated by a value of ‘1’ in /sys/kernel/livepatch/&lt;name&gt;/transition. For more information about this process, see the “Consistency model” section.</p>
+<p>Second, once all tasks have been unpatched, the ‘transition’ value changes to ‘0’. All the functions (struct klp_func) associated with the to-be-disabled patch are removed from the corresponding struct klp_ops. The ftrace handler is unregistered and the struct klp_ops is freed when the func_stack list becomes empty.</p>
+<p>Third, the sysfs interface is destroyed.</p>
+</section>
+<section id="removing">
+<h3>5.5. 削除<a class="headerlink" href="#removing" title="この見出しへのパーマリンク">¶</a></h3>
+<p>Module removal is only safe when there are no users of functions provided by the module. This is the reason why the force feature permanently disables the removal. Only when the system is successfully transitioned to a new patch state (patched/unpatched) without being forced it is guaranteed that no task sleeps or runs in the old code.</p>
+</section>
+</section>
+<section id="sysfs">
+<h2>6. sysfs<a class="headerlink" href="#sysfs" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Information about the registered patches can be found under /sys/kernel/livepatch. The patches could be enabled and disabled by writing there.</p>
+<p>/sys/kernel/livepatch/&lt;patch&gt;/force attributes allow administrator to affect a patching operation.</p>
+<p>See Documentation/ABI/testing/sysfs-kernel-livepatch for more details.</p>
+</section>
+<section id="limitations">
+<h2>7. 制限<a class="headerlink" href="#limitations" title="この見出しへのパーマリンク">¶</a></h2>
+<p>The current Livepatch implementation has several limitations:</p>
+<blockquote>
+<div><ul>
+<li><p>Only functions that can be traced could be patched.</p>
+<p>Livepatchは動的ftraceに基づいています。特に、ftraceを実装する関数や、livepatch用のftraceハンドラを実装する関数はパッチできません。そうしないとコードが無限ループに陥る可能性があります。このような潜在的な誤りを防ぐため、問題のある関数は「notrace」でマークされます。</p>
+</li>
+<li><p>動的ftraceが関数の最初に位置している場合にのみ、Livepatchは信頼性を保証します。</p>
+<p>スタックや関数パラメータが何らかの形で変更される前に、関数をリダイレクトする必要があります。たとえば、x86_64ではgccコンパイラオプション「-fentry」を使用する必要があります。</p>
+<p>例外としてPPCポートがあります。これは相対アドレッシングとTOCを使用しており、各関数がTOCを処理し、LRを保存した後にftraceハンドラを呼び出す必要があります。この操作は戻るときに逆操作する必要があります。幸いなことに、汎用的なftraceコードも同様の問題があり、すべてftraceレベルで処理されています。</p>
+</li>
+<li><p>ftraceフレームワークを使用するkretprobesは、パッチされた関数と競合します。</p>
+<p>kretprobesとlivepatchの両方とも、リターンアドレスを変更するftraceハンドラを使用します。最初にハンドラを使用する側が勝ち、もう一方のハンドラが既に使用されている場合、プローブまたはパッチのいずれかが拒否されます。</p>
+</li>
+<li><p>元の関数内のkprobesは、コードが新しい実装にリダイレクトされたときに無視されます。</p>
+<p>この状況に関する警告を追加するための進行中の作業があります。</p>
+</li>
+</ul>
+</div></blockquote>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">カーネルライブパッチ</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Livepatch</a></li>
+<li class="toctree-l2"><a class="reference internal" href="callbacks.html">(Un)パッチングコールバック</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cumulative-patches.html">アトミック置換と累積パッチ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="module-elf-format.html">ライブパッチモジュールELF形式</a></li>
+<li class="toctree-l2"><a class="reference internal" href="shadow-vars.html">シャドウ変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="system-state.html">システム状態の変更</a></li>
+</ul>
+</li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">カーネルライブパッチ</a><ul>
+<li>前へ: <a href="index.html" title="前章">カーネルライブパッチ</a></li>
+<li>次へ: <a href="callbacks.html" title="次章">(Un)パッチングコールバック</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/livepatch/livepatch.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

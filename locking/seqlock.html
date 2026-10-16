@@ -1,0 +1,1088 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>シーケンスカウンタとシーケンシャルロック — Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="spinlocks.html" rel="next" title="ロックの教訓"/>
+<link href="rt-mutex.html" rel="prev" title="PIサポート付きRTミューテックスサブシステム"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="sequence-counters-and-sequential-locks">
+<h1>シーケンスカウンタとシーケンシャルロック<a class="headerlink" href="#sequence-counters-and-sequential-locks" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>シーケンスカウンタは、ロックレスリーダー（読み取り専用の再試行ループ）とライタースタービングが発生しないリーダー-ライターコンシステンシメカニズムです。これは、まれにしか書かれないデータ（例：システム時間）に対して使用され、リーダーが一貫した情報セットを必要とし、情報が変化した場合に再試行する意欲がある場合に用いられます。</p>
+<p>読み取り側クリティカルセクションの開始時にシーケンスカウントが偶数であり、終了時に同じシーケンスカウント値が再読まれる場合、データセットは一貫しています。このデータセット内のデータは、読み取り側クリティカルセクション内でコピーする必要があります。クリティカルセクションの開始と終了の間にシーケンスカウントが変化した場合、リーダーは再試行する必要があります。</p>
+<p>ライターは、クリティカルセクションの開始と終了時にシーケンスカウントをインクリメントします。クリティカルセクションを開始した後、シーケントカウントは奇数になり、リーダーに更新が進行中であることを示します。クリティカルセクション終了時にシーケンスカウントは再び偶数に戻り、リーダーが進展できるようになります。</p>
+<p>シーケンスカウンタの書き込み側クリティカルセクションは、読み取り側セクションによってプリエンプションまたは割り込まれてはなりません。それ以外の場合、リーダーはスピンロック状態でスケジューラータイク全体にわたって待機する必要があります。そのリーダーがリアルタイムスケジューリングクラスに属する場合、永遠にスピンし、カーネルはライブロックを発生させます。</p>
+<p>保護されたデータにポインタが含まれている場合、このメカニズムは使用できません。ライターがリーダーが追跡しているポインタを無効化する可能性があるためです。</p>
+</section>
+<section id="sequence-counters-seqcount-t">
+<span id="seqcount-t"></span><h2>シーケンスカウンタ（<code class="docutils literal notranslate"><span class="pre">seqcount_t</span></code>)<a class="headerlink" href="#sequence-counters-seqcount-t" title="この見出しへのパーマリンク">¶</a></h2>
+<p>これは素朴なカウントメカニズムであり、複数のライターに対する保護は提供していません。そのため、書き込み側クリティカルセクションは外部ロックによってシリアル化される必要があります。</p>
+<p>書き込みシリアル化プリミティブが明示的にプリエンプションを無効にしない場合、書き込み側セクションに入る前にプリエンプションを明示的に無効にする必要があります。読み取りセクションがハードIRQまたはソフトIRQコンテキストから呼び出される場合、割り込みまたはボトムハーフもそれぞれ書き込みセクションに入る前に無効にする必要があります。</p>
+<p>ライターサーバライズーションと非プリエンプションのシーケンスカウンタ要件を自動的に処理したい場合は、
+<a class="reference internal" href="#seqlock-t"><span class="std std-ref">シーケンシャルロック（seqlock_t）</span></a> を呼び出してください。</p>
+<p>初期化:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/* dynamic */
+seqcount_t foo_seqcount;
+seqcount_init(&amp;foo_seqcount);
+
+/* static */
+static seqcount_t foo_seqcount = SEQCNT_ZERO(foo_seqcount);
+
+/* C99 struct init */
+struct {
+        .seq   = SEQCNT_ZERO(foo.seq),
+} foo;
+</pre></div>
+</div>
+<p>書き込みパス:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/* Serialized context with disabled preemption */
+
+write_seqcount_begin(&amp;foo_seqcount);
+
+/* ... [[write-side critical section]] ... */
+
+write_seqcount_end(&amp;foo_seqcount);
+</pre></div>
+</div>
+<p>読み取りパス:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>do {
+        seq = read_seqcount_begin(&amp;foo_seqcount);
+
+        /* ... [[read-side critical section]] ... */
+
+} while (read_seqcount_retry(&amp;foo_seqcount, seq));
+</pre></div>
+</div>
+<section id="sequence-counters-with-associated-locks-seqcount-lockname-t">
+<span id="seqcount-locktype-t"></span><h3>関連するロックを持つシーケンスカウンタ（<code class="docutils literal notranslate"><span class="pre">seqcount_LOCKNAME_t</span></code>)<a class="headerlink" href="#sequence-counters-with-associated-locks-seqcount-lockname-t" title="この見出しへのパーマリンク">¶</a></h3>
+<p>議論されているように、 <a class="reference internal" href="#seqcount-t"><span class="std std-ref">シーケンスカウンタ（seqcount_t）</span></a>シーケンスカウンタの書込み側のクリティカルセクションはシリアル化され、非プリエンプティブでなければならない。このシーケンスカウンタの変種は、初期化時に書込み側のシリアル化に使用されるロックを関連付けることで、lockdepが書込み側のクリティカルセクションが適切にシリアル化されているかを検証できるようにします。</p>
+<p>lockdepが無効化されている場合、またはストレージやランタイムのオーバーヘッドがない場合は、このロック関連付けはノーオペレーション（NOOP）です。lockdepが有効化されている場合、lock pointerはstruct seqcountに保存され、書込み側のクリティカルセクションの開始時にlockdepの「ロックが保持されている」アサーションが挿入され、適切に保護されているかを検証します。</p>
+<p>プリエンプションを明示的に無効化しないロックタイプでは、書込み側の関数でプリエンプション保護が強制されます。</p>
+<p>以下のシーケンスカウンタと関連付けられたロックが定義されています：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">seqcount_spinlock_t</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">seqcount_raw_spinlock_t</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">seqcount_rwlock_t</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">seqcount_mutex_t</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">seqcount_ww_mutex_t</span></code></p></li>
+</ul>
+</div></blockquote>
+<p>シーケンスカウンタの読み取りと書き込みAPIは、plain seqcount_tまたは上記のseqcount_LOCKNAME_tの変種のいずれかを引数として受け取ります。</p>
+<p>初期化（「LOCKNAME」をサポートされているロックの1つに置き換えて）：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/* dynamic */
+seqcount_LOCKNAME_t foo_seqcount;
+seqcount_LOCKNAME_init(&amp;foo_seqcount, &amp;lock);
+
+/* static */
+static seqcount_LOCKNAME_t foo_seqcount =
+        SEQCNT_LOCKNAME_ZERO(foo_seqcount, &amp;lock);
+
+/* C99 struct init */
+struct {
+        .seq   = SEQCNT_LOCKNAME_ZERO(foo.seq, &amp;lock),
+} foo;
+</pre></div>
+</div>
+<p>書き込みパス：同様に <a class="reference internal" href="#seqcount-t"><span class="std std-ref">シーケンスカウンタ（seqcount_t）</span></a>、関連付けられた書き込みシリアル化ロックが取得されたコンテキストから実行されている場合。</p>
+<p>読み取りパス：同様に <a class="reference internal" href="#seqcount-t"><span class="std std-ref">シーケンスカウンタ（seqcount_t）</span></a>.</p>
+</section>
+<section id="latch-sequence-counters-seqcount-latch-t">
+<span id="seqcount-latch-t"></span><h3>ラッチシーケンスカウンタ（<code class="docutils literal notranslate"><span class="pre">seqcount_latch_t</span></code>)<a class="headerlink" href="#latch-sequence-counters-seqcount-latch-t" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ラッチシーケンスカウンタは、マルチバージョンコンカレンシー制御メカニズムであり、埋め込まれたseqcount_tカウンタの偶奇値を用いて保護データの2つのコピー間を切り替えることで、シーケンスカウンタの読み取りパスが自身の書込み側クリティカルセクションを安全に中断できるようにします。</p>
+<p>読み取り側セクションがNMIハンドラから呼び出される可能性がある場合、書込み側セクションが読み取りによって中断されないことを保証できない場合はseqcount_latch_tを使用してください。</p>
+<p>確認 <cite><a class="reference internal" href="#c.raw_write_seqcount_latch" title="raw_write_seqcount_latch"><code class="xref c c-func docutils literal notranslate"><span class="pre">raw_write_seqcount_latch()</span></code></a></cite> 詳しくは</p>
+</section>
+</section>
+<section id="sequential-locks-seqlock-t">
+<span id="seqlock-t"></span><h2>シーケンシャルロック（<code class="docutils literal notranslate"><span class="pre">seqlock_t</span></code>)<a class="headerlink" href="#sequential-locks-seqlock-t" title="この見出しへのパーマリンク">¶</a></h2>
+<p>これは、前述のメカニズムに加え、 <a class="reference internal" href="#seqcount-t"><span class="std std-ref">シーケンスカウンタ（seqcount_t）</span></a> 書込み側のシリアル化と非プリエンプティブ性を実現する埋め込まれたスピニングロックを含みます。</p>
+<p>読み取り側セクションがハードIRQまたはソフトIRQコンテキストから呼び出される場合、それぞれの割り込みまたはボトムハーフを無効化する書込み側関数の変種を使用してください。</p>
+<p>初期化:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/* dynamic */
+seqlock_t foo_seqlock;
+seqlock_init(&amp;foo_seqlock);
+
+/* static */
+static DEFINE_SEQLOCK(foo_seqlock);
+
+/* C99 struct init */
+struct {
+        .seql   = __SEQLOCK_UNLOCKED(foo.seql)
+} foo;
+</pre></div>
+</div>
+<p>書き込みパス:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>write_seqlock(&amp;foo_seqlock);
+
+/* ... [[write-side critical section]] ... */
+
+write_sequnlock(&amp;foo_seqlock);
+</pre></div>
+</div>
+<p>読み取りパス、3つのカテゴリ：</p>
+<ol class="arabic">
+<li><p>通常のシーケンスリーダーは、ライターアクセスをブロックしないが、ライターが進行中である場合、シーケンス番号の変化を検知して再試行する必要がある。ライターはリーダーの進行を待つことなく：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>do {
+        seq = read_seqbegin(&amp;foo_seqlock);
+
+        /* ... [[read-side critical section]] ... */
+
+} while (read_seqretry(&amp;foo_seqlock, seq));
+</pre></div>
+</div>
+</li>
+<li><p>ロックングリーダーは、ライターまたは他のロックングリーダーが進行中である場合、待機する。進行中のロックングリーダーはライターのクリティカルセクションの進入をブロックする。このリーダーロックは排他ロックである。rwlock_tとは異なり、1つのロックングリーダーのみがこれを取得できる：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>read_seqlock_excl(&amp;foo_seqlock);
+
+/* ... [[read-side critical section]] ... */
+
+read_sequnlock_excl(&amp;foo_seqlock);
+</pre></div>
+</div>
+</li>
+<li><p>渡されたマーカーに応じて、条件付きロックレスリーダー（1の場合）またはロックリーダー（2の場合）を使用します。これにより、書き込みアクティビティの急激な増加時にロックレスリーダーのスターバーション（再試行ループの過剰）を回避できます。まず、ロックレスリーダーの試行を行います（マーカーを渡す）。その試行が失敗した場合（奇数のシーケンスカウンタが返され、次のイテレーションのマーカーとして使用されます）、ロックレスリーダーはフルなロックリーダーに変換され、再試行ループは必要ありません。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/* marker; even initialization */
+int seq = 0;
+do {
+        read_seqbegin_or_lock(&amp;foo_seqlock, &amp;seq);
+
+        /* ... [[read-side critical section]] ... */
+
+} while (need_seqretry(&amp;foo_seqlock, seq));
+done_seqretry(&amp;foo_seqlock, seq);
+</pre></div>
+</div>
+</li>
+</ol>
+</section>
+<section id="api-documentation">
+<h2>APIドキュメンテーション<a class="headerlink" href="#api-documentation" title="この見出しへのパーマリンク">¶</a></h2>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.seqcount_init">
+<span class="sig-name descname"><span class="n"><span class="pre">seqcount_init</span></span></span><a class="headerlink" href="#c.seqcount_init" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">seqcount_init</span> <span class="pre">(s)</span></code></p>
+<blockquote>
+<div><p>seqcount_tのランタイム初期化子</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">s</span></code></dt><dd><p>seqcount_tインスタンスへのポインタ</p>
+</dd>
+</dl>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.SEQCNT_ZERO">
+<span class="sig-name descname"><span class="n"><span class="pre">SEQCNT_ZERO</span></span></span><a class="headerlink" href="#c.SEQCNT_ZERO" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">SEQCNT_ZERO</span> <span class="pre">(name)</span></code></p>
+<blockquote>
+<div><p>seqcount_tの静的初期化子</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">name</span></code></dt><dd><p>seqcount_tインスタンスの名前</p>
+</dd>
+</dl>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.__read_seqcount_begin">
+<span class="sig-name descname"><span class="n"><span class="pre">__read_seqcount_begin</span></span></span><a class="headerlink" href="#c.__read_seqcount_begin" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">__read_seqcount_begin</span> <span class="pre">(s)</span></code></p>
+<blockquote>
+<div><p>バリアーなしでseqcount_tの読み取りセクションを開始</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">s</span></code></dt><dd><p>seqcount_tまたはseqcount_LOCKNAME_tのいずれかの変体へのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>__read_seqcount_beginはread_seqcount_beginと同様ですが、smp_rmb()バリアーを持ちません。呼び出し元は、このクリティカルセクションで保護される変数を実際に読み込む前に、smp_rmb()または同等の順序を提供する必要があります。</p>
+<p>注意して使用してください。クリティカルコードのみで使用し、バリアーがどのように提供されているかをコメントしてください。</p>
+<p><strong>戻り値</strong></p>
+<p>渡すカウント <a class="reference internal" href="#c.read_seqcount_retry" title="read_seqcount_retry"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqcount_retry()</span></code></a></p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.raw_read_seqcount_begin">
+<span class="sig-name descname"><span class="n"><span class="pre">raw_read_seqcount_begin</span></span></span><a class="headerlink" href="#c.raw_read_seqcount_begin" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">raw_read_seqcount_begin</span> <span class="pre">(s)</span></code></p>
+<blockquote>
+<div><p>ロックデップなしでseqcount_tの読み取りセクションを開始</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">s</span></code></dt><dd><p>seqcount_tまたはseqcount_LOCKNAME_tのいずれかの変体へのポインタ</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>渡すカウント <a class="reference internal" href="#c.read_seqcount_retry" title="read_seqcount_retry"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqcount_retry()</span></code></a></p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.read_seqcount_begin">
+<span class="sig-name descname"><span class="n"><span class="pre">seqcount_tの読み取りクリティカルセクションを開始</span></span></span><a class="headerlink" href="#c.read_seqcount_begin" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">read_seqcount_begin</span> <span class="pre">(s)</span></code></p>
+<blockquote>
+<div><p>seqcount_tの読み取りクリティカルセクションを開始</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">s</span></code></dt><dd><p>seqcount_tまたはseqcount_LOCKNAME_tのいずれかの変体へのポインタ</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>渡すカウント <a class="reference internal" href="#c.read_seqcount_retry" title="read_seqcount_retry"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqcount_retry()</span></code></a></p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.raw_read_seqcount">
+<span class="sig-name descname"><span class="n"><span class="pre">raw_read_seqcount</span></span></span><a class="headerlink" href="#c.raw_read_seqcount" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">raw_read_seqcount</span> <span class="pre">(s)</span></code></p>
+<blockquote>
+<div><p>seqcount_tのrawカウンタ値を読み取る</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">s</span></code></dt><dd><p>seqcount_tまたはseqcount_LOCKNAME_tのいずれかの変体へのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>raw_read_seqcountは指定されたseqcount_tの読み取りクリティカルセクションを開きます。ロックデップのチェックは行わず、シーケンスカウンタのLSBをチェックまたはマスクすることもありません。呼び出し元はその処理を担当します。</p>
+<p><strong>戻り値</strong></p>
+<p>渡すカウント <a class="reference internal" href="#c.read_seqcount_retry" title="read_seqcount_retry"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqcount_retry()</span></code></a></p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.raw_seqcount_begin">
+<span class="sig-name descname"><span class="n"><span class="pre">raw_seqcount_begin</span></span></span><a class="headerlink" href="#c.raw_seqcount_begin" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">raw_seqcount_begin</span> <span class="pre">(s)</span></code></p>
+<blockquote>
+<div><p>ロックデップなしでseqcount_tの読み取りクリティカルセクションを開始し、カウンタの安定化も行わない</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">s</span></code></dt><dd><p>seqcount_tまたはseqcount_LOCKNAME_tのいずれかの変体へのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>seqcount_tの読み取りクリティカルセクションを開きます。ただし、 <a class="reference internal" href="#c.read_seqcount_begin" title="seqcount_tの読み取りクリティカルセクションを開始"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqcount_begin()</span></code></a>この関数はカウントの安定化を待つことはありません。開始時にライターがアクティブな場合、その <a class="reference internal" href="#c.read_seqcount_retry" title="read_seqcount_retry"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqcount_retry()</span></code></a> 読み取りクリティカルセクションの終わりで処理を終了します。</p>
+<p>この関数は、読み取りセクションが小さく、他の外部手段によって成功する確率が高い特別なカーネルのホットパスでのみ使用してください。これにより、1つのブランチインストラクションを節約できます。</p>
+<p><strong>戻り値</strong></p>
+<p>渡すカウント <a class="reference internal" href="#c.read_seqcount_retry" title="read_seqcount_retry"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqcount_retry()</span></code></a></p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.__read_seqcount_retry">
+<span class="sig-name descname"><span class="n"><span class="pre">__read_seqcount_retry</span></span></span><a class="headerlink" href="#c.__read_seqcount_retry" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">__read_seqcount_retry</span> <span class="pre">(s,</span> <span class="pre">start)</span></code></p>
+<blockquote>
+<div><p>バリアーなしでseqcount_tの読み取りセクションを終了</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">s</span></code></dt><dd><p>seqcount_tまたはseqcount_LOCKNAME_tのいずれかの変体へのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">start</span></code></dt><dd><p>カウント、から <a class="reference internal" href="#c.read_seqcount_begin" title="seqcount_tの読み取りクリティカルセクションを開始"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqcount_begin()</span></code></a></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>__read_seqcount_retryはread_seqcount_retryと同様ですが、smp_rmb()バリアーを持ちません。呼び出し元は、このクリティカルセクションで保護される変数を実際に読み込む前に、smp_rmb()または同等の順序を提供する必要があります。</p>
+<p>注意して使用してください。クリティカルコードのみで使用し、バリアーがどのように提供されているかをコメントしてください。</p>
+<p><strong>戻り値</strong></p>
+<p>読み取りセクションの再試行が必要な場合はtrue、それ以外はfalse</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.read_seqcount_retry">
+<span class="sig-name descname"><span class="n"><span class="pre">read_seqcount_retry</span></span></span><a class="headerlink" href="#c.read_seqcount_retry" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">read_seqcount_retry</span> <span class="pre">(s,</span> <span class="pre">start)</span></code></p>
+<blockquote>
+<div><p>seqcount_tの読み取りクリティカルセクションを終了</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">s</span></code></dt><dd><p>seqcount_tまたはseqcount_LOCKNAME_tのいずれかの変体へのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">start</span></code></dt><dd><p>カウント、から <a class="reference internal" href="#c.read_seqcount_begin" title="seqcount_tの読み取りクリティカルセクションを開始"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqcount_begin()</span></code></a></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>read_seqcount_retryは、指定されたseqcount_tの読み取りクリティカルセクションを閉じます。クリティカルセクションが無効だった場合、無視する必要があります（通常は再試行します）。</p>
+<p><strong>戻り値</strong></p>
+<p>読み取りセクションの再試行が必要な場合はtrue、それ以外はfalse</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.raw_write_seqcount_begin">
+<span class="sig-name descname"><span class="n"><span class="pre">raw_write_seqcount_begin</span></span></span><a class="headerlink" href="#c.raw_write_seqcount_begin" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">raw_write_seqcount_begin</span> <span class="pre">(s)</span></code></p>
+<blockquote>
+<div><p>lockdep（ロックデップ）を用いないseqcount_tの書き込みセクションを開始</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">s</span></code></dt><dd><p>seqcount_tまたはseqcount_LOCKNAME_tのいずれかの変体へのポインタ</p>
+</dd>
+</dl>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.raw_write_seqcount_end">
+<span class="sig-name descname"><span class="n"><span class="pre">raw_write_seqcount_end</span></span></span><a class="headerlink" href="#c.raw_write_seqcount_end" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">raw_write_seqcount_end</span> <span class="pre">(s)</span></code></p>
+<blockquote>
+<div><p>lockdepを用いないseqcount_tの書き込みセクションを終了</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">s</span></code></dt><dd><p>seqcount_tまたはseqcount_LOCKNAME_tのいずれかの変体へのポインタ</p>
+</dd>
+</dl>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.write_seqcount_begin_nested">
+<span class="sig-name descname"><span class="n"><span class="pre">write_seqcount_begin_nested</span></span></span><a class="headerlink" href="#c.write_seqcount_begin_nested" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">write_seqcount_begin_nested</span> <span class="pre">(s,</span> <span class="pre">subclass)</span></code></p>
+<blockquote>
+<div><p>カスタムのlockdepネストレベルでseqcount_tの書き込みセクションを開始</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">s</span></code></dt><dd><p>seqcount_tまたはseqcount_LOCKNAME_tのいずれかの変体へのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">subclass</span></code></dt><dd><p>lockdepネストレベル</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>参照 <a class="reference internal" href="lockdep-design.html"><span class="doc">ランタイムロックの正しさを検証するツール</span></a></p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.write_seqcount_begin">
+<span class="sig-name descname"><span class="n"><span class="pre">write_seqcount_begin</span></span></span><a class="headerlink" href="#c.write_seqcount_begin" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">write_seqcount_begin</span> <span class="pre">(s)</span></code></p>
+<blockquote>
+<div><p>seqcount_tの書き込み側クリティカルセクションを開始</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">s</span></code></dt><dd><p>seqcount_tまたはseqcount_LOCKNAME_tのいずれかの変体へのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>write_seqcount_beginは、指定されたseqcount_tの書き込み側クリティカルセクションを開きます。</p>
+<p><strong>コンテキスト</strong></p>
+<p>seqcount_tの書き込み側クリティカルセクションはシリアル化され、非プリエンプティブでなければなりません。ハードIRQまたはソフトIRQコンテキストからリーダーが呼び出される可能性がある場合、割込みまたはボトムハーフはそれぞれ無効にする必要があります。</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.write_seqcount_end">
+<span class="sig-name descname"><span class="n"><span class="pre">write_seqcount_end</span></span></span><a class="headerlink" href="#c.write_seqcount_end" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">write_seqcount_end</span> <span class="pre">(s)</span></code></p>
+<blockquote>
+<div><p>seqcount_tの書き込み側クリティカルセクションを終了</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">s</span></code></dt><dd><p>seqcount_tまたはseqcount_LOCKNAME_tのいずれかの変体へのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>書き込みセクションは <a class="reference internal" href="#c.write_seqcount_begin" title="write_seqcount_begin"><code class="xref c c-func docutils literal notranslate"><span class="pre">write_seqcount_begin()</span></code></a>.</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.raw_write_seqcount_barrier">
+<span class="sig-name descname"><span class="n"><span class="pre">raw_write_seqcount_barrier</span></span></span><a class="headerlink" href="#c.raw_write_seqcount_barrier" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">raw_write_seqcount_barrier</span> <span class="pre">(s)</span></code></p>
+<blockquote>
+<div><p>seqcount_tの書き込みバリアンスを実行</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">s</span></code></dt><dd><p>seqcount_tまたはseqcount_LOCKNAME_tのいずれかの変体へのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>これは通常の一貫性保証ではなく、順序保証を提供するために使用できます。これは2つの連続するwmb()を1つのwmbに統合できるため、1つ安いです。</p>
+<p>バリアンス周辺の書き込みはすべてアトミック（例: WRITE_ONCEを通じて）宣言する必要があります。a) 他のスレッドに書き込みが一括して見えるようにし、コンパイラの最適化を回避するため；b) どの書き込みがリーダーのクリティカルセクションに伝達されるべきかを文書化するためです。これは、バリアンスの前後にある書き込みがseq-writerのクリティカルセクション内に含まれていないため、リーダーが進行中の書き込みを認識する必要があるからです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>seqcount_t seq;
+bool X = true, Y = false;
+
+void read(void)
+{
+        bool x, y;
+
+        do {
+                int s = read_seqcount_begin(&amp;seq);
+
+                x = X; y = Y;
+
+        } while (read_seqcount_retry(&amp;seq, s));
+
+        BUG_ON(!x &amp;&amp; !y);
+}
+
+void write(void)
+{
+        WRITE_ONCE(Y, true);
+
+        raw_write_seqcount_barrier(seq);
+
+        WRITE_ONCE(X, false);
+}
+</pre></div>
+</div>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.write_seqcount_invalidate">
+<span class="sig-name descname"><span class="n"><span class="pre">write_seqcount_invalidate</span></span></span><a class="headerlink" href="#c.write_seqcount_invalidate" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">write_seqcount_invalidate</span> <span class="pre">(s)</span></code></p>
+<blockquote>
+<div><p>進行中のseqcount_tの読み取り側操作を無効化</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">s</span></code></dt><dd><p>seqcount_tまたはseqcount_LOCKNAME_tのいずれかの変体へのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>write_seqcount_invalidateの後、seqcount_tの読み取り側操作は成功してデータがこの時点より古いものを見ることはできなくなります。</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.SEQCNT_LATCH_ZERO">
+<span class="sig-name descname"><span class="n"><span class="pre">SEQCNT_LATCH_ZERO</span></span></span><a class="headerlink" href="#c.SEQCNT_LATCH_ZERO" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">SEQCNT_LATCH_ZERO</span> <span class="pre">(seq_name)</span></code></p>
+<blockquote>
+<div><p>seqcount_latch_tの静的初期化子</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seq_name</span></code></dt><dd><p>seqcount_latch_tインスタンスの名前</p>
+</dd>
+</dl>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.seqcount_latch_init">
+<span class="sig-name descname"><span class="n"><span class="pre">seqcount_latch_init</span></span></span><a class="headerlink" href="#c.seqcount_latch_init" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">seqcount_latch_init</span> <span class="pre">(s)</span></code></p>
+<blockquote>
+<div><p>seqcount_latch_tのランタイム初期化子</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">s</span></code></dt><dd><p>seqcount_latch_tインスタンスへのポインタ</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.raw_read_seqcount_latch">
+<span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">raw_read_seqcount_latch</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="n"><span class="pre">seqcount_latch_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">s</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.raw_read_seqcount_latch" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>偶数/奇数のラッチデータコピーを選択</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">seqcount_latch_t</span> <span class="pre">*s</span></code></dt><dd><p>seqcount_latch_tへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>参照 <a class="reference internal" href="#c.raw_write_seqcount_latch" title="raw_write_seqcount_latch"><code class="xref c c-func docutils literal notranslate"><span class="pre">raw_write_seqcount_latch()</span></code></a> 詳細情報と完全なリーダー/ライターアクセス例についてはこちら。</p>
+<p><strong>戻り値</strong></p>
+<p>シーケンスカウンタのraw値。最低位のビットを用いて読み込むデータコピーのインデックスとして使用します。その後、全体のカウンタは <a class="reference internal" href="#c.read_seqcount_latch_retry" title="read_seqcount_latch_retry"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqcount_latch_retry()</span></code></a>.</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.read_seqcount_latch_retry">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">read_seqcount_latch_retry</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="n"><span class="pre">seqcount_latch_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">s</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="n"><span class="pre">start</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.read_seqcount_latch_retry" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>seqcount_latch_tの読み取りセクションを終了</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">seqcount_latch_t</span> <span class="pre">*s</span></code></dt><dd><p>seqcount_latch_tへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">start</span></code></dt><dd><p>カウント、から <a class="reference internal" href="#c.raw_read_seqcount_latch" title="raw_read_seqcount_latch"><code class="xref c c-func docutils literal notranslate"><span class="pre">raw_read_seqcount_latch()</span></code></a></p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>読み取りセクションの再試行が必要な場合はtrue、それ以外はfalse</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.raw_write_seqcount_latch">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">raw_write_seqcount_latch</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqcount_latch_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">s</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.raw_write_seqcount_latch" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>ラッチリーダーを偶数/奇数コピーにリダイレクト</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqcount_latch_t</span> <span class="pre">*s</span></code></dt><dd><p>seqcount_latch_tへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>ラッチ技術は、非原子的変更中にクエリを許可するマルチバージョンコンカレンシー制御手法です。クエリが変更を妨げることを保証できる場合（例：コンカレンシーがCPU間で厳密に制御されている場合）は、この技術は必要ありません。</p>
+<p>伝統的なRCU/ロックレスデータ構造は原子的変更によってクエリが古い状態または新しい状態を観測することを保証しますが、ラッチは非原子的更新にも同様の保証を提供します。トレードオフはストレージコストの倍増です。データ構造全体の2つのコピーを維持する必要があります。</p>
+<p>非常に単純に説明すると、まず1つのコピーを変更し、その後もう一つのコピーを変更します。これにより常に1つのコピーが安定した状態にあり、応答を提供できるようになります。</p>
+<p>基本的な形式は以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct latch_struct {
+        seqcount_latch_t        seq;
+        struct data_struct      data[2];
+};
+</pre></div>
+</div>
+<p>外部シリアル化されていると仮定される変更は以下の手順を実行します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void latch_modify(struct latch_struct *latch, ...)
+{
+        smp_wmb();      // Ensure that the last data[1] update is visible
+        latch-&gt;seq.sequence++;
+        smp_wmb();      // Ensure that the seqcount update is visible
+
+        modify(latch-&gt;data[0], ...);
+
+        smp_wmb();      // Ensure that the data[0] update is visible
+        latch-&gt;seq.sequence++;
+        smp_wmb();      // Ensure that the seqcount update is visible
+
+        modify(latch-&gt;data[1], ...);
+}
+</pre></div>
+</div>
+<p>クエリは以下の形式になります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct entry *latch_query(struct latch_struct *latch, ...)
+{
+        struct entry *entry;
+        unsigned seq, idx;
+
+        do {
+                seq = raw_read_seqcount_latch(&amp;latch-&gt;seq);
+
+                idx = seq &amp; 0x01;
+                entry = data_query(latch-&gt;data[idx], ...);
+
+        // This includes needed smp_rmb()
+        } while (read_seqcount_latch_retry(&amp;latch-&gt;seq, seq));
+
+        return entry;
+}
+</pre></div>
+</div>
+<p>変更中にクエリは最初にdata[1]にリダイレクトされます。その後data[0]を変更します。変更が完了したらクエリをdata[0]に戻し、data[1]を変更できます。</p>
+<p>注意2：</p>
+<blockquote>
+<div><p>データが動的データ構造である場合、通常のRCUパターンを使用してデータ構造内のオブジェクトのライフタイムを管理する必要があります。</p>
+</div></blockquote>
+<p><strong>注意</strong></p>
+<blockquote>
+<div><p>非原子的変更不要という条件は、データが動的データ構造である場合の新しいエントリの公開を含みません。</p>
+<p>イテレーションがdata[0]から開始され、変更シーケンス全体を欠くして中断される可能性があります。再開後に新しいエントリを観測するかもしれません。</p>
+</div></blockquote>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.seqlock_init">
+<span class="sig-name descname"><span class="n"><span class="pre">seqlock_init</span></span></span><a class="headerlink" href="#c.seqlock_init" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">seqlock_init</span> <span class="pre">(sl)</span></code></p>
+<blockquote>
+<div><p>seqlock_tの動的初期化子</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">sl</span></code></dt><dd><p>seqlock_tインスタンスへのポインタ</p>
+</dd>
+</dl>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.DEFINE_SEQLOCK">
+<span class="sig-name descname"><span class="n"><span class="pre">DEFINE_SEQLOCK</span></span></span><a class="headerlink" href="#c.DEFINE_SEQLOCK" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">DEFINE_SEQLOCK</span> <span class="pre">(sl)</span></code></p>
+<blockquote>
+<div><p>静的割当のseqlock_tを定義する</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">sl</span></code></dt><dd><p>seqlock_tインスタンスの名前</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.read_seqbegin">
+<span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">read_seqbegin</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">sl</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.read_seqbegin" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>seqlock_tの読み取り側クリティカルセクションを開始する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">seqlock_t</span> <span class="pre">*sl</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>read_seqretryに渡すカウント <a class="reference internal" href="#c.read_seqretry" title="read_seqretry"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqretry()</span></code></a></p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.read_seqretry">
+<span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">read_seqretry</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">sl</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="n"><span class="pre">start</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.read_seqretry" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>seqlock_tの読み取り側セクションを終了する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">const</span> <span class="pre">seqlock_t</span> <span class="pre">*sl</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">start</span></code></dt><dd><p>カウント、から <a class="reference internal" href="#c.read_seqbegin" title="read_seqbegin"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqbegin()</span></code></a></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>read_seqretryは指定されたseqlock_tの読み取り側クリティカルセクションを終了します。クリティカルセクションが無効な場合、無視する必要があります（通常は再試行します）。</p>
+<p><strong>戻り値</strong></p>
+<p>読み取りセクションの再試行が必要な場合はtrue、それ以外はfalse</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.write_seqlock">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">write_seqlock</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">sl</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.write_seqlock" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>seqlock_tの書き込み側クリティカルセクションを開始する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqlock_t</span> <span class="pre">*sl</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>write_seqlockは指定されたseqlock_tの書き込み側クリティカルセクションを開きます。また、このシーケンシャルロック内に埋め込まれたspinlock_tを暗黙的に取得します。すべてのseqlock_tの書き込み側セクションは自動的にシリアル化され、非 preemptible になります。</p>
+<p><strong>コンテキスト</strong></p>
+<p>seqlock_tの読み取り側セクションや他の書き込み側クリティカルセクションがハードIRQまたはソフトIRQコンテキストから呼び出される場合、この関数の_irqsaveまたは_bhバリアントを使用してください。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.write_sequnlock">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">write_sequnlock</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">sl</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.write_sequnlock" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>seqlock_tの書き込み側クリティカルセクションを終了する</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqlock_t</span> <span class="pre">*sl</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>write_sequnlockは、指定されたseqlock_tの(シリアル化され、非プリエンプティブな)書き込み側クリティカルセクションを閉じます。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.write_seqlock_bh">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">write_seqlock_bh</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">sl</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.write_seqlock_bh" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>softirqsを無効にしたseqlock_tの書き込みセクションを開始します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqlock_t</span> <span class="pre">*sl</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>bhバリアントの <a class="reference internal" href="#c.write_seqlock" title="write_seqlock"><code class="xref c c-func docutils literal notranslate"><span class="pre">write_seqlock()</span></code></a>. 読み込み側セクション、または他の書き込み側セクションがsoftirqコンテキストから呼び出せる場合にのみ使用してください。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.write_sequnlock_bh">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">write_sequnlock_bh</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">sl</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.write_sequnlock_bh" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>softirqsを無効にしたseqlock_tの書き込みセクションを終了します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqlock_t</span> <span class="pre">*sl</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>write_sequnlock_bhは、write_seqlock_bhで開いたシリアル化され、非プリエンプティブかつsoftirqsを無効にしたseqlock_tの書き込み側クリティカルセクションを閉じます
+<a class="reference internal" href="#c.write_seqlock_bh" title="write_seqlock_bh"><code class="xref c c-func docutils literal notranslate"><span class="pre">write_seqlock_bh()</span></code></a>.</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.write_seqlock_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">write_seqlock_irq</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">sl</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.write_seqlock_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割込み不可なseqlock_tの書き込みセクションを開始します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqlock_t</span> <span class="pre">*sl</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>_irqバリアントの <a class="reference internal" href="#c.write_seqlock" title="write_seqlock"><code class="xref c c-func docutils literal notranslate"><span class="pre">write_seqlock()</span></code></a>. 読み込み側セクション、または他の書き込みセクションがhardirqコンテキストから呼び出せる場合にのみ使用してください。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.write_sequnlock_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">write_sequnlock_irq</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">sl</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.write_sequnlock_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割込み不可なseqlock_tの書き込みセクションを終了します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqlock_t</span> <span class="pre">*sl</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>write_sequnlock_irqは、write_seqlock_irqで開いたシリアル化され、割込み不可なseqlock_tの書き込み側セクションを閉じます <a class="reference internal" href="#c.write_seqlock_irq" title="write_seqlock_irq"><code class="xref c c-func docutils literal notranslate"><span class="pre">write_seqlock_irq()</span></code></a>.</p>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.write_seqlock_irqsave">
+<span class="sig-name descname"><span class="n"><span class="pre">write_seqlock_irqsave</span></span></span><a class="headerlink" href="#c.write_seqlock_irqsave" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">write_seqlock_irqsave</span> <span class="pre">(lock,</span> <span class="pre">flags)</span></code></p>
+<blockquote>
+<div><p>割込み不可なseqlock_tの書き込みセクションを開始します</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">lock</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">flags</span></code></dt><dd><p>呼び出し元のローカル割込み状態を保存するスタックに割り当てられた保存領域を、後でpassするためのものです <a class="reference internal" href="#c.write_sequnlock_irqrestore" title="write_sequnlock_irqrestore"><code class="xref c c-func docutils literal notranslate"><span class="pre">write_sequnlock_irqrestore()</span></code></a>.</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>_irqsaveバリアントの <a class="reference internal" href="#c.write_seqlock" title="write_seqlock"><code class="xref c c-func docutils literal notranslate"><span class="pre">write_seqlock()</span></code></a>. 読み込み側セクション、または他の書き込みセクションがhardirqコンテキストから呼び出せる場合にのみ使用してください。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.write_sequnlock_irqrestore">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">write_sequnlock_irqrestore</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">sl</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.write_sequnlock_irqrestore" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割込み不可なseqlock_tの書き込みセクションを終了します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqlock_t</span> <span class="pre">*sl</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">flags</span></code></dt><dd><p>呼び出し元の保存された割込み状態、from <a class="reference internal" href="#c.write_seqlock_irqsave" title="write_seqlock_irqsave"><code class="xref c c-func docutils literal notranslate"><span class="pre">write_seqlock_irqsave()</span></code></a></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>write_sequnlock_irqrestoreは、write_seqlock_irqsaveで開いたシリアル化され、割込み不可なseqlock_tの書き込みセクションを閉じます <a class="reference internal" href="#c.write_seqlock_irqsave" title="write_seqlock_irqsave"><code class="xref c c-func docutils literal notranslate"><span class="pre">write_seqlock_irqsave()</span></code></a>.</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.read_seqlock_excl">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">read_seqlock_excl</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">sl</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.read_seqlock_excl" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>seqlock_tのロック読者セクションを開始します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqlock_t</span> <span class="pre">*sl</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>read_seqlock_exclはseqlock_tのロック読者クリティカルセクションを開きます。ロック読者は排他的に <em>両方を組み合わせます</em> 他のライターをロックアウトします <em>および</em> 他のロック読者をロックアウトしますが、埋め込まれたシーケンス番号は更新しません。</p>
+<p>ロック読者は通常のspin_lock()/spin_unlock()のように動作します。</p>
+<p>開いた読み込みセクションは必ず <a class="reference internal" href="#c.read_sequnlock_excl" title="read_sequnlock_excl"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_sequnlock_excl()</span></code></a>.</p>
+<p><strong>コンテキスト</strong></p>
+<p>seqlock_tの書き込みセクション、 <em>または他の読み込みセクション</em>がhardirqまたはsoftirqコンテキストから呼び出せる場合、この関数の_irqsaveまたは_bhバリアントを使用してください。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.read_sequnlock_excl">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">read_sequnlock_excl</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">sl</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.read_sequnlock_excl" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>seqlock_tのロック読者クリティカルセクションを終了します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqlock_t</span> <span class="pre">*sl</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.read_seqlock_excl_bh">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">read_seqlock_excl_bh</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">sl</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.read_seqlock_excl_bh" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>softirqsを無効にしたseqlock_tのロック読者セクションを開始します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqlock_t</span> <span class="pre">*sl</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>bhバリアントの <a class="reference internal" href="#c.read_seqlock_excl" title="read_seqlock_excl"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqlock_excl()</span></code></a>. seqlock_tの書き込み側セクション、 <em>または他の読み込みセクション</em>がsoftirqコンテキストから呼び出せる場合にのみこのバリアントを使用してください。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.read_sequnlock_excl_bh">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">read_sequnlock_excl_bh</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">sl</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.read_sequnlock_excl_bh" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>softirq無効化されたseqlock_t ロックリーダーセクションの停止</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqlock_t</span> <span class="pre">*sl</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.read_seqlock_excl_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">read_seqlock_excl_irq</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">sl</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.read_seqlock_excl_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>中断不能なseqlock_t ロックリーダーセクションの開始</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqlock_t</span> <span class="pre">*sl</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>_irqバリアントの <a class="reference internal" href="#c.read_seqlock_excl" title="read_seqlock_excl"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqlock_excl()</span></code></a>. seqlock_t 書き込み側セクションから呼び出せる場合にのみ使用してください。 <em>または他の読み込みセクション</em>, ハードIRQコンテキストから呼び出せる場合にのみ使用してください。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.read_sequnlock_excl_irq">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">read_sequnlock_excl_irq</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">sl</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.read_sequnlock_excl_irq" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>割込み無効化されたseqlock_t ロックリーダーセクションの終了</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqlock_t</span> <span class="pre">*sl</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+</dl>
+<dl class="c macro">
+<dt class="sig sig-object c" id="c.read_seqlock_excl_irqsave">
+<span class="sig-name descname"><span class="n"><span class="pre">read_seqlock_excl_irqsave</span></span></span><a class="headerlink" href="#c.read_seqlock_excl_irqsave" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd></dd></dl>
+<p><code class="docutils literal notranslate"><span class="pre">read_seqlock_excl_irqsave</span> <span class="pre">(lock,</span> <span class="pre">flags)</span></code></p>
+<blockquote>
+<div><p>中断不能なseqlock_t ロックリーダーセクションの開始</p>
+</div></blockquote>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">lock</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">flags</span></code></dt><dd><p>呼び出し元のローカル割込み状態を保存するスタックに割り当てられた保存領域を、後でpassするためのものです <a class="reference internal" href="#c.read_sequnlock_excl_irqrestore" title="read_sequnlock_excl_irqrestore"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_sequnlock_excl_irqrestore()</span></code></a>.</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>_irqsaveバリアントの <a class="reference internal" href="#c.read_seqlock_excl" title="read_seqlock_excl"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqlock_excl()</span></code></a>. seqlock_t 書き込み側セクションから呼び出せる場合にのみ使用してください。 <em>または他の読み込みセクション</em>, ハードIRQコンテキストから呼び出せる場合にのみ使用してください。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.read_sequnlock_excl_irqrestore">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">read_sequnlock_excl_irqrestore</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">sl</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.read_sequnlock_excl_irqrestore" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>中断不能なseqlock_t ロックリーダーセクションの終了</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqlock_t</span> <span class="pre">*sl</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">flags</span></code></dt><dd><p>呼び出し元が保存した割込み状態、from <a class="reference internal" href="#c.read_seqlock_excl_irqsave" title="read_seqlock_excl_irqsave"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqlock_excl_irqsave()</span></code></a></p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.read_seqbegin_or_lock">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">read_seqbegin_or_lock</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">lock</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">seq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.read_seqbegin_or_lock" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>seqlock_t ロックレスまたはロックリーダーの開始</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqlock_t</span> <span class="pre">*lock</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">*seq</span></code></dt><dd><p>マーカーおよび戻り値パラメータ。渡された値が偶数の場合、リーダーは <em>ロックレス</em> seqlock_t リーダーとして <a class="reference internal" href="#c.read_seqbegin" title="read_seqbegin"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqbegin()</span></code></a>渡された値が奇数の場合、リーダーは <em>ロック</em> リーダーとして <a class="reference internal" href="#c.read_seqlock_excl" title="read_seqlock_excl"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqlock_excl()</span></code></a>この関数の最初の呼び出しにおいて、呼び出し元 <em>grace periodsを尊重しなければなりませんし、</em> 初期化し、偶数値を <strong>seq</strong>; このように、ロックレスの読み取りがまず試されるようになります。</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>read_seqbegin_or_lock は、通常のロックレス seqlock_t 読み取りセクションをまず試すように設計された API です。奇数のカウンターが見つかった場合、ロックレス読み取りの試行は失敗し、次の読み取り反復では完全な seqlock_t ロックリーダーに変換されます。</p>
+<p>これは、書き込み側のアクティビティが急激に増加した場合のロックレスリーダーの starvation（過剰な再試行ループ）を回避するために通常使用されます。</p>
+<p>確認 <a class="reference internal" href="#"><span class="doc">シーケンスカウンタとシーケンシャルロック</span></a> テンプレート例コードのため。</p>
+<p><strong>コンテキスト</strong></p>
+<p>seqlock_tの書き込みセクション、 <em>または他の読み込みセクション</em>がhardirqまたはsoftirqコンテキストから呼び出せる場合、この関数の_irqsaveまたは_bhバリアントを使用してください。</p>
+<p><strong>戻り値</strong></p>
+<p>遭遇したシーケンスカウンタ値は、 <strong>seq</strong>
+パラメータとしてオーバーロードされ、戻り値として使用されます。この戻り値は <a class="reference internal" href="#c.need_seqretry" title="need_seqretry"><code class="xref c c-func docutils literal notranslate"><span class="pre">need_seqretry()</span></code></a>. 読み取りセクションを再試行する必要がある場合、この戻り値も次の <strong>seq</strong>
+パラメータとして次の <a class="reference internal" href="#c.read_seqbegin_or_lock" title="read_seqbegin_or_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqbegin_or_lock()</span></code></a> 反復に渡す必要があります。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.need_seqretry">
+<span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">need_seqretry</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">lock</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">seq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.need_seqretry" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>seqlock_t 「ロックまたはロックレス」読み取りセクションの検証</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqlock_t</span> <span class="pre">*lock</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">seq</span></code></dt><dd><p>シーケンスカウント、from <a class="reference internal" href="#c.read_seqbegin_or_lock" title="read_seqbegin_or_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqbegin_or_lock()</span></code></a></p>
+</dd>
+</dl>
+<p><strong>戻り値</strong></p>
+<p>読み取りセクションの再試行が必要な場合 true、それ以外は false</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.done_seqretry">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">done_seqretry</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">lock</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">seq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.done_seqretry" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>seqlock_t 「ロックまたはロックレス」リーダーセクションの終了</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqlock_t</span> <span class="pre">*lock</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">seq</span></code></dt><dd><p>カウント、から <a class="reference internal" href="#c.read_seqbegin_or_lock" title="read_seqbegin_or_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqbegin_or_lock()</span></code></a></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>done_seqretry は、 <a class="reference internal" href="#c.read_seqbegin_or_lock" title="read_seqbegin_or_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqbegin_or_lock()</span></code></a> および検証された <a class="reference internal" href="#c.need_seqretry" title="need_seqretry"><code class="xref c c-func docutils literal notranslate"><span class="pre">need_seqretry()</span></code></a>.</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.read_seqbegin_or_lock_irqsave">
+<span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">read_seqbegin_or_lock_irqsave</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">lock</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">seq</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.read_seqbegin_or_lock_irqsave" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>seqlock_t ロックレスリーダー、または中断不能なロックリーダーの開始</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqlock_t</span> <span class="pre">*lock</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">*seq</span></code></dt><dd><p>マーカーおよび戻り値パラメータ。確認 <a class="reference internal" href="#c.read_seqbegin_or_lock" title="read_seqbegin_or_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqbegin_or_lock()</span></code></a>.</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>これは _irqsave バリアントの <a class="reference internal" href="#c.read_seqbegin_or_lock" title="read_seqbegin_or_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqbegin_or_lock()</span></code></a>. seqlock_t の書き込みセクションがハードIRQコンテキストから呼び出せる場合にのみ使用してください。 <em>または他の読み込みセクション</em>ハードIRQコンテキストから呼び出せる場合にのみ使用してください。</p>
+<p><strong>注意</strong></p>
+<p>割り込みは「ロックングリーダー」モードの場合にのみ無効になります。</p>
+<p><strong>戻り値</strong></p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>ロックングリーダーの場合の保存されたローカル割り込み状態は、以下に渡す必要があります。 <a class="reference internal" href="#c.done_seqretry_irqrestore" title="done_seqretry_irqrestore"><code class="xref c c-func docutils literal notranslate"><span class="pre">done_seqretry_irqrestore()</span></code></a>.</p></li>
+<li><p>検出されたシーケンスカウンタ値は、以下を通じて返されます。 <strong>seq</strong>
+返却パラメータとしてオーバーロードされます。確認してください。 <a class="reference internal" href="#c.read_seqbegin_or_lock" title="read_seqbegin_or_lock"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqbegin_or_lock()</span></code></a>.</p></li>
+</ol>
+</div></blockquote>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.done_seqretry_irqrestore">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">done_seqretry_irqrestore</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">seqlock_t</span></span><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">lock</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">seq</span></span>, <span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">long</span></span><span class="w"> </span><span class="n"><span class="pre">フラグ</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.done_seqretry_irqrestore" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>seqlock_t ロックレスリーダーの終了、または非割り込み可能なロックングリーダーセクションの終了を表します。</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">seqlock_t</span> <span class="pre">*lock</span></code></dt><dd><p>seqlock_tへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">seq</span></code></dt><dd><p>カウント、から <a class="reference internal" href="#c.read_seqbegin_or_lock_irqsave" title="read_seqbegin_or_lock_irqsave"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqbegin_or_lock_irqsave()</span></code></a></p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">flags</span></code></dt><dd><p>ロックングリーダーの場合の呼び出し元の保存されたローカル割り込み状態も、から <a class="reference internal" href="#c.read_seqbegin_or_lock_irqsave" title="read_seqbegin_or_lock_irqsave"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqbegin_or_lock_irqsave()</span></code></a></p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>これは _irqrestore バリアントの <a class="reference internal" href="#c.done_seqretry" title="done_seqretry"><code class="xref c c-func docutils literal notranslate"><span class="pre">done_seqretry()</span></code></a>. 読み取りセクションは、以下で開かなければなりません。 <a class="reference internal" href="#c.read_seqbegin_or_lock_irqsave" title="read_seqbegin_or_lock_irqsave"><code class="xref c c-func docutils literal notranslate"><span class="pre">read_seqbegin_or_lock_irqsave()</span></code></a>、および以下で検証されなければなりません。 <a class="reference internal" href="#c.need_seqretry" title="need_seqretry"><code class="xref c c-func docutils literal notranslate"><span class="pre">need_seqretry()</span></code></a>.</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">ロック</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="locktypes.html">ロックの種類とそのルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lockdep-design.html">ランタイムロックの正しさを検証するツール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lockstat.html">ロック統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="locktorture.html">カーネルロックのトラウトテスト操作</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mutex-design.html">ジェネリックミューテックスサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rt-mutex-design.html">RTミューテックスの実装設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rt-mutex.html">PIサポート付きRTミューテックスサブシステム</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">シーケンスカウンタとシーケンシャルロック</a></li>
+<li class="toctree-l2"><a class="reference internal" href="spinlocks.html">ロックの教訓</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ww-mutex-design.html">Wound/Wait Deadlock-Proof Mutex Design</a></li>
+<li class="toctree-l2"><a class="reference internal" href="preempt-locking.html">プリエンプティブカーネルでの適切なロック: カーネルコードのプリエンプ安全性を保つ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pi-futex.html">軽量PIフェイクス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="futex-requeue-pi.html">フェイクス再配置PI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hwspinlock.html">ハードウェアスピンロックフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="percpu-rw-semaphore.html">ペルCPU読み取り専用セマフォ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="robust-futexes.html">ロバストフェイクスの説明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="robust-futex-ABI.html">The robust futex ABI</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">ロック</a><ul>
+<li>前へ: <a href="rt-mutex.html" title="前章">PIサポート付きRTミューテックスサブシステム</a></li>
+<li>次へ: <a href="spinlocks.html" title="次章">ロックの教訓</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/locking/seqlock.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

@@ -1,0 +1,553 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>カーネルTLSオフロード — Linuxカーネルドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="nfc.html" rel="next" title="Linux NFCサブシステム"/>
+<link href="tls.html" rel="prev" title="カーネルTLS"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="kernel-tls-offload">
+<h1>カーネルTLSオフロード<a class="headerlink" href="#kernel-tls-offload" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="kernel-tls-operation">
+<h2>カーネルTLS操作<a class="headerlink" href="#kernel-tls-operation" title="この見出しへのパーマリンク">¶</a></h2>
+<p>LinuxカーネルはTLS接続オフロードインフラストラクチャを提供します。TCP接続が <code class="docutils literal notranslate"><span class="pre">ESTABLISHED</span></code> 状態になったらユーザー空間でTLS上位レイヤープロトコル（ULP）を有効化し、暗号化接続状態をインストールできます。ユーザー向けインターフェースに関する詳細については、TLSドキュメンテーションを参照してください。 <a class="reference internal" href="tls.html#kernel-tls"><span class="std std-ref"><a class="reference internal" href="tls.html"><span class="doc">カーネルTLS</span></a></span></a>.</p>
+<p><code class="docutils literal notranslate"><span class="pre">ktls</span></code> 3つのモードで動作できます：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>ソフトウェア暗号モード（<code class="docutils literal notranslate"><span class="pre">TLS_SW</span></code>) - CPUが暗号化処理を行います。基本的なケースではCPUと同期する暗号操作のみが使用できますが、呼び出しコンテキストによっては非同期暗号アクセラレータを活用することもあります。アクセラレータの使用は、ソケット読み取り時の追加遅延を引き起こします（暗号化はreadシステムコールが行われたときから開始されます）およびシステム全体の追加I/O負荷を生じます。</p></li>
+<li><p>パケットベースNICオフロードモード（<code class="docutils literal notranslate"><span class="pre">TLS_HW</span></code>) - パケットが順序通りに到達する場合、NICがパケット単位で暗号化処理を行います。このモードはカーネルスタックと最もよく統合され、このドキュメントの後半部分で詳しく説明しています（<code class="docutils literal notranslate"><span class="pre">ethtool</span></code> フラグ <code class="docutils literal notranslate"><span class="pre">tls-hw-tx-offload</span></code> および <code class="docutils literal notranslate"><span class="pre">tls-hw-rx-offload</span></code>).</p></li>
+<li><p>フルTCP NICオフロードモード（<code class="docutils literal notranslate"><span class="pre">TLS_HW_RECORD</span></code>) - NICドライバとファームウェアがカーネルネットワークスタックを自前のTCP処理で置き換えるモードです。Linuxネットワークスタックを使用する生産環境では使用できません（たとえばファイアウォール機能やQoS、パケットスケジューリングなど）（<code class="docutils literal notranslate"><span class="pre">ethtool</span></code> フラグ <code class="docutils literal notranslate"><span class="pre">tls-hw-record</span></code>).</p></li>
+</ul>
+</div></blockquote>
+<p>操作モードはデバイス設定に基づいて自動的に選択されます。現在は接続ごとのオフロードの有効化または無効化をサポートしていません。</p>
+<section id="tx">
+<h3>TX<a class="headerlink" href="#tx" title="この見出しへのパーマリンク">¶</a></h3>
+<p>高レベルではユーザーの書き込みリクエストがスキャッターリストに変換され、TLS ULPがこれをインターセプトし、レコードフレーミングを挿入して暗号化（ <code class="docutils literal notranslate"><span class="pre">TLS_SW</span></code>
+モード）を行います。その後、変更後のスキャッターリストをTCPレイヤーに渡します。この時点でTCPスタックは通常通り動作します。</p>
+<p>In <code class="docutils literal notranslate"><span class="pre">TLS_HW</span></code> モードでは暗号化はTLS ULPで行われません。代わりにパケットがデバイスドライバに到達し、ドライバはパケットが属するソケットに基づいて暗号オフロードをマークし、デバイスに暗号化および送信処理を委譲します。</p>
+</section>
+<section id="rx">
+<h3>RX<a class="headerlink" href="#rx" title="この見出しへのパーマリンク">¶</a></h3>
+<p>受信側では、デバイスが復号および認証を成功した場合、ドライバは関連する
+<a class="reference internal" href="kapi.html#c.sk_buff" title="sk_buff"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">sk_buff</span></code></a>に復号済みビットを設定します。パケットはTCPスタックに到達し、通常通り処理されます。 <code class="docutils literal notranslate"><span class="pre">ktls</span></code> データがソケットにキューイングされたときに通知され、 <code class="docutils literal notranslate"><span class="pre">strparser</span></code> メカニズムを使用してレコードを区切ります。読み取りリクエストが行われると、レコードがソケットから取得され復号ルーチンに渡されます。デバイスがレコードのすべてのセグメントを復号した場合、復号はスキップされ、それ以外の場合はソフトウェア経路が復号を行います。</p>
+<figure class="align-center" id="id9" style="width: 28em">
+<img alt="TLSオフロードレイヤー" src="../_images/tls-offload-layers.svg"/><figcaption>
+<p><span class="caption-text">カーネルTLSスタックのレイヤー</span><a class="headerlink" href="#id9" title="この画像へのパーマリンク">¶</a></p>
+</figcaption>
+</figure>
+</section>
+</section>
+<section id="device-configuration">
+<h2>デバイス設定<a class="headerlink" href="#device-configuration" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ドライバの初期化中にデバイスが機能を設定し、そのポインタをインストールします。 <code class="docutils literal notranslate"><span class="pre">NETIF_F_HW_TLS_RX</span></code> および
+<code class="docutils literal notranslate"><span class="pre">NETIF_F_HW_TLS_TX</span></code> 機能およびそのポインタをネットワークデバイスに設定します。
+<code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">tlsdev_ops</span></code>
+ネットワークデバイスのポインタを設定します。 <code class="xref c c-member docutils literal notranslate"><span class="pre">tlsdev_ops</span></code> 構造体の
+<a class="reference internal" href="kapi.html#c.net_device" title="net_device"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">net_device</span></code></a>.</p>
+<p>TLS暗号通信の状態がソケットにインストールされるとき（受信（RX）方向と送信（TX）方向それぞれで1回ずつ実行され、これらは完全に独立しています）、 <code class="docutils literal notranslate"><span class="pre">ktls</span></code> カーネルが下位ネットワークデバイスがオフロードをサポートしているかを確認し、オフロードを試みます。オフロッドが失敗した場合、通信はソフトウェアで完全に処理され、オフロードが試みられなかったかのように同じメカニズムで行われます。</p>
+<p>オフロードリクエストは、 <code class="xref c c-member docutils literal notranslate"><span class="pre">tls_dev_add</span></code> コールバック経由で実行されます。
+<code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">tlsdev_ops</span></code>:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="kt">int</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="n">tls_dev_add</span><span class="p">)(</span><span class="k">struct</span><span class="w"> </span><span class="nc">net_device</span><span class="w"> </span><span class="o">*</span><span class="n">netdev</span><span class="p">,</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">sock</span><span class="w"> </span><span class="o">*</span><span class="n">sk</span><span class="p">,</span><span class="w"></span>
+<span class="w">                   </span><span class="k">enum</span><span class="w"> </span><span class="n">tls_offload_ctx_dir</span><span class="w"> </span><span class="n">direction</span><span class="p">,</span><span class="w"></span>
+<span class="w">                   </span><span class="k">struct</span><span class="w"> </span><span class="nc">tls_crypto_info</span><span class="w"> </span><span class="o">*</span><span class="n">crypto_info</span><span class="p">,</span><span class="w"></span>
+<span class="w">                   </span><span class="n">u32</span><span class="w"> </span><span class="n">start_offload_tcp_sn</span><span class="p">);</span><span class="w"></span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">direction</span></code> これは暗号情報が受信パケットか送信パケットに関するものであるかを示します。 <code class="docutils literal notranslate"><span class="pre">sk</span></code> ドライバはこのパラメータを使用して、接続の5要素とソケットファミリ（IPv4 vs IPv6）を取得します。 <code class="docutils literal notranslate"><span class="pre">crypto_info</span></code> 暗号情報には、鍵、IV、salt、およびTLSレコードのシーケンス番号が含まれます。 <code class="docutils literal notranslate"><span class="pre">start_offload_tcp_sn</span></code> これは、シーケンス番号が[...]のレコードの開始に該当するTCPシーケンス番号を示します。ドライバは、カーネル構造の末尾に自身の状態を追加できます（参照）。 <code class="docutils literal notranslate"><span class="pre">crypto_info</span></code>カーネル構造の末尾に自身の状態を追加できます（参照）。 <code class="xref c c-member docutils literal notranslate"><span class="pre">driver_state</span></code> members in <code class="docutils literal notranslate"><span class="pre">include/net/tls.h</span></code>) 追加の割当とポインタのデリファレンスを避けるため。</p>
+<section id="id1">
+<h3>TX<a class="headerlink" href="#id1" title="この見出しへのパーマリンク">¶</a></h3>
+<p>TX状態がインストールされた後、スタックはストリームの最初のセグメントが正確にシーケンス番号から始まるように保証します。 <code class="docutils literal notranslate"><span class="pre">start_offload_tcp_sn</span></code> シーケンス番号、TCPシーケンス番号のマッチングを簡略化します。</p>
+<p>TXオフロードが完全に初期化されたからといって、ドライバーを通じて処理されるオフロードされたソケットに属するすべてのセグメントが予想されるシーケンス番号の後ろに配置され、カーネルのレコード情報を持つとは限りません。特に、接続状態をカーネルにインストールする前からすでに暗号化されたデータがソケットにキューイングされている可能性があります。</p>
+</section>
+<section id="id2">
+<h3>RX<a class="headerlink" href="#id2" title="この見出しへのパーマリンク">¶</a></h3>
+<p>RX方向ではローカルネットワーキングスタックがセグメンテーションの制御が少ないので、初期レコードのTCPシーケンス番号はセグメント内どこでもあり得ます。</p>
+</section>
+</section>
+<section id="normal-operation">
+<h2>通常動作<a class="headerlink" href="#normal-operation" title="この見出しへのパーマリンク">¶</a></h2>
+<p>少なくとも各接続、各方向に対してデバイスは以下の状態を保持します:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>暗号秘密鍵（鍵、IV、ソルト）</p></li>
+<li><p>暗号処理状態（部分ブロック、部分認証タグなど）</p></li>
+<li><p>レコードメタデータ（シーケンス番号、処理オフセットと長さ）</p></li>
+<li><p>予想されるTCPシーケンス番号</p></li>
+</ul>
+</div></blockquote>
+<p>レコード長またはレコードセグメンテーションに関する保証はありません。特に、セグメントはレコード内の任意の位置から開始し、任意の数のレコードを含む可能性があります。セグメントが順序通りに受信されるものと仮定すると、デバイスはセグメンテーションに関係なく暗号処理と認証を実行できる必要があります。これを行うためには、デバイスがセグメント間の少量の状態を保持する必要があります。これには少なくとも以下のものが含まれます:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>部分ヘッダー（セグメントがTLSヘッダーの一部のみを運搬していた場合)</p></li>
+<li><p>部分データブロック</p></li>
+<li><p>部分認証タグ（すべてのデータが確認済みですが、認証タグの一部を次のセグメントから読み書きする必要があります）</p></li>
+</ul>
+</div></blockquote>
+<p>TLSオフロードではレコード再構築は必要ありません。パケットが順序正しく到達する場合、デバイスはそれらを個別に処理して進捗を確保できる必要があります。</p>
+<section id="id3">
+<h3>TX<a class="headerlink" href="#id3" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルスタックはレコードフレーミングを行い、認証タグのスペースを確保し、すべての他のTLSヘッダーやテールフィールドを埋め込みます。</p>
+<p>デバイスとドライバーは、パケットがデバイスに到達した後でソフトウェアフォールバックが利用できなくなるため、再送の可能性を考慮して予期されるTCPシーケンス番号を維持します。順序で渡されるセグメントについては、ドライバーがパケットに接続識別子（5-tuple検索ではHWオフロードを必要とするパケットを特定できません、参照してください）を付与し、デバイスに渡します。 <a class="reference internal" href="#tuple-problems"><span class="std std-ref">5-tupleマッチングの制限</span></a> デバイスはパケットがTLS処理を必要とするものであると識別し、シーケンス番号が予期されるものであることを確認します。デバイスはレコードデータの暗号化と認証を実行し、認証タグとTCPチェックサムを正しい値に置き換えます。</p>
+</section>
+<section id="id4">
+<h3>RX<a class="headerlink" href="#id4" title="この見出しへのパーマリンク">¶</a></h3>
+<p>パケットがホストにDMA送信される前に（NICの埋め込まれたスイッチングおよびパケット変換機能の後）、デバイスはレイヤー4チェックサムを検証し、パケットが属する可能性のあるTLS接続を5-tuple検索で見つけます（技術的にはIPアドレスとTCPポート番号の4-tuple検索で十分です、プロトコルは常にTCPです）。接続が一致した場合、デバイスはTCPシーケンス番号が予期されるものであるかを確認し、TLS処理（レコードの区切り、復号、各レコードの認証）を進みます。デバイスはレコードフレーミングを変更せず、スタックがレコードの復封を処理します。デバイスはホストに渡されるパケットごとのコンテキスト（ディスクリプタ）でTLSオフロードの成功を示します。</p>
+<p>TLSオフロードパケットの受信後、ドライバーは <code class="xref c c-member docutils literal notranslate"><span class="pre">decrypted</span></code> の <a class="reference internal" href="kapi.html#c.sk_buff" title="sk_buff"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">sk_buff</span></code></a>
+にマークを設定します。ネットワークスタックは復号済みと未復号のセグメントがGROやソケットレイヤーによって結合されないようにし、部分復号を処理します。</p>
+</section>
+</section>
+<section id="resync-handling">
+<h2>再同期処理<a class="headerlink" href="#resync-handling" title="この見出しへのパーマリンク">¶</a></h2>
+<p>パケットのドロップやネットワークのパケット再配置がある場合、デバイスはTLSストリームと同期を失い、カーネルのTCPスタックとの再同期が必要になることがあります。</p>
+<p>デバイステーブルに成功裏に追加され、TLS_HWモードにある接続のみが再同期が試行されます。たとえば、暗号化状態がカーネルにインストールされたときにテーブルが満杯だった場合、その接続はオフロードされることはありません。したがって、再同期リクエストには暗号化接続状態は含まれません。</p>
+<section id="id5">
+<h3>TX<a class="headerlink" href="#id5" title="この見出しへのパーマリンク">¶</a></h3>
+<p>オフロードされたソケットから送信されたセグメントは、受信側の再送との同様な方法で同期を失うことがあります。ローカルのドロップは可能ですが、ネットワークの再順序は起こりません。現在、同期を失ったセグメントを処理するためのメカニズムは2つあります。</p>
+<section id="crypto-state-rebuilding">
+<h4>暗号化状態の再構築<a class="headerlink" href="#crypto-state-rebuilding" title="この見出しへのパーマリンク">¶</a></h4>
+<p>同期を失ったセグメントが送信されるたびに、ドライバーはデバイスに十分な情報を提供して暗号化操作を実行できるようにします。これは、現在のセグメントの前の記録の一部をパケットコンテキストとともにデバイスに渡す必要があり、TCPシーケンス番号とTLSレコード番号も含むため、デバイスが暗号化状態を初期化し、前のデータを処理して破棄（認証タグを挿入できるように）し、実際に処理するパケットに移行できるようにします。</p>
+<p>このモードでは、実装に応じてドライバーが暗号化状態と新しいシーケンス番号とともに継続を要求するか、または前のストリーム状態を継続するかを選択できます（同期を失ったセグメントが再送だったと仮定）。前者は単純で、再送検出を必要としないため、効率が確認されるまで推奨されます。</p>
+</section>
+<section id="next-record-sync">
+<h4>次のレコード同期<a class="headerlink" href="#next-record-sync" title="この見出しへのパーマリンク">¶</a></h4>
+<p>同期を失ったセグメントが検出された場合、ドライバーは <code class="docutils literal notranslate"><span class="pre">ktls</span></code> ソフトウェアフェールバックコードがそれを暗号化することを要求します。セグメントのシーケンス番号が予想より小さい場合、ドライバーは再送とみなしてデバイス状態を変更しません。セグメントが未来の値である場合、ローカルドロップを示唆する可能性があり、ドライバーはスタックにデバイスを次のレコード状態に同期させるよう依頼し、ソフトウェアにフェールバックします。</p>
+<p>再同期リクエストは以下の通り示されます:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="kt">void</span><span class="w"> </span><span class="n">tls_offload_tx_resync_request</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">sock</span><span class="w"> </span><span class="o">*</span><span class="n">sk</span><span class="p">,</span><span class="w"> </span><span class="n">u32</span><span class="w"> </span><span class="n">got_seq</span><span class="p">,</span><span class="w"> </span><span class="n">u32</span><span class="w"> </span><span class="n">exp_seq</span><span class="p">)</span><span class="w"></span>
+</pre></div>
+</div>
+<p>再同期が完了するまで、ドライバーは予想されるTCPシーケンス番号にアクセスすべきではありません（これは別のコンテキストから更新されます）。再同期が完了したかをテストするためには、以下のヘルパーを使用してください:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="kt">bool</span><span class="w"> </span><span class="n">tls_offload_tx_resync_pending</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">sock</span><span class="w"> </span><span class="o">*</span><span class="n">sk</span><span class="p">)</span><span class="w"></span>
+</pre></div>
+</div>
+<p>次回 <code class="docutils literal notranslate"><span class="pre">ktls</span></code> レコードをプッシュする際には、まずTCPシーケンス番号とTLSレコード番号をドライバーに送信します。スタックは、接続が最初に追加されたときのように、新しいレコードがセグメント境界で開始されるようにします。</p>
+</section>
+</section>
+<section id="id6">
+<h3>RX<a class="headerlink" href="#id6" title="この見出しへのパーマリンク">¶</a></h3>
+<p>少量のRX再配置イベントは完全な再同期を必要としない場合があります。特に、レコード境界が復元可能な場合、デバイスは同期を失ってはいけません:</p>
+<figure class="align-center" id="id10">
+<img alt="非ヘッダーセグメントの再配置" src="../_images/tls-offload-reorder-good.svg"/><figcaption>
+<p><span class="caption-text">非ヘッダセグメントの再配置</span><a class="headerlink" href="#id10" title="この画像へのパーマリンク">¶</a></p>
+</figcaption>
+</figure>
+<p>緑のセグメントは正常に復号され、青のセグメントはワイヤーで受信したまま通過し、赤のストライプは新しいレコードの開始を示します。</p>
+<p>上記の例ではセグメント1が正常に受信・復号され、セグメント2はドロップされセグメント3が順序を外れて到達します。デバイスはセグメント1のレコード長に基づき、セグメント3内に次のレコードが開始していることを認識します。セグメント3は、セグメント2からのデータが不足しているため、その内部の前のレコードの残り部分を処理できないためそのまま通過します。ただし、セグメント3内の新しいレコードの認証アルゴリズムの状態と部分ブロックを収集し、セグメント4と5が到達した際に復号を継続できます。最後にセグメント2が到達した際、それはデバイスの予想されるウィンドウ外にあるため、特別な処理なしにそのまま通過します。 <code class="docutils literal notranslate"><span class="pre">ktls</span></code> ソフトウェアフォールバックは、セグメント1、2、3をまたぐレコードの復号を処理します。デバイスは、2つのセグメントが復号されなかったにもかかわらず、再同期を失っていません。</p>
+<p>失われたセグメントにレコードヘッダが含まれており、次のレコードヘッダがすでに通過した後に到達した場合、カーネルの再同期が必要になるかもしれません:</p>
+<figure class="align-center" id="id11">
+<img alt="ヘッダーセグメントの再配置" src="../_images/tls-offload-reorder-bad.svg"/><figcaption>
+<p><span class="caption-text">TLSヘッダを含むセグメントの再配置</span><a class="headerlink" href="#id11" title="この画像へのパーマリンク">¶</a></p>
+</figcaption>
+</figure>
+<p>この例ではセグメント2がドロップされ、これはレコードヘッダを含んでいます。デバイスはセグメント4がTLSヘッダを含んでいることを検出するには、セグメント2からの前のレコードの長さを知る必要があります。この場合、デバイスはストリームとの再同期を失います。</p>
+<section id="stream-scan-resynchronization">
+<h4>ストリームスキャンによる再同期<a class="headerlink" href="#stream-scan-resynchronization" title="この見出しへのパーマリンク">¶</a></h4>
+<p>デバイスが再同期を失い、ストリームが予想されるTCPシーケンス番号よりも最大サイズのレコード分多く到達した場合、デバイスは既知のヘッダパターンのスキャンを開始します。たとえばTLS 1.2およびTLS 1.3では、次のバイト値がSSL/TLSバージョンフィールドに現れます。 <code class="docutils literal notranslate"><span class="pre">0x03</span> <span class="pre">0x03</span></code> パターンが一致した後、デバイスは予想される位置（推測された位置の長さフィールドに基づく）でヘッダの解析を継続します。予想される位置に有効なヘッダが含まれない場合、スキャンを再開します。</p>
+<p>ヘッダーが一致した場合、デバイスはカーネルに確認リクエストを送信し、推測された位置が正しいか（TLSレコードが本当にその位置から始まっているか）を尋ね、そのヘッダーが持つレコードシーケンス番号を確認します。カーネルは推測された位置が正しいと確認し、デバイスにレコードシーケンス番号を伝えます。この間、デバイスは確認されたレコードからすべてのレコードを解析し、カウントしており、カーネルから提供されたレコード番号にこれまでに見たレコード数を加算します。この時点でデバイスは同期しており、次のセグメント境界で復号を再開できます。</p>
+<p>極端なケースでは、デバイスが連続する一致したヘッダーに捕らえられ、カーネルから返信を受けることができない可能性があります（カーネルからの否定的な確認がありません）。実装では定期的にスキャンを再開するようにするかもしれませんが、誤ったマッチングが極めて稀であるため、定期的な再起動は必要とされません。</p>
+<p>確認リクエストがパケットストリームに非同期的に渡される場合、レコードがカーネルによって処理される前に確認リクエストが到達する可能性があるため、特別な注意が必要です。</p>
+</section>
+<section id="stack-driven-resynchronization">
+<h4>スタック駆動型の再同期<a class="headerlink" href="#stack-driven-resynchronization" title="この見出しへのパーマリンク">¶</a></h4>
+<p>ドライバーは、レコードが復号されなくなるとスタックに再同期を要求できます。接続がこのモードで構成されている場合、スタックは2つの完全に暗号化されたレコードを受信した後、自動的に再同期をスケジュールします。</p>
+<p>スタックはソケットがドレインされるのを待機し、デバイスに次の予期されるレコード番号とそのTCPシーケンス番号を通知します。レコードが完全に暗号化されたまま受信され続ける場合、スタックは指数関数的バックオフ（最初は2つの暗号化レコード後、次は4レコード後、8レコード後、16レコード後…最大で128レコードごと）で再同期を試行します。</p>
+</section>
+</section>
+</section>
+<section id="error-handling">
+<h2>エラー処理<a class="headerlink" href="#error-handling" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="id7">
+<h3>TX<a class="headerlink" href="#id7" title="この見出しへのパーマリンク">¶</a></h3>
+<p>スタックはパケットを選択されたTLSオフロードデバイス以外のデバイスにリダイレクトまたはリルートする場合があります。スタックは以下の <code class="xref c c-func docutils literal notranslate"><span class="pre">sk_validate_xmit_skb()</span></code> アシスタント（TLSオフロードコードが <code class="xref c c-func docutils literal notranslate"><span class="pre">tls_validate_xmit_skb()</span></code> このハックにインストール）。オフロードはデータが完全に確認されるまですべてのレコードに関する情報を保持するため、skbsが誤ったデバイスに到達した場合でもソフトウェアフォールバックで処理できます。</p>
+<p>送信側のTLSオフロード処理中にエラーが発生した場合、パケットはドロップされる必要があります。たとえば、スタックやデバイスのバグによりパケットの順序が崩れ、デバイスに到達したが暗号化できない場合、そのパケットはドロップされる必要があります。</p>
+</section>
+<section id="id8">
+<h3>RX<a class="headerlink" href="#id8" title="この見出しへのパーマリンク">¶</a></h3>
+<p>受信側でTLSオフロードに問題が発生した場合、そのパケットはワイヤーで受信したままホストのネットワークスタックに渡す必要があります。</p>
+<p>例えば、セグメント内のどのレコードにも認証失敗が発生した場合、変更せずにソフトウェアのフォールバックにパケットを渡す必要があります。これはパケットを「インプレース」で変更しないことを意味します。部分的な復号処理のためにセグメントを分割することは推奨されません。言い換えれば、パケット内のすべてのレコードが成功裏に処理・認証されたか、またはワイヤーで受信したままホストのスタックに渡す必要があります（デバイスが正確なエラーを提供する場合、ドライバ内で元のパケットを復元する必要があります）。</p>
+<p>Linuxのネットワークスタックは、パケットごとの復号および認証エラーを報告する機能を提供していません。エラーのあるパケットは、 <code class="xref c c-member docutils literal notranslate"><span class="pre">decrypted</span></code> markが設定されていない必要があります。</p>
+<p>不正確なチェックサムを含むパケットは、TLSオフロードで処理すべきではありません。</p>
+</section>
+</section>
+<section id="performance-metrics">
+<h2>パフォーマンスメトリクス<a class="headerlink" href="#performance-metrics" title="この見出しへのパーマリンク">¶</a></h2>
+<p>TLSオフロードの性能は以下の基本的なメトリクスで特徴付けられます:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>最大接続数</p></li>
+<li><p>接続設定レート</p></li>
+<li><p>接続設定遅延</p></li>
+<li><p>総合的な暗号処理性能</p></li>
+</ul>
+</div></blockquote>
+<p>注意点として、各TCP接続には両方向でTLSセッションが必要であり、性能は方向ごとに別々に報告される可能性があります。</p>
+<section id="max-connection-count">
+<h3>最大接続数<a class="headerlink" href="#max-connection-count" title="この見出しへのパーマリンク">¶</a></h3>
+<p>デバイスがサポート可能な接続数は、
+<code class="docutils literal notranslate"><span class="pre">devlink</span> <span class="pre">resource</span></code> API。</p>
+</section>
+<section id="total-cryptographic-performance">
+<h3>総合的な暗号処理性能<a class="headerlink" href="#total-cryptographic-performance" title="この見出しへのパーマリンク">¶</a></h3>
+<p>オフロード性能はセグメントおよびレコードのサイズに依存する可能性があります。</p>
+<p>デバイスの暗号サブシステムの過負荷は、非オフロードストリームに大きなパフォーマンスへの影響を与えないようにする必要があります。</p>
+</section>
+</section>
+<section id="statistics">
+<h2>統計<a class="headerlink" href="#statistics" title="この見出しへのパーマリンク">¶</a></h2>
+<p>以下の最小限のTLS関連統計情報はドライバによって報告される必要があります:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">rx_tls_decrypted_packets</span></code> - 成功的に復号されたRXパケットの数（TLSストリームに含まれる）。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">rx_tls_decrypted_bytes</span></code> - 成功的に復号されたRXパケット内のTLSペイロードバイト数。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">rx_tls_ctx</span></code> - TLS RX HWオフロードコンテキストの数（デバイスに追加された復号用）。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">rx_tls_del</span></code> - TLS RX HWオフロードコンテキストの数（デバイスから削除された、接続が完了した場合）。</p></li>
+<li><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">rx_tls_resync_req_pkt</span></code> - 再同期リクエストを含む受信TLSパケットの数</dt><dd><p>。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">rx_tls_resync_req_start</span></code> - TLS非同期再同期リクエスト</dt><dd><p>が開始された回数。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">rx_tls_resync_req_end</span></code> - TLS非同期再同期リクエスト</dt><dd><p>適切に終了し、HWで追跡されたtcp-seqを提供した場合</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">rx_tls_resync_req_skip</span></code> - TLS非同期再同期リクエスト</dt><dd><p>プロシージャが開始され、適切に終了しなかった回数。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">rx_tls_resync_res_ok</span></code> - TLS再同期応答呼び出し</dt><dd><p>がドライバによって成功裏に処理された回数。</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">rx_tls_resync_res_skip</span></code> - TLS再同期応答呼び出し</dt><dd><p>ドライバによって失敗して終了した回数。</p>
+</dd>
+</dl>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">rx_tls_err</span></code> - TLSストリームに含まれるRXパケットが、状態機械の予期せぬエラーにより復号されなかった回数。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">tx_tls_encrypted_packets</span></code> - TLSペイロードを暗号化するためにデバイスに渡されたTXパケットの数。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">tx_tls_encrypted_bytes</span></code> - 送信パケットにデバイスに渡されたTLSペイロードバイト数（暗号化用）。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">tx_tls_ctx</span></code> - 暗号化用にデバイスに追加されたTLS送信HWオフロードコンテキストの数。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">tx_tls_ooo</span></code> - TLSストリームに属するが予期された順序で到達しなかった送信パケットの数。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">tx_tls_skip_no_sync_data</span></code> - TLSストリームに属し、順序通りに到達しなかった送信パケットの数。ただし、再送信された接続ハンドシェイクデータのため、HWオフロードルーチンをスキップし通常の送信フローに処理されました。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">tx_tls_drop_no_sync_data</span></code> - TLSストリームに属する送信パケットが、順序通りに到達しなかったため関連するレコードが見つからずドロップされた数。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">tx_tls_drop_bypass_req</span></code> - TLSストリームに属する送信パケットが、ソフトウェアで暗号化されたデータとハードウェア暗号オフロードを期待するデータを含むためドロップされた数。</p></li>
+</ul>
+</div></blockquote>
+</section>
+<section id="notable-corner-cases-exceptions-and-additional-requirements">
+<h2>重要なエッジケース、例外処理および追加要件<a class="headerlink" href="#notable-corner-cases-exceptions-and-additional-requirements" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="tuple-matching-limitations">
+<span id="tuple-problems"></span><h3>5-tupleマッチングの制限<a class="headerlink" href="#tuple-matching-limitations" title="この見出しへのパーマリンク">¶</a></h3>
+<p>デバイスはソケットの5タプルに基づいて受信パケットを認識できます。現在の <code class="docutils literal notranslate"><span class="pre">ktls</span></code> 実装では、トンネリングや仮想ネットワーキングに使用されるソフトウェアインターフェース経由でルーティングされたソケットのオフロードはサポートされません。ただし、ネットワーキングスタックで行われるパケット変換（特にBPFロジックなど）は通常、中間ソフトウェアデバイスを必要としないため、デバイスレベルで5タプルマッチが常に失われる可能性があります。このような場合でも、デバイスは送信オフロード（暗号化）を実行し、ソフトウェアでの復号（受信）にスムーズにフェールバックする必要があります。</p>
+</section>
+<section id="out-of-order">
+<h3>順序違い<a class="headerlink" href="#out-of-order" title="この見出しへのパーマリンク">¶</a></h3>
+<p>NICでの追加処理は、パケットの送信または受信順序を変更してはなりません。例えば、純粋なACKパケットはデータセグメントと順序を変更してはいけません。</p>
+</section>
+<section id="ingress-reorder">
+<h3>イングレス順序再構成<a class="headerlink" href="#ingress-reorder" title="この見出しへのパーマリンク">¶</a></h3>
+<p>デバイスは連続するTCPセグメントのパケット再配列（正しい順序に並べる）を行うことが許可されていますが、追加のバッファリングは禁止されています。</p>
+</section>
+<section id="coexistence-with-standard-networking-offload-features">
+<h3>標準ネットワーキングオフロード機能との共存<a class="headerlink" href="#coexistence-with-standard-networking-offload-features" title="この見出しへのパーマリンク">¶</a></h3>
+<p>オフロード <code class="docutils literal notranslate"><span class="pre">ktls</span></code> ソケットは標準TCPスタック機能を透明にサポートする必要があります。デバイスTLSオフロードを有効にしても、ワイヤー上のパケットに違いは生じてはなりません。</p>
+</section>
+<section id="transport-layer-transparency">
+<h3>トランスポートレイヤー透過性<a class="headerlink" href="#transport-layer-transparency" title="この見出しへのパーマリンク">¶</a></h3>
+<p>デバイスはTLSオフロードの目的でパケットヘッダーを変更してはなりません。</p>
+<p>デバイスはTLSオフロードに必要なもの以外のパケットヘッダーに依存してはなりません。</p>
+</section>
+<section id="segment-drops">
+<h3>セグメントドロップ<a class="headerlink" href="#segment-drops" title="この見出しへのパーマリンク">¶</a></h3>
+<p>パケットのドロップは、致命的なシステムエラーの際にのみ許容され、通常の運用で発生するエラー処理として使用してはなりません。言い換えれば、TCP再送信に依存してコーナーケースを処理するというアプローチは許容されません。</p>
+</section>
+<section id="tls-device-features">
+<h3>TLSデバイス機能<a class="headerlink" href="#tls-device-features" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ドライバーはTLSデバイス機能フラグの変更を無視すべきです。これらのフラグはコアによって適切に対応されます。 <code class="docutils literal notranslate"><span class="pre">ktls</span></code> TLSデバイス機能フラグは新しいTLS接続オフロードの追加を制御します。フラグがクリアされた後でも、古い接続はアクティブなままです。</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxネットワーキングドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="netdev-FAQ.html">netdev FAQ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="af_xdp.html">AF_XDP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bareudp.html">Bare UDPトンネリングモジュールドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="batman-adv.html">batman-adv</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can.html">SocketCAN - コントローラー・エリア・ネットワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can_ucan_protocol.html">UCANプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="device_drivers/index.html">ハードウェアデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dsa/index.html">分散スイッチアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="devlink/index.html">Linux Devlinkドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="caif/index.html">CAIF</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ethtool-netlink.html">ethtool用Netlinkインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ieee802154.html">IEEE 802.15.4開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="j1939.html">J1939ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kapi.html">LinuxネットワーキングとネットワークデバイスAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="msg_zerocopy.html">MSG_ZEROCOPY</a></li>
+<li class="toctree-l2"><a class="reference internal" href="failover.html">フェールオーバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="net_dim.html">Net DIM - ジェネリックネットワークダイナミック割込みモデレーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="net_failover.html">NET_FAILOVER</a></li>
+<li class="toctree-l2"><a class="reference internal" href="page_pool.html">ページプールAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phy.html">PHY抽象レイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sfp-phylink.html">phylink</a></li>
+<li class="toctree-l2"><a class="reference internal" href="alias.html">IPアリアシング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bridge.html">イーサネットブリッジング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="snmp_counter.html">SNMPカウンター</a></li>
+<li class="toctree-l2"><a class="reference internal" href="checksum-offloads.html">チェックサムオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="segmentation-offloads.html">セグメンテーションオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="scaling.html">Linuxネットワーキングスタックにおけるスケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tls.html">カーネルTLS</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">カーネルTLSオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nfc.html">Linux NFCサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6lowpan.html">6lowpanインターフェース用Netdevプライベートデータルーム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6pack.html">6packプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet-hardware.html">ARCnetハードウェア</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet.html">ARCnet</a></li>
+<li class="toctree-l2"><a class="reference internal" href="atm.html">ATM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ax25.html">AX.25</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bonding.html">LinuxイーサネットボンディングドライバHOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cdc_mbim.html">cdc_mbim - CDC MBIMモバイルブロードバンドモデム用ドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dccp.html">DCCPプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dctcp.html">DCTCP（データセンターTCP）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="decnet.html">Linux DECnetネットワーキングレイヤー情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dns_resolver.html">DNSリゾルバー・モジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="driver.html">Softnetドライバーの問題</a></li>
+<li class="toctree-l2"><a class="reference internal" href="eql.html">EQLドライバー: シリアルIPロードバランシングガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="fib_trie.html">LC-trie実装ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="filter.html">Linux Socket Filtering（別名Berkeley Packet Filter（BPF））</a></li>
+<li class="toctree-l2"><a class="reference internal" href="framerelay.html">フレームリレー（FR）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic-hdlc.html">ジェネリックHDLCレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic_netlink.html">ジェネリックネットリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gen_stats.html">ネットリンクユーザー向けジェネリックネットワーキング統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gtp.html">LinuxカーネルGTPトンネリングモジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ila.html">識別子ロケーターアドレスング（ILA）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipddp.html">AppleTalk-IPデカプセル化とAppleTalk-IPエンカプセル化</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip_dynaddr.html">IPダイナミックアドレスハックポートv0.03</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipsec.html">IPsec</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip-sysctl.html">IP Sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipv6.html">IPv6</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvlan.html">IPVLANドライバーガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvs-sysctl.html">IPvs-sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kcm.html">カーネルコネクションマルチプレクサ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="l2tp.html">L2TP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lapb-module.html">Linux LAPBモジュールインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mac80211-injection.html">mac80211を使用したパケットインジェクションの使い方</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mpls-sysctl.html">MPLS Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="multiqueue.html">マルチキューネットワークデバイスサポートガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netconsole.html">Netconsole</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdev-features.html">ネットデバイス機能の混乱とその解決方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdevices.html">ネットワークデバイス、カーネル、そしてあなた！</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netfilter-sysctl.html">Netfilter Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netif-msg.html">NETIFメッセージレベル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_conntrack-sysctl.html">Netfilter Conntrack Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_flowtable.html">Netfilterのフローテーブルインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="openvswitch.html">Open vSwitch datapath開発者ドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="operstates.html">運用状態</a></li>
+<li class="toctree-l2"><a class="reference internal" href="packet_mmap.html">パケットMMAP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phonet.html">Linux Phonetプロトコルファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pktgen.html">Linuxパケットジェネレーターガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="plip.html">PLIP: 平行線インターネットプロトコルデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ppp_generic.html">PPPジェネリックドライバーおよびチャネルインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="proc_net_tcp.html">proc/net/tcpおよびproc/net/tcp6変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="radiotap-headers.html">radiotapヘッダの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html">概要</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-architecture">RDSアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#socket-interface">ソケットインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rdma-for-rds">RDS用RDMA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#congestion-notifications">コンゲスト通知</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-protocol">RDSプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-transport-layer">RDSトランスポートレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-kernel-structures">RDSカーネル構造体</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#connection-management">接続管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#the-send-path">送信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#the-recv-path">受信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#multipath-rds-mprds">マルチパスRDS (mprds)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="regulatory.html">Linuxワイヤレス規制ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html">RxRPC ネットワークプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#socket-options">ソケットオプション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#security">セキュリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#example-client-usage">例: クライアントの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sctp.html">LinuxカーネルSCTP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="secid.html">LSM/SeLinux secid</a></li>
+<li class="toctree-l2"><a class="reference internal" href="seg6-sysctl.html">Seg6 Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="statistics.html">インターフェース統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="strparser.html">ストリームパーサー (strparser)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="switchdev.html">イーサネットスイッチデバイスドライバモデル (switchdev)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysfs-tagging.html">Sysfsタグ付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tc-actions-env-rules.html">TCアクション - 環境ルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tcp-thin.html">スリムストリームとTCP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="team.html">チーム (Team)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="timestamping.html">タイムスタンピング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tproxy.html">透過プロキシサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tuntap.html">ユニバーサルTUN/TAPデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="udplite.html">UDP-Liteプロトコル (RFC 3828)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vrf.html">仮想ルーティングおよびフォワーディング (VRF)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vxlan.html">仮想拡張ローカルエリアネットワーキングドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html">パケットレイヤーからデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html#device-driver-to-packet-layer">デバイスドライバからパケットレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25.html">Linux X.25プロジェクト</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_device.html">XFRMデバイス - IPsec計算のオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_proc.html">XFRMプロセス - /proc/net/xfrm_*ファイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sync.html">XFRM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sysctl.html">XFRMシステムコール</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxネットワーキングドキュメント</a><ul>
+<li>前へ: <a href="tls.html" title="前章">カーネルTLS</a></li>
+<li>次へ: <a href="nfc.html" title="次章">Linux NFCサブシステム</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/networking/tls-offload.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

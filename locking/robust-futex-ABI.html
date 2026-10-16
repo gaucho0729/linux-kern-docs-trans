@@ -1,0 +1,261 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>robust futex ABI — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="../accounting/index.html" rel="next" title="アカウント"/>
+<link href="robust-futexes.html" rel="prev" title="ロバストフェイクスの説明"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="the-robust-futex-abi">
+<h1>The robust futex ABI<a class="headerlink" href="#the-robust-futex-abi" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Started by Paul Jackson &lt;<a class="reference external" href="mailto:pj%40sgi.com">pj<span>@</span>sgi<span>.</span>com</a>&gt;</p>
+</dd>
+</dl>
+<p>Robust_futexesは、通常のfutexとは別に、タスク終了時に保持されているロックのクリーンアップをカーネルが支援するメカニズムを提供します。</p>
+<p>スレッドが保持しているfutexに関する興味深いデータは、ユーザー空間のリンクリストに保存され、ロックの取得と解放に伴って効率的に更新できます。カーネルの干渉なしに。</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>各スレッドがカーネルにその保持しているrobust_futexのリストの開始位置を伝えるための、一度の呼び出し、および</p></li>
+<li><p>終了時に実行される内部カーネルコードで、終了するスレッドが保持しているリストに記載されたすべてのロックを処理します。</p></li>
+</ol>
+</div></blockquote>
+<p>既存の通常のfutexは、「高速ユーザースペースロック」メカニズムを提供しており、競合しないロック処理にはシステムコールを必要とせず、競合するロック処理にはカーネル内に待機しているスレッドのリストを保持することで処理を行います。sys_futex(2)システムコールのオプションは、特定のfutexを待機するか、特定のfutexに待機中のスレッドを起こす機能をサポートしています。</p>
+<p>robust_futexを動作させるには、ユーザーのコード（通常はアプリケーションにリンクされたライブラリなど）がカーネルが期待するように正確にリスト要素を管理・配置する必要があります。これに失敗すると、不適切にリストされたロックが終了時にクリーンアップされず、他のスレッドが同じロックを待機している場合にデッドロックやその他の障害が発生する可能性があります。</p>
+<p>robust_futexを使用する可能性があるスレッドは、まず以下のシステムコールを実行する必要があります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>asmlinkage long
+sys_set_robust_list(struct robust_list_head __user *head, size_t len);
+</pre></div>
+</div>
+<p>ポインタ「head」は、スレッドのアドレス空間内の構造体を指しており、その構造体は3つのワードから構成されます。各ワードは32ビットアーキテクチャでは32ビット、64ビットアーキテクチャでは64ビットであり、ローカルのバイト順で定義されています。各スレッドは独自のスレッドプライベートな「head」を持つ必要があります。</p>
+<p>スレッドが64ビットネイティブアーキテクチャのカーネル上で32ビット互換モードで実行されている場合、実際には2つのこのような構造体を持つことができます。1つは32ビットワードを用いた32ビット互換モード用の構造体、もう1つは64ビットワードを用いた64ビットネイティブモード用の構造体です。カーネルが64ビットであり32ビット互換モードをサポートしている場合、対応するリストを処理するため、タスク終了時に両方のリストを処理しようとします。 <a class="reference internal" href="../kernel-hacking/locking.html#c.sys_set_robust_list" title="sys_set_robust_list"><code class="xref c c-func docutils literal notranslate"><span class="pre">sys_set_robust_list()</span></code></a> 対応するリストを設定するためのコールが行われた場合、カーネルは処理を行います。</p>
+<blockquote>
+<div><p>「head」のメモリ構造内の最初のワードは、以下の説明のように1つのロックエントリを1つのロックごとに含むシングルリンクリストへのポインタを保持しています。リストが空の場合、ポインタは自身を指す「head」になります。最後のロックエントリは「head」に戻ります。</p>
+<p>2番目の語は「offset」と呼ばれ、関連する「lock entry」のアドレスからのオフセット（プラスまたはマイナス）を指定します。このオフセットによって呼ばれる「lock word」がどの位置にあるかを示します。「lock word」は常に32ビットの語であり、他の語とは異なります。「lock word」は上位2ビットにフラグビットを、下位30ビットにロックを保持しているスレッドのスレッドID（TID）を保持します。フラグビットについては以下の説明を参照してください。</p>
+<p>3番目の語は「list_op_pending」と呼ばれ、リストの挿入や削除中に「lock entry」のアドレスの一時的なコピーを保持します。スレッドがロック操作またはアンロック操作の途中で終了した場合、競合状態を正しく解決するために必要です。</p>
+</div></blockquote>
+<p>「head」から始まるシングルリンクリスト上の各「lock entry」は、次の「lock entry」を指す単一の語で構成され、次の「lock entry」がなくなる場合は「head」に戻るポインタを持ちます。さらに、「offset」語で指定されたオフセット位置に「lock word」が配置されています。</p>
+<p>「lock word」は常に32ビットであり、futexメカニズムで使用される同じ32ビットのロック変数として意図されています。robust_futexesと併用する場合、カーネルはスレッドの終了時にロックを待機している次のスレッドを起こすことができるのは、その次のスレッドがfutexメカニズムでこの「lock word」のアドレスをカーネルに登録した場合に限ります。</p>
+<p>各スレッドが現在保持しているfutexロックについて、終了時のクリーンアップにrobust_futexサポートを希望する場合、このリストにその「lock entry」を1つ保持し、指定された「offset」位置に関連する「lock word」を配置する必要があります。スレッドがこのようなロックを保持しながら終了した場合、カーネルはこのリストをたどり、そのロックを保持しているスレッドが終了したことを示すビットを設定し、futexメカニズムを使用してそのロックを待機している次のスレッドを起こします。</p>
+<p>スレッドが上記のシステムコールを呼び出してrobust_futexesを使用することを予期していることを示した場合、カーネルはそのタスク用に渡された「head」ポインタを保存します。タスクは後でこの値を取得するために以下のシステムコールを使用できます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>asmlinkage long
+sys_get_robust_list(int pid, struct robust_list_head __user **head_ptr,
+                    size_t __user *len_ptr);
+</pre></div>
+</div>
+<p>スレッドがより大きなユーザー側のロック構造体に埋め込まれたrobust_futexesを使用する予定です。1つのロックごとに1つのrobust_futexを使用します。カーネルのrobust_futexメカニズムは、その構造体に何が含まれているかは気にせず、そのスレッドが使用するすべてのrobust_futexesで「lock word」への「オフセット」が同じである限り動作します。スレッドは現在保持しているロックを「lock entry」ポインタを使用してリンクする必要があります。また、ロック間の他のリンク（例：双方向リストの逆側）がある可能性もありますが、カーネルにとっては重要ではありません。</p>
+<p>カーネルは、このリストがカーネルが知っている「ヘッド」ポインタで始まり、スレッドが予期せぬ終了時に保持しているロックをクリーンアップするための基本的なサービスを提供できます。これはrobust_futexesが提供するサービスです。</p>
+<p>通常の操作中には、競合するスレッド内のユーザー側コードと、既存のfutexメカニズムがロックの待機と再開を処理します。カーネルがrobust_futexesに関与する必要があるのは、リストの「ヘッド」ポインタを記憶し、スレッド終了時にリストをたどって終了するスレッドが保持しているロックを処理することです。</p>
+<p>スレッドの共有メモリ内には、特定の時点で何千ものfutexロック構造体がさまざまなデータ構造に存在する可能性があります。ただし、そのスレッドが現在保持しているロックの構造体だけが、そのスレッドのrobust_futexリンクされたロックリストに存在する必要があります。</p>
+<p>ユーザー共有メモリ領域内の特定のfutexロック構造体は、アクセス可能なスレッドのいずれかがいつでも保持する可能性があります。そのロックを保持しているスレッド（存在する場合）は、ロックワードの下位30ビットにそのスレッドのTIDを記録します。</p>
+<p>タスクがいつ終了してもロックのクリーンアップを正しく処理するため、ユーザー側コードは「lock entry」の挿入・削除時に以下のプロトコルを遵守する必要があります（タスクがリスト操作中に予期せぬシグナル9を受け取る可能性があるため）。</p>
+<p>挿入時の手順:</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>「list_op_pending」ワードを挿入する「lock entry」のアドレスに設定します。</p></li>
+<li><p>futexロックを取得します。</p></li>
+<li><p>「lock word」の下位30ビットにスレッドID（TID）を含めて、「head」から始まるリンクリストにロックエントリを追加します。</p></li>
+<li><p>「list_op_pending」ワードをクリアします。</p></li>
+</ol>
+</div></blockquote>
+<p>削除時の手順:</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>削除する「lock entry」のアドレスを「list_op_pending」ワードに設定します。</p></li>
+<li><p>このロックのロックエントリを「head」リストから削除します。</p></li>
+<li><p>futexロックを解放します。</p></li>
+<li><p>lock_op_pendingのワードをクリアする。</p></li>
+</ol>
+</div></blockquote>
+<p>終了時に、カーネルは「list_op_pending」に保存されたアドレスと、「head」からリストをたどって見つかった各「lock word」のアドレスを考慮します。このようなアドレスごとに、そのアドレスからオフセット「offset」の位置にある「lock word」の下位30ビットが終了するスレッドのスレッドID（TID）と一致する場合、カーネルは以下の2つの操作を行います：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>そのワードのビット31（0x80000000）が設定されている場合、そのアドレスに対してfutexのウェイクアップを試みるため、そのアドレスにfutexメカニズムで待機している次のスレッドを起こします。</p></li>
+<li><p>「lock word」のビット30（0x40000000）をアトミックに設定します。</p></li>
+</ol>
+</div></blockquote>
+<p>上記では、ビット31はそのロックに対するfutex待機者によって設定され、待機中のことを示し、ビット30はカーネルによって設定され、ロックを保持しながら終了したロック所有者を示します。</p>
+<p>カーネルの終了処理では、以下のいずれかの条件が満たされた時点で、リストのスキャンを静かに停止します：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>「head」ポインタまたはその後続するリンクリストポインタがユーザー空間のワードの有効アドレスでない場合</p></li>
+<li><p>「lock word」の計算された位置（アドレス＋オフセット）が32ビットユーザー空間ワードの有効アドレスでない場合</p></li>
+<li><p>リストに100万（今後のカーネル設定変更により変更される可能性がある）以上の要素が含まれる場合。</p></li>
+</ol>
+</div></blockquote>
+<p>カーネルがリストのエントリーアドレスの「lock word」に現在のスレッドのTIDが下位30ビットにない場合、そのエントリーに対して何もせず、次のエントリーに進みます。</p>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">ロック</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="locktypes.html">ロックの種類とそのルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lockdep-design.html">ランタイムロックの正しさを検証するツール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lockstat.html">ロック統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="locktorture.html">カーネルロックのトラウトテスト操作</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mutex-design.html">ジェネリックミューテックスサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rt-mutex-design.html">RTミューテックスの実装設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rt-mutex.html">PIサポート付きRTミューテックスサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="seqlock.html">シーケンスカウンタとシーケンシャルロック</a></li>
+<li class="toctree-l2"><a class="reference internal" href="spinlocks.html">ロックの教訓</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ww-mutex-design.html">Wound/Wait Deadlock-Proof Mutex Design</a></li>
+<li class="toctree-l2"><a class="reference internal" href="preempt-locking.html">プリエンプティブカーネルでの適切なロック: カーネルコードのプリエンプ安全性を保つ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pi-futex.html">軽量PIフェイクス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="futex-requeue-pi.html">フェイクス再配置PI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hwspinlock.html">ハードウェアスピンロックフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="percpu-rw-semaphore.html">ペルCPU読み取り専用セマフォ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="robust-futexes.html">ロバストフェイクスの説明</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">The robust futex ABI</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">ロック</a><ul>
+<li>前へ: <a href="robust-futexes.html" title="前章">ロバストフェイクスの説明</a></li>
+<li>次へ: <a href="../accounting/index.html" title="次章">アカウント</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/locking/robust-futex-ABI.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

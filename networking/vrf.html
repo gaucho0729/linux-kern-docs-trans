@@ -1,0 +1,661 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>仮想ルーティングとフォワーディング (VRF) — Linuxカーネルドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="vxlan.html" rel="next" title="仮想拡張ローカルエリアネットワーキングドキュメンテーション"/>
+<link href="udplite.html" rel="prev" title="UDP-Liteプロトコル (RFC 3828)"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="virtual-routing-and-forwarding-vrf">
+<h1>仮想ルーティングおよびフォワーディング (VRF)<a class="headerlink" href="#virtual-routing-and-forwarding-vrf" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="the-vrf-device">
+<h2>VRFデバイス<a class="headerlink" href="#the-vrf-device" title="この見出しへのパーマリンク">¶</a></h2>
+<p>VRFデバイスとipルールの組み合わせにより、Linuxネットワークスタック内で仮想ルーティングとフォワーディングドメイン（VRF、具体的にはVRF-lite）を作成できるようになります。一つの使用例はマルチテナント問題で、各テナントが独自のルーティングテーブルを持ち、少なくともデフォルトゲートウェイが異なる必要があるケースです。</p>
+<p>プロセスはVRFデバイスにソケットをバインドすることで「VRFを意識した」状態になります。その結果、ソケットを通るパケットはVRFデバイスに関連付けられたルーティングテーブルを使用します。VRFデバイスの実装の重要な特徴は、レイヤー3以上にのみ影響を与えるため、L2ツール（例：LLDP）は影響を受けません（つまり、各VRFごとに実行する必要はありません）。設計上、より優先度の高いipルール（ポリシーベースルーティング、PBR）をVRFデバイスのルールよりも優先して使用できるようにしています。</p>
+<p>さらに、VRFデバイスはネットワークネームスペース内にVRFをネストする機能も提供します。例えばネットワークネームスペースはデバイス層でネットワークインターフェースを分離し、ネームスペース内のインターフェース上のVLANはL2分離を提供し、VRFデバイスはL3分離を提供します。</p>
+<section id="design">
+<h3>設計<a class="headerlink" href="#design" title="この見出しへのパーマリンク">¶</a></h3>
+<p>VRFデバイスは関連付けられたルーティングテーブルとともに作成されます。ネットワークインターフェースはその後、VRFデバイスに所属させられます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+-----------------------------+
+|           vrf-blue          |  ===&gt; route table 10
++-----------------------------+
+   |        |            |
++------+ +------+     +-------------+
+| eth1 | | eth2 | ... |    bond1    |
++------+ +------+     +-------------+
+                         |       |
+                     +------+ +------+
+                     | eth8 | | eth9 |
+                     +------+ +------+
+</pre></div>
+</div>
+<p>受信された所属デバイスのパケットはIPv4およびIPv6処理スタック内でVRFデバイスに切り替えられ、パケットがVRFデバイスを通るかのように見えるようになります。同様に、出力時にルーティングルールが使用され、パケットはVRFデバイスドライバに送られ、その後実際のインターフェースから送出されます。これにより、VRFデバイス上のtcpdumpはVRF全体の入出力パケットをキャプチャできます。<a class="footnote-reference brackets" href="#id3" id="id1">1</a>。同様に、netfilter<a class="footnote-reference brackets" href="#id4" id="id2">2</a> およびtcルールもVRFデバイスを使用して、VRFドメイン全体に適用されるルールを指定できます。</p>
+<dl class="footnote brackets">
+<dt class="label" id="id3"><span class="brackets"><a class="fn-backref" href="#id1">1</a></span></dt>
+<dd><p>転送状態のパケットはデバイスを通らないため、tcpdumpで確認できません。この制限については今後のリリースで再検討します。</p>
+</dd>
+<dt class="label" id="id4"><span class="brackets"><a class="fn-backref" href="#id2">2</a></span></dt>
+<dd><p>イングレス時のiptablesはPREROUTINGルールをサポートし、skb-&gt;devは実際のイングレスデバイスに設定され、INPUTおよびPREROUTINGルールはskb-&gt;devがVRFデバイスに設定されます。エグレス時のPOSTROUTINGおよびOUTPUTルールは、VRFデバイスまたは実際のエグレスデバイスのいずれかを使用して記述できます。</p>
+</dd>
+</dl>
+</section>
+<section id="setup">
+<h3>設定<a class="headerlink" href="#setup" title="この見出しへのパーマリンク">¶</a></h3>
+<ol class="arabic">
+<li><p>VRFデバイスはFIBテーブルと関連付けられて作成されます。例：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>ip link add vrf-blue type vrf table 10
+ip link set dev vrf-blue up
+</pre></div>
+</div>
+</li>
+<li><p>l3mdev FIBルールは、デバイスに関連するテーブルへのルックアップを指示します。1つのl3mdevルールですべてのVRFに対応可能です。最初のデバイスがデフォルトの優先度1000で作成されるとき、VRFデバイスはIPv4およびIPv6用のl3mdevルールを追加します。必要に応じてユーザーはこのルールを削除し、異なる優先度で追加したり、VRFごとのルールをインストールできます。</p>
+<p>v4.8カーネル以前では、各VRFデバイスに対してiifおよびoifルールが必要でした：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>ip ru add oif vrf-blue table 10
+ip ru add iif vrf-blue table 10
+</pre></div>
+</div>
+</li>
+<li><p>テーブル（およびしたがってVRFのデフォルトルート）のデフォルトルートを設定します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>ip route add table 10 unreachable default metric 4278198272
+</pre></div>
+</div>
+<p>この高いメトリック値は、ルーティングプロトコルによってデフォルトの到達不能ルートを上書きできるようにします。FRRoutingはカーネルメトリックを管理距離（上位バイト）と優先度（下位3バイト）の組み合わせとして解釈します。したがって、上記のメトリックは[255/8192]に翻訳されます。</p>
+</li>
+<li><p>L3インターフェースをVRFデバイスに所属させます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>ip link set dev eth1 master vrf-blue
+</pre></div>
+</div>
+<p>所属させたデバイスのローカルおよび接続ルートは、自動的にVRFデバイスに関連するテーブルに移動します。所属させたデバイスに依存する追加のルートは削除され、所属後のVRF FIBテーブルに再挿入する必要があります。</p>
+<p>IPv6 sysctlオプションkeep_addr_on_downを有効にすると、VRF所属の変更に伴ってIPv6グローバルアドレスを保持できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>sysctl -w net.ipv6.conf.all.keep_addr_on_down=1
+</pre></div>
+</div>
+</li>
+<li><p>追加のVRFルートが関連するテーブルに追加されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>ip route add table 10 ...
+</pre></div>
+</div>
+</li>
+</ol>
+</section>
+<section id="applications">
+<h3>アプリケーション<a class="headerlink" href="#applications" title="この見出しへのパーマリンク">¶</a></h3>
+<p>VRF内で動作するアプリケーションは、ソケットをVRFデバイスにバインドする必要があります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>setsockopt(sd, SOL_SOCKET, SO_BINDTODEVICE, dev, strlen(dev)+1);
+</pre></div>
+</div>
+<p>またはcmsgとIP_PKTINFOを使用して出力デバイスを指定します。</p>
+<p>未バインドソケットのポートバインディングのスコープはデフォルトVRFに限定されます。つまり、l3mdevに所属するインターフェースからのパケットには一致せず、プロセスはl3mdevにバインドすることで同じポートにバインドできます。</p>
+<p>デフォルトVRFコンテキスト（つまり、どのVRFデバイスにもバインドされていない）で動作するTCP &amp; UDPサービスは、tcp_l3mdev_acceptおよびudp_l3mdev_accept sysctlオプションを有効にすることで、すべてのVRFドメインを横断して動作できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>sysctl -w net.ipv4.tcp_l3mdev_accept=1
+sysctl -w net.ipv4.udp_l3mdev_accept=1
+</pre></div>
+</div>
+<p>これらのオプションはデフォルトで無効なので、ソケットはそのVRFのパケットのみを選択します。RAWソケットには類似のオプションがあり、後方互換性のためデフォルトで有効です。これは、cmsgとIP_PKTINFOを使用して出力デバイスを指定するためのものです。ただし、対応するVRFにバインドされていないソケットを使用します。これにより、例えば古いping実装をデバイスを指定して実行できますが、VRF内で実行する必要はありません。このオプションは無効にすることで、VRFコンテキストで受信したパケットはVRFにバインドされたRAWソケットのみで処理され、デフォルトVRFのパケットはバインドされていないソケットのみで処理されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>sysctl -w net.ipv4.raw_l3mdev_accept=0
+</pre></div>
+</div>
+<p>VRFデバイス上のnetfilterルールは、デフォルトのVRFコンテキストで実行されているサービスへのアクセスを制限するために使用できます。</p>
+</section>
+</section>
+<hr class="docutils"/>
+<section id="using-iproute2-for-vrfs">
+<h2>iproute2を用いたVRFの利用<a class="headerlink" href="#using-iproute2-for-vrfs" title="この見出しへのパーマリンク">¶</a></h2>
+<p>iproute2はv4.7からvrfキーワードをサポートしています。後方互換性のため、このセクションでは適切な場所でvrfキーワードを使用したコマンドと古い形式のコマンドの両方をリストしています。</p>
+<ol class="arabic">
+<li><p>VRFを作成する</p>
+<p>VRFデバイスをインスタンス化し、テーブルに関連付けるには:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip link add dev NAME type vrf table ID
+</pre></div>
+</div>
+<p>v4.8からはカーネルがl3mdev FIBルールをサポートしており、1つのルールですべてのVRFをカバーできます。l3mdevルールは最初のデバイス作成時にIPv4およびIPv6で作成されます。</p>
+</li>
+<li><p>VRFの一覧表示</p>
+<p>作成されたVRFの一覧を表示するには:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip [-d] link show type vrf
+  NOTE: The -d option is needed to show the table id
+</pre></div>
+</div>
+<p>例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip -d link show type vrf
+11: mgmt: &lt;NOARP,MASTER,UP,LOWER_UP&gt; mtu 1500 qdisc pfifo_fast state UP mode DEFAULT group default qlen 1000
+    link/ether 72:b3:ba:91:e2:24 brd ff:ff:ff:ff:ff:ff promiscuity 0
+    vrf table 1 addrgenmode eui64
+12: red: &lt;NOARP,MASTER,UP,LOWER_UP&gt; mtu 1500 qdisc pfifo_fast state UP mode DEFAULT group default qlen 1000
+    link/ether b6:6f:6e:f6:da:73 brd ff:ff:ff:ff:ff:ff promiscuity 0
+    vrf table 10 addrgenmode eui64
+13: blue: &lt;NOARP,MASTER,UP,LOWER_UP&gt; mtu 1500 qdisc pfifo_fast state UP mode DEFAULT group default qlen 1000
+    link/ether 36:62:e8:7d:bb:8c brd ff:ff:ff:ff:ff:ff promiscuity 0
+    vrf table 66 addrgenmode eui64
+14: green: &lt;NOARP,MASTER,UP,LOWER_UP&gt; mtu 1500 qdisc pfifo_fast state UP mode DEFAULT group default qlen 1000
+    link/ether e6:28:b8:63:70:bb brd ff:ff:ff:ff:ff:ff promiscuity 0
+    vrf table 81 addrgenmode eui64
+</pre></div>
+</div>
+<p>または簡潔な出力では:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip -br link show type vrf
+mgmt         UP             72:b3:ba:91:e2:24 &lt;NOARP,MASTER,UP,LOWER_UP&gt;
+red          UP             b6:6f:6e:f6:da:73 &lt;NOARP,MASTER,UP,LOWER_UP&gt;
+blue         UP             36:62:e8:7d:bb:8c &lt;NOARP,MASTER,UP,LOWER_UP&gt;
+green        UP             e6:28:b8:63:70:bb &lt;NOARP,MASTER,UP,LOWER_UP&gt;
+</pre></div>
+</div>
+</li>
+<li><p>ネットワークインターフェースをVRFに割り当てる</p>
+<p>ネットワークインターフェースは、netdeviceをVRFデバイスにslave化することでVRFに割り当てられます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip link set dev NAME master NAME
+</pre></div>
+</div>
+<p>slave化により、接続済みおよびローカルルートは自動的にVRFデバイスに関連付けられたテーブルに移動します。</p>
+<p>例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip link set dev eth0 master mgmt
+</pre></div>
+</div>
+</li>
+<li><p>VRFに割り当てられたデバイスを表示する</p>
+<p>特定のVRFに割り当てられたデバイスを表示するには、ipコマンドにmasterオプションを追加します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip link show vrf NAME
+$ ip link show master NAME
+</pre></div>
+</div>
+<p>例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip link show vrf red
+3: eth1: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1500 qdisc pfifo_fast master red state UP mode DEFAULT group default qlen 1000
+    link/ether 02:00:00:00:02:02 brd ff:ff:ff:ff:ff:ff
+4: eth2: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1500 qdisc pfifo_fast master red state UP mode DEFAULT group default qlen 1000
+    link/ether 02:00:00:00:02:03 brd ff:ff:ff:ff:ff:ff
+7: eth5: &lt;BROADCAST,MULTICAST&gt; mtu 1500 qdisc noop master red state DOWN mode DEFAULT group default qlen 1000
+    link/ether 02:00:00:00:02:06 brd ff:ff:ff:ff:ff:ff
+</pre></div>
+</div>
+<p>または簡潔な出力では:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip -br link show vrf red
+eth1             UP             02:00:00:00:02:02 &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt;
+eth2             UP             02:00:00:00:02:03 &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt;
+eth5             DOWN           02:00:00:00:02:06 &lt;BROADCAST,MULTICAST&gt;
+</pre></div>
+</div>
+</li>
+<li><p>VRFに関連するネイバーエントリを表示する</p>
+<p>VRFデバイスにslave化されたデバイスに関連するネイバーエントリを一覧表示するには、ipコマンドにmasterオプションを追加します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip [-6] neigh show vrf NAME
+$ ip [-6] neigh show master NAME
+</pre></div>
+</div>
+<p>例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$  ip neigh show vrf red
+10.2.1.254 dev eth1 lladdr a6:d9:c7:4f:06:23 REACHABLE
+10.2.2.254 dev eth2 lladdr 5e:54:01:6a:ee:80 REACHABLE
+
+$ ip -6 neigh show vrf red
+2002:1::64 dev eth1 lladdr a6:d9:c7:4f:06:23 REACHABLE
+</pre></div>
+</div>
+</li>
+<li><p>VRFに関連するアドレスを表示する</p>
+<p>VRFに関連するインターフェースのアドレスを表示するには、ipコマンドにmasterオプションを追加します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip addr show vrf NAME
+$ ip addr show master NAME
+</pre></div>
+</div>
+<p>例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip addr show vrf red
+3: eth1: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1500 qdisc pfifo_fast master red state UP group default qlen 1000
+    link/ether 02:00:00:00:02:02 brd ff:ff:ff:ff:ff:ff
+    inet 10.2.1.2/24 brd 10.2.1.255 scope global eth1
+       valid_lft forever preferred_lft forever
+    inet6 2002:1::2/120 scope global
+       valid_lft forever preferred_lft forever
+    inet6 fe80::ff:fe00:202/64 scope link
+       valid_lft forever preferred_lft forever
+4: eth2: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1500 qdisc pfifo_fast master red state UP group default qlen 1000
+    link/ether 02:00:00:00:02:03 brd ff:ff:ff:ff:ff:ff
+    inet 10.2.2.2/24 brd 10.2.2.255 scope global eth2
+       valid_lft forever preferred_lft forever
+    inet6 2002:2::2/120 scope global
+       valid_lft forever preferred_lft forever
+    inet6 fe80::ff:fe00:203/64 scope link
+       valid_lft forever preferred_lft forever
+7: eth5: &lt;BROADCAST,MULTICAST&gt; mtu 1500 qdisc noop master red state DOWN group default qlen 1000
+    link/ether 02:00:00:00:02:06 brd ff:ff:ff:ff:ff:ff
+</pre></div>
+</div>
+<p>または簡潔な形式では:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip -br addr show vrf red
+eth1             UP             10.2.1.2/24 2002:1::2/120 fe80::ff:fe00:202/64
+eth2             UP             10.2.2.2/24 2002:2::2/120 fe80::ff:fe00:203/64
+eth5             DOWN
+</pre></div>
+</div>
+</li>
+<li><p>VRFに関連するルートを表示する</p>
+<p>VRFのルートを表示するには、ipコマンドを使用してVRFデバイスに関連するテーブルを表示します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip [-6] route show vrf NAME
+$ ip [-6] route show table ID
+</pre></div>
+</div>
+<p>例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip route show vrf red
+unreachable default  metric 4278198272
+broadcast 10.2.1.0 dev eth1  proto kernel  scope link  src 10.2.1.2
+10.2.1.0/24 dev eth1  proto kernel  scope link  src 10.2.1.2
+local 10.2.1.2 dev eth1  proto kernel  scope host  src 10.2.1.2
+broadcast 10.2.1.255 dev eth1  proto kernel  scope link  src 10.2.1.2
+broadcast 10.2.2.0 dev eth2  proto kernel  scope link  src 10.2.2.2
+10.2.2.0/24 dev eth2  proto kernel  scope link  src 10.2.2.2
+local 10.2.2.2 dev eth2  proto kernel  scope host  src 10.2.2.2
+broadcast 10.2.2.255 dev eth2  proto kernel  scope link  src 10.2.2.2
+
+$ ip -6 route show vrf red
+local 2002:1:: dev lo  proto none  metric 0  pref medium
+local 2002:1::2 dev lo  proto none  metric 0  pref medium
+2002:1::/120 dev eth1  proto kernel  metric 256  pref medium
+local 2002:2:: dev lo  proto none  metric 0  pref medium
+local 2002:2::2 dev lo  proto none  metric 0  pref medium
+2002:2::/120 dev eth2  proto kernel  metric 256  pref medium
+local fe80:: dev lo  proto none  metric 0  pref medium
+local fe80:: dev lo  proto none  metric 0  pref medium
+local fe80::ff:fe00:202 dev lo  proto none  metric 0  pref medium
+local fe80::ff:fe00:203 dev lo  proto none  metric 0  pref medium
+fe80::/64 dev eth1  proto kernel  metric 256  pref medium
+fe80::/64 dev eth2  proto kernel  metric 256  pref medium
+ff00::/8 dev red  metric 256  pref medium
+ff00::/8 dev eth1  metric 256  pref medium
+ff00::/8 dev eth2  metric 256  pref medium
+unreachable default dev lo  metric 4278198272  error -101 pref medium
+</pre></div>
+</div>
+</li>
+<li><p>VRFのルート検索</p>
+<p>VRFのテストルート検索は以下のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip [-6] route get vrf NAME ADDRESS
+$ ip [-6] route get oif NAME ADDRESS
+</pre></div>
+</div>
+<p>例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip route get 10.2.1.40 vrf red
+10.2.1.40 dev eth1  table red  src 10.2.1.2
+    cache
+
+$ ip -6 route get 2002:1::32 vrf red
+2002:1::32 from :: dev eth1  table red  proto kernel  src 2002:1::2  metric 256  pref medium
+</pre></div>
+</div>
+</li>
+<li><p>ネットワークインターフェースをVRFから削除する</p>
+<p>ネットワークインターフェースは、VRFデバイスとのslave化を解除することでVRFから削除されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip link set dev NAME nomaster
+</pre></div>
+</div>
+<p>接続済みルートはデフォルトテーブルに戻され、ローカルエントリはローカルテーブルに移動します。</p>
+<p>例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip link set dev eth0 nomaster
+</pre></div>
+</div>
+</li>
+</ol>
+<hr class="docutils"/>
+<p>この例で使用したコマンド:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>cat &gt;&gt; /etc/iproute2/rt_tables.d/vrf.conf &lt;&lt;EOF
+1  mgmt
+10 red
+66 blue
+81 green
+EOF
+
+function vrf_create
+{
+    VRF=$1
+    TBID=$2
+
+    # create VRF device
+    ip link add ${VRF} type vrf table ${TBID}
+
+    if [ "${VRF}" != "mgmt" ]; then
+        ip route add table ${TBID} unreachable default metric 4278198272
+    fi
+    ip link set dev ${VRF} up
+}
+
+vrf_create mgmt 1
+ip link set dev eth0 master mgmt
+
+vrf_create red 10
+ip link set dev eth1 master red
+ip link set dev eth2 master red
+ip link set dev eth5 master red
+
+vrf_create blue 66
+ip link set dev eth3 master blue
+
+vrf_create green 81
+ip link set dev eth4 master green
+
+
+Interface addresses from /etc/network/interfaces:
+auto eth0
+iface eth0 inet static
+      address 10.0.0.2
+      netmask 255.255.255.0
+      gateway 10.0.0.254
+
+iface eth0 inet6 static
+      address 2000:1::2
+      netmask 120
+
+auto eth1
+iface eth1 inet static
+      address 10.2.1.2
+      netmask 255.255.255.0
+
+iface eth1 inet6 static
+      address 2002:1::2
+      netmask 120
+
+auto eth2
+iface eth2 inet static
+      address 10.2.2.2
+      netmask 255.255.255.0
+
+iface eth2 inet6 static
+      address 2002:2::2
+      netmask 120
+
+auto eth3
+iface eth3 inet static
+      address 10.2.3.2
+      netmask 255.255.255.0
+
+iface eth3 inet6 static
+      address 2002:3::2
+      netmask 120
+
+auto eth4
+iface eth4 inet static
+      address 10.2.4.2
+      netmask 255.255.255.0
+
+iface eth4 inet6 static
+      address 2002:4::2
+      netmask 120
+</pre></div>
+</div>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxネットワーキングドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="netdev-FAQ.html">netdev FAQ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="af_xdp.html">AF_XDP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bareudp.html">Bare UDPトンネリングモジュールドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="batman-adv.html">batman-adv</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can.html">SocketCAN - コントローラー・エリア・ネットワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can_ucan_protocol.html">UCANプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="device_drivers/index.html">ハードウェアデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dsa/index.html">分散スイッチアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="devlink/index.html">Linux Devlinkドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="caif/index.html">CAIF</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ethtool-netlink.html">ethtool用Netlinkインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ieee802154.html">IEEE 802.15.4開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="j1939.html">J1939ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kapi.html">LinuxネットワーキングとネットワークデバイスAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="msg_zerocopy.html">MSG_ZEROCOPY</a></li>
+<li class="toctree-l2"><a class="reference internal" href="failover.html">フェールオーバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="net_dim.html">Net DIM - ジェネリックネットワークダイナミック割込みモデレーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="net_failover.html">NET_FAILOVER</a></li>
+<li class="toctree-l2"><a class="reference internal" href="page_pool.html">ページプールAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phy.html">PHY抽象レイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sfp-phylink.html">phylink</a></li>
+<li class="toctree-l2"><a class="reference internal" href="alias.html">IPアリアシング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bridge.html">イーサネットブリッジング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="snmp_counter.html">SNMPカウンター</a></li>
+<li class="toctree-l2"><a class="reference internal" href="checksum-offloads.html">チェックサムオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="segmentation-offloads.html">セグメンテーションオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="scaling.html">Linuxネットワーキングスタックにおけるスケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tls.html">カーネルTLS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tls-offload.html">カーネルTLSオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nfc.html">Linux NFCサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6lowpan.html">6lowpanインターフェース用Netdevプライベートデータルーム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6pack.html">6packプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet-hardware.html">ARCnetハードウェア</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet.html">ARCnet</a></li>
+<li class="toctree-l2"><a class="reference internal" href="atm.html">ATM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ax25.html">AX.25</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bonding.html">LinuxイーサネットボンディングドライバHOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cdc_mbim.html">cdc_mbim - CDC MBIMモバイルブロードバンドモデム用ドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dccp.html">DCCPプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dctcp.html">DCTCP（データセンターTCP）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="decnet.html">Linux DECnetネットワーキングレイヤー情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dns_resolver.html">DNSリゾルバー・モジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="driver.html">Softnetドライバーの問題</a></li>
+<li class="toctree-l2"><a class="reference internal" href="eql.html">EQLドライバー: シリアルIPロードバランシングガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="fib_trie.html">LC-trie実装ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="filter.html">Linux Socket Filtering（別名Berkeley Packet Filter（BPF））</a></li>
+<li class="toctree-l2"><a class="reference internal" href="framerelay.html">フレームリレー（FR）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic-hdlc.html">ジェネリックHDLCレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic_netlink.html">ジェネリックネットリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gen_stats.html">ネットリンクユーザー向けジェネリックネットワーキング統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gtp.html">LinuxカーネルGTPトンネリングモジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ila.html">識別子ロケーターアドレスング（ILA）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipddp.html">AppleTalk-IPデカプセル化とAppleTalk-IPエンカプセル化</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip_dynaddr.html">IPダイナミックアドレスハックポートv0.03</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipsec.html">IPsec</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip-sysctl.html">IP Sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipv6.html">IPv6</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvlan.html">IPVLANドライバーガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvs-sysctl.html">IPvs-sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kcm.html">カーネルコネクションマルチプレクサ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="l2tp.html">L2TP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lapb-module.html">Linux LAPBモジュールインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mac80211-injection.html">mac80211を使用したパケットインジェクションの使い方</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mpls-sysctl.html">MPLS Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="multiqueue.html">マルチキューネットワークデバイスサポートガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netconsole.html">Netconsole</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdev-features.html">ネットデバイス機能の混乱とその解決方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdevices.html">ネットワークデバイス、カーネル、そしてあなた！</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netfilter-sysctl.html">Netfilter Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netif-msg.html">NETIFメッセージレベル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_conntrack-sysctl.html">Netfilter Conntrack Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_flowtable.html">Netfilterのフローテーブルインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="openvswitch.html">Open vSwitch datapath開発者ドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="operstates.html">運用状態</a></li>
+<li class="toctree-l2"><a class="reference internal" href="packet_mmap.html">パケットMMAP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phonet.html">Linux Phonetプロトコルファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pktgen.html">Linuxパケットジェネレーターガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="plip.html">PLIP: 平行線インターネットプロトコルデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ppp_generic.html">PPPジェネリックドライバーおよびチャネルインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="proc_net_tcp.html">proc/net/tcpおよびproc/net/tcp6変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="radiotap-headers.html">radiotapヘッダの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html">概要</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-architecture">RDSアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#socket-interface">ソケットインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rdma-for-rds">RDS用RDMA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#congestion-notifications">コンゲスト通知</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-protocol">RDSプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-transport-layer">RDSトランスポートレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-kernel-structures">RDSカーネル構造体</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#connection-management">接続管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#the-send-path">送信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#the-recv-path">受信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#multipath-rds-mprds">マルチパスRDS (mprds)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="regulatory.html">Linuxワイヤレス規制ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html">RxRPC ネットワークプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#socket-options">ソケットオプション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#security">セキュリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#example-client-usage">例: クライアントの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sctp.html">LinuxカーネルSCTP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="secid.html">LSM/SeLinux secid</a></li>
+<li class="toctree-l2"><a class="reference internal" href="seg6-sysctl.html">Seg6 Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="statistics.html">インターフェース統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="strparser.html">ストリームパーサー (strparser)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="switchdev.html">イーサネットスイッチデバイスドライバモデル (switchdev)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysfs-tagging.html">Sysfsタグ付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tc-actions-env-rules.html">TCアクション - 環境ルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tcp-thin.html">スリムストリームとTCP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="team.html">チーム (Team)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="timestamping.html">タイムスタンピング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tproxy.html">透過プロキシサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tuntap.html">ユニバーサルTUN/TAPデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="udplite.html">UDP-Liteプロトコル (RFC 3828)</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">仮想ルーティングおよびフォワーディング (VRF)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vxlan.html">仮想拡張ローカルエリアネットワーキングドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html">パケットレイヤーからデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html#device-driver-to-packet-layer">デバイスドライバからパケットレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25.html">Linux X.25プロジェクト</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_device.html">XFRMデバイス - IPsec計算のオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_proc.html">XFRMプロセス - /proc/net/xfrm_*ファイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sync.html">XFRM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sysctl.html">XFRMシステムコール</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxネットワーキングドキュメント</a><ul>
+<li>前へ: <a href="udplite.html" title="前章">UDP-Liteプロトコル (RFC 3828)</a></li>
+<li>次へ: <a href="vxlan.html" title="次章">仮想拡張ローカルエリアネットワーキングドキュメンテーション</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/networking/vrf.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

@@ -1,0 +1,464 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Linuxネットワーキングスタックのスケーリング — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="tls.html" rel="next" title="カーネルTLS"/>
+<link href="segmentation-offloads.html" rel="prev" title="セグメンテーションオフロード"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="scaling-in-the-linux-networking-stack">
+<h1>Linuxネットワーキングスタックにおけるスケーリング<a class="headerlink" href="#scaling-in-the-linux-networking-stack" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このドキュメントでは、Linuxネットワーキングスタックにおける補完的な技術セットについて説明し、マルチプロセッサシステムにおける並列性の向上とパフォーマンスの改善を目的としています。</p>
+<p>以下の技術が説明されています：</p>
+<ul class="simple">
+<li><p>RSS: 受信側スケーリング</p></li>
+<li><p>RPS: 受信パケットステアリング</p></li>
+<li><p>RFS: 受信フローステアリング</p></li>
+<li><p>高速化された受信フローのステアリング</p></li>
+<li><p>XPS: 送信パケットステアリング</p></li>
+</ul>
+</section>
+<section id="rss-receive-side-scaling">
+<h2>RSS: 受信側スケーリング<a class="headerlink" href="#rss-receive-side-scaling" title="この見出しへのパーマリンク">¶</a></h2>
+<p>現代のNIC（ネットワークインターフェースカード）は、複数の受信および送信ディスクリプタキュー（マルチキュー）をサポートしています。受信時に、NICは異なるパケットを異なるキューに送ることで、CPU間で処理を分散できます。NICは、各パケットに対してフィルタを適用し、それを少数の論理フローのいずれかに割り当てることでパケットを分散します。各フローのパケットは、別個の受信キューにリダイレクトされ、そのキューは別個のCPUで処理されます。このメカニズムは一般的に「受信側スケーリング」（RSS）として知られています。RSSおよび他のスケーリング技術の目標は、パフォーマンスを均等に向上させることです。マルチキューの分散はトラフィックの優先順位付けにも利用できますが、これはこれらの技術の焦点ではありません。</p>
+<p>RSSで使用されるフィルタは、ネットワークおよび/またはトランスポートレイヤーヘッダー上のハッシュ関数で構成されます。例えば、パケットのIPアドレスとTCPポートの4要素ハッシュです。RSSの最も一般的なハードウェア実装は、128エントリの間接テーブルを使用します。各エントリはキュー番号を保存しており、パケットの受信キューは、計算されたハッシュ（通常はトーチリズハッシュ）の下位7ビットをマスクして得られる数値を間接テーブルのキーとして使用し、対応する値を読み取ることで決定されます。</p>
+<p>一部の高度なNICは、プログラマブルフィルタに基づいてパケットをキューにリダイレクトできます。例えば、ウェブサーバーにバインドされたTCPポート80のパケットは、独自の受信キューにリダイレクトされます。このような「n-タプル」フィルタは、ethtool（–config-ntuple）から設定できます。</p>
+<section id="rss-configuration">
+<h3>RSSの設定<a class="headerlink" href="#rss-configuration" title="この見出しへのパーマリンク">¶</a></h3>
+<p>マルチキューをサポートするNICのドライバは、通常、ハードウェアキューの数を指定するカーネルモジュールパラメータを提供します。例えば、bnx2xドライバではこのパラメータはnum_queuesと呼ばれます。典型的なRSS設定では、デバイスが十分なキューをサポートする場合、各CPUに1つの受信キューを割り当て、そうでない場合は少なくとも各メモリドメイン（メモリレベルL1、L2、NUMAノードなどを持つCPUの集合）に1つずつ割り当てます。</p>
+<p>RSSデバイスのインデックステーブルは、マスクされたハッシュでキューを解決する仕組みを持ち、通常ドライバが初期化時にプログラムします。デフォルトのマッピングはテーブル内でキューを均等に配分しますが、ethtoolコマンド（–show-rxfh-indir および –set-rxfh-indir）を使用して実行時にもインデックステーブルを取得・変更できます。インデックステーブルを変更することで、キューごとに異なる相対的な重みを割り当てることも可能です。</p>
+<section id="rss-irq-configuration">
+<h4>RSS IRQ設定<a class="headerlink" href="#rss-irq-configuration" title="この見出しへのパーマリンク">¶</a></h4>
+<p>各受信キューには個別に割り当てられたIRQがあります。NICはこのIRQを通じて、指定されたキューに新しいパケットが到着したことをCPUに通知します。PCIeデバイスのシグナル経路ではメッセージ送信割込み（MSI-X）が使用され、各割込みを特定のCPUにルーティングできます。キューとIRQの割り当ては/proc/interruptsから確認可能です。デフォルトではIRQは任意のCPUで処理される可能性があります。パケット処理の一部が受信割込み処理で行われるため、CPU間で受信割込みを分散することが望ましいです。各割込みのIRQアフィニティを手動で調整するには <a class="reference internal" href="../core-api/irq/irq-affinity.html"><span class="doc">SMP IRQ アフィニティ</span></a>、一部のシステムではirqbalanceというデーモンが動的にIRQ割り当てを最適化し、手動設定を上書きする可能性があります。</p>
+</section>
+<section id="suggested-configuration">
+<h4>推奨設定<a class="headerlink" href="#suggested-configuration" title="この見出しへのパーマリンク">¶</a></h4>
+<p>レイテンシーが懸念される場合や受信割込み処理がボトルネックになる場合はRSSを有効にします。CPU間で負荷を分散することでキューの長さが短縮されます。低レイテンシーなネットワーキングでは、システム内のCPU数（またはNICの最大値、低い場合はそれに準じる）に合わせてキューを最大限に割り当てることが最適です。高レートでの最適な設定は、CPUの過負荷による受信キューのオーバーフローが発生しない最小の受信キュー数です。これはデフォルトモードで割込み統合が有効な場合、追加されるキューごとに割込み（および作業）の総数が増加するためです。</p>
+<p>CPUごとの負荷はmpstatユーティリティで確認できますが、ハイパースレッディング（HT）を持つプロセッサでは各ハイパースレッディングが別個のCPUとして表示されます。割込み処理ではHTは初期テストではメリットが見られず、システム内のCPUコア数に合わせてキュー数を制限してください。</p>
+</section>
+</section>
+</section>
+<section id="rps-receive-packet-steering">
+<h2>RPS: 受信パケットステアリング<a class="headerlink" href="#rps-receive-packet-steering" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Receive Packet Steering (RPS) は、論理的に RSS のソフトウェア実装とみなされます。ソフトウェアであるため、データパスにおいて後段で呼ばれる必要があります。RSS はハードウェア割込みハンドラを実行するキューおよび CPU を選択しますが、RPS は割込みハンドラの上位プロトコル処理を実行する CPU を選択します。これは、パケットを目的の CPU のバックログキューに配置し、CPU を起動することで実現されます。RPS は RSS と比較して以下の利点があります:</p>
+<ol class="arabic simple">
+<li><p>任意の NIC と併用可能です</p></li>
+<li><p>ソフトウェアフィルタを追加して新しいプロトコルのハッシュ処理が容易です</p></li>
+<li><p>ハードウェアデバイスの割込みレートは増加しません（ただしプロセッサ間割込み (IPI) を導入します）</p></li>
+</ol>
+<p>RPS は受信割込みハンドラの下半分で呼ばれます。ドライバがネットワークスタックへパケットを送信する際、 <a class="reference internal" href="kapi.html#c.netif_rx" title="netif_rx"><code class="xref c c-func docutils literal notranslate"><span class="pre">netif_rx()</span></code></a> または
+<a class="reference internal" href="kapi.html#c.netif_receive_skb" title="netif_receive_skb"><code class="xref c c-func docutils literal notranslate"><span class="pre">netif_receive_skb()</span></code></a>。これらは get_rps_cpu() 関数を呼び出し、パケットを処理するキューを選択します。</p>
+<p>RPS のターゲット CPU を決定する最初のステップは、パケットのアドレスやポートに基づいたフローのハッシュ計算です（プロトコルによって 2 重または 4 重のハッシュが使用されます）。これはパケットの関連するフローの一貫したハッシュとして機能します。このハッシュはハードウェアによって提供されるか、スタック内で計算されます。機能するハードウェアはパケットの受信ディスクリプタにハッシュを渡すことができ、これは通常 RSS で使用される同じハッシュ（例: Toeplitz ハッシュ）です。このハッシュは skb-&gt;hash に保存され、スタックの他の場所でパケットのフローのハッシュとして使用できます。</p>
+<p>各受信ハードウェアキューには、RPS がパケットを処理するための CPU のリストが関連付けられています。各受信パケットに対して、フローのハッシュをリストのサイズで割った余りからインデックスを計算します。インデックスされた CPU がパケットの処理ターゲットとなり、パケットはその CPU のバックログキューの末尾にキューイングされます。下半分ルーチンの終わりに、キューイングされたパケットがある CPU に対して IPI が送信されます。IPI はリモート CPU のバックログ処理を起動し、キューイングされたパケットはネットワークスタックへ処理されます。</p>
+<section id="rps-configuration">
+<h3>RPS 設定<a class="headerlink" href="#rps-configuration" title="この見出しへのパーマリンク">¶</a></h3>
+<p>RPS は CONFIG_RPS kconfig シンボルでコンパイルされたカーネルが必要です（SMP ではデフォルトで有効）。コンパイルされていても、明示的に設定されていない限り RPS は無効です。各受信キューに対して RPS がトラフィックを転送可能な CPU のリストを sysfs ファイルエントリで設定できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/class/net/&lt;dev&gt;/queues/rx-&lt;n&gt;/rps_cpus
+</pre></div>
+</div>
+<p>このファイルは CPU のビットマップを実装しています。ビットマップがゼロ（デフォルト）の場合、RPS は無効となり、パケットは割込みした CPU で処理されます。 <a class="reference internal" href="../core-api/irq/irq-affinity.html"><span class="doc">SMP IRQ アフィニティ</span></a> CPUがビットマップに割り当てられる仕組みを説明しています。</p>
+<section id="id1">
+<h4>推奨設定<a class="headerlink" href="#id1" title="この見出しへのパーマリンク">¶</a></h4>
+<p>単一のキューデバイスの場合、典型的なRPS設定は、割り込みCPUと同じメモリドメインにあるCPUをrps_cpusに設定することです。NUMAローカリティが問題でなければ、システム内のすべてのCPUを指定することも可能です。高トラフィック状態では、割り込みCPUをマップから除外する方が賢明かもしれません。なぜなら、そのCPUがすでに多くの作業を実行しているからです。</p>
+<p>マルチキューシステムでは、RSSがハードウェア受信キューを各CPUに割り当てるように設定されている場合、RPSは冗長で不要かもしれません。ハードウェアキューがCPUより少ない場合、各キューのrps_cpusがそのキューの割り込みCPUと同じメモリドメインのCPUである場合、RPSは有益かもしれません。</p>
+</section>
+</section>
+<section id="rps-flow-limit">
+<h3>RPS フロー制限<a class="headerlink" href="#rps-flow-limit" title="この見出しへのパーマリンク">¶</a></h3>
+<p>RPSは、CPU間で受信処理をスケーリングする際にパケットの再配列を導入しません。すべてのフローが同じCPUにパケットを送信する場合のトレードオフは、パケットレートが異なるフローによってCPUの負荷が不均衡になる可能性があります。極端なケースでは、単一のフローがトラフィックを支配します。特に多くの同時接続を持つ一般的なサーバー作業負荷では、このような挙動は設定ミスや偽装されたソースからのDoS攻撃などの問題を示唆しています。</p>
+<p>フロー制限はオプションのRPS機能で、CPU競合時に小規模なフローを優先するために、大規模なフローのパケットを小規模なフローのパケットよりも少し早くドロップします。これはRPSまたはRFS宛てのCPUが飽和に近づいた場合にのみ有効です。CPUの入力パケットキューがsysctl net.core.netdev_max_backlogで設定された最大キュー長の半分を超えた場合、カーネルは過去256パケットのフローベースのパケットカウントを開始します。新しいパケットが到着する際、フローが設定された比率（デフォルトでは半分）を超える場合、新しいパケットはドロップされます。他のフローのパケットは、入力パケットキューがnetdev_max_backットに達するまでドロップされません。入力パケットキュー長がしきい値以下の場合、パケットはドロップされませんので、フロー制限は接続を完全に切断しません。つまり、大規模なフローも接続を維持します。</p>
+<section id="interface">
+<h4>インターフェース<a class="headerlink" href="#interface" title="この見出しへのパーマリンク">¶</a></h4>
+<p>フロー制限はデフォルトでコンパイルされています（CONFIG_NET_FLOW_LIMIT）が、有効になっていません。各CPUで独立して実装されており（ロックやキャッシュ競合を避けるため）、sysctl net.core.flow_limit_cpu_bitmapの関連ビットを設定することで各CPUごとに有効/無効を切り替えます。procfsから呼び出される際には、rps_cpusと同じCPUビットマップインターフェースを提供しています（上記参照）。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/proc/sys/net/core/flow_limit_cpu_bitmap
+</pre></div>
+</div>
+<p>フローごとのレートは、各パケットをハッシュテーブルのバケットに割り当て、各バケットのカウンターをインクリメントすることで計算されます。ハッシュ関数はRPSでCPUを選択するのと同じですが、バケット数がCPU数よりはるかに多い場合があるため、フロー制限は大規模なフローをより細かい粒度で識別し、偽陽性を減らします。デフォルトのテーブルには4096個のバケットがあります。この値はsysctlを通じて変更可能です:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>net.core.flow_limit_table_len
+</pre></div>
+</div>
+<p>この値は新しいテーブルが割り当てられるときにのみ参照されます。変更しても既存のアクティブなテーブルには影響しません。</p>
+</section>
+<section id="id2">
+<h4>推奨設定<a class="headerlink" href="#id2" title="この見出しへのパーマリンク">¶</a></h4>
+<p>多くの同時接続を持つシステムでは、1つの接続がCPUの50%を占めることで問題が発生している場合があります。このような環境では、ネットワークrx割込みを処理するすべてのCPUでこの機能を有効にしてください（/proc/irq/N/smp_affinityで設定されたCPU）。</p>
+<p>この機能は、入力パケットキューの長さがフロー制限閾値（50%）＋フロー履歴長（256）を上回ることを前提としています。実験ではnet.core.netdev_max_backlogを1000または10000に設定すると良好な性能を示しました。</p>
+</section>
+</section>
+</section>
+<section id="rfs-receive-flow-steering">
+<h2>RFS: 受信フローステアリング<a class="headerlink" href="#rfs-receive-flow-steering" title="この見出しへのパーマリンク">¶</a></h2>
+<p>RPSはハッシュ値のみに基づいてパケットを振り分け、一般的に均等な負荷分散を提供しますが、アプリケーションのローカル性を考慮しません。これを実現するのがReceive Flow Steering（RFS）です。RFSの目的は、パケットを処理するアプリケーションスレッドが実行されているCPUに処理を振り分け、データキャッシュヒット率を向上させることです。RFSはRPSのメカニズムを同じくして、他のCPUのバックログにパケットを enqueue し、そのCPUを起動します。</p>
+<p>RFSでは、パケットのハッシュ値によって直接転送されません。代わりに、ハッシュ値はフローロックアップテーブルのインデックスとして使用されます。このテーブルはフローを処理しているCPUをマッピングしており、フローのハッシュ値（上記RPSセクション参照）をもとにこのテーブルのインデックスが計算されます。各エントリに記録されているCPUは、そのフローを最後に処理したCPUです。エントリに有効なCPUが記録されていない場合、そのエントリにマッピングされたパケットは通常のRPSで振り分けられます。複数のテーブルエントリが同じCPUを指す可能性があります。特に多くのフローと少ないCPUがある場合、1つのアプリケーションスレッドが多くの異なるフローハッシュを持つフローを処理している可能性が高いです。</p>
+<p>rps_sock_flow_tableは、フローごとの <em>望ましい</em> CPUを含むグローバルなフローテーブルです。各テーブル値は、現在ユーザー空間でフローを処理しているCPUのインデックスです。各テーブル値はrecvmsgおよびsendmsg呼び出し（特にinet_recvmsg(), inet_sendmsg(), inet_sendpage(), およびtcp_splice_read()）中に更新されるCPUインデックスです。</p>
+<p>スケジューラが、古いCPUで受信待ちのパケットを持つスレッドを新しいCPUに移動させると、パケットが順序を崩して到着する可能性があります。これを防ぐためにRFSは、各フローの未処理パケットを追跡するための2番目のフローテーブルを使用します:rps_dev_flow_tableは、各デバイスのハードウェア受信キューごとに特有のテーブルです。各テーブル値はCPUインデックスとカウンタを保持しており、CPUインデックスはこのフローのパケットがさらにカーネル処理のためにキューイングされるCPUを示します。 <em>現在の</em> 理想的には、カーネルとユーザースペースの処理が同じCPUで行われるため、両テーブルのCPUインデックスは一致します。しかし、スケジューラが最近ユーザースペーススレッドを移動させた場合、カーネルが古いCPUで処理待ちのパケットを保持しているため、この条件は成立しない可能性があります。</p>
+<p>rps_dev_flow_tableのカウンタは、このフローのパケットが最後にキューイングされた際の現在CPUのバックログ長を記録します。各バックログキューにはヘッドカウンタがあり、キューイング解除時にインクリメントされます。テールカウンタはヘッドカウンタ＋キュー長として計算されます。つまり、rps_dev_flow[i]のカウンタは、フローiの現在割り当てられたCPUでキューイングされたフローiの最後の要素を示します（もちろん、エントリiはハッシュによって選択され、複数のフローが同じエントリiにハッシュされる可能性があります）。</p>
+<p>そして、出力順序のパケットを防ぐためのトリックは、パケット処理のCPUを選択する際（get_rps_cpu()）に、パケットが受信されたキューのrps_sock_flowテーブルとrps_dev_flowテーブルを比較することです。フローの望ましいCPU（rps_sock_flowテーブルに記録）が、現在のCPU（rps_dev_flowテーブルに記録）と一致する場合、パケットはそのCPUのバックログにキューイングされます。一致しない場合、以下のいずれかが真であれば現在のCPUを望ましいCPUに更新します：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>現在のCPUのキューイングヘッドカウンタ &gt;= rps_dev_flow[i]に記録されたテールカウンタ値</p></li>
+<li><p>現在のCPUが未設定（&gt;= nr_cpu_ids）</p></li>
+<li><p>現在のCPUがオフライン</p></li>
+</ul>
+</div></blockquote>
+<p>このチェックの後、パケットは（更新された可能性のある）現在のCPUに送られます。これらのルールは、古いCPUに未処理のパケットが存在しない状態でフローが新しいCPUに移動するようにするため、未処理のパケットが新しいCPUで処理されるパケットよりも後に到着する可能性があるためです。</p>
+<section id="rfs-configuration">
+<h3>RFSの設定<a class="headerlink" href="#rfs-configuration" title="この見出しへのパーマリンク">¶</a></h3>
+<p>RFSはkconfigシンボルCONFIG_RPSが有効になっている場合（SMPでデフォルトで有効）にのみ利用可能です。機能は明示的に設定されるまで無効のままです。グローバルフローテーブルのエントリ数は次の通り設定されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/proc/sys/net/core/rps_sock_flow_entries
+</pre></div>
+</div>
+<p>各キューごとのフローテーブルのエントリ数は以下の方法で設定されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/class/net/&lt;dev&gt;/queues/rx-&lt;n&gt;/rps_flow_cnt
+</pre></div>
+</div>
+<section id="id3">
+<h4>推奨設定<a class="headerlink" href="#id3" title="この見出しへのパーマリンク">¶</a></h4>
+<p>これらは、受信キューでRFSを有効にする前に設定する必要があります。両方の値は2の累乗に丸められます。推奨されるフロー数は、任意の時点で予想されるアクティブな接続数に依存しますが、これはオープンしている接続数よりも大幅に少ない可能性があります。私たちは、中程度の負荷のサーバーでrps_sock_flow_entriesに32768を設定すると比較的うまく動作することを確認しました。</p>
+<p>単一キューのデバイスの場合、単一キューのrps_flow_cnt値は通常、rps_sock_flow_entriesと同じ値に設定されます。複数キューのデバイスでは、各キューのrps_flow_cnt値はrps_sock_flow_entries / Nとして設定される可能性があります。ここでNはキューの数です。例えば、rps_sock_flow_entriesが32760に設定され、16の受信キューが設定されている場合、各キューのrps_flow_cnt値は2048に設定される可能性があります。</p>
+</section>
+</section>
+</section>
+<section id="accelerated-rfs">
+<h2>加速されたRFS<a class="headerlink" href="#accelerated-rfs" title="この見出しへのパーマリンク">¶</a></h2>
+<p>加速されたRFSはRFSに対してRSSがRPSに対して持つ役割と同じです。アプリケーションスレッドが各フローのパケットを処理している場所に基づいてフローを制御するソフトウェア状態を活用したハードウェアアクセラレートされたロードバランシングメカニズムです。パケットがデータを処理しているスレッドのローカルなCPUに直接送信されるため、加速されたRFSはRFSよりもパフォーマンスが向上するはずです。ターゲットCPUはアプリケーションが実行されているCPUと同じか、少なくともキャッシュ階層においてアプリケーションスレッドのCPUにローカルなCPUになります。</p>
+<p>加速されたRFSを有効にするには、ネットワークスタックがパケットが特定のフローに一致するときに望ましいハードウェアキューを指定するndo_rx_flow_steerドライバ関数を呼び出します。ネットワークスタックは、rps_dev_flow_table内のフロー項目が更新されるたびにこの関数を自動的に呼び出します。ドライバは、そのデバイス固有の方法でNICにパケットを制御するようにプログラミングします。</p>
+<p>フローのハードウェアキューはrps_dev_flow_tableに記録されたCPUから導出されます。スタックはNICドライバが維持するCPUとハードウェアキューのマップを参照します。これは/proc/interruptsで表示されるIRQアフィニティーテーブルの自動生成された逆マップです。ドライバはcpu_rmap（「CPUアフィニティ逆マップ」）カーネルライブラリ内の関数を使用してこのマップを埋めます。各CPUに対して、マップ内の対応するキューはキャッシュローカリティにおいて処理CPUに最も近いキューに設定されます。</p>
+<section id="accelerated-rfs-configuration">
+<h3>加速されたRFSの設定<a class="headerlink" href="#accelerated-rfs-configuration" title="この見出しへのパーマリンク">¶</a></h3>
+<p>加速されたRFSは、カーネルがCONFIG_RFS_ACCELでコンパイルされ、NICデバイスとドライバがサポートを提供している場合にのみ利用可能です。また、ethtoolを通じてntupleフィルタリングが有効になっている必要があります。CPUとキューのマッピングは、ドライバが各受信キューに対して設定したIRQアフィニティから自動的に推論されるため、追加の設定は必要ありません。</p>
+<section id="id4">
+<h4>推奨設定<a class="headerlink" href="#id4" title="この見出しへのパーマリンク">¶</a></h4>
+<p>RFSを使用したい場合、NICがハードウェアアクセラレーションをサポートしている場合は、この技術を有効にする必要があります。</p>
+</section>
+</section>
+</section>
+<section id="xps-transmit-packet-steering">
+<h2>XPS: 送信パケットステアリング<a class="headerlink" href="#xps-transmit-packet-steering" title="この見出しへのパーマリンク">¶</a></h2>
+<p>送信パケットステアリングは、複数のキューを持つデバイスでパケットを送信する際、どの送信キューを使用するかを知的選択で決定するメカニズムです。これは、CPUとハードウェアキューへのマッピング、または受信キューとハードウェア送信キューへのマッピングの2種類のマップを記録することで実現できます。</p>
+<ol class="arabic simple">
+<li><p>XPS（CPUを使用）マップ</p></li>
+</ol>
+<p>このマッピングの目的は、通常、特定のCPUサブセットにキューを専有的に割り当てることです。これらのキューの送信完了処理は、このセット内のCPUで行われます。この選択は2つの利点があります。まず、デバイスキューロックの競合が大幅に減少します（各CPUが独自の送信キューを持つ場合、競合を完全に排除できます）。次に、送信完了時のキャッシュミス率が低下します、特にsk_buff構造体を保持するデータキャッシュラインに対して特に効果的です。</p>
+<ol class="arabic simple" start="2">
+<li><p>XPS（受信キューを使用）マップ</p></li>
+</ol>
+<p>このマッピングは、管理者が設定した受信キュー（receive queue）のマッピング構成に基づいて送信キュー（transmit queue）を選択するために使用されます。複数の受信キューが複数の送信キューにマッピングされる（many:many）ことも可能ですが、一般的な使用ケースは1:1のマッピングです。これにより、送受信の同じキュー関連付けでパケットを送信できるようになります。これは、CPUを特定のアプリケーションスレッドに割り当てるのが難しい忙しいポーリング（busy polling）マルチスレッドワークロードにおいて、有効です。アプリケーションスレッドはCPUに固定されず、各スレッドが単一のキューで受信したパケットを処理します。受信キュー番号は接続のソケットにキャッシュされます。このモデルでは、関連する受信キューに対応する送信キューでパケットを送信することで、CPUのオーバーヘッドを低く保つことができます。送信完了処理は、アプリケーションがポーリングしている同じキュー関連付けにロックされます。これにより、別のCPUで割り込みをトリガーするオーバーヘッドを回避できます。アプリケーションが忙しいポーリング中にパケットをクリーンアップする際、送信完了処理も同じスレッドコンテキストで処理されるため、レイテンシーが低減されます。</p>
+<p>XPSは、送信キューごとにCPU/受信キューのビットマップを設定することで送信キューに設定されます。ネットワークデバイスごとに、CPUから送信キューへの逆マッピング、または受信キューから送信キューへの逆マッピングが計算され維持されます。フローの最初のパケットを送信する際、get_xps_queue()関数が呼び出されてキューを選択します。この関数は、ソケット接続の受信キューIDを受信キューから送信キューの検索テーブルで一致させます。代替として、この関数は実行中のCPUのIDをCPUからキューの検索テーブルのキーとして使用することもできます。IDが単一のキューと一致する場合、そのキューが送信に使用されます。複数のキューが一致する場合、フローハッシュを用いてセット内のインデックスを計算してキューを選択します。受信キュー（複数）のマッピングに基づいて送信キューを選択する際、送信デバイスは受信デバイスと検証されません。これはデータパスでの高コストな検索操作を必要とするためです。</p>
+<p>特定のフローを送信するために選択されたキューは、そのフロー（例：TCP接続）に対応するソケット構造体に保存されます。この送信キューは、その後のフローでのパケット送信時に無秩序（ooo）パケットを防ぐために使用されます。この選択は、フロー内のすべてのパケットに対してget_xps_queues()の呼び出しコストを均等に分散します。無秩序パケットを回避するため、フローのキューは、フロー内のパケットがskb-&gt;ooo_okayが設定されている場合にのみ変更可能です。このフラグは、フローに未処理のパケットが存在しないことを示しており、送信キューを変更しても無秩序パケットが発生するリスクがありません。トランスポート層はooo_okayを適切に設定する責任があります。たとえば、TCPは接続のすべてのデータが確認されたときにこのフラグを設定します。</p>
+<section id="xps-configuration">
+<h3>XPSの設定<a class="headerlink" href="#xps-configuration" title="この見出しへのパーマリンク">¶</a></h3>
+<p>XPSはkconfigシンボルCONFIG_XPSが有効になっている場合（SMPではデフォルトで有効）にのみ利用可能です。コンパイルされた場合、デバイス初期化時にXPSがどのように設定されるかはドライバ依存です。CPU/受信キューと送信キューのマッピングはsysfsを使用して確認および設定可能です：</p>
+<p>CPUマップに基づく選択:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/class/net/&lt;dev&gt;/queues/tx-&lt;n&gt;/xps_cpus
+</pre></div>
+</div>
+<p>受信キューのマップに基づく選択:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/class/net/&lt;dev&gt;/queues/tx-&lt;n&gt;/xps_rxqs
+</pre></div>
+</div>
+<section id="id5">
+<h4>推奨設定<a class="headerlink" href="#id5" title="この見出しへのパーマリンク">¶</a></h4>
+<p>単一の送信キューを持つネットワークデバイスでは、XPS設定に影響されません。これは選択肢がないためです。複数キューのシステムでは、XPSを設定して各CPUが1つのキューにマッピングされるようにすることが望ましいです。システム内のCPU数と同じ数のキューがある場合、各キューが1つのCPUにマッピングされ、競合が発生しない排他的なペアリングが可能です。キューがCPU数より少ない場合、そのキューを共有する最適なCPUは、そのキューの送信完了処理（送信割込み）を行うCPUとキャッシュを共有するCPUと考えられます。</p>
+<p>受信キューに基づく送信キュー選択では、XPSが受信キューを送信キューにマッピングするように明示的に設定する必要があります。ユーザー設定の受信キューマップが適用されない場合、CPUマップに基づいて送信キューが選択されます。</p>
+</section>
+</section>
+</section>
+<section id="per-tx-queue-rate-limitation">
+<h2>各TXキューごとのレート制限<a class="headerlink" href="#per-tx-queue-rate-limitation" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ハードウェアで実装されたレート制限メカニズムで、現在はMbps値を設定することでmax-rate属性をサポートしています：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/class/net/&lt;dev&gt;/queues/tx-&lt;n&gt;/tx_maxrate
+</pre></div>
+</div>
+<p>ゼロの値は無効を意味し、これはデフォルト値です。</p>
+</section>
+<section id="further-information">
+<h2>さらに詳しい情報<a class="headerlink" href="#further-information" title="この見出しへのパーマリンク">¶</a></h2>
+<p>RPSとRFSはkernel 2.6.35で導入されました。XPSはkernel 2.6.38に統合されました。元のパッチはTom Herbert（<a class="reference external" href="mailto:therbert%40google.com">therbert<span>@</span>google<span>.</span>com</a>)</p>
+<p>によって提出されました。加速されたRFSはkernel 2.6.35で導入され、元のパッチはBen Hutchings（<a class="reference external" href="mailto:bwh%40kernel.org">bwh<span>@</span>kernel<span>.</span>org</a>)</p>
+<p>著者:</p>
+<ul class="simple">
+<li><p>によって提出されました。Tom Herbert（<a class="reference external" href="mailto:therbert%40google.com">therbert<span>@</span>google<span>.</span>com</a>)</p></li>
+<li><p>Willem de Bruijn（<a class="reference external" href="mailto:willemb%40google.com">willemb<span>@</span>google<span>.</span>com</a>)</p></li>
+</ul>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxネットワーキングドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="netdev-FAQ.html">netdev FAQ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="af_xdp.html">AF_XDP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bareudp.html">Bare UDPトンネリングモジュールドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="batman-adv.html">batman-adv</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can.html">SocketCAN - コントローラー・エリア・ネットワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can_ucan_protocol.html">UCANプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="device_drivers/index.html">ハードウェアデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dsa/index.html">分散スイッチアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="devlink/index.html">Linux Devlinkドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="caif/index.html">CAIF</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ethtool-netlink.html">ethtool用Netlinkインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ieee802154.html">IEEE 802.15.4開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="j1939.html">J1939ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kapi.html">LinuxネットワーキングとネットワークデバイスAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="msg_zerocopy.html">MSG_ZEROCOPY</a></li>
+<li class="toctree-l2"><a class="reference internal" href="failover.html">フェールオーバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="net_dim.html">Net DIM - ジェネリックネットワークダイナミック割込みモデレーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="net_failover.html">NET_FAILOVER</a></li>
+<li class="toctree-l2"><a class="reference internal" href="page_pool.html">ページプールAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phy.html">PHY抽象レイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sfp-phylink.html">phylink</a></li>
+<li class="toctree-l2"><a class="reference internal" href="alias.html">IPアリアシング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bridge.html">イーサネットブリッジング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="snmp_counter.html">SNMPカウンター</a></li>
+<li class="toctree-l2"><a class="reference internal" href="checksum-offloads.html">チェックサムオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="segmentation-offloads.html">セグメンテーションオフロード</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Linuxネットワーキングスタックにおけるスケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tls.html">カーネルTLS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tls-offload.html">カーネルTLSオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nfc.html">Linux NFCサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6lowpan.html">6lowpanインターフェース用Netdevプライベートデータルーム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6pack.html">6packプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet-hardware.html">ARCnetハードウェア</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet.html">ARCnet</a></li>
+<li class="toctree-l2"><a class="reference internal" href="atm.html">ATM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ax25.html">AX.25</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bonding.html">LinuxイーサネットボンディングドライバHOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cdc_mbim.html">cdc_mbim - CDC MBIMモバイルブロードバンドモデム用ドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dccp.html">DCCPプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dctcp.html">DCTCP（データセンターTCP）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="decnet.html">Linux DECnetネットワーキングレイヤー情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dns_resolver.html">DNSリゾルバー・モジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="driver.html">Softnetドライバーの問題</a></li>
+<li class="toctree-l2"><a class="reference internal" href="eql.html">EQLドライバー: シリアルIPロードバランシングガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="fib_trie.html">LC-trie実装ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="filter.html">Linux Socket Filtering（別名Berkeley Packet Filter（BPF））</a></li>
+<li class="toctree-l2"><a class="reference internal" href="framerelay.html">フレームリレー（FR）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic-hdlc.html">ジェネリックHDLCレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic_netlink.html">ジェネリックネットリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gen_stats.html">ネットリンクユーザー向けジェネリックネットワーキング統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gtp.html">LinuxカーネルGTPトンネリングモジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ila.html">識別子ロケーターアドレスング（ILA）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipddp.html">AppleTalk-IPデカプセル化とAppleTalk-IPエンカプセル化</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip_dynaddr.html">IPダイナミックアドレスハックポートv0.03</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipsec.html">IPsec</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip-sysctl.html">IP Sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipv6.html">IPv6</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvlan.html">IPVLANドライバーガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvs-sysctl.html">IPvs-sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kcm.html">カーネルコネクションマルチプレクサ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="l2tp.html">L2TP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lapb-module.html">Linux LAPBモジュールインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mac80211-injection.html">mac80211を使用したパケットインジェクションの使い方</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mpls-sysctl.html">MPLS Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="multiqueue.html">マルチキューネットワークデバイスサポートガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netconsole.html">Netconsole</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdev-features.html">ネットデバイス機能の混乱とその解決方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdevices.html">ネットワークデバイス、カーネル、そしてあなた！</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netfilter-sysctl.html">Netfilter Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netif-msg.html">NETIFメッセージレベル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_conntrack-sysctl.html">Netfilter Conntrack Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_flowtable.html">Netfilterのフローテーブルインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="openvswitch.html">Open vSwitch datapath開発者ドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="operstates.html">運用状態</a></li>
+<li class="toctree-l2"><a class="reference internal" href="packet_mmap.html">パケットMMAP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phonet.html">Linux Phonetプロトコルファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pktgen.html">Linuxパケットジェネレーターガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="plip.html">PLIP: 平行線インターネットプロトコルデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ppp_generic.html">PPPジェネリックドライバーおよびチャネルインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="proc_net_tcp.html">proc/net/tcpおよびproc/net/tcp6変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="radiotap-headers.html">radiotapヘッダの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html">概要</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-architecture">RDSアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#socket-interface">ソケットインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rdma-for-rds">RDS用RDMA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#congestion-notifications">コンゲスト通知</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-protocol">RDSプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-transport-layer">RDSトランスポートレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-kernel-structures">RDSカーネル構造体</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#connection-management">接続管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#the-send-path">送信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#the-recv-path">受信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#multipath-rds-mprds">マルチパスRDS (mprds)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="regulatory.html">Linuxワイヤレス規制ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html">RxRPC ネットワークプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#socket-options">ソケットオプション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#security">セキュリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#example-client-usage">例: クライアントの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sctp.html">LinuxカーネルSCTP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="secid.html">LSM/SeLinux secid</a></li>
+<li class="toctree-l2"><a class="reference internal" href="seg6-sysctl.html">Seg6 Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="statistics.html">インターフェース統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="strparser.html">ストリームパーサー (strparser)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="switchdev.html">イーサネットスイッチデバイスドライバモデル (switchdev)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysfs-tagging.html">Sysfsタグ付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tc-actions-env-rules.html">TCアクション - 環境ルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tcp-thin.html">スリムストリームとTCP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="team.html">チーム (Team)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="timestamping.html">タイムスタンピング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tproxy.html">透過プロキシサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tuntap.html">ユニバーサルTUN/TAPデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="udplite.html">UDP-Liteプロトコル (RFC 3828)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vrf.html">仮想ルーティングおよびフォワーディング (VRF)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vxlan.html">仮想拡張ローカルエリアネットワーキングドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html">パケットレイヤーからデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html#device-driver-to-packet-layer">デバイスドライバからパケットレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25.html">Linux X.25プロジェクト</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_device.html">XFRMデバイス - IPsec計算のオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_proc.html">XFRMプロセス - /proc/net/xfrm_*ファイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sync.html">XFRM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sysctl.html">XFRMシステムコール</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxネットワーキングドキュメント</a><ul>
+<li>前へ: <a href="segmentation-offloads.html" title="前章">セグメンテーションオフロード</a></li>
+<li>次へ: <a href="tls.html" title="次章">カーネルTLS</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/networking/scaling.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

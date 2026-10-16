@@ -1,0 +1,384 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Open vSwitch datapath開発者ドキュメント — The Linux Kernelドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="operstates.html" rel="next" title="運用状態"/>
+<link href="nf_flowtable.html" rel="prev" title="Netfilterのフローテーブルインフラストラクチャ"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="open-vswitch-datapath-developer-documentation">
+<h1>Open vSwitch datapath開発者ドキュメント<a class="headerlink" href="#open-vswitch-datapath-developer-documentation" title="この見出しへのパーマリンク">¶</a></h1>
+<p>Open vSwitchのカーネルモジュールは、選択されたネットワークデバイスにおけるフローレベルのパケット処理を柔軟にユーザースペースから制御できます。これにより、単純なイーサネットスイッチ、ネットワークデバイスのボンディング、VLAN処理、ネットワークアクセス制御、フローベースのネットワーク制御など、さまざまな機能を実装できます。</p>
+<p>カーネルモジュールは複数の「データパス」（ブリッジに相当）を実装しており、それぞれが複数の「バーチャルポート」（ブリッジ内のポートに相当）を持ちます。各データパスには「フローテーブル」が関連付けられており、ユーザースペースがパケットヘッダーとメタデータに基づくキーをもとにアクションのセットをマッピングする「フロー」を設定します。最も一般的なアクションはパケットを別のバーチャルポートに転送することですが、他のアクションも実装可能です。</p>
+<p>パケットがバーチャルポートに到達すると、カーネルモジュールはそのフローキーを抽出し、フローテーブルで検索します。マッチするフローがあれば関連するアクションを実行し、マッチしない場合はユーザースペースにパケットをキューイングして処理させます（ユーザースペースは、同様のパケットを完全にカーネル内での処理に移行するためのフローを設定する可能性があります）。</p>
+<section id="flow-key-compatibility">
+<h2>フロー キーの互換性<a class="headerlink" href="#flow-key-compatibility" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ネットワークプロトコルは時間とともに進化します。新しいプロトコルが重要になり、既存のプロトコルはその重要性を失います。Open vSwitchのカーネルモジュールが今後も関連性を持ち続けるためには、新しいバージョンがフローキーとして追加プロトコルを解析できる必要があります。将来は、すでに廃れたプロトコルの解析をサポートしないことも望ましいかもしれません。そのため、Open vSwitchのNetlinkインターフェースは、ユーザースペースアプリケーションが過去または将来のバージョンのフローキーと互換性を保つように設計されています。</p>
+<p>この前後互換性をサポートするため、カーネルモジュールがユーザースペースにパケットを渡す際には、パケットから解析したフローキーも同時に渡します。ユーザースペースはパケットから自身のフローキーを抽出し、カーネルが提供するバージョンと比較します：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>ユーザースペースがパケットのフローキーとして認識している内容がカーネルのものと一致する場合、特別な処理は必要ありません。</p></li>
+<li><p>カーネルのフローキーがユーザースペースのバージョンよりも多くのフィールドを含む場合（例えば、カーネルがIPv6ヘッダーを解析したが、ユーザースペースはイーサネットタイプに止まっている場合など）、これも特別な処理は必要ありません。ユーザースペースはカーネルが提供するフローキーを使用して通常通りフローを設定できます。</p></li>
+<li><p>ユーザースペースのフロー・キーにカーネルのそれよりも多くのフィールドが含まれる場合、例えばユーザースペースがIPv6ヘッダをデコードしたが、カーネルがイーサネットタイプで停止した場合、ユーザースペースはフローをカーネルに設定せずにパケットを手動で転送できます。このケースではパフォーマンスが悪化しますが、カーネルがフローの一部とみなすすべてのパケットがユーザースペースに送られるためです。ただし、ユーザースペースが追加フィールドの値が転送動作に影響を与えないことを確認できる場合、フローを設定してもかまいません。</p></li>
+</ul>
+</div></blockquote>
+<p>フロー・キーが時間とともにどのように進化するかは、この仕組みが動作する上で重要です。以下のセクションでは詳しく説明します。</p>
+</section>
+<section id="flow-key-format">
+<h2>フロー キー形式<a class="headerlink" href="#flow-key-format" title="この見出しへのパーマリンク">¶</a></h2>
+<p>フロー・キーはNetlinkソケットを介して、Netlink属性のシーケンスとして渡されます。一部の属性はパケットメタデータを表し、パケット自体から抽出できない情報（例：パケットが受信されたvport）を指します。ほとんどの属性はパケット内のヘッダから抽出され、例えばイーサネット、IP、TCPヘッダのソースおよび宛先アドレスなどが該当します。</p>
+<p>&lt;linux/openvswitch.h&gt;ヘッダーファイルがフロー・キー属性の正確な形式を定義しています。ここでの説明を簡潔にするために、ここではカンマで区切った文字列として記述し、括弧で引数やネストを示します。例えば、以下の例はvport 1で到達したTCPパケットに対応するフロー・キーを表しています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>in_port(1), eth(src=e0:91:f5:21:d0:b2, dst=00:02:e3:0f:80:a4),
+eth_type(0x0800), ipv4(src=172.16.0.20, dst=172.18.0.52, proto=17, tos=0,
+frag=no), tcp(src=49163, dst=80)
+</pre></div>
+</div>
+<p>議論に重要な情報でない引数はしばしば省略されます。例えば：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>in_port(1), eth(...), eth_type(0x0800), ipv4(...), tcp(...)
+</pre></div>
+</div>
+</section>
+<section id="wildcarded-flow-key-format">
+<h2>ワイルドカード付きフロー キー形式<a class="headerlink" href="#wildcarded-flow-key-format" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ワイルドカードフローはNetlinkソケットを介して2つのNetlink属性シーケンスで記述されます。1つは上述のフロー・キーと、もう1つはオプションのフロー・マスクです。</p>
+<p>ワイルドカードフローは、正確な一致フローのグループを表すことができます。マスクの各「1」ビットは、フロー・キーの対応するビットと正確に一致します。一方、「0」ビットは無視するビットであり、入力パケットの「1」または「0」ビットと一致します。ワイルドカードフローを使用することで、ユーザー空間プログラムが処理する必要のある新しいフローの数を減らすことで、フローの設定速度を向上させることができます。</p>
+<p>マスクNetlink属性のサポートは、カーネルとユーザースペースプログラムの双方でオプションです。カーネルはマスク属性を無視し、正確な一致フローをインストールするか、ユーザースペースプログラムが指定したよりも少ない数のワイルドカードビットをカーネルで実装する場合があります。この場合、カーネルが実装しないビットの変化は、追加のフロー設定にしかなりません。また、カーネルモジュールは、フローコンテキスト属性をサポートもしくは提供しないユーザースペースプログラムとも動作します。</p>
+<p>カーネルがワイルドカードビットを無視または変更するため、ユーザースペースプログラムが正確にインストールされたマッチを把握するのは困難です。2つのアプローチが考えられます：カーネルフローテーブルに一致しなくなったときにフローを反応的にインストールする（ワイルドカードの変化を一切確認しない）か、カーネルの応答メッセージを利用してインストールされたワイルドカードを特定する方法です。</p>
+<p>ユーザースペースとやりとりする際、カーネルは最初にインストールされたキーのマッチ部分を正確に保持する必要があります。これにより、将来のすべての操作でフローを特定するハンドルが得られます。ただし、インストールされたフローのマスクを報告する際には、カーネルが課す制限を含める必要があります。</p>
+<p>オーバーラップしたワイルドカードフローを使用する際の挙動は未定義です。ユーザースペースプログラムは、入力パケットがワイルドカードを含むか含まないかに関わらず、常に1つのフローのみに一致するように保証する責任があります。現在の実装では、オーバーラップしたワイルドカードフローをベストエフォートで検出し、一部のフローを拒否する可能性があります。ただし、この挙動は今後のバージョンで変更される可能性があります。</p>
+</section>
+<section id="unique-flow-identifiers">
+<h2>一意のフロー識別子<a class="headerlink" href="#unique-flow-identifiers" title="この見出しへのパーマリンク">¶</a></h2>
+<p>フロー識別のハンドルとして、キーの元のマッチ部分を使用する代わりに、ユニークフロー識別子（UFID）を使用するという代替案があります。UFIDは、カーネルとユーザースペースプログラムの双方でオプションです。</p>
+<p>UFIDをサポートするユーザースペースプログラムは、フロー設定時にフローに加えてUFIDを提供する必要があります。その後、すべての将来の操作でUFIDを使用してフローを参照する必要があります。カーネルはUFIDが指定されている場合、元のフローキーでフローをインデックス化する必要はありません。</p>
+</section>
+<section id="basic-rule-for-evolving-flow-keys">
+<h2>フロー キーの進化に関する基本ルール<a class="headerlink" href="#basic-rule-for-evolving-flow-keys" title="この見出しへのパーマリンク">¶</a></h2>
+<p>「フローキー互換性」のルールに従うアプリケーションの前後互換性を維持するためには、注意が必要です。</p>
+<p>基本的なルールは明らかです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>==================================================================
+New network protocol support must only supplement existing flow
+key attributes.  It must not change the meaning of already defined
+flow key attributes.
+==================================================================
+</pre></div>
+</div>
+<p>このルールには目立ちにくい影響があるため、いくつかの例を確認してみる価値があります。例えば、カーネルモジュールがすでにVLANパースを実装していなかったとします。代わりに、802.1Q TPID（0x8100）をエッジタイプとして解釈し、パケットの解析をそこで打ち切ったとします。このような802.1Qヘッダーを持つパケットのフロー・キーは、メタデータを無視すると以下のように見えます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>eth(...), eth_type(0x8100)
+</pre></div>
+</div>
+<p>直感的には、VLANサポートを追加するには、「vlan」フロー・キー属性という新しい属性を追加してVLANタグを含め、既存のフィールド定義を用いてVLANタグの後ろにあるエンカプスレーションヘッダーを解析し続けるのが合理的です。この変更により、VLAN 10のTCPパケットのフロー・キーは以下のように見えます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>eth(...), vlan(vid=10, pcp=0), eth_type(0x0800), ip(proto=6, ...), tcp(...)
+</pre></div>
+</div>
+<p>しかし、この変更は、新しい「vlan」フロー・キー属性を理解していないユーザースペースアプリケーションに悪影響を及ぼします。アプリケーションは、上記のフロー互換性ルールに従って理解できない「vlan」属性を無視し、フローがIPパケットを含んでいると誤って仮定する可能性があります。これは悪い仮定です（フローがIPパケットを含んでいるのは、803.1Qヘッダーを解析してスキップした場合に限ります）。これにより、アプリケーションの挙動がカーネルバージョンによって変化する可能性があります。</p>
+<p>解決策は、ネストされた属性を用いることです。これは、802.1Qサポートがネストされた属性を用いる理由です。VLAN 10のTCPパケットは実際に以下のように表現されます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>eth(...), eth_type(0x8100), vlan(vid=10, pcp=0), encap(eth_type(0x0800),
+ip(proto=6, ...), tcp(...)))
+</pre></div>
+</div>
+<p>「eth_type」、「ip」、「tcp」フロー・キー属性が「encap」属性内にネストされていることに注目してください。したがって、「vlan」キーを理解していないアプリケーションはこれらの属性を認識できず、誤って解釈することはありません。（また、外側のeth_typeは0x8100のまま変更されていません。）</p>
+</section>
+<section id="handling-malformed-packets">
+<h2>形式の正しくないパケットの処理<a class="headerlink" href="#handling-malformed-packets" title="この見出しへのパーマリンク">¶</a></h2>
+<p>カーネル内で形式の悪いプロトコルヘッダー、不良なチェックサムなどによるパケットをドロップしないでください。これにより、ユーザースペースが単純なイーサネットスイッチを実装してすべてのパケットを転送するのを防ぐことができます。</p>
+<p>代わりに、このような場合、空のコンテンツを持つ属性を含めます。空のコンテンツが有効なプロトコル値である可能性があっても、実際にはほとんど見られない限り、ユーザースペースがそれらの値を持つすべてのパケットを個別に処理するために転送するだけで十分です。</p>
+<p>例えば、IPヘッダーがTCP（プロトコル6）を示しているが、IPヘッダーの後にTCPヘッダーが欠落しているパケットを考えてみましょう。このパケットのフロー・キーには、ソースと宛先がすべてゼロのtcp属性が含まれます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>eth(...), eth_type(0x0800), ip(proto=6, ...), tcp(src=0, dst=0)
+</pre></div>
+</div>
+<p>もう一つの例として、Ethernetタイプが0x8100であるパケットを考えてみましょう。これはVLAN TCIが続くことを示していますが、Ethernetタイプの直後に切断されている場合があります。このようなパケットのフロー・キーには、すべてゼロビットのVLANと空のencap属性が含まれ、以下のように表示されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>eth(...), eth_type(0x8100), vlan(0), encap()
+</pre></div>
+</div>
+<p>TCPパケットでソースと宛先ポートが0であるような場合とは異なり、すべてゼロビットのVLAN TCIはそれほど珍しくありません。そのため、カーネル内ではVLAN_TAG_PRESENT（CFIビット）が通常設定されており、この状況を区別できるようにしています。したがって、この第二例のフロー・キーは、欠落または不正なVLAN TCIを明確に示します。</p>
+</section>
+<section id="other-rules">
+<h2>その他のルール<a class="headerlink" href="#other-rules" title="この見出しへのパーマリンク">¶</a></h2>
+<p>フロー・キーに関する他のルールははるかに繊細ではありません：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>同一のネスティングレベルで重複した属性は許容されません。</p></li>
+<li><p>属性の順序は重要ではありません。</p></li>
+<li><p>カーネルがユーザースペースにフロー・キーを送信する際には、常に同じ方法で組み立てます。これにより、ユーザースペースが完全に解釈できないフロー・キーでもハッシュ処理や比較が可能になります。</p></li>
+</ul>
+</div></blockquote>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxネットワーキングドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="netdev-FAQ.html">netdev FAQ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="af_xdp.html">AF_XDP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bareudp.html">Bare UDPトンネリングモジュールドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="batman-adv.html">batman-adv</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can.html">SocketCAN - コントローラー・エリア・ネットワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can_ucan_protocol.html">UCANプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="device_drivers/index.html">ハードウェアデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dsa/index.html">分散スイッチアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="devlink/index.html">Linux Devlinkドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="caif/index.html">CAIF</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ethtool-netlink.html">ethtool用Netlinkインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ieee802154.html">IEEE 802.15.4開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="j1939.html">J1939ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kapi.html">LinuxネットワーキングとネットワークデバイスAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="msg_zerocopy.html">MSG_ZEROCOPY</a></li>
+<li class="toctree-l2"><a class="reference internal" href="failover.html">フェールオーバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="net_dim.html">Net DIM - ジェネリックネットワークダイナミック割込みモデレーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="net_failover.html">NET_FAILOVER</a></li>
+<li class="toctree-l2"><a class="reference internal" href="page_pool.html">ページプールAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phy.html">PHY抽象レイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sfp-phylink.html">phylink</a></li>
+<li class="toctree-l2"><a class="reference internal" href="alias.html">IPアリアシング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bridge.html">イーサネットブリッジング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="snmp_counter.html">SNMPカウンター</a></li>
+<li class="toctree-l2"><a class="reference internal" href="checksum-offloads.html">チェックサムオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="segmentation-offloads.html">セグメンテーションオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="scaling.html">Linuxネットワーキングスタックにおけるスケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tls.html">カーネルTLS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tls-offload.html">カーネルTLSオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nfc.html">Linux NFCサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6lowpan.html">6lowpanインターフェース用Netdevプライベートデータルーム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6pack.html">6packプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet-hardware.html">ARCnetハードウェア</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet.html">ARCnet</a></li>
+<li class="toctree-l2"><a class="reference internal" href="atm.html">ATM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ax25.html">AX.25</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bonding.html">LinuxイーサネットボンディングドライバHOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cdc_mbim.html">cdc_mbim - CDC MBIMモバイルブロードバンドモデム用ドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dccp.html">DCCPプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dctcp.html">DCTCP（データセンターTCP）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="decnet.html">Linux DECnetネットワーキングレイヤー情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dns_resolver.html">DNSリゾルバー・モジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="driver.html">Softnetドライバーの問題</a></li>
+<li class="toctree-l2"><a class="reference internal" href="eql.html">EQLドライバー: シリアルIPロードバランシングガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="fib_trie.html">LC-trie実装ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="filter.html">Linux Socket Filtering（別名Berkeley Packet Filter（BPF））</a></li>
+<li class="toctree-l2"><a class="reference internal" href="framerelay.html">フレームリレー（FR）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic-hdlc.html">ジェネリックHDLCレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic_netlink.html">ジェネリックネットリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gen_stats.html">ネットリンクユーザー向けジェネリックネットワーキング統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gtp.html">LinuxカーネルGTPトンネリングモジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ila.html">識別子ロケーターアドレスング（ILA）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipddp.html">AppleTalk-IPデカプセル化とAppleTalk-IPエンカプセル化</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip_dynaddr.html">IPダイナミックアドレスハックポートv0.03</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipsec.html">IPsec</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip-sysctl.html">IP Sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipv6.html">IPv6</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvlan.html">IPVLANドライバーガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvs-sysctl.html">IPvs-sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kcm.html">カーネルコネクションマルチプレクサ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="l2tp.html">L2TP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lapb-module.html">Linux LAPBモジュールインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mac80211-injection.html">mac80211を使用したパケットインジェクションの使い方</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mpls-sysctl.html">MPLS Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="multiqueue.html">マルチキューネットワークデバイスサポートガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netconsole.html">Netconsole</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdev-features.html">ネットデバイス機能の混乱とその解決方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdevices.html">ネットワークデバイス、カーネル、そしてあなた！</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netfilter-sysctl.html">Netfilter Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netif-msg.html">NETIFメッセージレベル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_conntrack-sysctl.html">Netfilter Conntrack Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_flowtable.html">Netfilterのフローテーブルインフラストラクチャ</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Open vSwitch datapath開発者ドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="operstates.html">運用状態</a></li>
+<li class="toctree-l2"><a class="reference internal" href="packet_mmap.html">パケットMMAP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phonet.html">Linux Phonetプロトコルファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pktgen.html">Linuxパケットジェネレーターガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="plip.html">PLIP: 平行線インターネットプロトコルデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ppp_generic.html">PPPジェネリックドライバーおよびチャネルインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="proc_net_tcp.html">proc/net/tcpおよびproc/net/tcp6変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="radiotap-headers.html">radiotapヘッダの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html">概要</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-architecture">RDSアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#socket-interface">ソケットインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rdma-for-rds">RDS用RDMA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#congestion-notifications">コンゲスト通知</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-protocol">RDSプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-transport-layer">RDSトランスポートレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-kernel-structures">RDSカーネル構造体</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#connection-management">接続管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#the-send-path">送信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#the-recv-path">受信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#multipath-rds-mprds">マルチパスRDS (mprds)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="regulatory.html">Linuxワイヤレス規制ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html">RxRPC ネットワークプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#socket-options">ソケットオプション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#security">セキュリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#example-client-usage">例: クライアントの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sctp.html">LinuxカーネルSCTP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="secid.html">LSM/SeLinux secid</a></li>
+<li class="toctree-l2"><a class="reference internal" href="seg6-sysctl.html">Seg6 Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="statistics.html">インターフェース統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="strparser.html">ストリームパーサー (strparser)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="switchdev.html">イーサネットスイッチデバイスドライバモデル (switchdev)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysfs-tagging.html">Sysfsタグ付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tc-actions-env-rules.html">TCアクション - 環境ルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tcp-thin.html">スリムストリームとTCP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="team.html">チーム (Team)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="timestamping.html">タイムスタンピング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tproxy.html">透過プロキシサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tuntap.html">ユニバーサルTUN/TAPデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="udplite.html">UDP-Liteプロトコル (RFC 3828)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vrf.html">仮想ルーティングおよびフォワーディング (VRF)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vxlan.html">仮想拡張ローカルエリアネットワーキングドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html">パケットレイヤーからデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html#device-driver-to-packet-layer">デバイスドライバからパケットレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25.html">Linux X.25プロジェクト</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_device.html">XFRMデバイス - IPsec計算のオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_proc.html">XFRMプロセス - /proc/net/xfrm_*ファイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sync.html">XFRM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sysctl.html">XFRMシステムコール</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxネットワーキングドキュメント</a><ul>
+<li>前へ: <a href="nf_flowtable.html" title="前章">Netfilterのフローテーブルインフラストラクチャ</a></li>
+<li>次へ: <a href="operstates.html" title="次章">運用状態</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/networking/openvswitch.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

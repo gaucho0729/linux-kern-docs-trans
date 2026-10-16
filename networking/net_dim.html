@@ -1,0 +1,771 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Net DIM - 一般的なネットワーク動的割込みモデレーション — Linux Kernel ドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="net_failover.html" rel="next" title="NET_FAILOVER"/>
+<link href="failover.html" rel="prev" title="フェールオーバー"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="net-dim-generic-network-dynamic-interrupt-moderation">
+<h1><a class="toc-backref" href="#id1">Net DIM - ジェネリックネットワークダイナミック割込みモデレーション</a><a class="headerlink" href="#net-dim-generic-network-dynamic-interrupt-moderation" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Tal Gilboa &lt;<a class="reference external" href="mailto:talgi%40mellanox.com">talgi<span>@</span>mellanox<span>.</span>com</a>&gt;</p>
+</dd>
+</dl>
+<div class="contents topic" id="contents">
+<p class="topic-title">内容</p>
+<ul class="simple">
+<li><p><a class="reference internal" href="#net-dim-generic-network-dynamic-interrupt-moderation" id="id1">Net DIM - ジェネリックネットワークダイナミック割込みモデレーション</a></p>
+<ul>
+<li><p><a class="reference internal" href="#assumptions" id="id2">前提条件</a></p></li>
+<li><p><a class="reference internal" href="#introduction" id="id3">はじめに</a></p></li>
+<li><p><a class="reference internal" href="#net-dim-algorithm" id="id4">Net DIMアルゴリズム</a></p></li>
+<li><p><a class="reference internal" href="#registering-a-network-device-to-dim" id="id5">DIMへのネットワークデバイスの登録</a></p></li>
+<li><p><a class="reference internal" href="#example" id="id6">例</a></p></li>
+<li><p><a class="reference internal" href="#dynamic-interrupt-moderation-dim-library-api" id="id7">動的割込みモデレーション（DIM）ライブラリAPI</a></p></li>
+</ul>
+</li>
+</ul>
+</div>
+<section id="assumptions">
+<h2><a class="toc-backref" href="#id2">前提条件</a><a class="headerlink" href="#assumptions" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このドキュメントでは、読者がネットワークドライバーや一般的な割込みモデレーションに関する基本的な知識を持っていることを前提としています。</p>
+</section>
+<section id="introduction">
+<h2><a class="toc-backref" href="#id3">はじめに</a><a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>動的割込みモデレーション（DIM）（ネットワーク分野では）は、チャネルの割込みモデレーション設定を変更してパケット処理を最適化するメカニズムを指します。このメカニズムには、システムから収集したランタイムデータを分析して、チャネルのモデレーションパラメータを変更するかどうかを決定するアルゴリズムが含まれます。Net DIM はこのようなメカニズムです。アルゴリズムの各反復において、データサンプルを分析し、前のサンプルと比較して必要に応じて割込みモデレーション設定の一部を変更するかどうかを決定します。データサンプルにはデータ帯域幅、パケット数、イベント数が含まれており、サンプル間の時間も測定されます。Net DIM は現在のデータと前のデータを比較し、調整された割込みモデレーション設定オブジェクトを返します。一部のケースではアルゴリズムが変更を実行しないこともあります。設定項目はイベント間の最小許容時間（マイクロ秒）と、イベントごとの望ましいパケット数の最大値です。Net DIM アルゴリズムは帯域幅の向上を割込みレートの削減よりも重要視しています。</p>
+</section>
+<section id="net-dim-algorithm">
+<h2><a class="toc-backref" href="#id4">Net DIMアルゴリズム</a><a class="headerlink" href="#net-dim-algorithm" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Net DIM アルゴリズムの各反復は以下の手順に従います：</p>
+<ol class="arabic simple">
+<li><p>新しいデータサンプルを計算します。</p></li>
+<li><p>それを前のサンプルと比較します。</p></li>
+<li><p>決定を下します - 割込みモデレーション設定項目を提案します。</p></li>
+<li><p>提案された設定を適用するスケジュールワーク関数を実行します。</p></li>
+</ol>
+<p>最初の2つのステップはシンプルです。新しいデータと以前のデータの両方が、Net DIMに登録されたドライバーによって提供されます。以前のデータは、前の反復処理に提供された新しいデータを指します。比較ステップでは、新しいデータと以前のデータの差異を確認し、最後のステップの結果を決定します。帯域幅が増加した場合、ステップの結果は「改善（better）」と判定され、帯域幅が減少した場合、「悪化（worse）」と判定されます。帯域幅に変化がない場合は、パケットレートを同様に比較します。増加は「改善」、減少は「悪化」となります。パケットレートにも変化がない場合、割り込みレートを比較します。このアルゴリズムは割り込みレートを最小化することを目的としており、割り込みレートの増加は「悪化」、減少は「改善」とみなされます。ステップ#2では、誤った結果を避けるための最適化が行われています。差分が特定のパーセンテージ以上である場合にのみ、サンプル間の差を有効な差とみなします。また、Net DIMは自ら測定を行わないため、ドライバーが提供するデータが有効であると仮定しています。</p>
+<p>ステップ#3は、ステップ#2の結果とアルゴリズムの内部状態を基に、推奨される設定を決定します。状態はアルゴリズムの「方向」を反映しており、左（モデレーションの削減）、右（モデレーションの増加）、または停止（静止）のいずれかを示します。もう一つの最適化として、停止を決定する回数が多ければ多いほど、アルゴリズムの反復間隔が長くなるように設定されます。これにより、計算オーバーヘッドを削減します。また、「最も左」または「最も右」の決定に「駐車」した後、アルゴリズムは他の方向へステップを踏んでこの決定を検証する可能性があります。これは「深いスリープ状態」に陥らないようにするためです。決定がなされると、事前に定義されたプロファイルから割り込みモデレーションの設定が選択されます。</p>
+<p>最後のステップは、登録されたドライバーに推奨される設定を適用するように通知することです。これは、Net DIM APIによって定義され、登録されたドライバーが提供する作業関数をスケジュールすることで実現されます。</p>
+<p>ご覧の通り、Net DIM自体はシステムと積極的にやり取りしません。誤ったデータが提供された場合、正しい決定を下すのが困難になり、作業関数が推奨された設定を適用しない場合、Net DIMは無用になります。ただし、この仕組みにより、登録されたドライバーにはある程度の裁量が与えられ、特定の条件では部分的なデータを提供したり、アルゴリズムの推奨を無視する可能性があります。</p>
+</section>
+<section id="registering-a-network-device-to-dim">
+<h2><a class="toc-backref" href="#id5">DIMへのネットワークデバイスの登録</a><a class="headerlink" href="#registering-a-network-device-to-dim" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Net DIM APIは主な関数を公開しています <a class="reference internal" href="#c.net_dim" title="net_dim"><code class="xref c c-func docutils literal notranslate"><span class="pre">net_dim()</span></code></a>この関数はNet DIMアルゴリズムのエントリポイントであり、ドライバーが割り込みのモジュレーションパラメータを変更すべきかどうかを確認するたびに呼び出す必要があります。ドライバーは次の2つのデータ構造を提供する必要があります： <a class="reference internal" href="#c.dim" title="dim"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim</span></code></a> および
+<a class="reference internal" href="#c.dim_sample" title="dim_sample"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim_sample</span></code></a>. <a class="reference internal" href="#c.dim" title="dim"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim</span></code></a>
+特定のオブジェクト（RXキュー、TXキュー、その他のキューなど）のDIMの状態を記述します。これには現在選択されているプロファイル、以前のデータサンプル、ドライバーが提供したコールバック関数などが含まれます。
+<a class="reference internal" href="#c.dim_sample" title="dim_sample"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim_sample</span></code></a> データサンプルを記述し、これを <a class="reference internal" href="#c.dim" title="dim"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim</span></code></a>
+に保存されているデータサンプルと比較して、アルゴリズムの次のステップを決定します。サンプルにはドライバーが測定したバイト数、パケット数、割り込み数を含める必要があります。</p>
+<p>ネットワークドライバーからNet DIMを使用するには、ドライバーがメインの <a class="reference internal" href="#c.net_dim" title="net_dim"><code class="xref c c-func docutils literal notranslate"><span class="pre">net_dim()</span></code></a> 関数を呼び出す必要があります。推奨される方法は <a class="reference internal" href="#c.net_dim" title="net_dim"><code class="xref c c-func docutils literal notranslate"><span class="pre">net_dim()</span></code></a> ごとに割り込みを呼び出すことです。Net DIMには組み込まれたモジュレーションがあり、特定の条件で反復をスキップする可能性があるため、 <a class="reference internal" href="#c.net_dim" title="net_dim"><code class="xref c c-func docutils literal notranslate"><span class="pre">net_dim()</span></code></a>
+の呼び出しもモジュレーションする必要はありません。上記のように、ドライバーは
+<a class="reference internal" href="#c.dim" title="dim"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim</span></code></a> から <a class="reference internal" href="#c.net_dim" title="net_dim"><code class="xref c c-func docutils literal notranslate"><span class="pre">net_dim()</span></code></a> 型のオブジェクトを提供する必要があります。Net DIMを使用する各エンティティは、データ構造に <a class="reference internal" href="#c.dim" title="dim"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim</span></code></a> を含め、これを主なNet DIM APIオブジェクトとして使用する必要があります。 <a class="reference internal" href="#c.dim_sample" title="dim_sample"><code class="xref c c-type docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim_sample</span></code></a> は最新のバイト数、パケット数、割り込み数を保持する必要があります。計算は行わず、素データを含めるだけでよいです。</p>
+<p>以下の <a class="reference internal" href="#c.net_dim" title="net_dim"><code class="xref c c-func docutils literal notranslate"><span class="pre">net_dim()</span></code></a> 関数自体は何も返しません。代わりにNet DIMはドライバーが提供したコールバック関数に依存しており、アルゴリズムが割り込みモジュレーションパラメータを変更するときに呼び出されます。このコールバックはデータフローへのオーバーヘッドを加えないように、別スレッドでスケジュールされ実行されます。作業が完了した後、Net DIMアルゴリズムは次の反復に進むために適切な状態に設定する必要があります。</p>
+</section>
+<section id="example">
+<h2><a class="toc-backref" href="#id6">例</a><a class="headerlink" href="#example" title="この見出しへのパーマリンク">¶</a></h2>
+<p>以下のコードはドライバーをNet DIMに登録する方法を示しています。実際の使用例は完全ではありませんが、使用法の概要を明確にするはずです。</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;linux/dim.h&gt;</span><span class="cp"></span>
+
+<span class="cm">/* Callback for net DIM to schedule on a decision to change moderation */</span><span class="w"></span>
+<span class="kt">void</span><span class="w"> </span><span class="nf">my_driver_do_dim_work</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">work_struct</span><span class="w"> </span><span class="o">*</span><span class="n">work</span><span class="p">)</span><span class="w"></span>
+<span class="p">{</span><span class="w"></span>
+<span class="w">      </span><span class="cm">/* Get struct dim from struct work_struct */</span><span class="w"></span>
+<span class="w">      </span><span class="k">struct</span><span class="w"> </span><span class="nc">dim</span><span class="w"> </span><span class="o">*</span><span class="n">dim</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">container_of</span><span class="p">(</span><span class="n">work</span><span class="p">,</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">dim</span><span class="p">,</span><span class="w"></span>
+<span class="w">                                     </span><span class="n">work</span><span class="p">);</span><span class="w"></span>
+<span class="w">      </span><span class="cm">/* Do interrupt moderation related stuff */</span><span class="w"></span>
+<span class="w">      </span><span class="p">...</span><span class="w"></span>
+
+<span class="w">      </span><span class="cm">/* Signal net DIM work is done and it should move to next iteration */</span><span class="w"></span>
+<span class="w">      </span><span class="n">dim</span><span class="o">-&gt;</span><span class="n">state</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">DIM_START_MEASURE</span><span class="p">;</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="cm">/* My driver's interrupt handler */</span><span class="w"></span>
+<span class="kt">int</span><span class="w"> </span><span class="nf">my_driver_handle_interrupt</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">my_driver_entity</span><span class="w"> </span><span class="o">*</span><span class="n">my_entity</span><span class="p">,</span><span class="w"> </span><span class="p">...)</span><span class="w"></span>
+<span class="p">{</span><span class="w"></span>
+<span class="w">      </span><span class="p">...</span><span class="w"></span>
+<span class="w">      </span><span class="cm">/* A struct to hold current measured data */</span><span class="w"></span>
+<span class="w">      </span><span class="k">struct</span><span class="w"> </span><span class="nc">dim_sample</span><span class="w"> </span><span class="n">dim_sample</span><span class="p">;</span><span class="w"></span>
+<span class="w">      </span><span class="p">...</span><span class="w"></span>
+<span class="w">      </span><span class="cm">/* Initiate data sample struct with current data */</span><span class="w"></span>
+<span class="w">      </span><span class="n">dim_update_sample</span><span class="p">(</span><span class="n">my_entity</span><span class="o">-&gt;</span><span class="n">events</span><span class="p">,</span><span class="w"></span>
+<span class="w">                        </span><span class="n">my_entity</span><span class="o">-&gt;</span><span class="n">packets</span><span class="p">,</span><span class="w"></span>
+<span class="w">                        </span><span class="n">my_entity</span><span class="o">-&gt;</span><span class="n">bytes</span><span class="p">,</span><span class="w"></span>
+<span class="w">                        </span><span class="o">&amp;</span><span class="n">dim_sample</span><span class="p">);</span><span class="w"></span>
+<span class="w">      </span><span class="cm">/* Call net DIM */</span><span class="w"></span>
+<span class="w">      </span><span class="n">net_dim</span><span class="p">(</span><span class="o">&amp;</span><span class="n">my_entity</span><span class="o">-&gt;</span><span class="n">dim</span><span class="p">,</span><span class="w"> </span><span class="n">dim_sample</span><span class="p">);</span><span class="w"></span>
+<span class="w">      </span><span class="p">...</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="cm">/* My entity's initialization function (my_entity was already allocated) */</span><span class="w"></span>
+<span class="kt">int</span><span class="w"> </span><span class="nf">my_driver_init_my_entity</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">my_driver_entity</span><span class="w"> </span><span class="o">*</span><span class="n">my_entity</span><span class="p">,</span><span class="w"> </span><span class="p">...)</span><span class="w"></span>
+<span class="p">{</span><span class="w"></span>
+<span class="w">      </span><span class="p">...</span><span class="w"></span>
+<span class="w">      </span><span class="cm">/* Initiate struct work_struct with my driver's callback function */</span><span class="w"></span>
+<span class="w">      </span><span class="n">INIT_WORK</span><span class="p">(</span><span class="o">&amp;</span><span class="n">my_entity</span><span class="o">-&gt;</span><span class="n">dim</span><span class="p">.</span><span class="n">work</span><span class="p">,</span><span class="w"> </span><span class="n">my_driver_do_dim_work</span><span class="p">);</span><span class="w"></span>
+<span class="w">      </span><span class="p">...</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</pre></div>
+</div>
+</section>
+<section id="dynamic-interrupt-moderation-dim-library-api">
+<h2><a class="toc-backref" href="#id7">動的割込みモデレーション（DIM）ライブラリAPI</a><a class="headerlink" href="#dynamic-interrupt-moderation-dim-library-api" title="この見出しへのパーマリンク">¶</a></h2>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.dim_cq_moder">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">dim_cq_moder</span></span></span><a class="headerlink" href="#c.dim_cq_moder" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>CQのモジュレーション値の構造体。DIMとその消費者間での通信に使用します。</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct dim_cq_moder {
+  u16 usec;
+  u16 pkts;
+  u16 comps;
+  u8 cq_period_mode;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">usec</span></code></dt><dd><p>CQのタイマースケジュール（DIMによる推奨）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">pkts</span></code></dt><dd><p>CQのパケットカウンタースケジュール（DIMによる推奨）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">comps</span></code></dt><dd><p>完了カウンター</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cq_period_mode</span></code></dt><dd><p>CQの期間カウントモード（CQE/EQEから取得）</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.dim_sample">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">dim_sample</span></span></span><a class="headerlink" href="#c.dim_sample" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>DIMサンプルデータの構造体。DIMとその消費者間での通信に使用します。</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct dim_sample {
+  ktime_t time;
+  u32 pkt_ctr;
+  u32 byte_ctr;
+  u16 event_ctr;
+  u32 comp_ctr;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">time</span></code></dt><dd><p>サンプルタイムスタンプ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">pkt_ctr</span></code></dt><dd><p>パケット数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">byte_ctr</span></code></dt><dd><p>バイト数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">event_ctr</span></code></dt><dd><p>イベント数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">comp_ctr</span></code></dt><dd><p>現在の完了カウンター</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.dim_stats">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">dim_stats</span></span></span><a class="headerlink" href="#c.dim_stats" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>DIMの統計情報の構造体。現在の測定されたレートを保持するために使用します。</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct dim_stats {
+  int ppms;
+  int bpms;
+  int epms;
+  int cpms;
+  int cpe_ratio;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">ppms</span></code></dt><dd><p>毎ミリ秒のパケット数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">bpms</span></code></dt><dd><p>毎ミリ秒のバイト数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">epms</span></code></dt><dd><p>毎ミリ秒のイベント数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cpms</span></code></dt><dd><p>毎ミリ秒の完了数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cpe_ratio</span></code></dt><dd><p>完了数とイベント数の比率</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.dim">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">dim</span></span></span><a class="headerlink" href="#c.dim" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>動的割込み調整（DIM）のダイナミックな構造。特定のDIMインスタンスに関するすべての情報を保持します。</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct dim {
+  u8 state;
+  struct dim_stats prev_stats;
+  struct dim_sample start_sample;
+  struct dim_sample measuring_sample;
+  struct work_struct work;
+  void *priv;
+  u8 profile_ix;
+  u8 mode;
+  u8 tune_state;
+  u8 steps_right;
+  u8 steps_left;
+  u8 tired;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">state</span></code></dt><dd><p>アルゴリズムの状態（以下を参照）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">prev_stats</span></code></dt><dd><p>前回のイテレーションからの測定レート（比較用）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">start_sample</span></code></dt><dd><p>現在のイテレーション開始時のサンプリングデータ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">measuring_sample</span></code></dt><dd><p>A <a class="reference internal" href="#c.dim_sample" title="dim_sample"><code class="xref c c-type docutils literal notranslate"><span class="pre">dim_sample</span></code></a> 現在のイベントを更新するために使用されるデータ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">work</span></code></dt><dd><p>実行すべき作業</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">priv</span></code></dt><dd><p>dimを指す構造体へのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">profile_ix</span></code></dt><dd><p>現在のモジュレーションプロファイル</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mode</span></code></dt><dd><p>CQ期間カウントモード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">tune_state</span></code></dt><dd><p>アルゴリズム調整状態（以下を参照）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">steps_right</span></code></dt><dd><p>高モジュレーションへのステップ数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">steps_left</span></code></dt><dd><p>低モジュレーションへのステップ数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">tired</span></code></dt><dd><p>パーキング深度カウンター</p>
+</dd>
+</dl>
+<dl class="c enum">
+<dt class="sig sig-object c" id="c.dim_cq_period_mode">
+<span class="k"><span class="pre">enum</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">dim_cq_period_mode</span></span></span><a class="headerlink" href="#c.dim_cq_period_mode" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>CQ期間カウントモード</p>
+</dd></dl>
+<p><strong>定数</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">DIM_CQ_PERIOD_MODE_START_FROM_EQE</span></code></dt><dd><p>EQEからカウントを開始</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">DIM_CQ_PERIOD_MODE_START_FROM_CQE</span></code></dt><dd><p>CQEからカウントを開始（タイマーリセットを意味）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">DIM_CQ_PERIOD_NUM_MODES</span></code></dt><dd><p>モード数</p>
+</dd>
+</dl>
+<dl class="c enum">
+<dt class="sig sig-object c" id="c.dim_state">
+<span class="k"><span class="pre">enum</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">dim_state</span></span></span><a class="headerlink" href="#c.dim_state" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>DIMアルゴリズム状態</p>
+</dd></dl>
+<p><strong>定数</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">DIM_START_MEASURE</span></code></dt><dd><p>これは最初のイテレーションです（新しいプロファイルを適用した後も同様）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">DIM_MEASURE_IN_PROGRESS</span></code></dt><dd><p>アルゴリズムはすでに進行中です - 作業を実行する必要があるか確認</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">DIM_APPLY_NEW_PROFILE</span></code></dt><dd><p>DIM消費者が現在プロファイルを適用中です - 測定不要</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>アルゴリズムがイテレーションを開始する有効な状態にあるかどうかを決定します。</p>
+<dl class="c enum">
+<dt class="sig sig-object c" id="c.dim_tune_state">
+<span class="k"><span class="pre">enum</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">dim_tune_state</span></span></span><a class="headerlink" href="#c.dim_tune_state" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>DIMアルゴリズム調整状態</p>
+</dd></dl>
+<p><strong>定数</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">DIM_PARKING_ON_TOP</span></code></dt><dd><p>アルゴリズムがローカルなピークポイントを検出 - 明確な差異がある場合に終了</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">DIM_PARKING_TIRED</span></code></dt><dd><p>アルゴリズムが深いピークポイントを検出 - tired &gt; 0の場合は終了しない</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">DIM_GOING_RIGHT</span></code></dt><dd><p>アルゴリズムが高モジュレーションレベルを試行中</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">DIM_GOING_LEFT</span></code></dt><dd><p>アルゴリズムが低モジュレーションレベルを試行中</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>アルゴリズムが実行すべきアクションを決定します。</p>
+<dl class="c enum">
+<dt class="sig sig-object c" id="c.dim_stats_state">
+<span class="k"><span class="pre">enum</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">dim_stats_state</span></span></span><a class="headerlink" href="#c.dim_stats_state" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>DIMアルゴリズム統計状態</p>
+</dd></dl>
+<p><strong>定数</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">DIM_STATS_WORSE</span></code></dt><dd><p>現在のイテレーションは以前よりも性能が悪くなっています</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">DIM_STATS_SAME</span></code></dt><dd><p>現在のイテレーションは以前と同様の性能を示しています</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">DIM_STATS_BETTER</span></code></dt><dd><p>現在のイテレーションは以前よりも性能が向上しています</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>現在のイテレーションの評価を決定します。</p>
+<dl class="c enum">
+<dt class="sig sig-object c" id="c.dim_step_result">
+<span class="k"><span class="pre">enum</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">dim_step_result</span></span></span><a class="headerlink" href="#c.dim_step_result" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>DIMアルゴリズムステップ結果</p>
+</dd></dl>
+<p><strong>定数</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">DIM_STEPPED</span></code></dt><dd><p>通常のステップを実行しました</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">DIM_TOO_TIRED</span></code></dt><dd><p>同じステップが複数回実行された場合 - 疲れた駐車場に移動する必要があります</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">DIM_ON_EDGE</span></code></dt><dd><p>最も左または右のプロファイルに移動しました</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>これはステップの結果を説明しています</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.dim_on_top">
+<span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">dim_on_top</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.dim_on_top" title="dim"><span class="n"><span class="pre">dim</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dim</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.dim_on_top" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>現在の状態が停止するのに適した場所かどうかを確認（トップ位置）</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim</span> <span class="pre">*dim</span></code></dt><dd><p>DIMコンテキスト</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>現在のプロファイルが駐車場として適切かどうかを確認します。これによりDIMチェックの頻度が低下します（プロファイルを変更する必要がないと仮定するため）</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.dim_turn">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">dim_turn</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.dim_turn" title="dim"><span class="n"><span class="pre">dim</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dim</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.dim_turn" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>プロファイルの方向を変更して移動</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim</span> <span class="pre">*dim</span></code></dt><dd><p>DIMコンテキスト</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>右に移動していた場合は左に、左に移動していた場合は右に移動します。現在駐車中であれば何もしません</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.dim_park_on_top">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">dim_park_on_top</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.dim_park_on_top" title="dim"><span class="n"><span class="pre">dim</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dim</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.dim_park_on_top" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>トップ位置での駐車状態に移行</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim</span> <span class="pre">*dim</span></code></dt><dd><p>DIMコンテキスト</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>駐車状態に移行します。すべての移動履歴をクリアします</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.dim_park_tired">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">dim_park_tired</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.dim_park_tired" title="dim"><span class="n"><span class="pre">dim</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dim</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.dim_park_tired" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>疲れた駐車状態に移行</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim</span> <span class="pre">*dim</span></code></dt><dd><p>DIMコンテキスト</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>駐車状態に移行します。すべての移動履歴をクリアし、DIMチェックの頻度を低下させます</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.dim_calc_stats">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">dim_calc_stats</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.dim_sample" title="dim_sample"><span class="n"><span class="pre">dim_sample</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">start</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.dim_sample" title="dim_sample"><span class="n"><span class="pre">dim_sample</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">end</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.dim_stats" title="dim_stats"><span class="n"><span class="pre">dim_stats</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">curr_stats</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.dim_calc_stats" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>2つのサンプルの差を計算</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim_sample</span> <span class="pre">*start</span></code></dt><dd><p>サンプル開始</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim_sample</span> <span class="pre">*end</span></code></dt><dd><p>サンプル終了</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim_stats</span> <span class="pre">*curr_stats</span></code></dt><dd><p>サンプル間の差</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>2つのサンプル（データレート）間の差を計算します。カウンタの巻き戻しを考慮します</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.dim_update_sample">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">dim_update_sample</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">u16</span></span><span class="w"> </span><span class="n"><span class="pre">event_ctr</span></span>, <span class="n"><span class="pre">u64</span></span><span class="w"> </span><span class="n"><span class="pre">パケット</span></span>, <span class="n"><span class="pre">u64</span></span><span class="w"> </span><span class="n"><span class="pre">バイト</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.dim_sample" title="dim_sample"><span class="n"><span class="pre">dim_sample</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">s</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.dim_update_sample" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定された値でサンプルのフィールドを設定</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">u16</span> <span class="pre">event_ctr</span></code></dt><dd><p>設定するイベント数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">u64</span> <span class="pre">packets</span></code></dt><dd><p>設定するパケット数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">u64</span> <span class="pre">bytes</span></code></dt><dd><p>設定するバイト数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim_sample</span> <span class="pre">*s</span></code></dt><dd><p>DIMサンプル</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.dim_update_sample_with_comps">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">dim_update_sample_with_comps</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">u16</span></span><span class="w"> </span><span class="n"><span class="pre">event_ctr</span></span>, <span class="n"><span class="pre">u64</span></span><span class="w"> </span><span class="n"><span class="pre">パケット</span></span>, <span class="n"><span class="pre">u64</span></span><span class="w"> </span><span class="n"><span class="pre">バイト</span></span>, <span class="n"><span class="pre">u64</span></span><span class="w"> </span><span class="n"><span class="pre">comps</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.dim_sample" title="dim_sample"><span class="n"><span class="pre">dim_sample</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">s</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.dim_update_sample_with_comps" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定された値および完了パラメータを含めてサンプルのフィールドを設定</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">u16</span> <span class="pre">event_ctr</span></code></dt><dd><p>設定するイベント数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">u64</span> <span class="pre">packets</span></code></dt><dd><p>設定するパケット数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">u64</span> <span class="pre">bytes</span></code></dt><dd><p>設定するバイト数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">u64</span> <span class="pre">comps</span></code></dt><dd><p>設定する完了数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim_sample</span> <span class="pre">*s</span></code></dt><dd><p>DIMサンプル</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.net_dim_get_rx_moderation">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.dim_cq_moder" title="dim_cq_moder"><span class="n"><span class="pre">dim_cq_moder</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">net_dim_get_rx_moderation</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">u8</span></span><span class="w"> </span><span class="n"><span class="pre">cq_period_mode</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">ix</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.net_dim_get_rx_moderation" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定されたRXプロファイル用のCQモジュレーションオブジェクトを提供</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">u8</span> <span class="pre">cq_period_mode</span></code></dt><dd><p>CQ周期モード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">ix</span></code></dt><dd><p>プロファイルインデックス</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.net_dim_get_def_rx_moderation">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.dim_cq_moder" title="dim_cq_moder"><span class="n"><span class="pre">dim_cq_moder</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">net_dim_get_def_rx_moderation</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">u8</span></span><span class="w"> </span><span class="n"><span class="pre">cq_period_mode</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.net_dim_get_def_rx_moderation" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>受信のデフォルトのモデレーションを提供します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">u8</span> <span class="pre">cq_period_mode</span></code></dt><dd><p>CQ周期モード</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.net_dim_get_tx_moderation">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.dim_cq_moder" title="dim_cq_moder"><span class="n"><span class="pre">dim_cq_moder</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">net_dim_get_tx_moderation</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">u8</span></span><span class="w"> </span><span class="n"><span class="pre">cq_period_mode</span></span>, <span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="n"><span class="pre">ix</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.net_dim_get_tx_moderation" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>指定されたTXプロファイルに応じたCQモデレーションオブジェクトを提供します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">u8</span> <span class="pre">cq_period_mode</span></code></dt><dd><p>CQ周期モード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">ix</span></code></dt><dd><p>プロファイルインデックス</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.net_dim_get_def_tx_moderation">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.dim_cq_moder" title="dim_cq_moder"><span class="n"><span class="pre">dim_cq_moder</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">net_dim_get_def_tx_moderation</span></span></span><span class="sig-paren">(</span><span class="n"><span class="pre">u8</span></span><span class="w"> </span><span class="n"><span class="pre">cq_period_mode</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.net_dim_get_def_tx_moderation" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>送信のデフォルトのモデレーションを提供します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">u8</span> <span class="pre">cq_period_mode</span></code></dt><dd><p>CQ周期モード</p>
+</dd>
+</dl>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.net_dim">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">net_dim</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.net_dim" title="dim"><span class="n"><span class="pre">dim</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dim</span></span>, <span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.dim_sample" title="dim_sample"><span class="n"><span class="pre">dim_sample</span></span></a><span class="w"> </span><span class="n"><span class="pre">end_sample</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.net_dim" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>DIMアルゴリズムのエントリポイント</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim</span> <span class="pre">*dim</span></code></dt><dd><p>DIMインスタンス情報</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim_sample</span> <span class="pre">end_sample</span></code></dt><dd><p>現在のデータ測定</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>消費者によって呼び出されます。これはアルゴリズムの主なロジックで、データを処理して次の必要なアクションを決定します。</p>
+<dl class="c function">
+<dt class="sig sig-object c" id="c.rdma_dim">
+<span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">rdma_dim</span></span></span><span class="sig-paren">(</span><span class="k"><span class="pre">struct</span></span><span class="w"> </span><a class="reference internal" href="#c.rdma_dim" title="dim"><span class="n"><span class="pre">dim</span></span></a><span class="w"> </span><span class="p"><span class="pre">*</span></span><span class="n"><span class="pre">dim</span></span>, <span class="n"><span class="pre">u64</span></span><span class="w"> </span><span class="n"><span class="pre">completions</span></span><span class="sig-paren">)</span><a class="headerlink" href="#c.rdma_dim" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>適応型モデレーションを実行します</p>
+</dd></dl>
+<p><strong>パラメータ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">dim</span> <span class="pre">*dim</span></code></dt><dd><p>モデレーション構造体</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">u64</span> <span class="pre">completions</span></code></dt><dd><p>このラウンドで収集された完了数</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>rdma_dimの各呼び出しでは、最新の収集された完了数を新しいイベントとしてカウントします。十分なイベントが収集されると、アルゴリズムが新しいモデレーションレベルを決定します。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxネットワーキングドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="netdev-FAQ.html">netdev FAQ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="af_xdp.html">AF_XDP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bareudp.html">Bare UDPトンネリングモジュールドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="batman-adv.html">batman-adv</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can.html">SocketCAN - コントローラー・エリア・ネットワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can_ucan_protocol.html">UCANプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="device_drivers/index.html">ハードウェアデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dsa/index.html">分散スイッチアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="devlink/index.html">Linux Devlinkドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="caif/index.html">CAIF</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ethtool-netlink.html">ethtool用Netlinkインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ieee802154.html">IEEE 802.15.4開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="j1939.html">J1939ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kapi.html">LinuxネットワーキングとネットワークデバイスAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="msg_zerocopy.html">MSG_ZEROCOPY</a></li>
+<li class="toctree-l2"><a class="reference internal" href="failover.html">フェールオーバー</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Net DIM - ジェネリックネットワークダイナミック割込みモデレーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="net_failover.html">NET_FAILOVER</a></li>
+<li class="toctree-l2"><a class="reference internal" href="page_pool.html">ページプールAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phy.html">PHY抽象レイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sfp-phylink.html">phylink</a></li>
+<li class="toctree-l2"><a class="reference internal" href="alias.html">IPアリアシング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bridge.html">イーサネットブリッジング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="snmp_counter.html">SNMPカウンター</a></li>
+<li class="toctree-l2"><a class="reference internal" href="checksum-offloads.html">チェックサムオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="segmentation-offloads.html">セグメンテーションオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="scaling.html">Linuxネットワーキングスタックにおけるスケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tls.html">カーネルTLS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tls-offload.html">カーネルTLSオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nfc.html">Linux NFCサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6lowpan.html">6lowpanインターフェース用Netdevプライベートデータルーム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6pack.html">6packプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet-hardware.html">ARCnetハードウェア</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet.html">ARCnet</a></li>
+<li class="toctree-l2"><a class="reference internal" href="atm.html">ATM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ax25.html">AX.25</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bonding.html">LinuxイーサネットボンディングドライバHOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cdc_mbim.html">cdc_mbim - CDC MBIMモバイルブロードバンドモデム用ドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dccp.html">DCCPプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dctcp.html">DCTCP（データセンターTCP）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="decnet.html">Linux DECnetネットワーキングレイヤー情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dns_resolver.html">DNSリゾルバー・モジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="driver.html">Softnetドライバーの問題</a></li>
+<li class="toctree-l2"><a class="reference internal" href="eql.html">EQLドライバー: シリアルIPロードバランシングガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="fib_trie.html">LC-trie実装ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="filter.html">Linux Socket Filtering（別名Berkeley Packet Filter（BPF））</a></li>
+<li class="toctree-l2"><a class="reference internal" href="framerelay.html">フレームリレー（FR）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic-hdlc.html">ジェネリックHDLCレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic_netlink.html">ジェネリックネットリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gen_stats.html">ネットリンクユーザー向けジェネリックネットワーキング統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gtp.html">LinuxカーネルGTPトンネリングモジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ila.html">識別子ロケーターアドレスング（ILA）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipddp.html">AppleTalk-IPデカプセル化とAppleTalk-IPエンカプセル化</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip_dynaddr.html">IPダイナミックアドレスハックポートv0.03</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipsec.html">IPsec</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip-sysctl.html">IP Sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipv6.html">IPv6</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvlan.html">IPVLANドライバーガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvs-sysctl.html">IPvs-sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kcm.html">カーネルコネクションマルチプレクサ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="l2tp.html">L2TP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lapb-module.html">Linux LAPBモジュールインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mac80211-injection.html">mac80211を使用したパケットインジェクションの使い方</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mpls-sysctl.html">MPLS Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="multiqueue.html">マルチキューネットワークデバイスサポートガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netconsole.html">Netconsole</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdev-features.html">ネットデバイス機能の混乱とその解決方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdevices.html">ネットワークデバイス、カーネル、そしてあなた！</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netfilter-sysctl.html">Netfilter Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netif-msg.html">NETIFメッセージレベル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_conntrack-sysctl.html">Netfilter Conntrack Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_flowtable.html">Netfilterのフローテーブルインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="openvswitch.html">Open vSwitch datapath開発者ドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="operstates.html">運用状態</a></li>
+<li class="toctree-l2"><a class="reference internal" href="packet_mmap.html">パケットMMAP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phonet.html">Linux Phonetプロトコルファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pktgen.html">Linuxパケットジェネレーターガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="plip.html">PLIP: 平行線インターネットプロトコルデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ppp_generic.html">PPPジェネリックドライバーおよびチャネルインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="proc_net_tcp.html">proc/net/tcpおよびproc/net/tcp6変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="radiotap-headers.html">radiotapヘッダの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html">概要</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-architecture">RDSアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#socket-interface">ソケットインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rdma-for-rds">RDS用RDMA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#congestion-notifications">コンゲスト通知</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-protocol">RDSプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-transport-layer">RDSトランスポートレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-kernel-structures">RDSカーネル構造体</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#connection-management">接続管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#the-send-path">送信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#the-recv-path">受信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#multipath-rds-mprds">マルチパスRDS (mprds)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="regulatory.html">Linuxワイヤレス規制ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html">RxRPC ネットワークプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#socket-options">ソケットオプション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#security">セキュリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#example-client-usage">例: クライアントの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sctp.html">LinuxカーネルSCTP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="secid.html">LSM/SeLinux secid</a></li>
+<li class="toctree-l2"><a class="reference internal" href="seg6-sysctl.html">Seg6 Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="statistics.html">インターフェース統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="strparser.html">ストリームパーサー (strparser)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="switchdev.html">イーサネットスイッチデバイスドライバモデル (switchdev)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysfs-tagging.html">Sysfsタグ付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tc-actions-env-rules.html">TCアクション - 環境ルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tcp-thin.html">スリムストリームとTCP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="team.html">チーム (Team)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="timestamping.html">タイムスタンピング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tproxy.html">透過プロキシサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tuntap.html">ユニバーサルTUN/TAPデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="udplite.html">UDP-Liteプロトコル (RFC 3828)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vrf.html">仮想ルーティングおよびフォワーディング (VRF)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vxlan.html">仮想拡張ローカルエリアネットワーキングドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html">パケットレイヤーからデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html#device-driver-to-packet-layer">デバイスドライバからパケットレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25.html">Linux X.25プロジェクト</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_device.html">XFRMデバイス - IPsec計算のオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_proc.html">XFRMプロセス - /proc/net/xfrm_*ファイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sync.html">XFRM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sysctl.html">XFRMシステムコール</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxネットワーキングドキュメント</a><ul>
+<li>前へ: <a href="failover.html" title="前章">フェールオーバー</a></li>
+<li>次へ: <a href="net_failover.html" title="次章">NET_FAILOVER</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/networking/net_dim.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

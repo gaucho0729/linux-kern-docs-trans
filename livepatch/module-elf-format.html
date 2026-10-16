@@ -1,0 +1,353 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Livepatchモジュール ELF形式 — Linux Kernelドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="shadow-vars.html" rel="next" title="シャドウ変数"/>
+<link href="cumulative-patches.html" rel="prev" title="アトミック置換と累積パッチ"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="livepatch-module-elf-format">
+<h1>ライブパッチモジュールELF形式<a class="headerlink" href="#livepatch-module-elf-format" title="この見出しへのパーマリンク">¶</a></h1>
+<p>このドキュメントでは、livepatchモジュールが従うべきELF形式の要件について説明しています。</p>
+<section id="background-and-motivation">
+<h2>1. 背景と動機<a class="headerlink" href="#background-and-motivation" title="この見出しへのパーマリンク">¶</a></h2>
+<p>以前は、livepatchがアーキテクチャ固有のコードを別途記述してリロケーションを実装する必要がありました。しかし、モジュールローダー内にすでにアーキテクチャ固有のリロケーション処理用のコードが存在しているため、この古いアプローチではコードが冗長になってしまいました。そのため、コードを複製したり、モジュールローダーが既に実装している処理を再実装するのではなく、livepatchはモジュールローダー内の既存コードを活用してすべてのアーキテクチャ固有のリロケーション処理を行います。具体的には、livepatchはモジュールローダー内のapply_relocate_add()関数を再利用してリロケーションを記述します。このドキュメントで説明するpatchモジュールELF形式により、livepatchがこのような処理を実行できるようになります。このアプローチにより、livepatchが他のアーキテクチャへの移植をより容易にし、特定のアーキテクチャへの移植に必要なアーキテクチャ固有のコード量を減らすことが期待されています。</p>
+<p>apply_relocate_add()はモジュールのセクションヘッダーテーブル、シンボルテーブル、リロケーションセクションインデックスにアクセスする必要があります。そのため、livepatchモジュールではELF情報が保持されています（第5節を参照してください）。livepatchは独自のリロケーションセクションとシンボルを管理しており、このドキュメントでその詳細を説明しています。ELF定数としてlivepatchシンボルおよびリロケーションセクションをマークするための値は、glibcからの定義に基づきOS固有の範囲から選定されています。</p>
+<section id="why-does-livepatch-need-to-write-its-own-relocations">
+<h3>なぜlivepatchは独自のリロケーションを書く必要があるのでしょうか？<a class="headerlink" href="#why-does-livepatch-need-to-write-its-own-relocations" title="この見出しへのパーマリンク">¶</a></h3>
+<p>典型的なライブパッチモジュールは、非エクスポートされたグローバルシンボルや非インクルードされたローカルシンボルを参照できる関数のパッチ版を含みます。これらのシンボルを参照するリロケーションは、カーネルモジュールロー�ーダーが解決できないため、そのまま残すことはできません。したがって、ライブパッチモジュールは拒否されます。さらに、パッチモジュールのロード時にまだロードされていないモジュールに影響を与えるリロケーションを適用することもできません（例：未ロードのドライバに対するパッチ）。以前は、ライブパッチは結果となるパッチモジュールELF出力に特別な「dynrela」（ダイナミックrela）セクションを埋め込むことでこの問題を解決していました。dynrelのセクションを使用して、シンボルのスコープや所属するモジュールを考慮しながらシンボルを解決し、その後手動でダイナミックリロケーションを適用していました。しかし、このアプローチでは、ライブパッチがアーキテクチャ固有のコードを提供する必要がありました。新しい形式では、ライブパッチはdynrelaセクションの代わりに自身でSHT_RELAリロケーションセクションを管理し、リロケーションで参照するシンボルは特別なライブパッチシンボルです（セクション2と3を参照）。アーキテクチャ固有のライブパッチリロケーションコードは、apply_relocate_add()関数の呼び出しに置き換えられます。</p>
+</section>
+</section>
+<section id="livepatch-modinfo-field">
+<h2>2. ライブパッチ modinfoフィールド<a class="headerlink" href="#livepatch-modinfo-field" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ライブパッチモジュールは「livepatch」modinfo属性を必ず持つ必要があります。サンプルライブパッチモジュールの実装方法は、samples/livepatch/に記載されています。</p>
+<p>ユーザーは'modinfo'コマンドを使用し、「livepatch」フィールドの存在を確認することでライブパッチモジュールを識別できます。このフィールドは、カーネルモジュールローダーがライブパッチモジュールを識別するためにも使用されます。</p>
+<section id="example">
+<h3>例:<a class="headerlink" href="#example" title="この見出しへのパーマリンク">¶</a></h3>
+<p><strong>modinfo出力:</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>% modinfo livepatch-meminfo.ko
+filename:               livepatch-meminfo.ko
+livepatch:              Y
+license:                GPL
+depends:
+vermagic:               4.3.0+ SMP mod_unload
+</pre></div>
+</div>
+</section>
+</section>
+<section id="livepatch-relocation-sections">
+<h2>3. ライブパッチリロケーションセクション<a class="headerlink" href="#livepatch-relocation-sections" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ライブパッチモジュールは、適切なタイミングでモジュールやカーネル（vmlinux）にリロケーションを適用するために自身でELFリロケーションセクションを管理します。たとえば、現在ロードされていないドライバをパッチする場合、ライブパッチはそのドライバがロードされるときに該当するライブパッチリロケーションセクションを適用します。</p>
+<p>パッチモジュール内の各「オブジェクト」（例：vmlinux、またはモジュール）には、複数のライブパッチリロケーションセクションが関連付けられることがあります（例：同じオブジェクト内の複数関数へのパッチ）。ライブパッチリロケーションセクションとリロケーションを適用するターゲットセクション（通常は関数のテキストセクション）には1対1の対応関係があります。また、ライブパッチモジュールはライブパッチリロケーションセクションを持たない場合もあります（例：サンプルライブパッチモジュール、samples/livepatchを参照）</p>
+<p>ライブパッチモジュールではELF情報が保持されるため（第5節を参照）、apply_relocate_add()に適切なセクションインデックスを渡すことで、ライブパッチ再配置セクションを適用できます。これにより、再配置セクションにアクセスし、再配置を適用します。</p>
+<p>ライブパッチ再配置セクション内のrelaによって参照されるすべてのシンボルはライブパッチシンボルです。ライブパッチがapply_relocate_add()を呼び出す前にこれらのシンボルは解決する必要があります。詳しくは第3節をご参照ください。</p>
+</section>
+<section id="livepatch-relocation-section-format">
+<h2>3.1 ライブパッチ再配置セクションの形式<a class="headerlink" href="#livepatch-relocation-section-format" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ライブパッチ再配置セクションはSHF_RELA_LIVEPATCHセクションフラグでマークする必要があります。include/uapi/linux/elf.hで定義を確認してください。モジュールロー�ーダーはこのフラグを認識し、パッチモジュールのロード時にこれらの再配置セクションを適用しないようにします。また、SHF_ALLOCフラグでマークする必要があります。これにより、モジュールロード時にロー�ーダーがセクションを破棄しないようにします（つまり、他のSHF_ALLOCセクションと同様にメモリにコピーされます）。</p>
+<p>ライブパッチ再配置セクションの名前は以下の形式に従う必要があります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>.klp.rela.objname.section_name
+^        ^^     ^ ^          ^
+|________||_____| |__________|
+   [A]      [B]        [C]
+</pre></div>
+</div>
+<dl class="simple">
+<dt>[A]</dt><dd><p>再配置セクション名は文字列「.klp.rela.」で前につながれます。</p>
+</dd>
+<dt>[B]</dt><dd><p>再配置セクションが属するオブジェクトの名前（つまり「vmlinux」またはモジュール名）は前記のプレフィックスの直後に続きます。</p>
+</dd>
+<dt>[C]</dt><dd><p>この再配置セクションが適用されるセクションの実際の名前。</p>
+</dd>
+</dl>
+<section id="examples">
+<h3>例:<a class="headerlink" href="#examples" title="この見出しへのパーマリンク">¶</a></h3>
+<p><strong>ライブパッチ再配置セクションの名前：</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>.klp.rela.ext4.text.ext4_attr_store
+.klp.rela.vmlinux.text.cmdline_proc_show
+</pre></div>
+</div>
+<p><strong>vmlinuxおよびモジュール9p、btrfs、ext4をパッチするパッチモジュールの`readelf –sections`出力：</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Section Headers:
+[Nr] Name                          Type                    Address          Off    Size   ES Flg Lk Inf Al
+[ snip ]
+[29] .klp.rela.9p.text.caches.show RELA                    0000000000000000 002d58 0000c0 18 AIo 64   9  8
+[30] .klp.rela.btrfs.text.btrfs.feature.attr.show RELA     0000000000000000 002e18 000060 18 AIo 64  11  8
+[ snip ]
+[34] .klp.rela.ext4.text.ext4.attr.store RELA              0000000000000000 002fd8 0000d8 18 AIo 64  13  8
+[35] .klp.rela.ext4.text.ext4.attr.show RELA               0000000000000000 0030b0 000150 18 AIo 64  15  8
+[36] .klp.rela.vmlinux.text.cmdline.proc.show RELA         0000000000000000 003200 000018 18 AIo 64  17  8
+[37] .klp.rela.vmlinux.text.meminfo.proc.show RELA         0000000000000000 003218 0000f0 18 AIo 64  19  8
+[ snip ]                                       ^                                             ^
+                                               |                                             |
+                                              [*]                                           [*]
+</pre></div>
+</div>
+<dl class="simple">
+<dt>[*]</dt><dd><p>ライブパッチ再配置セクションはSHT_RELAセクションですが、いくつかの特殊な特徴を持っています。注意してください。これらはSHF_ALLOC（「A」）でマークされており、モジュールがメモリにロードされるときに破棄されません。また、SHF_RELA_LIVEPATCHフラグ（「o」- OS固有）も設定されています。</p>
+</dd>
+</dl>
+<p><strong>パッチモジュールの`readelf –relocs`出力：</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Relocation section '.klp.rela.btrfs.text.btrfs_feature_attr_show' at offset 0x2ba0 contains 4 entries:
+    Offset             Info             Type               Symbol's Value  Symbol's Name + Addend
+000000000000001f  0000005e00000002 R_X86_64_PC32          0000000000000000 .klp.sym.vmlinux.printk,0 - 4
+0000000000000028  0000003d0000000b R_X86_64_32S           0000000000000000 .klp.sym.btrfs.btrfs_ktype,0 + 0
+0000000000000036  0000003b00000002 R_X86_64_PC32          0000000000000000 .klp.sym.btrfs.can_modify_feature.isra.3,0 - 4
+000000000000004c  0000004900000002 R_X86_64_PC32          0000000000000000 .klp.sym.vmlinux.snprintf,0 - 4
+[ snip ]                                                                   ^
+                                                                           |
+                                                                          [*]
+</pre></div>
+</div>
+<dl class="simple">
+<dt>[*]</dt><dd><p>再配置によって参照されるすべてのシンボルはライブパッチシンボルです。</p>
+</dd>
+</dl>
+</section>
+</section>
+<section id="livepatch-symbols">
+<h2>4. ライブパッチシンボル<a class="headerlink" href="#livepatch-symbols" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Livepatch symbolsは、ライブパッチリロケーションセクションによって参照されるシンボルです。これらは、パッチ対象オブジェクトの新しいバージョンの関数からアクセスされるシンボルであり、モジュールロー�ーダーによってアドレスが解決できない（ローカルまたは未エクスポートされたグローバルシンボルの場合）ため、導入されました。モジュールローダーはエクスポートされたシンボルのみを解決し、すべての新しいパッチ関数で参照されるシンボルがエクスポートされているわけではありません。したがって、Livepatch symbolsが導入されました。また、パッチモジュールがまだロードされていないモジュールをパッチする場合など、パッチモジュールがロードされる時点でシンボルのアドレスが即座に判明しない場合にも使用されます。たとえば、ライブパッチがまだロードされていないモジュールをパッチする場合、関連するLivepatch symbolsはターゲットモジュールがロードされるときに単純に解決されます。いずれにしても、任意のLivepatchリロケーションセクションに対して、そのセクションで参照されるすべてのLivepatch symbolsは、apply_relocate_add()を呼び出す前に解決する必要があります。</p>
+<p>Livepatch symbolsはSHN_LIVEPATCHでマークする必要があります。これにより、モジュールローダーが識別し、無視できるようにします。Livepatchモジュールはこれらのシンボルをシンボルテーブルに保持し、シンボルテーブルはmodule-&gt;symtabを通じてアクセス可能になります。</p>
+</section>
+<section id="a-livepatch-module-s-symbol-table">
+<h2>4.1 ライブパッチモジュールのシンボルテーブル<a class="headerlink" href="#a-livepatch-module-s-symbol-table" title="この見出しへのパーマリンク">¶</a></h2>
+<p>通常、モジュールのシンボルテーブル（「コア」シンボルのみを含む簡易なコピー）はmodule-&gt;symtabを通じて利用可能になります（kernel/module.cのlayout_symtab()を参照）。ライブパッチモジュールでは、モジュールロード時にメモリにコピーされるシンボルテーブルは、パッチモジュールがコンパイルされたときに生成されるシンボルテーブルと完全に一致する必要があります。これは、各ライブパッチリロケーションセクションのリロケーションが、それぞれのシンボルに対してシンボルインデックスを参照するためであり、元のシンボルインデックス（およびシンボルテーブルの順序）が保持されることが、apply_relocate_add()が正しいシンボルを検索するための条件です。</p>
+<p>例えば、ライブパッチモジュールからの特定のrelaを以下のようにします::</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Relocation section '.klp.rela.btrfs.text.btrfs_feature_attr_show' at offset 0x2ba0 contains 4 entries:
+    Offset             Info             Type               Symbol's Value  Symbol's Name + Addend
+000000000000001f  0000005e00000002 R_X86_64_PC32          0000000000000000 .klp.sym.vmlinux.printk,0 - 4
+
+This rela refers to the symbol '.klp.sym.vmlinux.printk,0', and the symbol index is encoded
+in 'Info'. Here its symbol index is 0x5e, which is 94 in decimal, which refers to the
+symbol index 94.
+And in this patch module's corresponding symbol table, symbol index 94 refers to that very symbol:
+[ snip ]
+94: 0000000000000000     0 NOTYPE  GLOBAL DEFAULT OS [0xff20] .klp.sym.vmlinux.printk,0
+[ snip ]
+</pre></div>
+</div>
+</section>
+<section id="livepatch-symbol-format">
+<h2>4.2 ライブパッチシンボルの形式<a class="headerlink" href="#livepatch-symbol-format" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ライブパッチシンボルのセクションインデックスはSHN_LIVEPATCHでマークする必要があります。これにより、モジュールローダーが識別し、解決を試みないようになります。実際の定義はinclude/uapi/linux/elf.hを参照してください。</p>
+<p>ライブパッチシンボルの名前は次の形式に従う必要があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>.klp.sym.objname.symbol_name,sympos
+^       ^^     ^ ^         ^ ^
+|_______||_____| |_________| |
+   [A]     [B]       [C]    [D]
+</pre></div>
+</div>
+<dl class="simple">
+<dt>[A]</dt><dd><p>シンボル名は文字列「.klp.sym.」で接頭辞となります。</p>
+</dd>
+<dt>[B]</dt><dd><p>接頭辞の後には、シンボルが属するオブジェクト（つまり、「vmlinux」またはモジュール名）の名前が直ちに続きます。</p>
+</dd>
+<dt>[C]</dt><dd><p>実際のシンボル名</p>
+</dd>
+<dt>[D]</dt><dd><p>オブジェクト内のシンボルの位置（kallsymsに基づく）この情報は、同じオブジェクト内での複数のシンボルを区別するために使用されます。シンボルの位置は数値で表されます（0、1、2…）。一意のシンボルの位置は0です。</p>
+</dd>
+</dl>
+<section id="id1">
+<h3>例:<a class="headerlink" href="#id1" title="この見出しへのパーマリンク">¶</a></h3>
+<p><strong>ライブパッチのシンボル名:</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>.klp.sym.vmlinux.snprintf,0
+.klp.sym.vmlinux.printk,0
+.klp.sym.btrfs.btrfs_ktype,0
+</pre></div>
+</div>
+<p><strong>パッチモジュールの`readelf –symbols`出力:</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Symbol table '.symtab' contains 127 entries:
+   Num:    Value          Size Type    Bind   Vis     Ndx         Name
+   [ snip ]
+    73: 0000000000000000     0 NOTYPE  GLOBAL DEFAULT OS [0xff20] .klp.sym.vmlinux.snprintf,0
+    74: 0000000000000000     0 NOTYPE  GLOBAL DEFAULT OS [0xff20] .klp.sym.vmlinux.capable,0
+    75: 0000000000000000     0 NOTYPE  GLOBAL DEFAULT OS [0xff20] .klp.sym.vmlinux.find_next_bit,0
+    76: 0000000000000000     0 NOTYPE  GLOBAL DEFAULT OS [0xff20] .klp.sym.vmlinux.si_swapinfo,0
+  [ snip ]                                               ^
+                                                         |
+                                                        [*]
+</pre></div>
+</div>
+<dl class="simple">
+<dt>[*]</dt><dd><p>これらのシンボルの「Ndx」（セクションインデックス）はSHN_LIVEPATCH（0xff20）です。「OS」はOS固有のことを意味します。</p>
+</dd>
+</dl>
+</section>
+</section>
+<section id="symbol-table-and-elf-section-access">
+<h2>5. シンボルテーブルとElfセクションのアクセス<a class="headerlink" href="#symbol-table-and-elf-section-access" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ライブパッチモジュールのシンボルテーブルはmodule-&gt;symtabを通じてアクセス可能です。</p>
+<p>apply_relocate_add()は、モジュールのセクションヘッダ、シンボルテーブル、リロケーションセクションインデックスにアクセスする必要があります。そのため、ライブパッチモジュールではElf情報が保持され、モジュールロー�ーダーがmodule-&gt;klp_info（klp_modinfo構造体）を通じてアクセス可能にしています。ライブパッチモジュールがロードされる際、この構造体はモジュールロー�ーダーによって埋められます。以下の項目が記載されています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct klp_modinfo {
+        Elf_Ehdr hdr; /* Elf header */
+        Elf_Shdr *sechdrs; /* Section header table */
+        char *secstrings; /* String table for the section headers */
+        unsigned int symndx; /* The symbol table section index */
+};
+</pre></div>
+</div>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">カーネルライブパッチ</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="livepatch.html">Livepatch</a></li>
+<li class="toctree-l2"><a class="reference internal" href="callbacks.html">(Un)パッチングコールバック</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cumulative-patches.html">アトミック置換と累積パッチ</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">ライブパッチモジュールELF形式</a></li>
+<li class="toctree-l2"><a class="reference internal" href="shadow-vars.html">シャドウ変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="system-state.html">システム状態の変更</a></li>
+</ul>
+</li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">カーネルライブパッチ</a><ul>
+<li>前へ: <a href="cumulative-patches.html" title="前章">アトミック置換と累積パッチ</a></li>
+<li>次へ: <a href="shadow-vars.html" title="次章">シャドウ変数</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/livepatch/module-elf-format.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

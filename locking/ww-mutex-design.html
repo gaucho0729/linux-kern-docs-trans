@@ -1,0 +1,441 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Wound/Wait デッドロック回避ミューテックス設計 — Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="preempt-locking.html" rel="next" title="プリエンプティブカーネルでの適切なロック: カーネルコードのプリエンプ安全性を保つ"/>
+<link href="spinlocks.html" rel="prev" title="ロックの教訓"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="wound-wait-deadlock-proof-mutex-design">
+<h1>Wound/Wait Deadlock-Proof Mutex Design<a class="headerlink" href="#wound-wait-deadlock-proof-mutex-design" title="この見出しへのパーマリンク">¶</a></h1>
+<p>まず mutex-design.txt を読みましょう。これは wait/wound ミューテックスにも適用されます。</p>
+<section id="motivation-for-ww-mutexes">
+<h2>WW-ミューテックスの動機<a class="headerlink" href="#motivation-for-ww-mutexes" title="この見出しへのパーマリンク">¶</a></h2>
+<p>GPU は多くのバッファを扱う操作を行うことが多く、これらのバッファはコンテキスト/プロセス間で共有可能であり、異なるメモリドメイン（例：VRAM とシステムメモリ）に存在する場合もあります。PRIME / dmabuf を使用すれば、デバイス間でも共有可能になります。そのため、ドライバがバッファが準備完了を待つ必要がある状況はいくつかあります。この状況をバッファミューテックスの待機として考える場合、問題はバッファが execbuf/batch でどの順序で出現するかを保証することができない点にあります。これはユーザー空間の制御下にあり、アプリケーションが行う GL コールの順序の結果です。これによりデッドロックの可能性が生じます。問題はさらに複雑になりますが、ここでは簡略化のために、カーネルが GPU がバッファを処理する前にバッファを VRAM に移動する必要があるという点は無視してください。</p>
+<p>TTM グラフィックスサブシステムがこの問題に対処するためのアルゴリズムは非常に単純です。各バッファグループ（execbuf）をロックする際には、呼び出し元にグローバルカウンターから一意の予約ID/チケットが割り当てられます。execbuf に関連するすべてのバッファをロック中にデッドロックが発生した場合、予約ID（つまり最も古いタスク）が優先され、予約IDが大きい（つまり若いタスク）はすでにロックしたバッファをすべてアンロックし、再試行します。</p>
+<p>RDBMSの文献において、予約チケットはトランザクションと関連付けられ、デッドロック処理のアプローチとして「Wait-Die」と呼ばれる方法が用いられます。この名前は、ロックしているスレッドが既にロックされているミューテックスに遭遇した際の動作に基づいています。ロックしているトランザクションが若い場合、ロックしているトランザクションは待機します。ロックしているトランザクションが古い場合、ロックしているトランザクションはバックオフし、終了します。これがWait-Dieの由来です。また、もう一つのアルゴリズムとして「Wound-Wait」と呼ばれるものもあります。ロックしているトランザクションが若い場合、ロックしているトランザクションはロックしているトランザクションを「Wound（傷つける）」し、終了を求める処理を行います。ロックしているトランザクションが古い場合、ロックしているトラン�クションは他のトランザクションを待機します。これがWound-Waitの由来です。この2つのアルゴリズムはどちらも、トランザクションが最終的に成功することを保証する公平な方法です。しかし、Wound-WaitアルゴリズムはWait-Dieに比べて通常より少ないバックオフを生成する一方で、バックオフからの復旧においてはWait-Dieに比べてより多くの作業を伴います。また、Wound-Waitはトランザクションが他のトランザクションによって「Wound」される点でプリエンプティブなアルゴリズムとされます。これには、傷ついた状態を正確に検出する信頼できる方法と、実行中のトランザクションをプリエンプションする必要があるためです。注意点として、これはプロセスのプリエンプションとは異なります。Wound-Waitトランザクションは、傷つけられ（-EDEADLKを返す）後に終了した際にプリエンプションされたとみなされます。</p>
+</section>
+<section id="concepts">
+<h2>概念<a class="headerlink" href="#concepts" title="この見出しへのパーマリンク">¶</a></h2>
+<p>通常のミューテックスと比較して、w/wミューテックスのロックインターフェースには2つの追加の概念/オブジェクトが現れます:</p>
+<p>取得コンテキスト: 進展を最終的に確保するためには、ロックを取得しようとするタスクが新しい予約IDを取得するのではなく、ロック取得を開始した際に取得したIDを保持することが重要です。このチケットは取得コンテキストに保存されます。さらに、取得コンテキストはデバッグ状態を追跡し、w/wミューテックスインターフェースの誤使用を検出します。取得コンテキストはトランザクションを表します。</p>
+<p>w/wクラス: 通常のミューテックスと異なり、w/wミューテックスではロッククラスを明示的に指定する必要があります。これは取得コンテキストを初期化するための必要条件であり、ロッククラスは使用するアルゴリズム（Wound-WaitまたはWait-Die）を指定します。</p>
+<p>さらに、w/wロック取得関数には3つの異なるクラスがあります:</p>
+<ul>
+<li><p>ww_mutex_lockを使用した通常のロック取得</p></li>
+<li><p>競合しているロックに対してスローパスロック取得を実行する関数で、既に取得したロックをすべて解放した後、自身のトランザクションを殺したタスクが使用します。これらの関数には_slowというサフィックスが付きます。</p>
+<p>セマンティクスの観点から見れば、_slow関数は厳密には必要ではありません。なぜなら、他のすべての既取得ロックを解放した後で通常のww_mutex_lock関数を競合するロックに対して呼び出すだけで正しく動作するからです。畢竟、他のwwミューテックスがまだ取得されていない場合、デッドロックの可能性はなく、ww_mutex_lock呼び出しはブロック状態となり、-EDEADLKを早期に返すことはありません。_slow関数の利点はインターフェースの安全性にあります：</p>
+<ul class="simple">
+<li><p>ww_mutex_lockは__must_check int型の戻り値を持ち、ww_mutex_lock_slowはvoid型の戻り値を持ちます。注意してください、wwミューテックスコードはループ/再試行が必要なため、__must_checkは偽の警告を引き起こしません。ただし、最初のロック操作は決して失敗しません。</p></li>
+<li><p>フルデバッグが有効な場合、ww_mutex_lock_slowはすべての取得したwwミューテックスが解放されているかを確認し（デッドロックを防ぐ）、競合するロックに対してブロックするようにします（-EDEADLKのスローパスでスピンするのを防ぎ、ロックを取得できるまで待機します）。</p></li>
+</ul>
+</li>
+<li><p>単一のw/wミューテックスを取得するための関数で、通常のミューテックスと同じセマンティクスをもたらします。これはNULLコンテキストでww_mutex_lockを呼び出すことで実現されます。</p>
+<p>これは厳密には必要ではありませんが、通常は単一のロックを取得するだけの場合、コンテキストを設定する必要がなく、デッドロック回避チケットを取得するのを避けるのが望ましいです。</p>
+</li>
+</ul>
+<p>もちろん、シグナルによるウェイクアップ処理の通常のバリエーションも提供されています。</p>
+</section>
+<section id="usage">
+<h2>使い方<a class="headerlink" href="#usage" title="この見出しへのパーマリンク">¶</a></h2>
+<p>アルゴリズム（Wait-Die vs Wound-Wait）はDEFINE_WW_CLASS（Wound-Wait）かDEFINE_WD_CLASS（Wait-Die）を使用して選択されます。大まかなルールとして、同時進行する競合トランザクションの数が通常小さく、ロールバックの数を減らしたい場合にWound-Waitを使用します。</p>
+<p>同じw/wクラス内でロックを取得する3つの方法があります。メソッド#1および#2の一般的な定義：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static DEFINE_WW_CLASS(ww_class);
+
+struct obj {
+      struct ww_mutex lock;
+      /* obj data */
+};
+
+struct obj_entry {
+      struct list_head head;
+      struct obj *obj;
+};
+</pre></div>
+</div>
+<p>メソッド1、execbuf-&gt;buffers内のリストを使用し、再配置が許可されません。これはすでにどこかで追跡されている必要なオブジェクトのリストがある場合に便利です。さらに、ロックアシスタントは-EALREADYの戻りコードを呼び出し元に伝播させ、リストにオブジェクトが2回登録されていることを示す信号として利用できます。これはユーザー空間からの入力でリストが構築され、ABIがユーザー空間に重複エントリを許さない場合（例：GPUコマンドバッファ送信ioctl）に特に有用です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int lock_objs(struct list_head *list, struct ww_acquire_ctx *ctx)
+{
+      struct obj *res_obj = NULL;
+      struct obj_entry *contended_entry = NULL;
+      struct obj_entry *entry;
+
+      ww_acquire_init(ctx, &amp;ww_class);
+
+retry:
+      list_for_each_entry (entry, list, head) {
+              if (entry-&gt;obj == res_obj) {
+                      res_obj = NULL;
+                      continue;
+              }
+              ret = ww_mutex_lock(&amp;entry-&gt;obj-&gt;lock, ctx);
+              if (ret &lt; 0) {
+                      contended_entry = entry;
+                      goto err;
+              }
+      }
+
+      ww_acquire_done(ctx);
+      return 0;
+
+err:
+      list_for_each_entry_continue_reverse (entry, list, head)
+              ww_mutex_unlock(&amp;entry-&gt;obj-&gt;lock);
+
+      if (res_obj)
+              ww_mutex_unlock(&amp;res_obj-&gt;lock);
+
+      if (ret == -EDEADLK) {
+              /* we lost out in a seqno race, lock and retry.. */
+              ww_mutex_lock_slow(&amp;contended_entry-&gt;obj-&gt;lock, ctx);
+              res_obj = contended_entry-&gt;obj;
+              goto retry;
+      }
+      ww_acquire_fini(ctx);
+
+      return ret;
+}
+</pre></div>
+</div>
+<p>メソッド2は、execbuf-&gt;buffers内のリストを再配置可能な形で使用します。これはメソッド1と同様の- EALREADYによる重複エントリ検出のセマンティクスを持ちますが、リストの再配置により多少自然なコード表現が可能になります。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int lock_objs(struct list_head *list, struct ww_acquire_ctx *ctx)
+{
+      struct obj_entry *entry, *entry2;
+
+      ww_acquire_init(ctx, &amp;ww_class);
+
+      list_for_each_entry (entry, list, head) {
+              ret = ww_mutex_lock(&amp;entry-&gt;obj-&gt;lock, ctx);
+              if (ret &lt; 0) {
+                      entry2 = entry;
+
+                      list_for_each_entry_continue_reverse (entry2, list, head)
+                              ww_mutex_unlock(&amp;entry2-&gt;obj-&gt;lock);
+
+                      if (ret != -EDEADLK) {
+                              ww_acquire_fini(ctx);
+                              return ret;
+                      }
+
+                      /* we lost out in a seqno race, lock and retry.. */
+                      ww_mutex_lock_slow(&amp;entry-&gt;obj-&gt;lock, ctx);
+
+                      /*
+                       * Move buf to head of the list, this will point
+                       * buf-&gt;next to the first unlocked entry,
+                       * restarting the for loop.
+                       */
+                      list_del(&amp;entry-&gt;head);
+                      list_add(&amp;entry-&gt;head, list);
+              }
+      }
+
+      ww_acquire_done(ctx);
+      return 0;
+}
+</pre></div>
+</div>
+<p>メソッド#1と#2の両方において、ロック解除の仕組みは同じです。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void unlock_objs(struct list_head *list, struct ww_acquire_ctx *ctx)
+{
+      struct obj_entry *entry;
+
+      list_for_each_entry (entry, list, head)
+              ww_mutex_unlock(&amp;entry-&gt;obj-&gt;lock);
+
+      ww_acquire_fini(ctx);
+}
+</pre></div>
+</div>
+<p>オブジェクトのリストが即興的に構築される場合にメソッド3が有用です。例えば、グラフのエッジを調整する際、各ノードが独自のww_mutexロックを持つ場合、すべての関与ノードのロックを保持しているときにのみエッジを変更できるため、w/w mutexはこのようなケースに自然に適合します。その理由は以下の通りです：</p>
+<ul class="simple">
+<li><p>ロック取得の順序を問わないため、グラフの開始点から歩き始め、新しいエッジを繰り返し発見し、それらのエッジに接続するノードをロックダウンできるからです。</p></li>
+<li><p>- EALREADYの返却コードにより、特定のオブジェクトがすでにロックされていることを示すため、グラフ内のサイクルを解除するための追加の記録処理や、複数の開始点を使用する際の既にロックされているノードの追跡は不要です。</p></li>
+</ul>
+<p>このアプローチは、上述のメソッドと2つの重要な点で異なります：</p>
+<ul class="simple">
+<li><p>オブジェクトのリストは動的に構築されるため（再試行時に-EDEADLKの条件に遭遇した場合、リストは大きく異なる可能性があります）、ロックされていないオブジェクトを永続的なリストに保持する必要はありません。したがって、リスト_headをオブジェクト自体に移動できます。</p></li>
+<li><p>一方で、動的なオブジェクトリスト構築により、- EALREADYの返却コードを伝播させることはできません。</p></li>
+</ul>
+<p>メソッド#1と#2およびメソッド#3を組み合わせることも可能です。例えば、ユーザー空間から渡された開始ノードのリストを上述のメソッドのいずれかで最初にロックし、その後、メソッド#3を使用して操作に影響される追加のオブジェクトをロックします。バックオフ/再試行プロセスはやや複雑になります。なぜなら、動的ロックステップが-EDEADLKに遭遇した場合、固定リストで取得したすべてのオブジェクトをアンロックする必要があります。ただし、w/w mutexのデバッグチェックはこれらのケースにおけるインターフェースの誤使用を検出します。</p>
+<p>また、メソッド3はロック取得ステップで失敗しないです。なぜなら、- EALREADYを返却しないからです。もちろん、_interruptibleバリアントを使用する場合は異なりますが、ここでの例の範囲外です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct obj {
+      struct ww_mutex ww_mutex;
+      struct list_head locked_list;
+};
+
+static DEFINE_WW_CLASS(ww_class);
+
+void __unlock_objs(struct list_head *list)
+{
+      struct obj *entry, *temp;
+
+      list_for_each_entry_safe (entry, temp, list, locked_list) {
+              /* need to do that before unlocking, since only the current lock holder is
+              allowed to use object */
+              list_del(&amp;entry-&gt;locked_list);
+              ww_mutex_unlock(entry-&gt;ww_mutex)
+      }
+}
+
+void lock_objs(struct list_head *list, struct ww_acquire_ctx *ctx)
+{
+      struct obj *obj;
+
+      ww_acquire_init(ctx, &amp;ww_class);
+
+retry:
+      /* re-init loop start state */
+      loop {
+              /* magic code which walks over a graph and decides which objects
+               * to lock */
+
+              ret = ww_mutex_lock(obj-&gt;ww_mutex, ctx);
+              if (ret == -EALREADY) {
+                      /* we have that one already, get to the next object */
+                      continue;
+              }
+              if (ret == -EDEADLK) {
+                      __unlock_objs(list);
+
+                      ww_mutex_lock_slow(obj, ctx);
+                      list_add(&amp;entry-&gt;locked_list, list);
+                      goto retry;
+              }
+
+              /* locked a new object, add it to the list */
+              list_add_tail(&amp;entry-&gt;locked_list, list);
+      }
+
+      ww_acquire_done(ctx);
+      return 0;
+}
+
+void unlock_objs(struct list_head *list, struct ww_acquire_ctx *ctx)
+{
+      __unlock_objs(list);
+      ww_acquire_fini(ctx);
+}
+</pre></div>
+</div>
+<p>メソッド4：単一のオブジェクトのみをロックします。この場合、デッドロック検出と防止は明らかに過剰です。なぜなら、単一のロックを取得するだけで、1つのクラス内でデッドロックを発生させることはできません。このケースを簡略化するため、NULLコンテキストでw/w mutex APIを使用できます。</p>
+</section>
+<section id="implementation-details">
+<h2>実装の詳細<a class="headerlink" href="#implementation-details" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="design">
+<h3>設計:<a class="headerlink" href="#design" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>ww_mutexは現在、struct mutexをラップしており、これは通常のミューテックスロックには追加のオーバーヘッドが発生しないことを意味します。通常のミューテックスロックははるかに一般的です。そのため、wait/woundミューテックスが使われていない場合でも、コードサイズの増加はわずかです。</p>
+<p>waitリストには以下の不変条件を維持しています:</p>
+<ol class="arabic simple">
+<li><p>取得コンテキストを持つ待機者はスタンプ順に並び、取得コンテキストを持たない待機者はFIFO順に混在します。</p></li>
+<li><p>wait-dieでは、コンテキストを持つ待機者の中で、最初の待機者だけが他のロックをすでに取得している可能性があります（ctx-&gt;acquired &gt; 0）。注意点として、この待機者はリスト内で他のコンテキストを持たない待機者よりも後ろにくる可能性があります。</p></li>
+</ol>
+<p>wound-waitのプリエンプションはラズィプリエンプションスキームで実装されています。トランザクションのwounded状態は、新しいロックの競合が発生した際にのみチェックされます。その状況でトランザクションがwoundedであれば、バックオフしてwounded状態をクリアし、再試行します。このようにプリエンプションを実装する大きな利点は、woundedトランザクションが再開前に競合しているロックを特定して待機できる点です。単純にトランザクションを再開してしまうと、再度バックオフする必要がある状況に陥る可能性があります。</p>
+<p>一般的には競合が少ないものと期待されます。ロックは通常、デバイスへのアクセスをシリアル化するために使用され、最適化は無競合なケースに焦点を当てるべきです。</p>
+</div></blockquote>
+</section>
+<section id="lockdep">
+<h3>Lockdep:<a class="headerlink" href="#lockdep" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>APIの誤用をできるだけ多く警告するため、特別な注意を払っています。いくつかの一般的なAPIの誤用はCONFIG_DEBUG_MUTEXESで検出されますが、CONFIG_PROVE_LOCKINGが推奨されます。</p>
+<dl class="simple">
+<dt>警告されるエラーの例:</dt><dd><ul class="simple">
+<li><p>ww_acquire_finiまたはww_acquire_initを呼び忘れた。</p></li>
+<li><p>ww_acquire_done後に多くのミューテックスをロックしようとした。</p></li>
+<li><p>-EDEADLKで全てのミューテックスをアンロックした後、間違ったミューテックスをロックしようとした。</p></li>
+<li><p>-EDEADLK後に全てのミューテックスをアンロックする前、正しいミューテックスをロックしようとした。</p></li>
+<li><p>-EDEADLKが返された後でww_mutex_lock_slowを呼び出した。</p></li>
+<li><p>間違ったアンロック関数でミューテックスをアンロックした。</p></li>
+<li><p>同じコンテキストでww_acquire_*を2回呼び出した。</p></li>
+<li><p>ミューテックスとww_acquire_ctxで異なるww_classを使用した。</p></li>
+<li><p>デッドロックを引き起こす可能性のある通常のロックデップエラー。</p></li>
+</ul>
+</dd>
+<dt>デッドロックを引き起こす可能性のあるロックデップエラー:</dt><dd><ul class="simple">
+<li><p>ww_acquire_finiを1回目のww_acquire_ctxで呼び終わる前にもう一度ww_acquire_initを呼び出した。</p></li>
+<li><p>通常のデッドロックが発生する可能性がある。</p></li>
+</ul>
+</dd>
+</dl>
+</div></blockquote>
+<dl class="simple">
+<dt>FIXME:</dt><dd><p>TASK_DEADLOCKタスクステートフラグが実装されたらこのセクションを更新してください。</p>
+</dd>
+</dl>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">ロック</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="locktypes.html">ロックの種類とそのルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lockdep-design.html">ランタイムロックの正しさを検証するツール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lockstat.html">ロック統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="locktorture.html">カーネルロックのトラウトテスト操作</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mutex-design.html">ジェネリックミューテックスサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rt-mutex-design.html">RTミューテックスの実装設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rt-mutex.html">PIサポート付きRTミューテックスサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="seqlock.html">シーケンスカウンタとシーケンシャルロック</a></li>
+<li class="toctree-l2"><a class="reference internal" href="spinlocks.html">ロックの教訓</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Wound/Wait Deadlock-Proof Mutex Design</a></li>
+<li class="toctree-l2"><a class="reference internal" href="preempt-locking.html">プリエンプティブカーネルでの適切なロック: カーネルコードのプリエンプ安全性を保つ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pi-futex.html">軽量PIフェイクス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="futex-requeue-pi.html">フェイクス再配置PI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hwspinlock.html">ハードウェアスピンロックフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="percpu-rw-semaphore.html">ペルCPU読み取り専用セマフォ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="robust-futexes.html">ロバストフェイクスの説明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="robust-futex-ABI.html">The robust futex ABI</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">ロック</a><ul>
+<li>前へ: <a href="spinlocks.html" title="前章">ロックの教訓</a></li>
+<li>次へ: <a href="preempt-locking.html" title="次章">プリエンプティブカーネルでの適切なロック: カーネルコードのプリエンプ安全性を保つ</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/locking/ww-mutex-design.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

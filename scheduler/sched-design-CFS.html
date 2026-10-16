@@ -1,0 +1,294 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>CFS スケジューラ — Linux カーネルドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="sched-domains.html" rel="next" title="スケジューラドメイン"/>
+<link href="sched-deadline.html" rel="prev" title="期限ベースタスクスケジューリング"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="cfs-scheduler">
+<h1>CFSスケジューラ<a class="headerlink" href="#cfs-scheduler" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="overview">
+<h2>1. 概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>CFS は「完全な公平スケジューラ（Completely Fair Scheduler）」の略で、インゴ・モルナールによって実装され、Linux 2.6.23 にマージされた新しい「デスクトップ」プロセススケジューラです。これは、以前の vanilla スケジューラの SCHED_OTHER に関するインタラクティブコードの置き換えです。</p>
+<p>CFS の設計の 80% は単一の文でまとめられます：CFS は、現実のハードウェア上で「理想的で正確なマルチタスクCPU」をモデル化しています。</p>
+<p>「理想的なマルチタスクCPU」は（存在しない :-))、100% の物理的なパワーや、各タスクを正確に均等な速度で並列実行できるCPUです。たとえば、2つのタスクが実行されている場合、それぞれが50%の物理的なパワーや、実際に並列で実行されます。</p>
+<p>現実のハードウェアでは一度に1つのタスクしか実行できませんので、「仮想実行時間（virtual runtime）」という概念を導入します。タスクの仮想実行時間は、上記の理想的なマルチタスクCPU上で次のタイムスライスが開始されるタイミングを指定します。実際には、タスクの仮想実行時間は、実際の実行時間を実行中のタスクの総数で正規化したものです。</p>
+</section>
+<section id="few-implementation-details">
+<h2>2. 実装の詳細な情報<a class="headerlink" href="#few-implementation-details" title="この見出しへのパーマリンク">¶</a></h2>
+<p>CFSでは、仮想実行時間はタスクごとのp-&gt;se.vruntime（ナノ秒単位）値を通じて表現され、追跡されます。この方法により、「期待されるCPU時間」を正確にタイムスタンプを刻み、測定することが可能です。</p>
+<dl class="simple">
+<dt>[補足：理想的なハードウェアでは、常にすべてのタスクが同じp-&gt;se.vruntime値を持ち、</dt><dd><p>タスクが同時に実行され、どのタスクもCPU時間の「理想的な配分」からバランスを崩すことは決してありません。]</p>
+</dd>
+</dl>
+<p>CFSのタスク選択ロジックはこのp-&gt;se.vruntime値に基づいており、非常に単純です：常に最小のp-&gt;se.vruntime値を持つタスク（つまりこれまでに実行時間が最も少ないタスク）を実行しようとします。CFSは、実行可能なタスク間でCPU時間を「理想的なマルチタスクハードウェア」に近づけるように分割しようとします。</p>
+<p>CFSの設計の大部分はこの非常に単純な概念から導き出され、niceレベルやマルチプロセッシング、さまざまなアルゴリズムの変種といった追加機能で補完されています。これらはスリープ中のタスクを認識するためのものです。</p>
+</section>
+<section id="the-rbtree">
+<h2>3. レッドブラックツリー<a class="headerlink" href="#the-rbtree" title="この見出しへのパーマリンク">¶</a></h2>
+<p>CFSの設計は非常に革新しており、実行キュー用の古いデータ構造を使わず、時間順に並べたレッドブラックツリーを用いて将来のタスク実行の「タイムライン」を構築します。これにより、配列スイッチのアーティファクト（以前のバニラスケジューラーおよびRSDL/SDにも影響を与えるもの）がありません。</p>
+<p>CFSは、rq-&gt;cfs.min_vruntime値も保持しており、これは実行待ちキュー内のすべてのタスクの中で最小のvruntimeを単調に増加する値として追跡します。システムが実行した作業の総量はmin_vruntimeによって追跡され、この値は新たにアクティブ化されたエンティティを木の左側にできるだけ配置するために使用されます。</p>
+<p>実行待ちキュー内の実行中のタスクの総数は、rq-&gt;cfs.load値を通じて記録されます。これは実行待ちキューにキューイングされているタスクの重みの合計です。</p>
+<p>CFSは時間順に並べられた赤黒木を維持しており、すべての実行可能なタスクはp-&gt;se.vruntimeキーによってソートされます。CFSはこの木から「左端」のタスクを選び、それにこだわります。システムが進むにつれて、実行されたタスクは徐々に木の右側に配置されるため、すべてのタスクが「左端のタスク」となる機会が与えられ、決定的な時間内にCPUに実行されるようになります。</p>
+<p>まとめると、CFSはタスクを少し実行し、タスクがスケジューリングされる（またはスケジューラのティックが発生する）と、そのCPU使用量が「記録される」ことで、タスクが物理CPUを実際に使用した時間（小さな時間）がp-&gt;se.vruntimeに加算されます。p-&gt;se.vruntimeが十分に高くなり、時間順に並べられた赤黒木で他のタスクが「左端のタスク」になるようになる（左端のタスクに対する小さな「粒度」距離を加えて過剰にスケジューリングを防ぎ、キャッシュを破壊しないようにする）と、新しい左端のタスクが選ばれ、現在のタスクがプリエンプションされます。</p>
+</section>
+<section id="some-features-of-cfs">
+<h2>4. CFSの特徴<a class="headerlink" href="#some-features-of-cfs" title="この見出しへのパーマリンク">¶</a></h2>
+<p>CFSはナノ秒単位のアカウント管理を使用し、ジーフィーズや他のHZの詳細に依存しません。したがって、CFSスケジューラは以前のスケジューラが持っていた「タイムスライス」の概念を持ちませんし、まったくのヒューリスティクスもありません。唯一の中心的な調整可能なパラメータ（CONFIG_SCHED_DEBUGを有効にする必要があります）は、</p>
+<blockquote>
+<div><p>/proc/sys/kernel/sched_min_granularity_ns</p>
+</div></blockquote>
+<p>で、スケジューラを「デスクトップ」（つまり、低遅延）から「サーバー」（つまり、良いバッチ処理）のワークロードに調整できます。デフォルトではデスクトップワークロードに適した設定になっています。SCHED_BATCHはCFSスケジューラモジュールでも処理されます。</p>
+<p>設計上、CFSスケジューラは現在のストックスケジューラのヒューリスティクスに対する「攻撃」に対して脆弱ではありません。fiftyp.c、thud.c、chew.c、ring-test.c、massive_intr.cなどすべてのファイルは正常に動作し、インタラクティブ性に影響を与えず、予期される動作をします。</p>
+<p>CFSスケジューラは、以前のvanillaスケジューラよりもniceレベルやSCHED_BATCHの処理が大幅に強化されており、両方のワークロードがより積極的に隔離される。</p>
+<p>SMPロードバランシングは再設計・整理されており、ロードバランシングコードにはrunqueue-walkingの仮定がなくなった。スケジューリングモジュールのイテレータが使用され、バランスコードは大幅に簡潔になった。</p>
+</section>
+<section id="scheduling-policies">
+<h2>5. スケジューリングポリシー<a class="headerlink" href="#scheduling-policies" title="この見出しへのパーマリンク">¶</a></h2>
+<p>CFSは3つのスケジューリングポリシーを実装している:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>SCHED_NORMAL (従来はSCHED_OTHERと呼ばれていた): 通常のタスクに使用されるスケジューリングポリシー。</p></li>
+<li><p>SCHED_BATCH: 通常タスクほど頻繁にプリエンプションを起こさないため、タスクがより長く実行されキャッシュの利用効率が向上するが、インタラクティブ性を犠牲にする。これはバッチジョブに非常に適している。</p></li>
+<li><p>SCHED_IDLE: nice 19よりもさらに弱いが、優先度逆転問題によるデッドロックを避けるため、真のアイドルタイマースケジューラではない。</p></li>
+</ul>
+</div></blockquote>
+<p>SCHED_FIFO/_RRはsched/rt.cで実装されており、POSIX仕様に準拠している。</p>
+<p>util-linux-ng 2.13.1.1のchrtコマンドは、SCHED_IDLEを除いてすべてのポリシーを設定できる。</p>
+</section>
+<section id="scheduling-classes">
+<h2>6. スケジューリングクラス<a class="headerlink" href="#scheduling-classes" title="この見出しへのパーマリンク">¶</a></h2>
+<p>新しいCFSスケジューラは、拡張可能なスケジューリングモジュールの階層構造である「スケジューリングクラス」を導入するように設計されている。これらのモジュールはスケジューリングポリシーの詳細をカプセル化しており、コアコードはそれらについてあまり仮定をしないで処理する。</p>
+<p>sched/fair.cは上記のCFSスケジューラを実装している。</p>
+<p>sched/rt.cはSCHED_FIFOとSCHED_RRのセマンティクスを、以前のvanillaスケジューラよりシンプルな方法で実装している。100のランキュー（すべての100のRT優先度レベルに対応）を使用し、以前のスケジューラの140に代わっており、expired配列は必要ない。</p>
+<p>スケジューリングクラスはsched_class構造体を通じて実装されており、興味深いイベントが発生するたびに呼び出す必要のある関数のハンドラを含んでいる。</p>
+<p>これは（一部を除く）ハンドラの一覧:</p>
+<blockquote>
+<div><ul>
+<li><p>enqueue_task(…)</p>
+<p>タスクが実行可能状態に移るときに呼ばれる。スケジューリングエンティティ（タスク）を赤黒木に挿入し、nr_running変数をインクリメントする。</p>
+</li>
+<li><p>dequeue_task(…)</p>
+<p>タスクが実行不可能になったときに呼ばれる。対応するスケジューリングエンティティを赤黒木から削除し、nr_running変数をデクリメントする。</p>
+</li>
+<li><p>yield_task(…)</p>
+<p>この関数は基本的にdequeueの後にenqueueを行うだけだが、compat_yield sysctlが有効になっている場合は、赤黒木の右端にスケジューリングエンティティを配置する。</p>
+</li>
+<li><p>check_preempt_curr(…)</p>
+<p>この関数は、実行可能状態に入ったタスクが現在実行中のタスクを優先実行すべきかどうかを確認します。</p>
+</li>
+<li><p>pick_next_task(…)</p>
+<p>この関数は、次の実行に適したタスクを選びます。</p>
+</li>
+<li><p>set_curr_task(…)</p>
+<p>タスクがスケジューリングクラスを変更するか、タスクグループを変更するときにこの関数が呼ばれます。</p>
+</li>
+<li><p>task_tick(…)</p>
+<p>この関数は主にタイマーティック関数から呼び出されます。プロセスの切り替えを引き起こす可能性があります。これは実行中のタスクの優先実行を促進します。</p>
+</li>
+</ul>
+</div></blockquote>
+</section>
+<section id="group-scheduler-extensions-to-cfs">
+<h2>7. CFSへのグループスケジューラ拡張<a class="headerlink" href="#group-scheduler-extensions-to-cfs" title="この見出しへのパーマリンク">¶</a></h2>
+<p>通常、スケジューラは個々のタスクを対象とし、各タスクに公平なCPU時間を提供しようとします。時には、タスクをグループ化し、各グループに公平なCPU時間を提供することが望まれることがあります。たとえば、システム内の各ユーザーに公平なCPU時間を提供した後、各ユーザーに属するタスクに公平なCPU時間を提供することが望まれることがあります。</p>
+<p>CONFIG_CGROUP_SCHEDはまさにその目的を達成しようとします。タスクをグループ化し、そのようなグループ間でCPU時間を公平に分配します。</p>
+<p>CONFIG_RT_GROUP_SCHEDは、リアルタイム（つまり、SCHED_FIFOおよびSCHED_RR）タスクをグループ化することを許可します。</p>
+<p>CONFIG_FAIR_GROUP_SCHEDは、CFS（つまり、SCHED_NORMALおよびSCHED_BATCH）タスクをグループ化することを許可します。</p>
+<blockquote>
+<div><p>これらのオプションはCONFIG_CGROUPSが定義されている必要があります。管理者は、「cgroup」擬似ファイルシステムを使用して、任意のタスクグループを作成できます。詳しくは、
+<a class="reference internal" href="../admin-guide/cgroup-v1/cgroups.html"><span class="doc">制御グループ（Control Groups）</span></a> この擬似ファイルシステムについての詳細情報はこちらをご覧ください。</p>
+</div></blockquote>
+<p>CONFIG_FAIR_GROUP_SCHEDが定義されている場合、擬似ファイルシステムを使用して作成された各グループに対して「cpu.shares」ファイルが作成されます。以下の例の手順を参照して、「cgroups」擬似ファイルシステムを使用してタスクグループを作成し、そのCPUシェアを変更してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># mount -t tmpfs cgroup_root /sys/fs/cgroup
+# mkdir /sys/fs/cgroup/cpu
+# mount -t cgroup -ocpu none /sys/fs/cgroup/cpu
+# cd /sys/fs/cgroup/cpu
+
+# mkdir multimedia      # create "multimedia" group of tasks
+# mkdir browser         # create "browser" group of tasks
+
+# #Configure the multimedia group to receive twice the CPU bandwidth
+# #that of browser group
+
+# echo 2048 &gt; multimedia/cpu.shares
+# echo 1024 &gt; browser/cpu.shares
+
+# firefox &amp;     # Launch firefox and move it to "browser" group
+# echo &lt;firefox_pid&gt; &gt; browser/tasks
+
+# #Launch gmplayer (or your favourite movie player)
+# echo &lt;movie_player_pid&gt; &gt; multimedia/tasks
+</pre></div>
+</div>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxスケジューラ</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="completion.html">完了 - 「完了を待つ」バリアAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-arch.html">アーキテクチャ固有コードにおけるCPUスケジューラ実装ヒント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-bwc.html">CFS帯域制御</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-deadline.html">期限ベースタスクスケジューリング</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">CFSスケジューラ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-domains.html">スケジューラドメイン</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-capacity.html">容量感知スケジューリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-energy.html">エネルギー感知スケジューリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-nice-design.html">スケジューラ・ニース設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-rt-group.html">リアルタイムグループスケジューリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-stats.html">スケジューラ統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="text_files.html">スケジューラ pelt C プログラム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxスケジューラ</a><ul>
+<li>前へ: <a href="sched-deadline.html" title="前章">期限ベースタスクスケジューリング</a></li>
+<li>次へ: <a href="sched-domains.html" title="次章">スケジューラドメイン</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/scheduler/sched-design-CFS.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

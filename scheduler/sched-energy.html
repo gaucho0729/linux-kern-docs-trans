@@ -1,0 +1,388 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Energy Aware Scheduling — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="sched-nice-design.html" rel="next" title="スケジューラ・ニース設計"/>
+<link href="sched-capacity.html" rel="prev" title="容量感知スケジューリング"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="energy-aware-scheduling">
+<h1>エネルギー感知スケジューリング<a class="headerlink" href="#energy-aware-scheduling" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="introduction">
+<h2>1. はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Energy Aware Scheduling（EAS）は、スケジューラがCPUの消費エネルギーに与える影響を予測する能力を提供します。EASは、CPUのエネルギー消費を最小限に抑えつつ、スループットへの影響を軽減しながら、各タスクにエネルギー効率の高いCPUを選択するため、CPUのエネルギーモデル（EM）に依存しています。このドキュメントでは、EASの仕組みや設計上の主な決定事項、および動作させるために必要な要素について紹介します。</p>
+<p>さらに読み進める前に、以下の点をご確認ください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/!\ EAS does not support platforms with symmetric CPU topologies /!\
+</pre></div>
+</div>
+<p>EASは、エネルギー節約の可能性が高い異質なCPUのトポロジー（例：Arm big.LITTLE）でのみ動作します。</p>
+<p>EASが実際に使用するEMは、スケジューラによってではなく、専用のフレームワークによって管理されます。このフレームワークの詳細および提供する機能については、そのドキュメント（参照： <a class="reference internal" href="../power/energy-model.html"><span class="doc">デバイスのエネルギー計算モデル</span></a>).</p>
+</section>
+<section id="background-and-terminology">
+<h2>2. 背景と用語<a class="headerlink" href="#background-and-terminology" title="この見出しへのパーマリンク">¶</a></h2>
+<dl class="simple">
+<dt>最初に明確にしておくと：</dt><dd><ul class="simple">
+<li><p>エネルギー = [ジュール]（電池などのリソース）</p></li>
+<li><p>電力 = エネルギー/時間 = [ジュール/秒] = [ワット]</p></li>
+</ul>
+</dd>
+</dl>
+<p>EASの目標は、エネルギーを最小化しながら作業を完了することです。つまり、以下のものを最大化します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>performance [inst/s]
+--------------------
+    power [W]
+</pre></div>
+</div>
+<p>これは、以下のものを最小化することに等しいです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>energy [J]
+-----------
+instruction
+</pre></div>
+</div>
+<p>ながら、「良い」パフォーマンスを維持します。これは、スケジューラの現在のパフォーマンスのみを重視する最適化目標の代替となるものです。この代替は、エネルギー効率とパフォーマンスの2つの目標を考慮します。</p>
+<p>エネルギーモデル（EM）を導入する目的は、スケジューラが決定の影響を評価できるようにすることです。盲目的にエネルギー節約技術を適用するのではなく、特定のプラットフォームでのみポジティブな効果をもたらす可能性があるためです。同時に、EMはできるだけシンプルでなければならないため、スケジューラのレイテンシーへの影響を最小限に抑えます。</p>
+<p>要するに、EASはCFSタスクをCPUに割り当てる方法を変更します。スケジューラがタスクを実行するCPUを選択する際（起動時）、EMを用いて複数の優れたCPU候補の間で選択を行い、システムのスループットに悪影響を与えることなく、エネルギー消費を最小限に抑えるCPUを選びます。EASが行う予測は、プラットフォームのトポロジーに関する特定の知識（CPUの「容量」やそれぞれのエネルギーコストなど）に基づいています。</p>
+</section>
+<section id="topology-information">
+<h2>3. テポロジー情報<a class="headerlink" href="#topology-information" title="この見出しへのパーマリンク">¶</a></h2>
+<p>EAS（スケジューラの他の部分も含む）は、計算性能の違いを区別するために「容量（capacity）」という概念を使用します。「容量」は、システムで最も性能が高いCPUと比較して、CPUが最高周波数で動作するときに吸収できる作業量を表します。容量値は1024の範囲で正規化され、Per-Entity Load Tracking（PELT）メカニズムでタスクやCPUの利用信号と比較可能になります。容量と利用値をもとに、EASはタスク/CPUの規模や忙しさを推定し、パフォーマンスとエネルギーのトレードオフを評価する際の考慮に活用します。CPUの容量は、アーキテクチャ固有のコードを通じてarch_scale_cpu_capacity()コールバックで提供されます。</p>
+<p>EASが使用するその他のプラットフォーム知識は、エネルギーモデル（EM）フレームワークから直接読み込まれます。プラットフォームのEMは、システム内の各「パフォーマンスドメイン」ごとに電力コストテーブルで構成され（詳しくは <a class="reference internal" href="../power/energy-model.html"><span class="doc">デバイスのエネルギー計算モデル</span></a>
+パフォーマンスドメインに関する追加情報はこちら。）</p>
+<p>スケジューラは、スケジューリングドメインが構築されるか再構築されるときに、トポロジコード内でEMオブジェクトへの参照を管理します。各ルートドメイン（rd）に対して、スケジューラは現在のrd-&gt;spanと交差するすべてのパフォーマンスドメインを保持する単一連結リストを維持します。リストの各ノードには、EMフレームワークから提供されるstruct em_perf_domainへのポインタが含まれます。</p>
+<p>リストは排他CPUセットの設定に対応するため、ルートドメインに接続されます。排他CPUセットの境界はパフォーマンスドメインの境界と必ず一致するとは限らないため、異なるルートドメインのリストには重複する要素が含まれることがあります。</p>
+<dl>
+<dt>例1。</dt><dd><p>12コアのCPUを持つプラットフォームを想定し、3つのパフォーマンスドメイン（pd0、pd4、pd8）に分割されているとします。構成は以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>CPUs:   0 1 2 3 4 5 6 7 8 9 10 11
+PDs:   |--pd0--|--pd4--|---pd8---|
+RDs:   |----rd1----|-----rd2-----|
+</pre></div>
+</div>
+<p>ユーザー空間がシステムを2つの排他CPUセットに分割した場合、2つの独立したルートドメインが作成され、それぞれ6コアを含みます。この場合、図の上記でrd1とrd2と呼ばれる2つのルートドメインが生成されます。pd4がrd1とrd2の両方に交差するため、それぞれのルートドメインに接続されたリンク先「-&gt;pd」リストに含まれます：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>rd1-&gt;pd: pd0 -&gt; pd4</p></li>
+<li><p>rd2-&gt;3: pd4 -&gt; pd8</p></li>
+</ul>
+</div></blockquote>
+<p>注意点として、スケジューラはpd4に対して2つの重複するリストノードを生成します（それぞれのリストに1つずつ）。しかし、これらはすべてEMフレームワークの共有データ構造へのポインタを保持しています。</p>
+</dd>
+</dl>
+<p>これらのリストへのアクセスはホットプラグや他の操作と同時に発生する可能性があるため、トポロジ構造の他の部分と同様にRCUで保護されています。</p>
+<p>EASは、少なくとも1つのルートドメインがEASを開始するためのすべての条件を満たしたときに有効となる静的キー(sched_energy_present)も保持しています。これらの条件は第6節にまとめられています。</p>
+</section>
+<section id="energy-aware-task-placement">
+<h2>4. エネルギーを意識したタスク配置<a class="headerlink" href="#energy-aware-task-placement" title="この見出しへのパーマリンク">¶</a></h2>
+<p>EASはCFSタスクのウェイクアップバランスコードを上書きします。プラットフォームのEMとPELT信号を使用して、ウェイクアップバランス時にエネルギー効率の高いターゲットCPUを選択します。EASが有効な場合、select_task_rq_fair()はfind_energy_efficient_cpu()を呼び出して配置決定を行います。この関数は、各パフォーマンスドメインで最大の余剰容量（CPU容量 - CPU利用率）を持つCPUを探します。これは周波数を最低限に保つためのものです。その後、このCPUにタスクを配置することでエネルギーを節約できるかどうか、prev_cpu（タスクが前回アクティベーションで実行されていたCPU）と比較して確認します。</p>
+<p>find_energy_efficient_cpu()はcompute_energy()を使用して、ウェイクアップタスクが移動した場合のシステムのエネルギー消費量を推定します。compute_energy()は現在のCPUの利用率状況を確認し、タスク移動を「シミュレート」するために調整します。EMフレームワークはem_pd_energy() APIを提供し、与えられた利用率状況に基づいて各パフォーマンスドメインの予想されるエネルギー消費量を計算します。</p>
+<p>エネルギー最適化されたタスク配置の決定例は以下に詳述します。</p>
+<dl>
+<dt>例2。</dt><dd><p>以下に、2つの独立したパフォーマンスドメインからなる仮想プラットフォームを考えてみましょう。CPU0とCPU1は小規模CPU、CPU2とCPU3は大規模CPUです。</p>
+<p>スケジューラは、util_avgが200でprev_cpuが0のタスクPをどこに配置するかを決定する必要があります。</p>
+<p>CPUの現在の利用率状況は下記のグラフに示されています。CPU0〜3のutil_avgはそれぞれ400、100、600、500です。各パフォーマンスドメインには3つのOperating Performance Points（OPPs）があります。各OPPに関連するCPU容量と電力コストはエネルギー・モデル表に記載されています。Pのutil_avgは以下の図に「PP」として表示されています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>CPU util.
+ 1024                 - - - - - - -              Energy Model
+                                          +-----------+-------------+
+                                          |  Little   |     Big     |
+  768                 =============       +-----+-----+------+------+
+                                          | Cap | Pwr | Cap  | Pwr  |
+                                          +-----+-----+------+------+
+  512  ===========    - ##- - - - -       | 170 | 50  | 512  | 400  |
+                        ##     ##         | 341 | 150 | 768  | 800  |
+  341  -PP - - - -      ##     ##         | 512 | 300 | 1024 | 1700 |
+        PP              ##     ##         +-----+-----+------+------+
+  170  -## - - - -      ##     ##
+        ##     ##       ##     ##
+      ------------    -------------
+       CPU0   CPU1     CPU2   CPU3
+
+ Current OPP: =====       Other OPP: - - -     util_avg (100 each): ##
+</pre></div>
+</div>
+<p>find_energy_efficient_cpu()はまず、2つのパフォーマンスドメインで最大の余剰容量を持つCPU（この例ではCPU1とCPU3）を探します。次に、PをそれぞれのCPUに配置した場合のシステムエネルギーを推定し、PをCPU0に残すよりもエネルギーを節約できるかどうかを確認します。EASはOPPsが利用率に従うと仮定しています（これはschedutil CPUFreqガバナの動作と一致しています。このトピックについての詳細は第6節を参照してください）。</p>
+<p><strong>ケース1. PがCPU1に移動する</strong>:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1024                 - - - - - - -
+
+                                      Energy calculation:
+ 768                 =============     * CPU0: 200 / 341 * 150 = 88
+                                       * CPU1: 300 / 341 * 150 = 131
+                                       * CPU2: 600 / 768 * 800 = 625
+ 512  - - - - - -    - ##- - - - -     * CPU3: 500 / 768 * 800 = 520
+                       ##     ##          =&gt; total_energy = 1364
+ 341  ===========      ##     ##
+              PP       ##     ##
+ 170  -## - - PP-      ##     ##
+       ##     ##       ##     ##
+     ------------    -------------
+      CPU0   CPU1     CPU2   CPU3
+</pre></div>
+</div>
+<p><strong>ケース2. PがCPU3に移動する</strong>:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1024                 - - - - - - -
+
+                                      Energy calculation:
+ 768                 =============     * CPU0: 200 / 341 * 150 = 88
+                                       * CPU1: 100 / 341 * 150 = 43
+                              PP       * CPU2: 600 / 768 * 800 = 625
+ 512  - - - - - -    - ##- - -PP -     * CPU3: 700 / 768 * 800 = 729
+                       ##     ##          =&gt; total_energy = 1485
+ 341  ===========      ##     ##
+                       ##     ##
+ 170  -## - - - -      ##     ##
+       ##     ##       ##     ##
+     ------------    -------------
+      CPU0   CPU1     CPU2   CPU3
+</pre></div>
+</div>
+<p><strong>ケース3. Pはprev_cpu / CPU 0にとどまる</strong>:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>1024                 - - - - - - -
+
+                                      Energy calculation:
+ 768                 =============     * CPU0: 400 / 512 * 300 = 234
+                                       * CPU1: 100 / 512 * 300 = 58
+                                       * CPU2: 600 / 768 * 800 = 625
+ 512  ===========    - ##- - - - -     * CPU3: 500 / 768 * 800 = 520
+                       ##     ##          =&gt; total_energy = 1437
+ 341  -PP - - - -      ##     ##
+       PP              ##     ##
+ 170  -## - - - -      ##     ##
+       ##     ##       ##     ##
+     ------------    -------------
+      CPU0   CPU1     CPU2   CPU3
+</pre></div>
+</div>
+<p>これらの計算から、ケース1が最も低い総エネルギー消費を示しています。したがって、エネルギー効率の観点からCPU 1が最適な候補です。</p>
+</dd>
+</dl>
+<p>大規模なCPUは一般的に小規模なCPUよりも電力消費が大きく、タスクが小規模なCPUに収まらない場合に主に使用されます。ただし、小規模なCPUが常に大規模なCPUよりもエネルギー効率が高いとは限りません。たとえば、小規模なCPUの高いOPPsが、大規模なCPUの最低OPPsよりもエネルギー効率が悪くなる場合があります。そのため、小規模なCPUが特定の時点で十分な利用率を有している場合、その瞬間に起動する小さなタスクが、エネルギーを節約するためには大規模なCPUで実行する方が良い場合があります。</p>
+<p>また、すべての大規模CPUのOPPsが小規模CPUのそれよりもエネルギー効率が悪い場合でも、小さなタスクを大規模CPUで実行することで、特定の条件下ではエネルギーを節約できる可能性があります。実際、タスクを小規模CPUに配置すると、全体のパフォーマンスドメインのOPPが上昇し、すでに実行中のタスクのコストが増加します。タスクを大規模CPUに配置すると、そのタスクの実行コストは小規模CPUで実行するよりも高くなるかもしれませんが、小規模CPUの他のタスクには影響を与えません。したがって、CPU全体のエネルギー消費を考慮すると、1つのタスクを大規模コアで実行する追加コストが、小規模CPUのすべての他のタスクのOPPを上げるコストよりも小さい可能性があります。</p>
+<p>上述の例は、システム内のすべてのCPUで異なるOPPでの実行コストを知ることなく、一般的な方法で正確に処理するのはほぼ不可能です。EMベースの設計により、EASはこれらを正しく処理することができ、多くの問題を回避できます。ただし、高利用率のシナリオにおいてスループットへの影響を最小限に保つため、EASはもう一つのメカニズムである「オーバーユーティリゼーション」を実装しています。</p>
+</section>
+<section id="over-utilization">
+<h2>5. オーバーユーティリゼーション<a class="headerlink" href="#over-utilization" title="この見出しへのパーマリンク">¶</a></h2>
+<p>一般的な観点から見ると、EASが最も役立つユースケースは、CPU利用率が軽度〜中程度のものである。長時間CPUに依存したタスクが実行される際には、すべての可用CPU容量が必要となり、スケジューラがパフォーマンスを大幅に損なうことなくエネルギーを節約する手段は限られている。EASによるパフォーマンスへの影響を避けるため、CPUが計算能力の80%以上で使用される時点で「過剰に利用されている」とフラグが立つ。ルートドメイン内でどのCPUも過剰に利用されていない限り、ロードバランシングは無効化され、EASがウェイクアップバランシングコードを上書きする。EASは、パフォーマンスへの影響を出さずにシステムの最もエネルギー効率の高いCPUを他のCPUよりも優先的に使用する傾向がある。そのため、ロードバランサーを無効化して、EASが見つけたエネルギー効率的なタスク配置を破壊しないようにする。システムが過剰に利用されていない状態ではこの操作は安全である。なぜなら、80%の閾値を下回っているということは:</p>
+<blockquote>
+<div><ol class="loweralpha simple">
+<li><p>すべてのCPUにアイドル時間があるため、EASが使用する利用率信号は、システム内のさまざまなタスクの「サイズ」を正確に表している可能性が高い;</p></li>
+<li><p>すべてのタスクに十分なCPU容量がすでに提供されているため、ニース値に関係なく;</p></li>
+<li><p>アイドル容量があるため、すべてのタスクが定期的にブロッキング/スリープしており、ウェイクアップ時のバランス調整が十分である。</p></li>
+</ol>
+</div></blockquote>
+<p>1つのCPUが80%の閾値を越えると、上記の3つの仮定のうち少なくとも1つが誤りになる。この状況では、ルートドメイン全体に「過剰に利用されている」というフラグが立つため、EASは無効化され、ロードバランサーが再び有効化される。これにより、スケジューラはCPUに依存した状態でウェイクアップとロードバランスに負荷ベースのアルゴリズムを戻す。これにより、タスクのニース値への配慮がより適切になる。</p>
+<p>過剰利用の概念は、システム内にアイドル時間があるかどうかを検出することに大きく依存しているため、CFSよりも高いスケジューリングクラス（およびIRQ）が「盗まれた」CPU容量を考慮する必要がある。したがって、過剰利用の検出は、CFSタスクだけでなく、他のスケジューリングクラスやIRQによって使用される容量も考慮する。</p>
+</section>
+<section id="dependencies-and-requirements-for-eas">
+<h2>6. EASの依存関係と要件<a class="headerlink" href="#dependencies-and-requirements-for-eas" title="この見出しへのパーマリンク">¶</a></h2>
+<p>エネルギー効率スケジューリング（EAS）は、システムのCPUが特定のハードウェアプロパティを備えていること、およびカーネルの他の機能が有効になっていることを前提としている。このセクションではこれらの依存関係をリストアップし、それらを満たす方法についてのヒントを提供する。</p>
+<section id="asymmetric-cpu-topology">
+<h3>6.1 - 非対称CPUトポロジー<a class="headerlink" href="#asymmetric-cpu-topology" title="この見出しへのパーマリンク">¶</a></h3>
+<p>導入部で述べたように、EASは現在は非対称CPUトポロジーを持つプラットフォームでのみサポートされています。この要件は、スケジューリングドメインが構築される際、SD_ASYM_CPUCAPACITYフラグの存在を確認することでランタイムでチェックされます。</p>
+<p>参照 <a class="reference internal" href="sched-capacity.html"><span class="doc">容量感知スケジューリング</span></a> このフラグがsched_domain階層に設定されるために満たすべき要件について。</p>
+<p>EASはSMPと根本的に互換性がないわけではありませんが、SMPプラットフォームでの節約効果はまだ確認されていません。この制限は、他の証拠が示された場合、今後修正される可能性があります。</p>
+</section>
+<section id="energy-model-presence">
+<h3>6.2 - エネルギーモデルの存在<a class="headerlink" href="#energy-model-presence" title="この見出しへのパーマリンク">¶</a></h3>
+<p>EASはプラットフォームのエネルギー計算モデル（EM）を使用して、スケジューリング決定がエネルギーに与える影響を推定します。したがって、あなたのプラットフォームはEMフレームワークに電力コストテーブルを提供する必要があります。これを行うには、独立したEMフレームワークのドキュメンテーションを参照してください。 <a class="reference internal" href="../power/energy-model.html"><span class="doc">デバイスのエネルギー計算モデル</span></a>.</p>
+<p>また、EMが登録された後、スケジューリングドメインを再構築する必要があります。これによりEASが開始されます。</p>
+</section>
+<section id="energy-model-complexity">
+<h3>6.3 - エネルギーモデルの複雑さ<a class="headerlink" href="#energy-model-complexity" title="この見出しへのパーマリンク">¶</a></h3>
+<p>タスクのウェイクアップパスは非常にレイテンシーに敏感です。プラットフォームのエネルギー計算モデルが複雑すぎる（CPUが多すぎる、パフォーマンスドメインが多すぎる、パフォーマンスステートが多すぎるなど）場合、ウェイクアップパスでの使用コストが許容しがたい場合があります。エネルギー意識型ウェイクアップアルゴリズムの複雑さは以下の通りです：</p>
+<blockquote>
+<div><p>C = Nd * (Nc + Ns)</p>
+</div></blockquote>
+<p>Ndはパフォーマンスドメインの数、NcはCPUの数、Nsは総 OPP数（例：2つのパフォーマンスドメインでそれぞれ4つのOPPを持つ場合、Ns = 8）です。</p>
+<p>複雑さのチェックはスケジューリングドメインが構築される際、ルートドメインレベルで行われます。EASは、Cが完全に任意のEM_MAX_COMPLEXITY閾値（執筆時点では2048）を上回る場合、ルートドメインで開始されません。</p>
+<p>EASを使用したいが、プラットフォームのエネルギー計算モデルの複雑さが単一のルートドメインで使用するには高すぎる場合、選択肢は以下の2つに限られます：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>専用のCPUセットを使用してシステムを小さなルートドメインに分割し、それぞれでEASをローカルで有効化します。この選択肢は即座に動作しますが、ルートドメイン間の負荷バランスを妨げるため、全体的にバランスの取れたシステムを維持できなくなる可能性があります。</p></li>
+<li><p>EASウェイクアップアルゴリズムの複雑さを減らすパッチを提出し、より大きなエネルギー計算モデルに対応できるようにする。</p></li>
+</ol>
+</div></blockquote>
+</section>
+<section id="schedutil-governor">
+<h3>6.4 - Schedutilガバナ<a class="headerlink" href="#schedutil-governor" title="この見出しへのパーマリンク">¶</a></h3>
+<p>EASは、CPUが近い将来どのOPPで動作するかを予測し、エネルギー消費量を推定します。そのため、CPUのOPPはその利用率に従うと仮定されます。</p>
+<p>実際には、この仮定の正確性に関するハードな保証を提供するのは非常に困難です（ハードウェアが指示された動作をしない可能性があるためなど）。しかし、schedutilは他のCPUFreqのガバナーよりも少なくとも_利用率信号を基にした周波数を要求するという点で、ある程度の整合性を提供します。したがって、EASと併用するにはschedutilが唯一の健全なガバナーです。なぜなら、それは周波数要求とエネルギー予測の間にある程度の整合性を提供する唯一のガバナーだからです。</p>
+<p>schedutil以外のガバナーとEASを併用するのは推奨されません。</p>
+</section>
+<section id="scale-invariant-utilization-signals">
+<h3>6.5 スケール不変の利用率信号<a class="headerlink" href="#scale-invariant-utilization-signals" title="この見出しへのパーマリンク">¶</a></h3>
+<p>CPU間での正確な予測やすべてのパフォーマンス状態での予測を行うためには、EASは周波数不変かつCPU不変のPELT信号を必要とします。これらはアーキテクチャ定義のarch_scale{cpu,freq}_capacity()コールバックを用いて取得できます。</p>
+<p>これらの2つのコールバックを実装していないプラットフォームでEASを使用することはサポートされていません。</p>
+</section>
+<section id="multithreading-smt">
+<h3>6.6 マルチスレッド（SMT）<a class="headerlink" href="#multithreading-smt" title="この見出しへのパーマリンク">¶</a></h3>
+<p>現在のEASはSMTを認識していないため、マルチスレッドハードウェアを活用してエネルギーを節約することはできません。EASはスレッドを独立したCPUとみなすため、パフォーマンスとエネルギーの両面で逆効果になる可能性があります。</p>
+<p>SMTでのEASはサポートされていません。</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxスケジューラ</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="completion.html">完了 - 「完了を待つ」バリアAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-arch.html">アーキテクチャ固有コードにおけるCPUスケジューラ実装ヒント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-bwc.html">CFS帯域制御</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-deadline.html">期限ベースタスクスケジューリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-design-CFS.html">CFSスケジューラ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-domains.html">スケジューラドメイン</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-capacity.html">容量感知スケジューリング</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">エネルギー感知スケジューリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-nice-design.html">スケジューラ・ニース設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-rt-group.html">リアルタイムグループスケジューリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-stats.html">スケジューラ統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="text_files.html">スケジューラ pelt C プログラム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxスケジューラ</a><ul>
+<li>前へ: <a href="sched-capacity.html" title="前章">容量感知スケジューリング</a></li>
+<li>次へ: <a href="sched-nice-design.html" title="次章">スケジューラ・ニース設計</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/scheduler/sched-energy.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

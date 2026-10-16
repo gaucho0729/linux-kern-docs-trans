@@ -1,0 +1,1149 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>RxRPC Network Protocol — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="sctp.html" rel="next" title="LinuxカーネルSCTP"/>
+<link href="regulatory.html" rel="prev" title="Linuxワイヤレス規制ドキュメンテーション"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="rxrpc-network-protocol">
+<h1>RxRPC ネットワークプロトコル<a class="headerlink" href="#rxrpc-network-protocol" title="この見出しへのパーマリンク">¶</a></h1>
+<p>RxRPCプロトコルドライバーは、UDP上での信頼性のある二段階のトランスポートを提供し、RxRPCリモート操作を実行するために使用できます。これはAF_RXRPCファミリーのソケットを使用し、sendmsg()とrecvmsg()を用いて制御データとともにデータ、中止、エラーを送受信します。</p>
+<p>このドキュメントの内容:</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>概要。</p></li>
+<li><p>RxRPCプロトコルの概要。</p></li>
+<li><p>AF_RXRPCドライバモデル。</p></li>
+<li><p>制御メッセージ。</p></li>
+<li><p>ソケットオプション。</p></li>
+<li><p>セキュリティ。</p></li>
+<li><p>例: クライアントの使用方法。</p></li>
+<li><p>例: サーバーの使用方法。</p></li>
+<li><p>AF_RXRPCカーネルインターフェース。</p></li>
+<li><p>設定可能なパラメータ。</p></li>
+</ol>
+</div></blockquote>
+<section id="overview">
+<h2>概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>RxRPCは二層プロトコルです。セッション層はUDPをIPv4（またはIPv6）としてトランスポート層として使用し、信頼性のある仮想接続を提供しますが、実際のネットワークプロトコルを実装します。また、プレゼンテーション層はXDRを用いて構造化データをバイナリーブロブに変換し、逆に変換します（SunRPCも同様です）：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+-------------+
+| Application |
++-------------+
+|     XDR     |         Presentation
++-------------+
+|    RxRPC    |         Session
++-------------+
+|     UDP     |         Transport
++-------------+
+</pre></div>
+</div>
+<p>AF_RXRPCは提供します：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>カーネルとユーザースペースアプリケーションのためのRxRPC機能の一部を、セッション部分をLinuxネットワークプロトコル（AF_RXRPC）として実現することで提供します。</p></li>
+<li><p>二段階プロトコルです。クライアントはブロブ（リクエスト）を送信し、その後ブロブ（レスポンス）を受信します。サーバーはリクエストを受信し、その後レスポンスを送信します。</p></li>
+<li><p>1回の呼び出しで設定されたトランスポートシステムの再利用可能な要素を保持し、次の呼び出しを高速化します。</p></li>
+<li><p>セキュアなプロトコルで、クライアント側ではLinuxカーネルのキー保持機能を使用してセキュリティを管理します。サーバー側ではセキュリティ交渉においてより積極的である必要があります。</p></li>
+</ol>
+</div></blockquote>
+<p>AF_RXRPCはXDRマーシャリング/プレゼンテーション機能を提供しません。これはアプリケーションの責任です。AF_RXRPCはブロブのみを扱います。操作IDもリクエストブロブの最初の4バイトであり、カーネルの関心の範囲外です。</p>
+<p>AF_RXRPCファミリーのソケットは：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>SOCK_DGRAM型として作成されます；</p></li>
+<li><p>下位トランスポートを使用するプロトコルタイプとして提供されます - 現在はPF_INETのみがサポートされています。</p></li>
+</ol>
+</div></blockquote>
+<p>Andrew File System（AFS）は、このプロトコルを使用し、カーネル（ファイルシステム）とユーザースペース（ユーティリティ）の両方のコンポーネントを持つアプリケーションの例です。</p>
+</section>
+<section id="rxrpc-protocol-summary">
+<h2>RxRPCプロトコル概要<a class="headerlink" href="#rxrpc-protocol-summary" title="この見出しへのパーマリンク">¶</a></h2>
+<p>RxRPCプロトコルの概要：</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>RxRPCは他のネットワーキングプロトコル（現在はUDPのみ）上に配置され、ネットワークトランスポートを提供します。UDPポートなどはトランスポートエンドポイントを提供します。</p></li>
+<li><p>RxRPCは、任意のトランスポートエンドポイントから複数の仮想「接続」をサポートし、エンドポイントを共有可能にします。同じリモートエンドポイントでも共有できます。</p></li>
+<li><p>各接続は特定の「サービス」に接続されます。1つの接続は複数のサービスに接続することはできません。サービスはRxRPCにおけるポート番号に相当します。AF_RXRPCは複数のサービスがエンドポイントを共有できるようにします。</p></li>
+<li><p>クライアントが生成するパケットはマークされるため、トランスポートエンドポイントはクライアントとサーバーの接続間で共有できます（接続は方向性を持ちます）。</p></li>
+<li><p>1つのローカルトランスポートエンドポイントと1つのリモートエンドポイント上の1つのサービス間で、最大10億の接続が同時にサポートされることがあります。RxRPC接続は7つの数字で記述されます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Local address   }
+Local port      } Transport (UDP) address
+Remote address  }
+Remote port     }
+Direction
+Connection ID
+Service ID
+</pre></div>
+</div>
+</li>
+<li><p>各RxRPC操作は「コール」と呼ばれます。接続は最大40億のコールを実行できますが、1つの接続において同時に進行中のコールは最大4つまでです。</p></li>
+<li><p>コールは2段階で行われ、非対称です。クライアントが要求データを送信し、サービスが受信します。その後、サービスが応答データを送信し、クライアントが受信します。</p></li>
+<li><p>データブロブのサイズは不定であり、各段階の終わりはパケット内のフラグで示されます。1つのブロブを構成するパケット数は40億を越えてはなりません。これはシーケンス番号が巻き戻す可能性があるためです。</p></li>
+<li><p>要求データの最初の4バイトはサービス操作IDです。</p></li>
+<li><p>セキュリティは接続ごとに交渉されます。接続はその上に最初に到達したデータパケットで開始されます。セキュリティが要求された場合、サーバーは「チャレンジ」を発行し、クライアントが「レスポンス」で応じます。レスポンスが成功した場合、その接続の寿命にわたってセキュリティが設定され、その後のすべてのコールはそのセキュリティを使用します。サーバーがクライアントより接続を終了した場合、クライアントが再び接続を使用する際にはセキュリティが再交渉されます。</p></li>
+<li><p>コールはACKパケットを使用して信頼性を確保します。データパケットも各コールごとに明示的にシーケンス付けられます。</p></li>
+<li><p>ポジティブな確認にはハード・ACKとソフト・ACKの2種類があります。ハード・ACKは、遠隔側にすべてのデータが受信され処理されたことを示します。ソフト・ACKは、データが受信されたが、まだ破棄される可能性があることを示します。送信者は、ハード・ACKが届くまではどのパケットも破棄してはなりません。</p></li>
+<li><p>応答データパケットの受信は、要求を構成するすべてのデータパケットをハード・ACKします。</p></li>
+<li><p>要求が送信され、応答が受信され、応答の最後のパケットに対する最終的なハード・ACKがサーバーに届いたとき、コールは完了します。</p></li>
+<li><p>コールは、完了するまで任意のタイミングで両端から中止できます。</p></li>
+</ol>
+</div></blockquote>
+</section>
+<section id="af-rxrpc-driver-model">
+<h2>AF_RXRPCドライバモデル<a class="headerlink" href="#af-rxrpc-driver-model" title="この見出しへのパーマリンク">¶</a></h2>
+<p>AF_RXRPCドライバについて:</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>AF_RXRPCプロトコルは、トランスポートプロトコルの内部ソケットを透明に使用して、トランスポートエンドポイントを表します。</p></li>
+<li><p>AF_RXRPCソケットはRxRPC接続バンドルにマッピングされます。実際のRxRPC接続は透明に処理されます。1つのクライアントソケットは、同じサービスへの複数の同時呼び出しを行うことができます。1つのサーバークソケットは、多くのクライアントからの呼び出しを処理できます。</p></li>
+<li><p>追加の並列クライアント接続が起動され、追加の同時呼び出しをサポートします。これは調整可能な上限までです。</p></li>
+<li><p>各接続は、最後の呼び出しの完了後、調整可能な時間の間保持されます。新しい呼び出しで再利用できる場合があります。</p></li>
+<li><p>各内部UDPソケットは、最後の接続が破棄された後、調整可能な時間の間保持されます。新しい接続で再利用できる場合があります。</p></li>
+<li><p>クライアント側の接続は、セキュリティを記述する同じkey構造を持つ呼び合いで共有されます（他の条件が接続共有を許可する場合）。非セキュリティ保護の呼び出しも、接続を共有できます。</p></li>
+<li><p>サーバー側の接続は、クライアントがそう指定した場合に共有されます。</p></li>
+<li><p>ACKの処理はプロトコルドライバが自動で行い、Ping応答も含まれます。</p></li>
+<li><p>SO_KEEPALIVEは、接続を維持するために相手側にPingを自動で送ります[TODO]。</p></li>
+<li><p>ICMPエラーが受信された場合、そのエラーに影響されたすべての呼び出しは、recvmsg()を通じて適切なネットワークエラーで中止されます。</p></li>
+</ol>
+</div></blockquote>
+<p>RxRPCソケットのユーザーとの相互作用:</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>アドレスに非ゼロのサービスIDを割り当てることで、ソケットをサーバークソケットにします。</p></li>
+<li><p>クライアントでは、複数のsendmsgsの後にreplyをrecvmsgsで受信します。</p></li>
+<li><p>クライアントから送信されるリクエストの最初のsendmsgには、その呼び出しに関連するすべてのsendmsgsやrecvmsgsで使用するタグが含まれます。このタグは制御データに含まれます。</p></li>
+<li><p>connect()はクライアントソケットにデフォルトの宛先アドレスを提供します。これは、呼び出しの最初のsendmsg()で代替アドレスを指定することで上書きできます（struct msghdr::msg_name）。</p></li>
+<li><p>未バインドのクライアントにconnect()が呼ばれた場合、操作前にランダムなローカルポートが割り当てられます。</p></li>
+<li><p>サーバークソケットはクライアント呼び出しを行うこともできます。これを行うには、呼び出しの最初のsendmsg()で宛先アドレスを指定する必要があります。サーバーのトランスポートエンドポイントを使用してパケットを送信します。</p></li>
+<li><p>アプリケーションがコールに関連する最後のメッセージを受信した後、タグは再び表示されず、クライアントリソースを固定するために使用できます。同じタグで新しいコールを開始しても干渉の心配がありません。</p></li>
+<li><p>サーバーでは、1つまたは複数のrecvmsgsでリクエストが受信され、その後1つまたは複数のsendmsgsで応答が送信され、最後にlast recvmsgで最終ACKが受信されます。</p></li>
+<li><p>コールのデータを送信する際、sendmsgにMSG_MOREが指定される場合があります。これはそのコールでさらにデータが届くことを示します。</p></li>
+<li><p>コールのデータを受信する際、recvmsgにMSG_MOREが設定され、そのコールでさらにデータが届くことを示します。</p></li>
+<li><p>コールのデータまたはメッセージを受信する際、recvmsgがMSG_EORフラグを設定し、そのコールの最後のメッセージを示します。</p></li>
+<li><p>コールは、制御データにアボート制御メッセージを追加することで中止できます。アボートを発行すると、カーネルがそのコールのタグを使用しなくなります。そのコールの受信キューに待機しているメッセージは破棄されます。</p></li>
+<li><p>アボート、ビジー通知、チャレンジパケットはrecvmsgで配信され、制御データメッセージはコンテキストを示すよう設定されます。アボートまたはビジーメッセージを受信すると、カーネルがそのコールのタグを使用しなくなります。</p></li>
+<li><p>msghdr構造体の制御データ部分は、複数の用途があります：</p>
+<ol class="arabic simple">
+<li><p>対応するコールのタグ。</p></li>
+<li><p>送信または受信エラー、アボート、ビジー通知。</p></li>
+<li><p>受信コールの通知。</p></li>
+<li><p>デバッグリクエストの送信とデバッグ応答の受信 [TODO]。</p></li>
+</ol>
+</li>
+<li><p>カーネルが受信コールを受信し設定した後、サーバーアプリケーションに新しいコールが受け入れ待機中であることを通知するメッセージを送信します [recvmsgが特別な制御メッセージを報告します]。サーバーアプリケーションはsendmsgを使用して新しいコールにタグを割り当てます。割り当てが完了すると、リクエストデータの最初の部分がrecvmsgで配信されます。</p></li>
+<li><p>サーバーアプリケーションは、許可するセキュリティタイプに対応する秘密鍵のキーリングをサーバーソケットに提供する必要があります。セキュアな接続を設定する際、カーネルはキーリングから適切な秘密鍵を検索し、チャレンジパケットをクライアントに送信し、応答パケットを受信します。その後、カーネルがパケットの認証を確認し、接続を中止するかセキュリティを設定します。</p></li>
+<li><p>クライアントが通信をセキュリティで保護するために使用する鍵の名前は、ソケットオプションで指定されます。</p></li>
+</ol>
+</div></blockquote>
+<p>sendmsgに関する注意点：</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>MSG_WAITALLを設定することで、sendmsgがペアがパケットの受信を進んでいる場合にシグナルを無視して、合理的な時間内にすべてのデータを送信キューに並べることを可能にします。これにはクライアントが2*RTT時間ごとに少なくとも1つのパケットを受信する必要があります。</p>
+<p>この設定がされていない場合、sendmsg()は即座に返却します。何も消費されなかった場合はEINTR/ERESTARTSYSを返却し、消費されたデータ量を返却します。</p>
+</li>
+</ol>
+</div></blockquote>
+<p>recvmsgに関する注意点:</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>受信キューに特定のコールに属するデータメッセージの連続がある場合、recvmsgは以下の条件に達するまでそれらを処理し続けます:</p>
+<ol class="loweralpha simple">
+<li><p>そのコールの受信データの終わりに達した場合、</p></li>
+<li><p>非データメッセージに出会った場合、</p></li>
+<li><p>他のコールに属するメッセージに出会った場合、または</p></li>
+<li><p>ユーザー・バッファが満たされた場合。</p></li>
+</ol>
+<p>recvmsgがブロッキングモードで呼ばれた場合、上記の4つの条件のいずれかが満たされるまで待機し続けることになります。</p>
+</li>
+</ol>
+<ol class="arabic simple" start="2">
+<li><p>MSG_PEEKは同様に動作しますが、バッファにデータを一度でも入れた時点で即座に返却します。バッファを満たすのを待つことはありません。</p></li>
+<li><p>ユーザー・バッファにデータメッセージを部分的に消費した場合、そのメッセージの残りは次の受取者がキューの先頭に残されます。MSG_TRUNCは常にフラグ付けされません。</p></li>
+<li><p>コールにまだデータが残っている場合（そのフェーズで最後のデータメッセージの最後のバイトをコピーしていない場合）、MSG_MOREがフラグ付けされます。</p></li>
+</ol>
+</div></blockquote>
+</section>
+<section id="control-messages">
+<h2>コントロールメッセージ<a class="headerlink" href="#control-messages" title="この見出しへのパーマリンク">¶</a></h2>
+<p>AF_RXRPCはsendmsg()とrecvmsg()の制御メッセージを用いてコールを多重化し、特定のアクションを呼び出し、特定の状態を報告します。これらは以下の通りです:</p>
+<blockquote>
+<div><blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 34%"/>
+<col style="width: 4%"/>
+<col style="width: 16%"/>
+<col style="width: 46%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>MESSAGE ID</p></th>
+<th class="head"><p>SRT</p></th>
+<th class="head"><p>DATA</p></th>
+<th class="head"><p>MEANING</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>RXRPC_USER_CALL_ID</p></td>
+<td><p>sr-</p></td>
+<td><p>User ID</p></td>
+<td><p>アプリケーションのコール指定子</p></td>
+</tr>
+<tr class="row-odd"><td><p>RXRPC_ABORT</p></td>
+<td><p>srt</p></td>
+<td><p>Abort code</p></td>
+<td><p>発行/受信するAbort code</p></td>
+</tr>
+<tr class="row-even"><td><p>RXRPC_ACK</p></td>
+<td><p>-rt</p></td>
+<td><p>n/a</p></td>
+<td><p>最終ACKの受信</p></td>
+</tr>
+<tr class="row-odd"><td><p>RXRPC_NET_ERROR</p></td>
+<td><p>-rt</p></td>
+<td><p>error num</p></td>
+<td><p>コールにおけるネットワークエラー</p></td>
+</tr>
+<tr class="row-even"><td><p>RXRPC_BUSY</p></td>
+<td><p>-rt</p></td>
+<td><p>n/a</p></td>
+<td><p>コールが拒否されました（サーバーがビジー）</p></td>
+</tr>
+<tr class="row-odd"><td><p>RXRPC_LOCAL_ERROR</p></td>
+<td><p>-rt</p></td>
+<td><p>error num</p></td>
+<td><p>ローカルエラーが発生しました</p></td>
+</tr>
+<tr class="row-even"><td><p>RXRPC_NEW_CALL</p></td>
+<td><p>-r-</p></td>
+<td><p>n/a</p></td>
+<td><p>新しいコールの受信</p></td>
+</tr>
+<tr class="row-odd"><td><p>RXRPC_ACCEPT</p></td>
+<td><p>s–</p></td>
+<td><p>n/a</p></td>
+<td><p>新しいコールを受け入れる</p></td>
+</tr>
+<tr class="row-even"><td><p>RXRPC_EXCLUSIVE_CALL</p></td>
+<td><p>s–</p></td>
+<td><p>n/a</p></td>
+<td><p>排他クライアントコールを作成する</p></td>
+</tr>
+<tr class="row-odd"><td><p>RXRPC_UPGRADE_SERVICE</p></td>
+<td><p>s–</p></td>
+<td><p>n/a</p></td>
+<td><p>クライアントの呼び出しはアップグレード可能です</p></td>
+</tr>
+<tr class="row-even"><td><p>RXRPC_TX_LENGTH</p></td>
+<td><p>s–</p></td>
+<td><p>データ長</p></td>
+<td><p>Txデータの総長</p></td>
+</tr>
+</tbody>
+</table>
+<p>(SRT = Sendmsgで使用可能 / Recvmsgで届けられる / テルミナルメッセージ)</p>
+</div></blockquote>
+<ol class="arabic">
+<li><p>RXRPC_USER_CALL_ID</p>
+<p>アプリケーションの呼び出しIDを示すために使用されます。これはアプリケーションがクライアントで最初のデータメッセージにこれを添付するか、サーバーでRXRPC_ACCEPTメッセージとともに渡すことで指定します。recvmsg()はRXRPC_NEW_CALLメッセージ以外のすべてのメッセージとともにこれを渡します。</p>
+</li>
+<li><p>RXRPC_ABORT</p>
+<p>アプリケーションがsendmsgにこれを渡すことで呼び出しを中止できます。また、recvmsgがリモートからの中止を示すためにこれを届けることもできます。いずれの場合も、影響を受ける呼び出しを指定するためRXRPC_USER_CALL_IDと関連付ける必要があります。中止を送信する場合、そのユーザーIDに該当する呼び出しがなければエラーEBADSLTが返されます。</p>
+</li>
+<li><p>RXRPC_ACK</p>
+<p>サーバーアプリケーションに、クライアントから呼び出しの最終ACKが到達したことを通知します。これは影響を受ける呼び出しを示すRXRPC_USER_CALL_IDと関連付けられます。</p>
+</li>
+<li><p>RXRPC_NET_ERROR</p>
+<p>アプリケーションに、ペアーメッセージをやり取りする過程でICMPエラーメッセージが発生したことを通知します。制御メッセージデータには問題を示すerrnoクラスの整数値が含まれ、RXRPC_USER_CALL_IDは影響を受ける呼び出しを示します。</p>
+</li>
+<li><p>RXRPC_BUSY</p>
+<p>クライアントアプリケーションに、サーバーがビジーなため呼び出しを拒否したことを通知します。これは影響を受ける呼び出しを示すRXRPC_USER_CALL_IDと関連付けられます。</p>
+</li>
+<li><p>RXRPC_LOCAL_ERROR</p>
+<p>アプリケーションに、ローカルエラーが発生し、その結果呼び出しが中止されたことを通知します。制御メッセージデータには問題を示すerrnoクラスの整数値が含まれ、RXRPC_USER_CALL_IDは影響を受ける呼び出しを示します。</p>
+</li>
+<li><p>RXRPC_NEW_CALL</p>
+<p>サーバーアプリケーションに、新しい呼び出しが到着し受け入れを待っていることを通知します。ユーザーIDはこの後RXRPC_ACCEPTを通じて割り当てられるため、関連付けられません。</p>
+</li>
+<li><p>RXRPC_ACCEPT</p>
+<p>サーバーアプリケーションが呼び出しを受け入れようとする際に使用されます。RXRPC_USER_CALL_IDと関連付けられることで割り当てられるユーザーIDを示します。受け入れるべき呼び出しがない場合（タイムアウト、中止など）、sendmsgはエラーENODATAを返します。ユーザーIDが他の呼び出しで既に使用されている場合、エラーEBADSLTが返されます。</p>
+</li>
+<li><p>RXRPC_EXCLUSIVE_CALL</p>
+<p>クライアント呼び出しを一時的な接続で行うことを示すために使用します。呼び出しが終了した後で接続は破棄されます。</p>
+</li>
+<li><p>RXRPC_UPGRADE_SERVICE</p>
+<p>指定されたサービスIDがサーバーによってアップグレード可能かどうかを確認するためにクライアント呼び出しを行います。呼び出し元はrecvmsg()で返されるmsg_nameを確認し、実際に使用されているサービスIDを把握する必要があります。確認する操作は、両サービスで同じ引数を取る操作でなければなりません。</p>
+<p>このオプションがサーバーのアップグレード機能（またはその absence）を確立した後、返されたサービスIDをすべての今後の通信に使用し、RXRPC_UPGRADE_SERVICEはもはや設定されません。</p>
+</li>
+<li><p>RXRPC_TX_LENGTH</p>
+<p>呼び出しによって送信されるデータの総量をカーネルに通知するために使用します（クライアントリクエストまたはサービス応答に関わらず）。指定された場合、カーネルがユーザー空間バッファからパケットバッファへ直接暗号化を行うことが可能になります。これにより、バッファへのコピーとその後の暗号化を省略できます。このオプションは、呼び出しデータを提供する最初のsendmsg()にのみ指定可能です。実際に指定されたデータ量が異なる場合、EMSGSIZEエラーが発生します。</p>
+<p>このパラメータは__s64型で、送信されるデータ量を示します。この値はゼロ以下であってはなりません。</p>
+</li>
+</ol>
+</div></blockquote>
+<p>RXRPC__SUPPORTEDは、サポートされているコントロールメッセージタイプの最大値に1を加えた値として定義されています。実行時にはRXRPC_SUPPORTED_CMSGソケットオプション（以下参照）で照会可能です。</p>
+</section>
+</section>
+<section id="socket-options">
+<h1>ソケットオプション<a class="headerlink" href="#socket-options" title="この見出しへのパーマリンク">¶</a></h1>
+<p>AF_RXRPCソケットはSOL_RXRPCレベルで以下のソケットオプションをサポートしています：</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>RXRPC_SECURITY_KEY</p>
+<p>使用する鍵の説明を指定するために使用します。鍵は呼び出しプロセスのkeyringsからrequest_key()で抽出され、"rxrpc"型の鍵である必要があります。</p>
+<p>optvalポインタは説明文字列を指し、optlenは文字列の長さを示します（NULL終端文字は含めません）。</p>
+</li>
+<li><p>RXRPC_SECURITY_KEYRING</p>
+<p>上記と同様ですが、使用するサーバー秘密鍵のkeyringを指定します（鍵タイプは"keyring"）。セキュリティセクションを参照してください。</p>
+</li>
+<li><p>RXRPC_EXCLUSIVE_CONNECTION</p>
+<p>このオプションは、このソケットで行われる今後のすべての呼び出しに新しい接続を使用するように要求します。optvalはNULL、optlenは0でなければなりません。</p>
+</li>
+<li><p>RXRPC_MIN_SECURITY_LEVEL</p>
+<p>このオプションは、このソケットでの呼び出しに必要な最小セキュリティレベルを指定します。optvalは以下の値を持つintを指します：</p>
+<ol class="loweralpha">
+<li><p>RXRPC_SECURITY_PLAIN</p>
+<p>暗号化されたチェックサムのみ。</p>
+</li>
+<li><p>RXRPC_SECURITY_AUTH</p>
+<p>暗号化されたチェックサムに加えて、パケットがパディングされ、最初の8バイトが暗号化される。これは実際のパケット長を含むため、パケット長を含む情報が暗号化されます。</p>
+</li>
+<li><p>RXRPC_SECURITY_ENCRYPT</p>
+<p>暗号化されたチェックサムに加えて、パケット全体をパディングして暗号化し、実際のパケット長も含めています。</p>
+</li>
+</ol>
+</li>
+<li><p>RXRPC_UPGRADEABLE_SERVICE</p>
+<p>クライアントが要求した場合、2つのバインディングを持つサービスソケットが1つのバインドされたサービスを別のサービスにアップグレードできるようにするためのオプションです。optvalは2つの無符号短整数の配列を指さなければなりません。最初の値はアップグレード元のサービスIDで、2番目の値はアップグレード先のサービスIDです。</p>
+</li>
+<li><p>RXRPC_SUPPORTED_CMSG</p>
+<p>これは読み取り専用のオプションで、バッファにサポートされている最高のコントロールメッセージタイプを示す整数を書き込みます。</p>
+</li>
+</ol>
+</div></blockquote>
+</section>
+<section id="security">
+<h1>セキュリティ<a class="headerlink" href="#security" title="この見出しへのパーマリンク">¶</a></h1>
+<p>現在、実装されているのはkerberos 4に相当するプロトコルのみです（セキュリティインデックス2 - rxkad）。これにはrxkadモジュールをロードし、クライアント側ではAFS kaserverまたはkerberosサーバーから適切なタイプのチケットを取得し、「rxrpc」タイプのキーとしてインストールする必要があります。これは通常klogプログラムを使用して行います。簡単なklogプログラムの例は以下のURLにあります：</p>
+<blockquote>
+<div><p><a class="reference external" href="http://people.redhat.com/~dhowells/rxrpc/klog.c">http://people.redhat.com/~dhowells/rxrpc/klog.c</a></p>
+</div></blockquote>
+<p>クライアントでadd_key()に提供されるペイロードは以下の形式にする必要があります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct rxrpc_key_sec2_v1 {
+        uint16_t        security_index; /* 2 */
+        uint16_t        ticket_length;  /* length of ticket[] */
+        uint32_t        expiry;         /* time at which expires */
+        uint8_t         kvno;           /* key version number */
+        uint8_t         __pad[3];
+        uint8_t         session_key[8]; /* DES session key */
+        uint8_t         ticket[0];      /* the encrypted ticket */
+};
+</pre></div>
+</div>
+<p>チケットブロブは上記の構造に単純に追加されます。</p>
+<p>サーバーでは、「rxrpc_s」タイプのキーをサーバーに利用可能にする必要があります。これらは「&lt;serviceID&gt;:&lt;securityIndex&gt;」（例：AFS VLサービス用のrxkadキーは「52:2」）という説明を持つことになります。このようなキーが作成される際には、サーバーのシークレットキーをインスタンス化データとして指定する必要があります（以下例を参照）。</p>
+<blockquote>
+<div><p>add_key(“rxrpc_s”, “52:2”, secret_key, 8, keyring);</p>
+</div></blockquote>
+<p>サーバー・ソケットにキー環を渡すには、ソックス・オプションで名前を指定します。サーバー・ソケットは、セキュアなインカム接続が行われる際、このキー環からサーバーのシークレットキーを検索します。これは以下の例プログラムで確認できます：</p>
+<blockquote>
+<div><p><a class="reference external" href="http://people.redhat.com/~dhowells/rxrpc/listen.c">http://people.redhat.com/~dhowells/rxrpc/listen.c</a></p>
+</div></blockquote>
+</section>
+<section id="example-client-usage">
+<h1>例: クライアントの使用方法<a class="headerlink" href="#example-client-usage" title="この見出しへのパーマリンク">¶</a></h1>
+<p>クライアントは操作を以下のように実行します：</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>RxRPCソケットは以下のように設定されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>client = socket(AF_RXRPC, SOCK_DGRAM, PF_INET);
+</pre></div>
+</div>
+<p>第三パラメータは使用されるトランスポート・ソケットのプロトコルファミリを示します - 通常はIPv4ですが、IPv6も可能です [TODO]。</p>
+</li>
+<li><p>ローカルアドレスはオプションでバインドできます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct sockaddr_rxrpc srx = {
+        .srx_family     = AF_RXRPC,
+        .srx_service    = 0,  /* we're a client */
+        .transport_type = SOCK_DGRAM,   /* type of transport socket */
+        .transport.sin_family   = AF_INET,
+        .transport.sin_port     = htons(7000), /* AFS callback */
+        .transport.sin_address  = 0,  /* all local interfaces */
+};
+bind(client, &amp;srx, sizeof(srx));
+</pre></div>
+</div>
+<p>これは使用するローカルUDPポートを指定します。指定しない場合、ランダムな非特権ポートが使用されます。UDPポートは複数の関係のないRxRPCソケット間で共有可能です。セキュリティは各RxRPC仮想接続ごとに処理されます。</p>
+</li>
+<li><p>セキュリティ設定は以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>const char *key = "AFS:cambridge.redhat.com";
+setsockopt(client, SOL_RXRPC, RXRPC_SECURITY_KEY, key, strlen(key));
+</pre></div>
+</div>
+<p>セキュリティコンテキストを表すキーを取得するためrequest_key()を実行します。最小セキュリティレベルを設定できます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>unsigned int sec = RXRPC_SECURITY_ENCRYPT;
+setsockopt(client, SOL_RXRPC, RXRPC_MIN_SECURITY_LEVEL,
+           &amp;sec, sizeof(sec));
+</pre></div>
+</div>
+</li>
+<li><p>接続先のサーバーを指定できます（代替としてsendmsgを通じて指定することも可能です）：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct sockaddr_rxrpc srx = {
+        .srx_family     = AF_RXRPC,
+        .srx_service    = VL_SERVICE_ID,
+        .transport_type = SOCK_DGRAM,   /* type of transport socket */
+        .transport.sin_family   = AF_INET,
+        .transport.sin_port     = htons(7005), /* AFS volume manager */
+        .transport.sin_address  = ...,
+};
+connect(client, &amp;srx, sizeof(srx));
+</pre></div>
+</div>
+</li>
+<li><p>要求データは、各々に以下のコントロールメッセージが添付されてsendmsg()呼び出しでサーバーのソケットに投稿される必要があります。</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 34%"/>
+<col style="width: 66%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>RXRPC_USER_CALL_ID</p></td>
+<td><p>この呼び出しのユーザーIDを指定します</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>要求の最後の部分以外のすべての部分でmsghdr::msg_flagsにMSG_MOREを設定する必要があります。複数の要求は同時に送信可能です。</p>
+<p>最初のsendmsg()呼び出しでRXRPC_TX_LENGTHというコントロールメッセージを指定することもできます。</p>
+<p>デフォルトで接続された宛先以外の宛先に呼び出しが送信される場合は、その呼び出しの最初のメッセージでmsghdr::msg_nameを設定する必要があります。</p>
+</li>
+<li><p>応答データは、recvmsg()が取得できるようにサーバーのソケットに投稿されます。特定の呼び出しにまだ応答データが残っている場合、recvmsg()はMSG_MOREフラグを設定します。呼び出しの終了読み取りにはMSG_EORフラグが設定されます。</p>
+<p>すべてのデータは以下のコントロールメッセージが添付されて送信されます：</p>
+<blockquote>
+<div><p>RXRPC_USER_CALL_ID - この呼び出しのユーザーIDを指定します</p>
+</div></blockquote>
+<p>中止やエラーが発生した場合、この情報はコントロールデータバッファに返され、MSG_EORフラグが設定されて呼び出しの終了を示します。</p>
+</li>
+</ol>
+</div></blockquote>
+<p>クライアントは、RXRPC_UPGRADE_SERVICEを最初のsendmsg()呼び出しで指定することで、既知のサービスIDをアップグレード要求できます（利用可能な場合）。その後、recvmsg()が埋め込むmsg_nameでsrx_serviceを確認する必要があります。アップグレード要求が無視された場合、srx_serviceはsendmsg()に渡された値と同じになります。それ以外の場合は、サーバーがアップグレードしたサービスIDを示す値になります。注意点として、アップグレードされたサービスIDはサーバーが選択します。呼び出し元は、応答でサービスIDを確認するまで、さらなる呼び出しを送信してはなりません（同じ宛先への呼び出しはプローブが完了するまでブロックされます）。</p>
+<section id="example-server-usage">
+<h2>例サーバーの使用方法<a class="headerlink" href="#example-server-usage" title="この見出しへのパーマリンク">¶</a></h2>
+<p>サーバーは次の手順で操作を受け付けるように設定されます：</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>RxRPCソケットは以下の通り作成されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>server = socket(AF_RXRPC, SOCK_DGRAM, PF_INET);
+</pre></div>
+</div>
+<p>第三パラメータは使用するトランスポートソケットのアドレスタイプを示します（通常はIPv4）。</p>
+</li>
+<li><p>セキュリティ設定は、ソケットにサーバー秘密鍵を含むキーリングを指定することで望ましい場合に行われます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>keyring = add_key("keyring", "AFSkeys", NULL, 0,
+                  KEY_SPEC_PROCESS_KEYRING);
+
+const char secret_key[8] = {
+        0xa7, 0x83, 0x8a, 0xcb, 0xc7, 0x83, 0xec, 0x94 };
+add_key("rxrpc_s", "52:2", secret_key, 8, keyring);
+
+setsockopt(server, SOL_RXRPC, RXRPC_SECURITY_KEYRING, "AFSkeys", 7);
+</pre></div>
+</div>
+<p>キーリングはソケットに渡した後でも操作可能です。これにより、サーバーはライブ状態でキーを追加したり、置き換えたりできます。</p>
+</li>
+<li><p>ローカルアドレスは次にバインドする必要があります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct sockaddr_rxrpc srx = {
+        .srx_family     = AF_RXRPC,
+        .srx_service    = VL_SERVICE_ID, /* RxRPC service ID */
+        .transport_type = SOCK_DGRAM,   /* type of transport socket */
+        .transport.sin_family   = AF_INET,
+        .transport.sin_port     = htons(7000), /* AFS callback */
+        .transport.sin_address  = 0,  /* all local interfaces */
+};
+bind(server, &amp;srx, sizeof(srx));
+</pre></div>
+</div>
+<p>トランスポートパラメータが同じ場合、ソケットに複数のサービスIDをバインドできます（現在の制限は2つ）。これを実行するにはbind()を2回呼び出す必要があります。</p>
+</li>
+<li><p>サービスのアップグレードが必要な場合、最初の2つのサービスIDがバインドされていなければなりません。その後、以下のオプションを設定する必要があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>unsigned short service_ids[2] = { from_ID, to_ID };
+setsockopt(server, SOL_RXRPC, RXRPC_UPGRADEABLE_SERVICE,
+           service_ids, sizeof(service_ids));
+</pre></div>
+</div>
+<p>これは、サービスfrom_IDからサービスto_IDへの接続を自動的にアップグレードします。ユーザー空間にリクエストデータが届いたときに、recvmsg()を通じて取得するmsg_nameに反映されます。</p>
+</li>
+<li><p>サーバーは次に、受信する呼び出しを待機するように設定されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>listen(server, 100);
+</pre></div>
+</div>
+</li>
+<li><p>カーネルは、受信する接続があることを通知するために、サーバーにメッセージを送信します。これはサーバーのソケットでrecvmsg()で受信され、データはなく、単一のデータのない制御メッセージが添付されています:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>RXRPC_NEW_CALL
+</pre></div>
+</div>
+<p>この時点でrecvmsg()で返されるアドレスは無視すべきです。受信メッセージがポストされた呼び出しは、受信される前に処理される可能性があるため、キューに残っている最初の呼び出しが受信されます。</p>
+</li>
+<li><p>サーバーは、2つの制御データと実際のデータを含まないsendmsg()を発行して新しい呼び出しを承認します:</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 38%"/>
+<col style="width: 63%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>RXRPC_ACCEPT</p></td>
+<td><p>接続の承認を示す</p></td>
+</tr>
+<tr class="row-even"><td><p>RXRPC_USER_CALL_ID</p></td>
+<td><p>この呼び出しのユーザーIDを指定する</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+</li>
+<li><p>最初のリクエストデータパケットは、サーバーのソケットにポストされ、recvmsg()によって取得されます。この時点で、msghdr構造体のアドレスフィールドから呼び出しのRxRPCアドレスを読み取ることができます。</p>
+<p>その後のリクエストデータは、到着するたびにサーバーのソケットにポストされ、recvmsg()によって収集されます。リクエストデータのすべてのピースは、最後のピースを除いてMSG_MOREフラグが設定されます。</p>
+<p>すべてのデータは以下のコントロールメッセージが添付されて送信されます：</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 34%"/>
+<col style="width: 66%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>RXRPC_USER_CALL_ID</p></td>
+<td><p>この呼び出しのユーザーIDを指定します</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+</li>
+<li><p>応答データは、以下の制御メッセージを添付したsendmsg()呼び出しの連続でサーバーのソケットにポストする必要があります:</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 34%"/>
+<col style="width: 66%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>RXRPC_USER_CALL_ID</p></td>
+<td><p>この呼び出しのユーザーIDを指定します</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>特定の呼び出しの最後のメッセージを除き、すべてのmsghdr::msg_flagsにMSG_MOREを設定する必要があります。</p>
+</li>
+</ol>
+</div></blockquote>
+<ol class="arabic" start="10">
+<li><p>クライアントからの最終ACKは、受信時にrecvmsg()で取得できるようにポストされます。これは、データのないメッセージで、2つの制御メッセージが添付された形になります:</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 34%"/>
+<col style="width: 66%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>RXRPC_USER_CALL_ID</p></td>
+<td><p>この呼び出しのユーザーIDを指定します</p></td>
+</tr>
+<tr class="row-even"><td><p>RXRPC_ACK</p></td>
+<td><p>最終ACKを示す（データなし）</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>この呼び出しの最後のメッセージであることを示すためにMSG_EORフラグが設定されます。</p>
+</li>
+<li><p>応答データの最後のパケットが送信されるまで、sendmsg()を呼び出してデータのないメッセージを送信することで、呼び出しを中止できます。このメッセージには以下の制御メッセージが添付されます:</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 34%"/>
+<col style="width: 66%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>RXRPC_USER_CALL_ID</p></td>
+<td><p>この呼び出しのユーザーIDを指定します</p></td>
+</tr>
+<tr class="row-even"><td><p>RXRPC_ABORT</p></td>
+<td><p>中止コードを示す（4バイトのデータ）</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>この操作を実行すると、ソケットの受信キューに待機しているパケットはすべて破棄されます。</p>
+</li>
+</ol>
+<p>特定のサービスのすべての通信は、1つのサーバー・ソケットを通じて行われ、sendmsg()とrecvmsg()の制御メッセージによって影響を受ける呼び出しを特定します。</p>
+</section>
+<section id="af-rxrpc-kernel-interface">
+<h2>AF_RXRPCカーネルインターフェース<a class="headerlink" href="#af-rxrpc-kernel-interface" title="この見出しへのパーマリンク">¶</a></h2>
+<p>AF_RXRPCモジュールは、AFSファイルシステムなどの内核ユーティリティでも使用可能なインターフェースも提供しています。これにより、このようなユーティリティは次の操作が可能になります:</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>1つのソケット上で個々のクライアント呼び出しに直接異なるキーを使用するのではなく、使用したいキーごとに多数のソケットを開く必要はありません。</p></li>
+<li><p>RxRPCが呼び出しの発行またはソケットのオープン時にrequest_key()を呼び出すのを避けることができます。代わりに、ユーティリティが適切なタイミングでキーを要求する責任があります。たとえばAFSは、open()やunlink()などのVFS操作中にこれを実行します。このとき、呼び出し開始時にキーが渡されます。</p></li>
+<li><p>GFP_KERNEL以外のメモリ割当方法を使用することを要求できます。</p></li>
+<li><p>recvmsg()呼び出しのオーバーヘッドを回避できます。RxRPCメッセージはソケットRxキューに投入される前にインターセプトされ、ソケットバッファを直接操作することが可能です。</p></li>
+</ol>
+</div></blockquote>
+<p>RxRPC機能を使用するには、内核ユーティリティが依然としてAF_RXRPCソケットを開き、適切なアドレスをバインドし、サーバーのソケットである場合はリスンする必要があります。その後、このソケットを内核インターフェース関数に渡します。</p>
+<p>内核インターフェース関数は以下の通りです:</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>新しいクライアント呼び出しを開始:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct rxrpc_call *
+rxrpc_kernel_begin_call(struct socket *sock,
+                        struct sockaddr_rxrpc *srx,
+                        struct key *key,
+                        unsigned long user_call_ID,
+                        s64 tx_total_len,
+                        gfp_t gfp,
+                        rxrpc_notify_rx_t notify_rx,
+                        bool upgrade,
+                        bool intr,
+                        unsigned int debug_id);
+</pre></div>
+</div>
+<p>新しいRxRPC呼び出しを行うインフラストラクチャを割り当て、呼び出しと接続の番号を割り当てます。呼び出しはソケットがバインドされているUDPポートで行われ、接続済みクライアントソケットの宛先アドレスに送信されます（代替アドレスが指定されていない限り）。</p>
+<p>キーが指定されている場合、このキーが呼び出しをセキュリティ保護するために使用されます。ソケットにRXRPC_SECURITY_KEYソケットオプションでバインドされたキーではなく、このキーが使用されます。このようにセキュリティ保護された呼び出しは、可能な限り接続を共有します。</p>
+<p>user_call_IDはsendmsg()に渡される制御データバッファ内の値と同等です。これは内核データ構造を指すために使用することも完全に可能です。</p>
+<p>tx_total_lenは、この呼び出しで送信したいデータ量（この時点で未知の場合には-1）です。データサイズを設定することで、内核がパケットバッファに直接暗号化できるようになり、コピーを省略できます。値は-1以下であってはなりません。</p>
+<p>notify_rxは、受信データパケットやリモート中止などのイベントが発生したときに呼び出される関数へのポインタです。</p>
+<p>クライアント操作がサーバーにサービスのアップグレードを要求する場合は、upgradeをtrueに設定します。結果として得られるサービスIDはrxrpc_kernel_recv_data()によって返されます。</p>
+<p>呼出が中断可能である場合はintrをtrueに設定する必要があります。このフラグが設定されていない場合、この関数はチャネルが割り当てられるまで戻らない可能性があります。設定されている場合は、-ERESTARTSYSを返す可能性があります。</p>
+<p>debug_idはトレース用の呼び出しデバッグIDです。これはrxrpc_debug_idを原子的にインクリメントすることで取得できます。</p>
+<p>この関数が成功した場合、RxRPC呼出に対するオパキートな参照が返されます。呼び出し元はこの参照を保持しており、適切に終了させる必要があります。</p>
+</li>
+<li><p>クライアント呼出を終了する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void rxrpc_kernel_end_call(struct socket *sock,
+                           struct rxrpc_call *call);
+</pre></div>
+</div>
+<p>以前に開始された呼出を終了するために使用します。user_call_IDはAF_RXRPCの知識から削除され、指定された呼出と関連付けられることはありません。</p>
+</li>
+<li><p>呼出を通じてデータを送信する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>typedef void (*rxrpc_notify_end_tx_t)(struct sock *sk,
+                                      unsigned long user_call_ID,
+                                      struct sk_buff *skb);
+
+int rxrpc_kernel_send_data(struct socket *sock,
+                           struct rxrpc_call *call,
+                           struct msghdr *msg,
+                           size_t len,
+                           rxrpc_notify_end_tx_t notify_end_rx);
+</pre></div>
+</div>
+<p>これはクライアント呼出のリクエスト部分またはサーバー呼出の応答部分を提供するために使用されます。msg.msg_iovlenとmsg.msg_iovは使用するデータバッファを指定します。msg_iovはNULLであってはならず、内核の仮想アドレスにのみポインタを指さなければなりません。msg.msg_flagsにはMSG_MOREを指定する場合があります。これにより、この呼出に関する次のデータ送信が行われる可能性があります。</p>
+<p>msgは宛先アドレス、制御データ、またはMSG_MORE以外のフラグを指定してはなりません。lenは送信するデータの総量です。</p>
+<p>notify_end_rxはNULLであったり、呼出がTxフェーズを終了する状態に変化したときに呼び出す関数を指定するためのものです。この関数は呼出状態スピンロックを保持しながら呼び出されるため、応答や最終ACKが先に届くのを防ぎます。</p>
+</li>
+<li><p>呼出からデータを受信する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>  int rxrpc_kernel_recv_data(struct socket *sock,
+                             struct rxrpc_call *call,
+                             void *buf,
+                             size_t size,
+                             size_t *_offset,
+                             bool want_more,
+                             u32 *_abort,
+                             u16 *_service)
+
+This is used to receive data from either the reply part of a client call
+or the request part of a service call.  buf and size specify how much
+data is desired and where to store it.  *_offset is added on to buf and
+subtracted from size internally; the amount copied into the buffer is
+added to *_offset before returning.
+
+want_more should be true if further data will be required after this is
+satisfied and false if this is the last item of the receive phase.
+
+There are three normal returns: 0 if the buffer was filled and want_more
+was true; 1 if the buffer was filled, the last DATA packet has been
+emptied and want_more was false; and -EAGAIN if the function needs to be
+called again.
+
+If the last DATA packet is processed but the buffer contains less than
+the amount requested, EBADMSG is returned.  If want_more wasn't set, but
+more data was available, EMSGSIZE is returned.
+
+If a remote ABORT is detected, the abort code received will be stored in
+``*_abort`` and ECONNABORTED will be returned.
+
+The service ID that the call ended up with is returned into *_service.
+This can be used to see if a call got a service upgrade.
+</pre></div>
+</div>
+</li>
+<li><p>呼出を中止する??</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void rxrpc_kernel_abort_call(struct socket *sock,
+                             struct rxrpc_call *call,
+                             u32 abort_code);
+</pre></div>
+</div>
+<p>呼出が中止可能状態にある場合、この関数を使用して呼出を中止できます。指定された中止コードはABORTメッセージに含まれます。</p>
+</li>
+<li><p>受信したRxRPCメッセージをインターセプトする:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>typedef void (*rxrpc_interceptor_t)(struct sock *sk,
+                                    unsigned long user_call_ID,
+                                    struct sk_buff *skb);
+
+void
+rxrpc_kernel_intercept_rx_messages(struct socket *sock,
+                                   rxrpc_interceptor_t interceptor);
+</pre></div>
+</div>
+<p>この関数は指定されたAF_RXRPCソケットにインターセプター関数をインストールします。それ以降、ソケットのRxキューにたどり着くはずだったすべてのメッセージはこの関数にリダイレクトされます。注意点として、メッセージを正しい順序で処理し、DATAメッセージの順序性を維持する必要があります。</p>
+<p>インターセプター関数には、ソケットのアドレスと受信メッセージの処理、カーネルユーティリティによって割り当てられた呼出ID、およびメッセージを含むソケットバッファが提供されます。</p>
+<p>skb-&gt;markフィールドはメッセージのタイプを示します:</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 44%"/>
+<col style="width: 56%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>マークする</p></th>
+<th class="head"><p>意味</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>RXRPC_SKB_MARK_DATA</p></td>
+<td><p>データメッセージ</p></td>
+</tr>
+<tr class="row-odd"><td><p>RXRPC_SKB_MARK_FINAL_ACK</p></td>
+<td><p>インカム呼出のための最終ACKが受信されました</p></td>
+</tr>
+<tr class="row-even"><td><p>RXRPC_SKB_MARK_BUSY</p></td>
+<td><p>サーバーがビジーなためクライアント呼出が拒否されました</p></td>
+</tr>
+<tr class="row-odd"><td><p>RXRPC_SKB_MARK_REMOTE_ABORT</p></td>
+<td><p>ピアによって呼出が中止されました</p></td>
+</tr>
+<tr class="row-even"><td><p>RXRPC_SKB_MARK_NET_ERROR</p></td>
+<td><p>ネットワークエラーが検出されました</p></td>
+</tr>
+<tr class="row-odd"><td><p>RXRPC_SKB_MARK_LOCAL_ERROR</p></td>
+<td><p>ローカルエラーが発生しました</p></td>
+</tr>
+<tr class="row-even"><td><p>RXRPC_SKB_MARK_NEW_CALL</p></td>
+<td><p>受け入れ待ちの新しいインカム呼出</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>リモート中止メッセージはrxrpc_kernel_get_abort_code()で取得できます。2つのエラーメッセージはrxrpc_kernel_get_error_number()で取得できます。新しいコールはrxrpc_kernel_accept_call()で受け入れられます。</p>
+<p>データメッセージの内容は通常のソケットバッファ操作関数で抽出できます。データメッセージがシーケンスの最後のメッセージであるかどうかはrxrpc_kernel_is_data_last()で判定できます。データメッセージが使用されると、rxrpc_kernel_data_consumed()を呼び出す必要があります。</p>
+<p>メッセージはrxrpc_kernel_free_skb()で処理して破棄してください。すべてのメッセージタイプに追加の参照を取得して後で解放することが可能です。ただし、これはコールの状態を保持する可能性があり、メッセージが最終的に解放されるまでコールの状態を固定する場合があります。</p>
+</li>
+<li><p>受信コールを受け入れる:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct rxrpc_call *
+rxrpc_kernel_accept_call(struct socket *sock,
+                         unsigned long user_call_ID);
+</pre></div>
+</div>
+<p>これは受信コールを受け入れてコールIDを割り当てるための関数です。この関数はrxrpc_kernel_begin_call()に似ており、受け入れたコールは同じ方法で終了する必要があります。</p>
+<p>この関数が成功した場合、RxRPC呼出に対するオパキートな参照が返されます。呼び出し元はこの参照を保持しており、適切に終了させる必要があります。</p>
+</li>
+<li><p>受信コールを拒否する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int rxrpc_kernel_reject_call(struct socket *sock);
+</pre></div>
+</div>
+<p>これはソケットのキューにある最初の受信コールをBUSYメッセージで拒否します。受信コールがなかった場合は-ENODATAが返されます。コールが中止されていた場合は-ECONNABORTED、タイムアウトしていた場合は-ETIMEが返される可能性があります。</p>
+</li>
+<li><p>匿名セキュリティを行うためのnullキーを割り当てる:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct key *rxrpc_get_null_key(const char *keyname);
+</pre></div>
+</div>
+<p>これは特定のドメインで匿名セキュリティを示すために使用できるnull RxRPCキーを割り当てるための関数です。</p>
+</li>
+<li><p>コールのピアアドレスを取得する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void rxrpc_kernel_get_peer(struct socket *sock, struct rxrpc_call *call,
+                           struct sockaddr_rxrpc *_srx);
+</pre></div>
+</div>
+<p>これはコールのリモートピアアドレスを取得するための関数です。</p>
+</li>
+<li><p>コールのトータル送信データサイズを設定する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void rxrpc_kernel_set_tx_length(struct socket *sock,
+                                struct rxrpc_call *call,
+                                s64 tx_total_len);
+</pre></div>
+</div>
+<p>これはコールで送信するデータ量を設定します。これはコール開始時にリクエストサイズを設定する際の返信サイズとして使用する予定です。tx_total_lenは0未満であってはなりません。</p>
+</li>
+<li><p>コールのRTTを取得する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>u64 rxrpc_kernel_get_rtt(struct socket *sock, struct rxrpc_call *call);
+</pre></div>
+</div>
+<p>コールが使用するピアへのRTT時間を取得します。返される値はナノ秒単位です。</p>
+</li>
+<li><p>コールがまだ生きているかを確認する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>bool rxrpc_kernel_check_life(struct socket *sock,
+                             struct rxrpc_call *call,
+                             u32 *_life);
+void rxrpc_kernel_probe_life(struct socket *sock,
+                             struct rxrpc_call *call);
+</pre></div>
+</div>
+<p>最初の関数は <code class="docutils literal notranslate"><span class="pre">*_life</span></code> ピアからACKが受信されるたびに更新される数値を返します（特にPING RESPONSE ACKを含む）。呼び出し元は適切なインターバルを待ってから、2つのコールの数値を比較してコールが生きているかどうかを確認します。コールが完了状態に達するまでは常にtrueを返します。</p>
+<p>これにより、呼び出し元はサーバーがまだアクセス可能で、コールがサーバー上でまだ生きているかどうかを確認できます。サーバーがクライアント操作を処理している間、待機中に確認できます。</p>
+<p>2番目の関数は、ピングACKを送信してペアに応答させる試みを行い、その結果、1番目の関数が返す値が変化するようにします。注意点として、この関数はTASK_RUNNING状態で呼び出す必要があります。</p>
+</li>
+<li><p>返信のタイムスタンプを取得:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>bool rxrpc_kernel_get_reply_time(struct socket *sock,
+                                 struct rxrpc_call *call,
+                                 ktime_t *_ts)
+</pre></div>
+</div>
+<p>クライアントからの応答の最初のDATAパケットのタイムスタンプを取得できます。ただし、このタイムスタンプがRxリングにまだ存在している必要があります。成功した場合、タイムスタンプが <code class="docutils literal notranslate"><span class="pre">*_ts</span></code> に保存され、trueが返されます。失敗した場合はfalseが返されます。</p>
+</li>
+<li><p>リモートクライアントのエポックを取得:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>u32 rxrpc_kernel_get_epoch(struct socket *sock,
+                           struct rxrpc_call *call)
+</pre></div>
+</div>
+<p>インカムクライアントコールのパケットに含まれるエポックを取得できます。この値が返されます。コールがまだ進行中である限り、この関数は常に成功します。コールが期限切れになった後は呼び出すべきではありません。注意点として、ローカルクライアントコールに対してこの関数を呼び出すと、ローカルのエポックのみが返されます。</p>
+<p>この値は、リモートクライアントが再起動されたかどうかを判定するために使用できます。通常は変化しません。</p>
+</li>
+<li><p>コールの最大寿命を設定:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void rxrpc_kernel_set_max_life(struct socket *sock,
+                               struct rxrpc_call *call,
+                               unsigned long hard_timeout)
+</pre></div>
+</div>
+<p>コールの最大寿命をhard_timeout（ジーフィーズ単位）に設定します。タイムアウトが発生した場合、コールは中止され、-ETIMEまたは-ETIMEDOUTが返されます。</p>
+</li>
+<li><p>カーネル内でソケットにRXRPC_MIN_SECURITY_LEVEL sockoptを適用:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int rxrpc_sock_set_min_security_level(struct sock *sk,
+                                      unsigned int val);
+</pre></div>
+</div>
+<p>このソケットで行われるコールに必要な最小セキュリティレベルを指定します。</p>
+</li>
+</ol>
+</div></blockquote>
+</section>
+<section id="configurable-parameters">
+<h2>設定可能なパラメータ<a class="headerlink" href="#configurable-parameters" title="この見出しへのパーマリンク">¶</a></h2>
+<p>RxRPCプロトコルドライバーには、/proc/net/rxrpc/内のsysctlを通じて調整可能な複数の設定パラメータがあります:</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>req_ack_delay</p>
+<p>リクエストACKフラグが設定されたパケットを受信した後、実際にACKを送信するまでに待つミリ秒数です。</p>
+<p>通常、相手側は受信ウィンドウが満たされるまで（最大255パケット）パケットを送信し続けます。ACKを遅らせることが、複数のパケットを一度にACKするのを可能にします。</p>
+</li>
+<li><p>soft_ack_delay</p>
+<p>新しいパケットを受信した後、送信者に再送不要であることを通知するソフトACKを生成するまでのミリ秒数です。</p>
+</li>
+<li><p>idle_ack_delay</p>
+<p>受信キュー内のすべてのパケットが消費された後、ACKを送信して送信者がバッファを解放できるように通知するハードACKを生成するまでのミリ秒数です。ただし、ACKを送信する他の理由がなければこの処理は行われません。</p>
+</li>
+<li><p>resend_timeout</p>
+<p>パケットを送信した後、ACKが受信されない場合にパケットを再送するまでのミリ秒数です。</p>
+</li>
+<li><p>max_call_lifetime</p>
+<p>コールが進行中の最大時間（秒単位）で、この時間経過後にコールが予防的に終了します。</p>
+</li>
+<li><p>dead_call_expiry</p>
+<p>呼リストから死んだ呼を削除するまでの時間（秒単位）。死んだ呼は、ACKおよびABORTパケットの再送を目的として一時的に保持されます。</p>
+</li>
+<li><p>connection_expiry</p>
+<p>接続リストから接続を削除するまでの時間（秒単位）。接続が存在する間は、交渉されたセキュリティのプレースホルダーとして機能し、削除時にセキュリティ再交渉が必要になります。</p>
+</li>
+<li><p>transport_expiry</p>
+<p>トランスポートリストからトランスポートを削除するまでの時間（秒単位）。トランスポートが存在する間は、ペアデータを固定し、接続IDカウンターを保持します。</p>
+</li>
+<li><p>rxrpc_rx_window_size</p>
+<p>受信ウィンドウのサイズ（パケット単位）。これは、特定の呼に対して保持する未処理の受信パケットの最大数を示します。</p>
+</li>
+<li><p>rxrpc_rx_mtu</p>
+<p>受け入れる最大パケットMTUサイズ（バイト単位）。これは、ジャンボパケットを受け入れる意欲をペアに示します。</p>
+</li>
+<li><p>rxrpc_rx_jumbo_max</p>
+<p>受け入れるジャンボパケット内の最大パケット数。ジャンボパケット内の非終端パケットは4バイトのヘッダーに加えて正確に1412バイトのデータを含む必要があります。終端パケットは4バイトのヘッダーに加えて任意のデータを含むことができます。いずれにしても、ジャンボパケットのサイズはrxrpc_rx_mtuを超えてはなりません。</p>
+</li>
+</ol>
+</div></blockquote>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxネットワーキングドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="netdev-FAQ.html">netdev FAQ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="af_xdp.html">AF_XDP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bareudp.html">Bare UDPトンネリングモジュールドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="batman-adv.html">batman-adv</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can.html">SocketCAN - コントローラー・エリア・ネットワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can_ucan_protocol.html">UCANプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="device_drivers/index.html">ハードウェアデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dsa/index.html">分散スイッチアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="devlink/index.html">Linux Devlinkドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="caif/index.html">CAIF</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ethtool-netlink.html">ethtool用Netlinkインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ieee802154.html">IEEE 802.15.4開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="j1939.html">J1939ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kapi.html">LinuxネットワーキングとネットワークデバイスAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="msg_zerocopy.html">MSG_ZEROCOPY</a></li>
+<li class="toctree-l2"><a class="reference internal" href="failover.html">フェールオーバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="net_dim.html">Net DIM - ジェネリックネットワークダイナミック割込みモデレーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="net_failover.html">NET_FAILOVER</a></li>
+<li class="toctree-l2"><a class="reference internal" href="page_pool.html">ページプールAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phy.html">PHY抽象レイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sfp-phylink.html">phylink</a></li>
+<li class="toctree-l2"><a class="reference internal" href="alias.html">IPアリアシング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bridge.html">イーサネットブリッジング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="snmp_counter.html">SNMPカウンター</a></li>
+<li class="toctree-l2"><a class="reference internal" href="checksum-offloads.html">チェックサムオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="segmentation-offloads.html">セグメンテーションオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="scaling.html">Linuxネットワーキングスタックにおけるスケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tls.html">カーネルTLS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tls-offload.html">カーネルTLSオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nfc.html">Linux NFCサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6lowpan.html">6lowpanインターフェース用Netdevプライベートデータルーム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6pack.html">6packプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet-hardware.html">ARCnetハードウェア</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet.html">ARCnet</a></li>
+<li class="toctree-l2"><a class="reference internal" href="atm.html">ATM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ax25.html">AX.25</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bonding.html">LinuxイーサネットボンディングドライバHOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cdc_mbim.html">cdc_mbim - CDC MBIMモバイルブロードバンドモデム用ドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dccp.html">DCCPプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dctcp.html">DCTCP（データセンターTCP）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="decnet.html">Linux DECnetネットワーキングレイヤー情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dns_resolver.html">DNSリゾルバー・モジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="driver.html">Softnetドライバーの問題</a></li>
+<li class="toctree-l2"><a class="reference internal" href="eql.html">EQLドライバー: シリアルIPロードバランシングガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="fib_trie.html">LC-trie実装ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="filter.html">Linux Socket Filtering（別名Berkeley Packet Filter（BPF））</a></li>
+<li class="toctree-l2"><a class="reference internal" href="framerelay.html">フレームリレー（FR）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic-hdlc.html">ジェネリックHDLCレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic_netlink.html">ジェネリックネットリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gen_stats.html">ネットリンクユーザー向けジェネリックネットワーキング統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gtp.html">LinuxカーネルGTPトンネリングモジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ila.html">識別子ロケーターアドレスング（ILA）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipddp.html">AppleTalk-IPデカプセル化とAppleTalk-IPエンカプセル化</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip_dynaddr.html">IPダイナミックアドレスハックポートv0.03</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipsec.html">IPsec</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip-sysctl.html">IP Sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipv6.html">IPv6</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvlan.html">IPVLANドライバーガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvs-sysctl.html">IPvs-sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kcm.html">カーネルコネクションマルチプレクサ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="l2tp.html">L2TP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lapb-module.html">Linux LAPBモジュールインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mac80211-injection.html">mac80211を使用したパケットインジェクションの使い方</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mpls-sysctl.html">MPLS Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="multiqueue.html">マルチキューネットワークデバイスサポートガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netconsole.html">Netconsole</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdev-features.html">ネットデバイス機能の混乱とその解決方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdevices.html">ネットワークデバイス、カーネル、そしてあなた！</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netfilter-sysctl.html">Netfilter Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netif-msg.html">NETIFメッセージレベル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_conntrack-sysctl.html">Netfilter Conntrack Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_flowtable.html">Netfilterのフローテーブルインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="openvswitch.html">Open vSwitch datapath開発者ドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="operstates.html">運用状態</a></li>
+<li class="toctree-l2"><a class="reference internal" href="packet_mmap.html">パケットMMAP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phonet.html">Linux Phonetプロトコルファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pktgen.html">Linuxパケットジェネレーターガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="plip.html">PLIP: 平行線インターネットプロトコルデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ppp_generic.html">PPPジェネリックドライバーおよびチャネルインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="proc_net_tcp.html">proc/net/tcpおよびproc/net/tcp6変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="radiotap-headers.html">radiotapヘッダの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html">概要</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-architecture">RDSアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#socket-interface">ソケットインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rdma-for-rds">RDS用RDMA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#congestion-notifications">コンゲスト通知</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-protocol">RDSプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-transport-layer">RDSトランスポートレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-kernel-structures">RDSカーネル構造体</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#connection-management">接続管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#the-send-path">送信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#the-recv-path">受信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#multipath-rds-mprds">マルチパスRDS (mprds)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="regulatory.html">Linuxワイヤレス規制ドキュメンテーション</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">RxRPC ネットワークプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#socket-options">ソケットオプション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#security">セキュリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#example-client-usage">例: クライアントの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sctp.html">LinuxカーネルSCTP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="secid.html">LSM/SeLinux secid</a></li>
+<li class="toctree-l2"><a class="reference internal" href="seg6-sysctl.html">Seg6 Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="statistics.html">インターフェース統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="strparser.html">ストリームパーサー (strparser)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="switchdev.html">イーサネットスイッチデバイスドライバモデル (switchdev)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysfs-tagging.html">Sysfsタグ付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tc-actions-env-rules.html">TCアクション - 環境ルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tcp-thin.html">スリムストリームとTCP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="team.html">チーム (Team)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="timestamping.html">タイムスタンピング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tproxy.html">透過プロキシサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tuntap.html">ユニバーサルTUN/TAPデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="udplite.html">UDP-Liteプロトコル (RFC 3828)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vrf.html">仮想ルーティングおよびフォワーディング (VRF)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vxlan.html">仮想拡張ローカルエリアネットワーキングドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html">パケットレイヤーからデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html#device-driver-to-packet-layer">デバイスドライバからパケットレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25.html">Linux X.25プロジェクト</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_device.html">XFRMデバイス - IPsec計算のオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_proc.html">XFRMプロセス - /proc/net/xfrm_*ファイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sync.html">XFRM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sysctl.html">XFRMシステムコール</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxネットワーキングドキュメント</a><ul>
+<li>前へ: <a href="regulatory.html" title="前章">Linuxワイヤレス規制ドキュメンテーション</a></li>
+<li>次へ: <a href="sctp.html" title="次章">LinuxカーネルSCTP</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/networking/rxrpc.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

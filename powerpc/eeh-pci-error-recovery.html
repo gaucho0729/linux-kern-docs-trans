@@ -1,0 +1,342 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>PCIバスEEHエラー回復 — Linuxカーネルドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="elfnote.html" rel="next" title="ELF ノート PowerPC ネームスペース"/>
+<link href="dscr.html" rel="prev" title="DSCR (データストリーム制御レジスタ)"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="pci-bus-eeh-error-recovery">
+<h1>PCIバスEEHエラー回復<a class="headerlink" href="#pci-bus-eeh-error-recovery" title="この見出しへのパーマリンク">¶</a></h1>
+<p>Linas Vepstas &lt;<a class="reference external" href="mailto:linas%40austin.ibm.com">linas<span>@</span>austin<span>.</span>ibm<span>.</span>com</a>&gt;</p>
+<p>2005年1月12日</p>
+<section id="overview">
+<h2>概要:<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>IBM POWERベースのpSeriesおよびiSeriesコンピュータは、PCIバスエラー条件の幅広い検出および報告が可能な拡張されたPCIバスコントローラーチップを搭載しています。これらの機能は「EEH（Enhanced Error Handling）」と呼ばれており、EEHハードウェア機能により、PCIバスエラーをクリアし、PCIカードを「再起動」することなく、オペレーティングシステムの再起動を必要としなくなります。</p>
+<p>これは伝統的なPCIエラー処理とは対照的で、PCIチップがCPUに直接接続されており、エラーが発生するとCPUのマシンチェック/チェックストップ条件を引き起こし、CPUを完全に停止させる仕組みです。また、伝統的な技術としてエラーを無視する方法もありますが、これによりユーザーデータやカーネルデータの破損、アダプターの停止/応答なし状態、システムのクラッシュ/ロックアップといった問題が発生する可能性があります。したがって、EEHの目的は、オペレーティングシステムがPCIエラーから保護されることで信頼性と堅牢性が向上し、OSが個々のPCIデバイスを「再起動」/回復できるようになることです。</p>
+<p>今後の他社製のPCI-E仕様に基づいたシステムでも同様の機能が搭載される可能性があります。</p>
+</section>
+<section id="causes-of-eeh-errors">
+<h2>EEHエラーの原因<a class="headerlink" href="#causes-of-eeh-errors" title="この見出しへのパーマリンク">¶</a></h2>
+<p>EEHは当初、ハードウェアの故障（例：熱、湿度、ほこり、振動、不良な電気接続によるPCIカードの故障など）を防ぐために設計されました。現実の「EEHエラー」の大部分は、PCIカードが正しく挿してあることのない状態、または残念ながら非常に頻繁に発生するデバイスドライバのバグ、デバイスファームウェアのバグ、あるいは場合によってはPCIカードハードウェアのバグが原因です。</p>
+<p>最も一般的なソフトウェアのバグは、デバイスがシステムメモリ内のDMAアクセスが予約されていない場所にDMAを試行するものです。これは強力な機能であり、それ以外に静かなメモリ破損を防ぐことができます。過去数年間で、この方法により多数のデバイスドライバのバグが発見され修正されてきました。他のEEHエラーの原因として、データまたはアドレスラインのパリティエラー（例：PCIカードが正しく挿してあることのない状態による電気的接続不良）、PCI-Xスプリットコンプリーションエラー（ソフトウェア、デバイスファームウェア、またはデバイスPCIハードウェアのバグによる）が考えられます。ほぼすべての「真のハードウェア故障」は、物理的にPCIカードを外して再挿すことで解決できます。</p>
+</section>
+<section id="detection-and-recovery">
+<h2>検出と回復<a class="headerlink" href="#detection-and-recovery" title="この見出しへのパーマリンク">¶</a></h2>
+<p>以下の議論では、EEHエラーの検出と回復方法の一般的な概要を説明します。その後、Linuxカーネルでの現在の実装方法についても概説します。実際の実装は変更される可能性があり、一部の詳細な点についてはまだ議論が続いています。他のアーキテクチャが同様の機能を実装する場合、これらの点もまた影響を受ける可能性があります。</p>
+<p>PCIホストブリッジ（PHB、PCIバスをシステムCPU電子複合体に接続するバス制御装置）がPCIエラー状態を検出すると、影響を受けるPCIカードを「分離」します。分離により、システムからカードへの書き込みやカードからシステムへの書き込みがすべてブロックされ、すべての読み込みはFF（0xff、0xffff、0xffffffff）を返します。この値は、デバイスが物理的にスロットから外された場合と同じ値であるため選ばれました。これはPCIメモリ、I/O領域、PCIコンフィギュレーション領域へのアクセスも含みます。ただし、割り込みは継続して送信されます。</p>
+<p>検出と回復はppc64ファームウェアの支援で行われます。LinuxカーネルがファームウェアにアクセスするためのプログラミングインターフェースはRTAS（Run-Time Abstraction Services）と呼ばれます。Linuxカーネルは（すべきではありません）、PCIチップセット内のEEH機能を直接アクセスしない主な理由は、存在するチップセットが複数あり、それぞれ異なるインターフェースと特徴があるためです。ファームウェアは、すべてのpSeriesおよびiSeriesハードウェア（将来の互換性も含む）で動作する一貫した抽象レイヤーを提供します。</p>
+<p>OSやデバイスドライバーがPCIスロットがEEH分離されていると疑う場合、ファームウェアが提供する関数を呼び出してその状態を確認できます。確認できた場合、デバイスドライバーは待機中の作業を完了できなくなるため、一貫した状態に移行し、カードの回復を開始する必要があります。回復は通常、PCIデバイスをリセットする（PCI #RSTラインを2秒間ハイに保つ）ことから始まり、その後デバイスコンフィギュレーション領域（ベースアドレスレジスタ（BAR）、レイテンシータイマ、キャッシュラインサイズ、割り込みラインなど）を設定します。その後、デバイスドライバーの再初期化が続きます。最悪の場合、ホットプラグ可能なスロットではカードの電源を切り替えることも可能です。原則として、デバイスドライバーよりも上のレイヤーはPCIカードがこのように「再起動」されたことを知る必要はなく、理想的にはカードがリセットされる間、イーサネット/ディスク/USB I/Oに最大で一時停止が生じる程度です。</p>
+<p>3回または4回のリセット後もカードが復旧しない場合、カーネル/デバイスドライバーは最悪のシナリオ、つまりカードが完全に故障していると仮定し、このエラーをシステム管理者に報告する必要があります。さらに、エラー情報はRTASを通じて、またsyslogd（/var/log/messages）を通じてシステム管理者に通知されます。失敗したアダプターを処理する正しい方法は、標準的なPCIホットプラグツールを使用して故障したカードを除去・交換することです。</p>
+</section>
+<section id="current-ppc64-linux-eeh-implementation">
+<h2>現在のPPC64 Linux EEH実装<a class="headerlink" href="#current-ppc64-linux-eeh-implementation" title="この見出しへのパーマリンク">¶</a></h2>
+<p>現在、汎用的なEEH回復メカニズムが実装されており、個々のデバイスドライバーを修正することなくEEH回復をサポートできます。この汎用メカニズムはPCIホットプラグインフラストラクチャに依存し、イベントはユーザー空間/udevインフラストラクチャを通じて上位に伝搬されます。以下に、この仕組みがどのように実現されるかの詳細な説明を示します。</p>
+<p>EEHは、ブートプロセスの非常に初期段階でPHB（PCIホストブリッジ）で有効化する必要があります。また、PCIスロットにホットプラグが行われる場合にも有効化する必要があります。前者はarch/powerpc/platforms/pseries/eeh.c内のeeh_init()関数で実行され、後者はdrivers/pci/hotplug/pSeries_pci.cがeeh.cコードを呼び出すことで実行されます。PCIデバイスのスキャンを開始する前にEEHを有効化する必要があります。現在のPower5ハードウェアはEEHが有効でない場合では動作しませんが、古いPower4は無効でも動作します。実質的に、EEHはもう無効にできません。PCIデバイス <em>grace periodsを尊重しなければなりませんし、</em> はEEHコードに登録する必要があります。EEHコードはPCIデバイスのI/Oアドレス範囲を把握してエラーを検出する必要があります。任意のアドレスが与えられた場合、pci_get_device_by_addr()関数はそのアドレスに関連するPCIデバイス（存在すれば）を検索します。</p>
+<p>デフォルトのarch/powerpc/include/asm/io.hマクロ（readb()、inb()、insb()など）は、I/O読み込みがすべての0xffを返した場合を検出するチェックを含んでいます。その場合、eeh_dn_check_failure()関数が呼び出され、ファームウェアにすべての0xff値が真のEEHエラーを示すかどうかを尋ねます。それ以外の場合は通常処理が続きます。これらの偽陽性（誤検出）の総数は/proc/ppc64/eeh（変更の可能性あり）で確認できます。通常、これらの誤検出は起動時にPCIバスがスキャンされる際、バススキャンプロセスの一環として多数の0xff読み込みが発生するため起きます。</p>
+<p>フローズンスロットが検出された場合、arch/powerpc/platforms/pseries/eeh.cに記述されたコードがsyslog（/var/log/messages）にスタックトレースを出力します。このスタックトレースは、デバイスドライバの開発者にとって非常に有用で、EEHエラーが検出されたポイントを特定するのに役立ちます。エラー自体は通常、その少し前に行われます。</p>
+<p>次に、Linuxカーネルの notifier chain/work queue メカニズムを使用して、関心を持つすべての関係者に失敗を通知します。デバイスドライバやカーネルの他の部分は、
+<cite>eeh_register_notifier(struct notifier_block *)</cite> を使用してEEHイベントを通知を受け取ることができます。このイベントには、PCIデバイスへのポインタ、デバイスノード、およびいくつかの状態情報が含まれます。イベントの受信者は「自由に処理を行える」ことができ、デフォルトハンドラの説明はこのセクションの後半で行います。</p>
+<p>デバイスの回復を支援するために、eeh.cは以下の関数をエクスポートしています：</p>
+<dl class="simple">
+<dt>rtas_set_slot_reset()</dt><dd><p>PCI #RSTラインを1/8秒間アサートする</p>
+</dd>
+<dt>rtas_configure_bridge()</dt><dd><p>ファームウェアに、PCIスロットのトポロジカルに位置するすべてのPCIブリッジを構成するよう依頼する</p>
+</dd>
+<dt>eeh_save_bars() および eeh_restore_bars()：</dt><dd><p>デバイスおよびその下位にあるすべてのデバイスのPCIコンフィギュレーションスペース情報を保存および復元する</p>
+</dd>
+</dl>
+<p>EEH notifier_block イベントハンドラはdrivers/pci/hotplug/pSeries_pci.cに実装されており、handle_eeh_events()と呼ばれます。このハンドラはまずデバイスのBAR情報を保存し、その後rpaphp_unconfig_pci_adapter()を呼び出します。この最後の呼び出しにより、カードのデバイスドライバが停止され、ユーザー空間にueventsが送信されます。これにより、ユーザー空間のスクリプトが「ifdown eth0」などのコマンドを実行するなど、動作をトリガーします。このハンドラはその後5秒間待機し、ユーザー空間スクリプトが十分に実行されるのを待つためです。その後、PCIカードを再起動し、デバイスのBAR情報を再構成し、その下にあるすべてのブリッジを再構成します。最後にrpaphp_enable_pci_slot()を呼び出し、デバイスドライバを再起動し、ユーザー空間にさらにイベントをトリガーします（たとえば、eth0インターフェースの「ifup eth0」の呼び出しなど）。</p>
+</section>
+<section id="device-shutdown-and-user-space-events">
+<h2>デバイスシャットダウンとユーザー空間イベント<a class="headerlink" href="#device-shutdown-and-user-space-events" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このセクションでは、PCIスロットがアンコンフィギュレーションされた際の挙動を説明し、特にデバイスドライバがシャットダウンされるプロセスと、ユーザー空間スクリプトにイベントが届く仕組みに焦点を当てます。</p>
+<p>以下は、EEHリセットの最初のフェーズでデバイスドライバのclose関数が呼び出される例です。以下はpcnet32デバイスドライバの例です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>rpa_php_unconfig_pci_adapter (struct slot *)  // in rpaphp_pci.c
+{
+  calls
+  pci_remove_bus_device (struct pci_dev *) // in /drivers/pci/remove.c
+  {
+    calls
+    pci_destroy_dev (struct pci_dev *)
+    {
+      calls
+      device_unregister (&amp;dev-&gt;dev) // in /drivers/base/core.c
+      {
+        calls
+        device_del (struct device *)
+        {
+          calls
+          bus_remove_device() // in /drivers/base/bus.c
+          {
+            calls
+            device_release_driver()
+            {
+              calls
+              struct device_driver-&gt;remove() which is just
+              pci_device_remove()  // in /drivers/pci/pci_driver.c
+              {
+                calls
+                struct pci_driver-&gt;remove() which is just
+                pcnet32_remove_one() // in /drivers/net/pcnet32.c
+                {
+                  calls
+                  unregister_netdev() // in /net/core/dev.c
+                  {
+                    calls
+                    dev_close()  // in /net/core/dev.c
+                    {
+                       calls dev-&gt;stop();
+                       which is just pcnet32_close() // in pcnet32.c
+                       {
+                         which does what you wanted
+                         to stop the device
+                       }
+                    }
+                 }
+               which
+               frees pcnet32 device driver memory
+            }
+ }}}}}}
+</pre></div>
+</div>
+<p>drivers/pci/pci_driver.cにおいて、struct device_driver-&gt;remove()はpci_device_remove()に等しく、これは <a class="reference internal" href="../PCI/pci.html#c.pci_driver" title="pci_driver"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">pci_driver</span></code></a>-&gt;remove() は pcnet32_remove_one() に等しく、これは <a class="reference internal" href="../networking/kapi.html#c.unregister_netdev" title="unregister_netdev"><code class="xref c c-func docutils literal notranslate"><span class="pre">unregister_netdev()</span></code></a>  （net/core/dev.c 内）で呼び出されます <a class="reference internal" href="../networking/kapi.html#c.dev_close" title="dev_close"><code class="xref c c-func docutils literal notranslate"><span class="pre">dev_close()</span></code></a>  （net/core/dev.c 内）で呼び出される dev-&gt;<a class="reference internal" href="../networking/ieee802154.html#c.stop" title="停止"><code class="xref c c-func docutils literal notranslate"><span class="pre">stop()</span></code></a> これは pcnet32_close() であり、その後適切なシャットダウンを行います</p>
+<p>—</p>
+<p>以下に、PCIデバイスが未設定状態になったときにユーザー空間に送信されるイベントの類似するスタックトレースを示します</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>rpa_php_unconfig_pci_adapter() {             // in rpaphp_pci.c
+  calls
+  pci_remove_bus_device (struct pci_dev *) { // in /drivers/pci/remove.c
+    calls
+    pci_destroy_dev (struct pci_dev *) {
+      calls
+      device_unregister (&amp;dev-&gt;dev) {        // in /drivers/base/core.c
+        calls
+        device_del(struct device * dev) {    // in /drivers/base/core.c
+          calls
+          kobject_del() {                    //in /libs/kobject.c
+            calls
+            kobject_uevent() {               // in /libs/kobject.c
+              calls
+              kset_uevent() {                // in /lib/kobject.c
+                calls
+                kset-&gt;uevent_ops-&gt;uevent()   // which is really just
+                a call to
+                dev_uevent() {               // in /drivers/base/core.c
+                  calls
+                  dev-&gt;bus-&gt;uevent() which is really just a call to
+                  pci_uevent () {            // in drivers/pci/hotplug.c
+                    which prints device name, etc....
+                 }
+               }
+               then kobject_uevent() sends a netlink uevent to userspace
+               --&gt; userspace uevent
+               (during early boot, nobody listens to netlink events and
+               kobject_uevent() executes uevent_helper[], which runs the
+               event process /sbin/hotplug)
+           }
+         }
+         kobject_del() then calls sysfs_remove_dir(), which would
+         trigger any user-space daemon that was watching /sysfs,
+         and notice the delete event.
+</pre></div>
+</div>
+</section>
+<section id="pro-s-and-con-s-of-the-current-design">
+<h2>現在の設計の利点と欠点<a class="headerlink" href="#pro-s-and-con-s-of-the-current-design" title="この見出しへのパーマリンク">¶</a></h2>
+<p>現在のEEHソフトウェア回復設計にはいくつかの問題があり、今後の改訂で改善される可能性があります。ただし、まず現在の設計の大きな利点は、個々のデバイスドライバーに変更を加える必要がないため、広範な対応が可能であることです。一方で、設計の最大の欠点は、ネットワークデーモンやファイルシステムといった必要のないものに影響を与える可能性があることです</p>
+<ul>
+<li><p>小さな不満としては、ネットワークカードのリセットがユーザー空間で連続して ifdown/ifup が実行され、ネットワークデーモンに影響を与える可能性があります。これはPCIカードが再起動されていることを知らなくても発生します</p></li>
+<li><p>より深刻な懸念は、SCSIデバイスのリセットがマウントされたファイルシステムに混乱を引き起こすことです。スクリプトは待機中のバッファをフラッシュせずに事後的にファイルシステムをアンマウントすることはできませんが、これはI/Oがすでに停止しているため不可能です。したがって、理想的にはリセットはブロック層の下で行われるべきであり、ファイルシステムに影響を与えないようにする必要があります</p>
+<p>Reiserfsはブロックデバイスからのエラーを許容しません。Ext3fsは許容し、読み書きを再試行します。両方ともこのシナリオでは軽くテストされてのみています</p>
+<p>SCSI-genericサブシステムには、SCSIデバイスのリセット、SCSIバスのリセット、SCSIホストバスアダプタ（HBA）のリセットを行うための組み込みコードがあります。SCSIコマンドが失敗した場合、これらのリセットは連鎖して試行されます。これらはブロック層に対して完全に非表示です。したがって、EEHリセットをこの連鎖イベントに組み込むのは自然なことです</p>
+</li>
+<li><p>ルートデバイスでSCSIエラーが発生した場合、sysadminが/bin、/sbin、/etc、/varなどramdisk/tmpfsから実行した foresightがなければ、すべてが失われてしまいます</p></li>
+</ul>
+</section>
+<section id="conclusions">
+<h2>結論<a class="headerlink" href="#conclusions" title="この見出しへのパーマリンク">¶</a></h2>
+<p>前進が続いています…</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">powerpc</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="booting.html">デバイスツリー起動</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bootwrapper.html">PowerPC ブート Wrapper</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cpu_families.html">CPU ファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cpu_features.html">CPU フィーチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cxl.html">コヒーレントアクセラレータインターフェース (CXL)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cxlflash.html">コヒーレントアクセラレータ (CXL) フラッシュ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dawr-power9.html">POWER9 上の DAWR に関する問題</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dscr.html">DSCR (データストリーム制御レジスタ)</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">PCIバスEEHエラー回復</a></li>
+<li class="toctree-l2"><a class="reference internal" href="elfnote.html">ELF ノート PowerPC ネームスペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="firmware-assisted-dump.html">ファームウェア支援ダンプ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hvcs.html">HVCS IBM 「ハイパーザーチャー仮想コンソールサーバー」インストールガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="imc.html">IMC (インメモリコレクションカウンタ)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="isa-versions.html">CPU と ISA バージョンマッピング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kaslr-booke32.html">Freescale BookE32 用 KASLR</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mpc52xx.html">Linux 2.6.x における MPC52xx ファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="papr_hcalls.html">ハイパーコール操作コード (hcalls)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pci_iov_resource_on_powernv.html">Powerenv 上の PCI Express I/O ビジュー化リソース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pmu-ebb.html">PMU イベントベースのブランチ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ptrace.html">Ptrace</a></li>
+<li class="toctree-l2"><a class="reference internal" href="qe_firmware.html">Freescale QUICC エンジンファームウェアのアップロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="syscall64-abi.html">Power Architecture 64 ビット Linux システムコール ABI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="transactional_memory.html">トランザクショナルメモリのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ultravisor.html">保護実行ファシリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vas-api.html">仮想アクセラレータスイッチボード (VAS) ユーザースペース API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vcpudispatch_stats.html">VCPU ディスパッチ統計</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">powerpc</a><ul>
+<li>前へ: <a href="dscr.html" title="前章">DSCR (データストリーム制御レジスタ)</a></li>
+<li>次へ: <a href="elfnote.html" title="次章">ELF ノート PowerPC ネームスペース</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/powerpc/eeh-pci-error-recovery.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

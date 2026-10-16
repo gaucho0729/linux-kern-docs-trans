@@ -1,0 +1,865 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Devlink Trap — The Linux Kernel documentation</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="bnxt.html" rel="next" title="bnxt devlink support"/>
+<link href="devlink-reload.html" rel="prev" title="Devlink Reload"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="devlink-trap">
+<h1>Devlinkトラップ<a class="headerlink" href="#devlink-trap" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="background">
+<h2>背景<a class="headerlink" href="#background" title="この見出しへのパーマリンク">¶</a></h2>
+<p>データパスのオフローディングが可能なデバイスは、ブリッジングやルーティングなどの機能を実行する際、カーネル（つまりCPU）に特定のパケットを送信できる必要があります。</p>
+<p>例えば、マルチキャストを認識するブリッジとして動作するデバイスは、IGMPメンバーシップレポートをカーネルに送信して、ブリッジモジュールが処理できるようにする必要があります。このようなパケットを処理しないと、ブリッジモジュールはMDBを構築できなくなります。</p>
+<p>もう一つの例として、ルーターとして動作するデバイスがTTLが1のIPパケットを受信した場合、そのパケットをルーティングする際、デバイスはカーネルに送信しなければなりません。そうしないと、カーネルがそのパケットをルーティングし、ICMPタイムアウトエラーのデータグラムを生成できなくなります。このようなパケットをカーネルにルーティングさせない場合、 <code class="docutils literal notranslate"><span class="pre">traceroute</span></code> などのユーティリティは動作しません。</p>
+<p>特定のパケットをカーネルに送信して処理させるという基本的な機能を「パケットトラップ」と呼びます。</p>
+</section>
+<section id="overview">
+<h2>概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">devlink-trap</span></code> このメカニズムは、機能を持つデバイスドライバーがサポートするパケットトラップを <code class="docutils literal notranslate"><span class="pre">devlink</span></code> に登録し、
+<code class="docutils literal notranslate"><span class="pre">devlink</span></code> にトラップされたパケットを報告できます。</p>
+<p>トラップされたパケットを受信した場合、 <code class="docutils literal notranslate"><span class="pre">devlink</span></code> は各トラップごとにパケットとバイト数を計測し、netlinkイベントを通じてユーザー空間にパケットを報告します。この際、トラップ理由、タイムスタンプ、入力ポートなどのすべてのメタデータを含めます。これは特にドロップトラップ（参照： <a class="reference internal" href="#trap-types"><span class="std std-ref">Trap Types</span></a>）において重要で、ユーザーが通常見えないパケットドロップの詳細な情報を取得できるようになります。</p>
+<p>次のダイアグラムは、以下の一般的な概要を提供します： <code class="docutils literal notranslate"><span class="pre">devlink-trap</span></code>:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>                            Netlink event: Packet w/ metadata
+                                           Or a summary of recent drops
+                          ^
+                          |
+ Userspace                |
++---------------------------------------------------+
+ Kernel                   |
+                          |
+                  +-------+--------+
+                  |                |
+                  |  drop_monitor  |
+                  |                |
+                  +-------^--------+
+                          |
+                          | Non-control traps
+                          |
+                     +----+----+
+                     |         |      Kernel's Rx path
+                     | devlink |      (non-drop traps)
+                     |         |
+                     +----^----+      ^
+                          |           |
+                          +-----------+
+                          |
+                  +-------+-------+
+                  |               |
+                  | Device driver |
+                  |               |
+                  +-------^-------+
+ Kernel                   |
++---------------------------------------------------+
+ Hardware                 |
+                          | Trapped packet
+                          |
+                       +--+---+
+                       |      |
+                       | ASIC |
+                       |      |
+                       +------+
+</pre></div>
+</div>
+</section>
+<section id="trap-types">
+<span id="id1"></span><h2>Trap Types<a class="headerlink" href="#trap-types" title="この見出しへのパーマリンク">¶</a></h2>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">devlink-trap</span></code> このメカニズムは、以下のパケットトラップタイプをサポートしています：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">drop</span></code>: トラップされたパケットは下位デバイスによってドロップされました。パケットは <code class="docutils literal notranslate"><span class="pre">devlink</span></code> によって処理され、カーネルのRxパスに注入されません。トラップアクション（参照： <a class="reference internal" href="#trap-actions"><span class="std std-ref">Trap Actions</span></a>）は変更可能です。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">exception</span></code>: トラップされたパケットは、下位デバイスの例外（例：TTLエラー、隣接エントリの不足）により意図した通りにフォワーディングされず、コントロールプレーンにトラップされました。パケットは <code class="docutils literal notranslate"><span class="pre">devlink</span></code> によって処理され、カーネルのRxパスに注入されます。このようなトラップのアクション変更はコントロールプレーンを破壊する可能性があるため許可されていません。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">control</span></code>: デバイスがコントロールプレーンの正しく動作に必要な制御パケットであるためトラップしました。例えば、ARPリクエストやIGMPクエリパケットです。パケットはカーネルのRxパスに注入されますが、カーネルのドロップモニタに報告されません。このようなトラップのアクション変更はコントロールプレーンを破壊する可能性があるため許可されていません。</p></li>
+</ul>
+</div></blockquote>
+</section>
+<section id="trap-actions">
+<span id="id2"></span><h2>Trap Actions<a class="headerlink" href="#trap-actions" title="この見出しへのパーマリンク">¶</a></h2>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">devlink-trap</span></code> このメカニズムは、以下のパケットトラップアクションをサポートしています：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">trap</span></code>: パケットの単一のコピーがCPUに送信されます。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">drop</span></code>パケットは下位デバイスによってドロップされ、CPUにコピーが送信されません。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mirror</span></code>パケットは下位デバイスによって転送され、CPUにコピーが送信されます。</p></li>
+</ul>
+</div></blockquote>
+</section>
+<section id="generic-packet-traps">
+<h2>汎用パケットトラップ<a class="headerlink" href="#generic-packet-traps" title="この見出しへのパーマリンク">¶</a></h2>
+<p>汎用パケットトラップは、特定の条件（例：TTLエラー）によりトラップされるパケットや、特定のパケットをトラップするためのトラップを記述するために使用されます。このようなトラップは複数のデバイスドライバで共有可能であり、以下の表にその説明を追加する必要があります。</p>
+<table class="colwidths-given docutils align-default" id="id4">
+<caption><span class="caption-text">汎用パケットトラップ一覧</span><a class="headerlink" href="#id4" title="この表へのパーマリンク">¶</a></caption>
+<colgroup>
+<col style="width: 5%"/>
+<col style="width: 5%"/>
+<col style="width: 90%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>名前</p></td>
+<td><p>タイプ</p></td>
+<td><p>説明</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">source_mac_is_multicast</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>デバイスがマルチキャストソースMACの理由でパケットをドロップした場合にトラップします。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vlan_tag_mismatch</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>デバイスがVLANタグの不一致の理由でパケットをドロップした場合にトラップします：イングレスブリッジポートがPVIDで設定されていない場合、パケットがラベルなし（untagged）または優先度ラベル（prio-tagged）で到達した場合。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ingress_vlan_filter</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>デバイスがイングレスブリッジポートに設定されていないVLANタグを持つパケットをドロップした場合にトラップします。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ingress_spanning_tree_filter</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>デバイスがイングレスブリッジポートのSTP状態が「フォワーディング」でないためパケットをドロップした場合にトラップします。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">port_list_is_empty</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>デバイスがフロッディング（例：未知のユニキャスト、登録されていないマルチキャスト）が必要なパケットをドロップした場合にトラップしますが、パケットをフロッディングすべきポートが存在しない場合。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">port_loopback_filter</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>デバイスがレイヤー2転送後、パケットを送信すべきポートが受信ポートのみであるためパケットをドロップした場合にトラップします。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">blackhole_route</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>デバイスがブラックホールルートに当たったためパケットをドロップした場合にトラップします。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ttl_value_is_too_small</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">exception</span></code></p></td>
+<td><p>デバイスがTTLが0またはそれ以下に減算されたユニキャストパケットをフォワーディングすべきであるためパケットをドロップした場合にトラップします。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tail_drop</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>デバイスが送信キューが満杯であるためパケットをキューイングできずドロップした場合にトラップします。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">non_ip</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>デバイスがレイヤー3検索が必要ですが、IPまたはMPLSパケットでないためパケットをドロップした場合にトラップします。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">uc_dip_over_mc_dmac</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>デバイスがルーティングが必要なパケットで、ユニキャスト宛先IPとマルチキャスト宛先MACを持つためパケットをドロップした場合にトラップします。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">dip_is_loopback_address</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>デバイスがルーティングが必要なパケットで、宛先IPがループバックアドレス（つまり、127.0.0.0/8および::1/128）であるためパケットをドロップした場合にトラップします。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sip_is_mc</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>デバイスがルーティングが必要なパケットで、ソースIPがマルチキャスト（つまり、224.0.0.0/8およびff::/8）であるためパケットをドロップした場合にトラップします。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sip_is_loopback_address</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>デバイスがルーティングが必要なパケットで、ソースIPがループバックアドレス（つまり、127.0.0.0/8および::1/128）であるためパケットをドロップした場合にトラップします。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ip_header_corrupted</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>デバイスが破棄したパケットをトラップします。これらのパケットはルーティングが必要であり、IPヘッダが破損しているため（チェックサムエラー、IPバージョン不正、またはインターネットヘッダーレングス（IHL）が短すぎる）</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ipv4_sip_is_limited_bc</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>デバイスが破棄したパケットをトラップします。これらのパケットはルーティングが必要であり、ソースIPアドレスが限定ブロードキャスト（例：255.255.255.255/32）であるため</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ipv6_mc_dip_reserved_scope</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>デバイスが破棄したIPv6パケットをトラップします。これらのパケットはルーティングが必要であり、IPv6マルチキャスト宛先IPアドレスが予約されたスコープ（例：ffx0::/16）を持つため</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ipv6_mc_dip_interface_local_scope</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>デバイスが破棄したIPv6パケットをトラップします。これらのパケットはルーティングが必要であり、IPv6マルチキャスト宛先IPアドレスがインターフェースローカルスコープ（例：ffx1::/16）を持つため</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mtu_value_is_too_small</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">exception</span></code></p></td>
+<td><p>デバイスがルーティングすべきだったが、エグレスインターフェースのMTUより大きいパケットをトラップします</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">unresolved_neigh</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">exception</span></code></p></td>
+<td><p>ルーティング後にIPネイバーに一致しないパケットをトラップします</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mc_reverse_path_forwarding</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">exception</span></code></p></td>
+<td><p>マルチキャストルーティング中に逆パスフォワーディング（RPF）チェックで失敗したマルチキャストIPパケットをトラップします</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">reject_route</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">exception</span></code></p></td>
+<td><p>拒否ルート（例："到達不可"、"禁止"）にヒットしたパケットをトラップします</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ipv4_lpm_miss</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">exception</span></code></p></td>
+<td><p>ルートに一致しないユニキャストIPv4パケットをトラップします</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ipv6_lpm_miss</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">exception</span></code></p></td>
+<td><p>ルートに一致しないユニキャストIPv6パケットをトラップします</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">non_routable_packet</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>デバイスがルーティングすべきではないパケットを破棄したためトラップします。例えば、デバイスがレイヤー2でIGMPクエリをフロッディングする場合、このようなパケットはルーティングせず破棄すべきです</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">decap_error</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">exception</span></code></p></td>
+<td><p>デカプセル化中に失敗したため破棄されたNVEおよびIPinIPパケットをトラップします（例：パケットが短すぎる、VXLANヘッダーに予約ビットが設定されている）</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">overlay_smac_is_mc</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>オーバーレイソースMACがマルチキャストであるため破棄されたNVEパケットをトラップします</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ingress_flow_action_drop</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>イングレスフロー動作ドロップ処理中に破棄されたパケットをトラップします</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">egress_flow_action_drop</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>エグレスフロー動作ドロップ処理中に破棄されたパケットをトラップします</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">stp</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>STPパケットをトラップします</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lacp</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>LACPパケットをトラップします</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lldp</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>LLDPパケットをトラップします</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">igmp_query</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IGMPメンバーシップクエリパケットをトラップします</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">igmp_v1_report</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IGMPバージョン1メンバーシップレポートパケットをトラップします</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">igmp_v2_report</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IGMPバージョン2メンバーシップレポートパケットをトラップします</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">igmp_v3_report</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IGMPバージョン3メンバーシップレポートパケットをトラップします</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">igmp_v2_leave</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IGMPバージョン2グループ離脱パケットをトラップします</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mld_query</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>MLDマルチキャストリスナークエリパケットをトラップします</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mld_v1_report</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>MLDバージョン1マルチキャストリスナーレポートパケットをトラップします</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mld_v2_report</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>MLDバージョン2マルチキャストリスナーレポートパケットをトラップします</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mld_v1_done</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>MLDバージョン1マルチキャストリスナー完了パケットをトラップします</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ipv4_dhcp</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IPv4 DHCPパケットをトラップします</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ipv6_dhcp</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IPv6 DHCPパケットをトラップします</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">arp_request</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>ARPリクエストパケットをトラップします</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">arp_response</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>ARPレスポンスパケットをトラップします</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">arp_overlay</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>NVEデカプセル化されたARPパケットがオーバーレイネットワークに到達した場合をトラップします。たとえば、解決が必要なアドレスがローカルアドレスである場合など</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ipv6_neigh_solicit</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IPv6ネイバー・ソリケーションパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ipv6_neigh_advert</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IPv6ネイバー・アドバタイズメントパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ipv4_bfd</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IPv4 BFDパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ipv6_bfd</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IPv6 BFDパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ipv4_ospf</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IPv4 OSPFパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ipv6_ospf</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IPv6 OSPFパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ipv4_bgp</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IPv4 BGPパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ipv6_bgp</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IPv6 BGPパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ipv4_vrrp</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IPv4 VRRPパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ipv6_vrrp</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IPv6 VRRPパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ipv4_pim</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IPv4 PIMパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ipv6_pim</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IPv6 PIMパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">uc_loopback</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>同じレイヤー3インターフェースから受信したパケットをルーティングする必要があるユニキャストパケットをキャプチャ。このようなパケットはカーネルによってルーティングされ、ICMPリダイレクトパケットを生成する可能性がある</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">local_route</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>ローカルルートに一致し、ローカルで配信する必要があるユニキャストパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">external_route</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>イングレスインターフェースと同じデバイス（例：スイッチASIC）に属さない外部インターフェース（例：マネジメントインターフェース）を経由してルーティングするパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ipv6_uc_dip_link_local_scope</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>リンクローカルスコープ（つまりfe80::/10）を持つ宛先IPアドレスをもつルーティングが必要なユニキャストIPv6パケットをキャプチャ。このキャプチャにより、デバイスドライバーはリンクローカルルートのプログラミングを回避できるが、ローカル配信用のパケットを受信できる</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ipv6_dip_all_nodes</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>宛先IPアドレスが「すべてのノードアドレス」（つまりff02::1）であるIPv6パケットをキャプチャ</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ipv6_dip_all_routers</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>宛先IPアドレスが「すべてのルーターアドレス」（つまりff02::2）であるIPv6パケットをキャプチャ</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ipv6_router_solicit</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IPv6ルーター・ソリケーションパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ipv6_router_advert</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IPv6ルーター・アドバタイズメントパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ipv6_redirect</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>IPv6リダイレクトメッセージパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ipv4_router_alert</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>ルーター・アラートオプションを含むルーティングが必要なIPv4パケットをキャプチャ。このようなパケットは、IP_ROUTER_ALERTソケットオプションが設定されたrawソケットにローカルで配信する必要がある</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ipv6_router_alert</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>ルーター・アラートオプションを含むHop-by-Hop拡張ヘッダーをもつルーティングが必要なIPv6パケットをキャプチャ。このようなパケットは、IPV6_ROUTER_ALERTソケットオプションが設定されたrawソケットにローカルで配信する必要がある</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ptp_event</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>PTPタイムクリティカルイベントメッセージ（Sync、Delay_req、Pdelay_ReqおよびPdelay_Resp）をキャプチャ</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ptp_general</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>PTP汎用メッセージ（Announce、Follow_Up、Delay_Resp、Pdelay_Resp_Follow_Up、マネジメントおよびシグナリング）をキャプチャ</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">flow_action_sample</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>フロー・アクション・サンプル処理中にサンプリングされたパケットをキャプチャ（例：tcのサンプルアクション経由）</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">flow_action_trap</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">control</span></code></p></td>
+<td><p>フロー・アクション・トラップ処理中にログされたパケットをキャプチャ（例：tcのトラップアクション経由）</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">early_drop</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>RED（ランダム・イアリー・デテクション）アルゴリズムによるドロップ（つまり早期ドロップ）のパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vxlan_parsing</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>VXLANヘッダー解析エラーによるドロップ（パケットの切断またはIフラグが設定されていない可能性がある）のパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">llc_snap_parsing</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>LLC+SNAPヘッダー解析エラーによるドロップのパケットをキャプチャ</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vlan_parsing</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>VLANヘッダーパースエラーによりドロップされたパケットをトラップします。予期せぬパケット切断を含む可能性があります。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">pppoe_ppp_parsing</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>PPPoE+PPPヘッダーパースエラーによりドロップされたパケットをトラップします。セッションIDが0xFFFF（予約済みで使用不可）である場合、PPPoE長さがフレーム受信サイズより大きい場合、またはこのヘッダー種別の一般的なエラーを含む可能性があります。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mpls_parsing</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>MPLSヘッダーパースエラーによりドロップされたパケットをトラップします。予期せぬヘッダートラムペーションを含む可能性があります。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">arp_parsing</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>ARPヘッダーパースエラーによりドロップされたパケットをトラップします。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ip_1_parsing</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>最初のIPヘッダーパースエラーによりドロップされたパケットをトラップします。このトラップには、IPチェックサム検査に通らないパケット、ヘッダーレンジ検査（最小20バイト）に失敗するパケット、パケット切断によりトータル長フィールドが受信パケット長を上回るなど、一般的なエラーを含む可能性があります。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ip_n_parsing</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>最後のIPヘッダーパースエラー（IP over IPトンネルの場合の内側のヘッダー）によりドロップされたパケットをトラップします。ip_1_parsingトラップと同じ一般的なエラー検査がここでも行われます。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">gre_parsing</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>GREヘッダーパースエラーによりドロップされたパケットをトラップします。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">udp_parsing</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>UDPヘッダーパースエラーによりドロップされたパケットをトラップします。チェックサムエラー、UDP長さが8バイト未満であることが検出された場合、またはヘッダートラムペーションが検出された場合を含む可能性があります。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tcp_parsing</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>TCPヘッダーパースエラーによりドロップされたパケットをトラップします。TCPチェックサムエラー、SYN、FINおよび/またはRESETの不適切な組み合わせなど、一般的なエラーを含む可能性があります。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ipsec_parsing</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>IPSECヘッダーパースエラーによりドロップされたパケットをトラップします。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sctp_parsing</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>SCTPヘッダーパースエラーによりドロップされたパケットをトラップします。ポート番号0が使用されたか、ヘッダーが切断されていることを意味します。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">dccp_parsing</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>DCCPヘッダーパースエラーによりドロップされたパケットをトラップします。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">gtp_parsing</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>GTPヘッダーパースエラーによりドロップされたパケットをトラップします。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">esp_parsing</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">drop</span></code></p></td>
+<td><p>ESPヘッダーパースエラーによりドロップされたパケットをトラップします。</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="driver-specific-packet-traps">
+<h2>ドライバ固有のパケットトラップ<a class="headerlink" href="#driver-specific-packet-traps" title="この見出しへのパーマリンク">¶</a></h2>
+<p>デバイスドライバーはドライバ固有のパケットトラップを登録できますが、これらは明確にドキュメント化する必要があります。このようなトラップはデバイス固有の例外に対応し、これらの例外によって引き起こされるパケットドロップのデバッグに役立ちます。以下のリストには、さまざまなデバイスドライバーが登録したドライバ固有トラップの説明へのリンクが含まれています。</p>
+<blockquote>
+<div><ul class="simple">
+<li><p><a class="reference internal" href="netdevsim.html"><span class="doc">netdevsim devlinkサポート</span></a></p></li>
+<li><p><a class="reference internal" href="mlxsw.html"><span class="doc">mlxsw devlinkサポート</span></a></p></li>
+</ul>
+</div></blockquote>
+</section>
+<section id="generic-packet-trap-groups">
+<span id="id3"></span><h2>汎用パケットトラップグループ<a class="headerlink" href="#generic-packet-trap-groups" title="この見出しへのパーマリンク">¶</a></h2>
+<p>汎用パケットトラップグループは論理的に関連するパケットトラップをまとめたものです。これらのグループは、メンバーのトラップすべてに対してトラップアクションの設定などの一括操作をユーザーに可能にします。さらに、 <code class="docutils literal notranslate"><span class="pre">devlink-trap</span></code> 個別トラップの統計が狭すぎる場合、グループごとのパケットとバイト数の集計統計を報告できます。これらのグループの説明は以下の表に追加する必要があります。</p>
+<table class="colwidths-given docutils align-default" id="id5">
+<caption><span class="caption-text">一般的なパケットトラップグループ一覧</span><a class="headerlink" href="#id5" title="この表へのパーマリンク">¶</a></caption>
+<colgroup>
+<col style="width: 10%"/>
+<col style="width: 90%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>名前</p></td>
+<td><p>説明</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">l2_drops</span></code></p></td>
+<td><p>レイヤー2フォワーディング（ブリッジ）中にデバイスによってドロップされたパケットのトラップを含みます。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">l3_drops</span></code></p></td>
+<td><p>レイヤー3フォワーディング中にデバイスによってドロップされたパケットのトラップを含みます。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">l3_exceptions</span></code></p></td>
+<td><p>レイヤー3フォワーディング中に例外（例：TTLエラー）によりドロップされたパケットのトラップを含みます。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">buffer_drops</span></code></p></td>
+<td><p>エンキュー決定によりデバイスによってドロップされたパケットのトラップを含みます。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tunnel_drops</span></code></p></td>
+<td><p>トンネルのカプセル化/デカプセル化中にデバイスによってドロップされたパケットのトラップを含みます。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">acl_drops</span></code></p></td>
+<td><p>ACL処理中にデバイスによってドロップされたパケットのトラップを含みます。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">stp</span></code></p></td>
+<td><p>STPパケットのトラップを含みます。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lacp</span></code></p></td>
+<td><p>LACPパケットのトラップを含みます。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lldp</span></code></p></td>
+<td><p>LLDPパケットのトラップを含みます。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mc_snooping</span></code></p></td>
+<td><p>マルチキャストスヌープングに必要なIGMPおよびMLDパケットのトラップを含みます。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dhcp</span></code></p></td>
+<td><p>DHCPパケットのトラップを含みます。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">neigh_discovery</span></code></p></td>
+<td><p>ネイバー発見パケット（例：ARP、IPv6 ND）のトラップを含みます。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">bfd</span></code></p></td>
+<td><p>BFDパケットのトラップを含みます。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ospf</span></code></p></td>
+<td><p>OSPFパケットのトラップを含みます。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">bgp</span></code></p></td>
+<td><p>BGPパケットのトラップを含みます。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vrrp</span></code></p></td>
+<td><p>VRRPパケットのトラップを含みます。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">pim</span></code></p></td>
+<td><p>PIMパケットのトラップを含みます。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">uc_loopback</span></code></p></td>
+<td><p>ユニキャストループバックパケット（つまり、
+<code class="docutils literal notranslate"><span class="pre">uc_loopback</span></code>）のトラップを含みます。このようなワンアームルーターなどのケースでは常にトリガーされるため、CPU使用率への影響を抑えるために、低レートのパケットトラップポリシングをグループにバインドできます。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">local_delivery</span></code></p></td>
+<td><p>ルーティング後にローカルに配信すべきだが、より具体的なトラップに一致しないパケットのトラップを含みます（例：
+<code class="docutils literal notranslate"><span class="pre">ipv4_bgp</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">external_delivery</span></code></p></td>
+<td><p>外部インターフェース（例：マネジメントインターフェース）を通じてルーティングすべきだが、イングレスインターフェースと同じデバイス（例：スイッチASIC）に属さないパケットのトラップを含みます。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ipv6</span></code></p></td>
+<td><p>さまざまなIPv6制御パケット（例：ルーター広告）のトラップを含みます。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ptp_event</span></code></p></td>
+<td><p>PTPタイムクリティカルイベントメッセージ（Sync、Delay_req、Pdelay_ReqおよびPdelay_Resp）のトラップを含みます。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ptp_general</span></code></p></td>
+<td><p>PTP汎用メッセージ（Announce、Follow_Up、Delay_Resp、Pdelay_Resp_Follow_Up、管理およびシグナリング）のトラップを含みます。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">acl_sample</span></code></p></td>
+<td><p>ACL処理中にデバイスによってサンプリングされたパケットのトラップを含みます。</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">acl_trap</span></code></p></td>
+<td><p>ACL処理中にデバイスによってトラップ（ログ）されたパケットのトラップを含みます。</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">parser_error_drops</span></code></p></td>
+<td><p>パース中にデバイスによって誤りとしてマークされたパケットのトラップを含みます。</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="packet-trap-policers">
+<h2>パケットトラップポリサー<a class="headerlink" href="#packet-trap-policers" title="この見出しへのパーマリンク">¶</a></h2>
+<p>以前説明したように、基盤となるデバイスは特定のパケットをCPUにトラップして処理することが可能です。ほとんどの場合、基盤となるデバイスはCPUが処理可能なパケットレートよりも何桁も高いレートを処理することが可能です。</p>
+<p>そのため、基盤となるデバイスがCPUを過負荷にするのを防ぐために、デバイスはCPUが処理可能なレートにトラップされたパケットを制御するパケットトラップポリサーを備えています。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">devlink-trap</span></code> このメカニズムにより、機能するデバイスドライバーはサポートされているパケットトラップポリサーを <code class="docutils literal notranslate"><span class="pre">devlink</span></code>に登録できます。デバイスドライバーは初期化時にこれらのポリサーをサポートされているパケットトラップグループと関連付けることができます（参照
+<a class="reference internal" href="#generic-packet-trap-groups"><span class="std std-ref">汎用パケットトラップグループ</span></a>）。</p>
+<p>デバイスドライバーは、ユーザー空間がポリサーのパラメータ（例：レート、バーストサイズ）やポリサーとトラップグループの関連付けを変更できるように、関連するコールバックを実装する必要があります。</p>
+<p>可能であれば、デバイスドライバーはユーザー空間がポリサーによって違反された設定ポリシーによりドロップされたパケット数を取得できるコールバックを実装する必要があります。</p>
+</section>
+<section id="testing">
+<h2>テスト<a class="headerlink" href="#testing" title="この見出しへのパーマリンク">¶</a></h2>
+<p>参照 <code class="docutils literal notranslate"><span class="pre">tools/testing/selftests/drivers/net/netdevsim/devlink_trap.sh</span></code> コアインフラストラクチャをカバーするテストのためのテストケースを追加する必要があります。</p>
+<p>デバイスドライバーは、サポートされているパケットトラップのトリガーなど、デバイス固有の機能に焦点を当ててテストを行う必要があります。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxネットワーキングドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../netdev-FAQ.html">netdev FAQ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../af_xdp.html">AF_XDP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bareudp.html">Bare UDPトンネリングモジュールドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../batman-adv.html">batman-adv</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../can.html">SocketCAN - コントローラー・エリア・ネットワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../can_ucan_protocol.html">UCANプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device_drivers/index.html">ハードウェアデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dsa/index.html">分散スイッチアーキテクチャ</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">Linux Devlinkドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../caif/index.html">CAIF</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ethtool-netlink.html">ethtool用Netlinkインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ieee802154.html">IEEE 802.15.4開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../j1939.html">J1939ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kapi.html">LinuxネットワーキングとネットワークデバイスAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../msg_zerocopy.html">MSG_ZEROCOPY</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../failover.html">フェールオーバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../net_dim.html">Net DIM - ジェネリックネットワークダイナミック割込みモデレーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../net_failover.html">NET_FAILOVER</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../page_pool.html">ページプールAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../phy.html">PHY抽象レイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sfp-phylink.html">phylink</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../alias.html">IPアリアシング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bridge.html">イーサネットブリッジング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../snmp_counter.html">SNMPカウンター</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../checksum-offloads.html">チェックサムオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../segmentation-offloads.html">セグメンテーションオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../scaling.html">Linuxネットワーキングスタックにおけるスケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tls.html">カーネルTLS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tls-offload.html">カーネルTLSオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nfc.html">Linux NFCサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../6lowpan.html">6lowpanインターフェース用Netdevプライベートデータルーム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../6pack.html">6packプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../arcnet-hardware.html">ARCnetハードウェア</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../arcnet.html">ARCnet</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../atm.html">ATM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ax25.html">AX.25</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bonding.html">LinuxイーサネットボンディングドライバHOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cdc_mbim.html">cdc_mbim - CDC MBIMモバイルブロードバンドモデム用ドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dccp.html">DCCPプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dctcp.html">DCTCP（データセンターTCP）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../decnet.html">Linux DECnetネットワーキングレイヤー情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dns_resolver.html">DNSリゾルバー・モジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../driver.html">Softnetドライバーの問題</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../eql.html">EQLドライバー: シリアルIPロードバランシングガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../fib_trie.html">LC-trie実装ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../filter.html">Linux Socket Filtering（別名Berkeley Packet Filter（BPF））</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../framerelay.html">フレームリレー（FR）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../generic-hdlc.html">ジェネリックHDLCレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../generic_netlink.html">ジェネリックネットリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../gen_stats.html">ネットリンクユーザー向けジェネリックネットワーキング統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../gtp.html">LinuxカーネルGTPトンネリングモジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ila.html">識別子ロケーターアドレスング（ILA）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipddp.html">AppleTalk-IPデカプセル化とAppleTalk-IPエンカプセル化</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ip_dynaddr.html">IPダイナミックアドレスハックポートv0.03</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipsec.html">IPsec</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ip-sysctl.html">IP Sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipv6.html">IPv6</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipvlan.html">IPVLANドライバーガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipvs-sysctl.html">IPvs-sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kcm.html">カーネルコネクションマルチプレクサ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../l2tp.html">L2TP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lapb-module.html">Linux LAPBモジュールインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mac80211-injection.html">mac80211を使用したパケットインジェクションの使い方</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mpls-sysctl.html">MPLS Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../multiqueue.html">マルチキューネットワークデバイスサポートガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../netconsole.html">Netconsole</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../netdev-features.html">ネットデバイス機能の混乱とその解決方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../netdevices.html">ネットワークデバイス、カーネル、そしてあなた！</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../netfilter-sysctl.html">Netfilter Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../netif-msg.html">NETIFメッセージレベル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nf_conntrack-sysctl.html">Netfilter Conntrack Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nf_flowtable.html">Netfilterのフローテーブルインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../openvswitch.html">Open vSwitch datapath開発者ドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../operstates.html">運用状態</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../packet_mmap.html">パケットMMAP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../phonet.html">Linux Phonetプロトコルファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pktgen.html">Linuxパケットジェネレーターガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../plip.html">PLIP: 平行線インターネットプロトコルデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ppp_generic.html">PPPジェネリックドライバーおよびチャネルインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../proc_net_tcp.html">proc/net/tcpおよびproc/net/tcp6変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../radiotap-headers.html">radiotapヘッダの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html">概要</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#rds-architecture">RDSアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#socket-interface">ソケットインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#rdma-for-rds">RDS用RDMA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#congestion-notifications">コンゲスト通知</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#rds-protocol">RDSプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#rds-transport-layer">RDSトランスポートレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#rds-kernel-structures">RDSカーネル構造体</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#connection-management">接続管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#the-send-path">送信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#the-recv-path">受信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#multipath-rds-mprds">マルチパスRDS (mprds)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../regulatory.html">Linuxワイヤレス規制ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rxrpc.html">RxRPC ネットワークプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rxrpc.html#socket-options">ソケットオプション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rxrpc.html#security">セキュリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rxrpc.html#example-client-usage">例: クライアントの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sctp.html">LinuxカーネルSCTP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../secid.html">LSM/SeLinux secid</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../seg6-sysctl.html">Seg6 Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../statistics.html">インターフェース統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../strparser.html">ストリームパーサー (strparser)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../switchdev.html">イーサネットスイッチデバイスドライバモデル (switchdev)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sysfs-tagging.html">Sysfsタグ付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tc-actions-env-rules.html">TCアクション - 環境ルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tcp-thin.html">スリムストリームとTCP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../team.html">チーム (Team)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../timestamping.html">タイムスタンピング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tproxy.html">透過プロキシサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tuntap.html">ユニバーサルTUN/TAPデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../udplite.html">UDP-Liteプロトコル (RFC 3828)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vrf.html">仮想ルーティングおよびフォワーディング (VRF)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vxlan.html">仮想拡張ローカルエリアネットワーキングドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../x25-iface.html">パケットレイヤーからデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../x25-iface.html#device-driver-to-packet-layer">デバイスドライバからパケットレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../x25.html">Linux X.25プロジェクト</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xfrm_device.html">XFRMデバイス - IPsec計算のオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xfrm_proc.html">XFRMプロセス - /proc/net/xfrm_*ファイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xfrm_sync.html">XFRM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xfrm_sysctl.html">XFRMシステムコール</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxネットワーキングドキュメント</a><ul>
+<li><a href="index.html">Linux Devlinkドキュメンテーション</a><ul>
+<li>前へ: <a href="devlink-reload.html" title="前章">Devlink Reload</a></li>
+<li>次へ: <a href="bnxt.html" title="次章">bnxt devlink support</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/networking/devlink/devlink-trap.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

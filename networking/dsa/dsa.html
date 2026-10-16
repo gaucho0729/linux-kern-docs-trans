@@ -1,0 +1,594 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>アーキテクチャ — Linux Kernel ドキュメント</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="b53.html" rel="next" title="Broadcom RoboSwitch Ethernet switch driver"/>
+<link href="index.html" rel="prev" title="分散スイッチアーキテクチャ"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="architecture">
+<h1>アーキテクチャ<a class="headerlink" href="#architecture" title="この見出しへのパーマリンク">¶</a></h1>
+<p>このドキュメントはサポートされる機能を説明しています <strong>分散スイッチアーキテクチャ (DSA)</strong> サブシステムの設計原則、制限、他のサブシステムとの相互作用、このサブシステム用ドライバの開発方法、および開発者向けのTODOリストを含みます。</p>
+<section id="design-principles">
+<h2>設計原則<a class="headerlink" href="#design-principles" title="この見出しへのパーマリンク">¶</a></h2>
+<p>分散スイッチアーキテクチャは、主にLinuxを用いてMarvellのイーサネットスイッチ（MV88E6xxx、通称リンクストリート製品ライン）をサポートするサブシステムとして設計されましたが、その後他のベンダーにも対応するようになりました。</p>
+<p>この設計の元となる哲学は、bridge、iproute2、ifconfigなどの未変更のLinuxツールを用いて、スイッチポートネットワークデバイスか通常のネットワークデバイスかに関わらず透明に動作できるようにすることでした。</p>
+<p>イーサネットスイッチは通常、複数のフロントパネルポートと、1つまたは複数のCPUまたは管理ポートから構成されます。DSAサブシステムは現在、スイッチからEthernetフレームを受信できるEthernetコントローラーに接続された管理ポートの存在に依存しています。これは、家庭用およびオフィス用のイーサネットスイッチの一般的な設定です：ルーター、ゲートウェイ、またはトポックオブザラックスイッチなど。このホストEthernetコントローラーは、DSAの用語とコードでは後に「マスターやCPU」と呼ばれます。</p>
+<p>DSAのDは「分散（Distributed）」を意味します。これは、スイッチ間のアップストリームおよびダウンストリームイーサネットリンクを介して、複数のスイッチを重ねて配置した分散スイッチを構成・管理できるように設計されています。これらの特定のポートは、DSAの用語とコードでは「dsaポート」と呼ばれます。複数のスイッチが接続された集合体は「スイッチツリー」と呼ばれます。</p>
+<p>各フロントパネルポートに対して、制御およびデータフローのエンドポイントとしてLinuxネットワーキングスタックで使用される専用のネットワークデバイスを作成します。これらの専用ネットワークインターフェースは、DSAの用語とコードでは「slaveネットワークインターフェース」と呼ばれます。</p>
+<p>DSAを用いる理想的なケースは、イーサネットスイッチが「スイッチタグ」と呼ばれるハードウェア機能をサポートしている場合です。これは、スイッチが特定のポートから受信または送信したイーサネットフレームに特定のタグを挿入し、管理インターフェースが次の情報を把握するのを助けるための機能です：</p>
+<ul class="simple">
+<li><p>このフレームがどのポートから到達したのか</p></li>
+<li><p>このフレームが転送された理由</p></li>
+<li><p>CPUが発信したトラフィックを特定のポートに送信する方法</p></li>
+</ul>
+<p>サブシステムは、タグの挿入/削除ができないスイッチにも対応していますが、その場合、機能はやや制限される可能性があります（トラフィックの分離はポートベースのVLAN IDに依存します）。</p>
+<p>DSAは現在、「cpu」および「dsa」ポートに対してネットワークインターフェースを作成していません。理由は以下の通りです：</p>
+<ul class="simple">
+<li><p>「cpu」ポートはマネジメントコントローラーのイーサネットスイッチ対応側であり、これにより同じ中継に対して2つのインターフェース（マスターネットデバイスと「cpu」ネットデバイス）が作成され、機能の重複が生じるためです。</p></li>
+<li><p>「dsa」ポート（複数可）は2つ以上のスイッチ間の単なる中継であり、実際には適切なネットワークインターフェースとして使用できません。このモデルでは、ダウンストリームまたは最上位のアップストリームインターフェースのみ意味があります。</p></li>
+</ul>
+<section id="switch-tagging-protocols">
+<h3>スイッチタグプロトコル<a class="headerlink" href="#switch-tagging-protocols" title="この見出しへのパーマリンク">¶</a></h3>
+<p>DSAは現在、5種類のタグプロトコルとタグなしモードをサポートしています。異なるプロトコルは以下の通り実装されています：</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">net/dsa/tag_trailer.c</span></code>: Marvellの4トラILERタグモード（レガシー）</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">net/dsa/tag_dsa.c</span></code>: MarvellのオリジナルDSAタグ</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">net/dsa/tag_edsa.c</span></code>: Marvellの拡張DSAタグ</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">net/dsa/tag_brcm.c</span></code>: Broadcomの4バイトタグ</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">net/dsa/tag_qca.c</span></code>: Qualcommの2バイトタグ</p></li>
+</ul>
+<p>タグプロトコルの正確な形式はベンダースペシフィックですが、一般的にはすべてのプロトコルが以下の要素を含みます：</p>
+<ul class="simple">
+<li><p>イーサネットフレームがどのポートから来た/どのポートに送られるかを識別します</p></li>
+<li><p>このフレームがマネジメントインターフェースに転送された理由を提供します</p></li>
+</ul>
+</section>
+<section id="master-network-devices">
+<h3>マスターネットワークデバイス<a class="headerlink" href="#master-network-devices" title="この見出しへのパーマリンク">¶</a></h3>
+<p>マスターネットワークデバイスは、CPU/マネジメントイーサネットインターフェース用の通常の、変更されていないLinuxネットワークデバイスドライバーです。このようなドライバーは、DSAが有効かどうかを知る必要がある場合があります（例：特定のオフロード機能の有効/無効化）。ただし、DSAサブシステムは業界標準ドライバーと組み合わせて動作することを証明しており、
+<code class="docutils literal notranslate"><span class="pre">e1000e,</span></code> <code class="docutils literal notranslate"><span class="pre">mv643xx_eth</span></code> これらのドライバーを変更することなく動作します。このようなネットワークデバイスは、ホストプロセッサとハードウェアイーサネットスイッチ間のパイプとして機能するため、しばしば「中継ネットワークデバイス」とも呼ばれます。</p>
+</section>
+<section id="networking-stack-hooks">
+<h3>ネットワーキングスタックのフック<a class="headerlink" href="#networking-stack-hooks" title="この見出しへのパーマリンク">¶</a></h3>
+<p>マスターネットデバイスをDSAと併用する場合、ネットワーキングスタックに小さなフックを設置して、DSAサブシステムがイーサネットスイッチ固有のタグプロトコルを処理できるようにします。DSAはネットワーキングスタックに特定の（仮想の）イーサネットタイプを登録することでこれを実現します（後述の <code class="docutils literal notranslate"><span class="pre">skb-&gt;protocol</span></code>)。これは「 <code class="docutils literal notranslate"><span class="pre">ptype</span></code> または <code class="docutils literal notranslate"><span class="pre">packet_type</span></code>」としても知られています。典型的なイーサネットフレーム受信シーケンスは以下のようになります：</p>
+<p>マスターネットワークデバイス（例：e1000e）：</p>
+<ol class="arabic">
+<li><p>受信割込みが発生：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>受信関数が呼び出されます</p></li>
+<li><p>基本的なパケット処理が行われます：長さやステータスの取得など</p></li>
+<li><p>イーサネットレイヤーで処理されるよう、パケットが準備されます。これには
+<code class="docutils literal notranslate"><span class="pre">eth_type_trans</span></code></p></li>
+</ul>
+</div></blockquote>
+</li>
+<li><p>net/ethernet/eth.c：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>eth_type_trans(skb, dev)
+        if (dev-&gt;dsa_ptr != NULL)
+                -&gt; skb-&gt;protocol = ETH_P_XDSA
+</pre></div>
+</div>
+</li>
+<li><p>drivers/net/ethernet/*：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>netif_receive_skb(skb)
+        -&gt; iterate over registered packet_type
+                -&gt; invoke handler for ETH_P_XDSA, calls dsa_switch_rcv()
+</pre></div>
+</div>
+</li>
+<li><p>net/dsa/dsa.c：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>-&gt; dsa_switch_rcv()
+        -&gt; invoke switch tag specific protocol handler in 'net/dsa/tag_*.c'
+</pre></div>
+</div>
+</li>
+<li><p>net/dsa/tag_*.c:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>スイッチタグプロトコルを検査して除去し、発信元ポートを特定する</p></li>
+<li><p>ポートごとのネットワークデバイスを特定する</p></li>
+<li><p>呼び出す <code class="docutils literal notranslate"><span class="pre">eth_type_trans()</span></code> DSAスレーブネットワークデバイスとともに</p></li>
+<li><p>呼び出される <code class="docutils literal notranslate"><span class="pre">netif_receive_skb()</span></code></p></li>
+</ul>
+</div></blockquote>
+</li>
+</ol>
+<p>この時点で、DSAスレーブネットワークデバイスは通常のイーサネットフレームを受け取り、ネットワークスタックによって処理可能になります。</p>
+</section>
+<section id="slave-network-devices">
+<h3>スレーブネットワークデバイス<a class="headerlink" href="#slave-network-devices" title="この見出しへのパーマリンク">¶</a></h3>
+<p>DSAによって作成されたスレーブネットワークデバイスは、それぞれのマスターネットワークデバイスの上にスタックされ、これらのネットワークインターフェースは、スイッチのフロントパネルポートごとに制御およびデータフローのエンドポイントとして責任をもつことになります。これらのインターフェースは以下の目的のために専門化されています:</p>
+<ul class="simple">
+<li><p>特定のスイッチポート間でトラフィックを送信・受信する際、スイッチタグプロトコル（存在する場合）を挿入/削除する</p></li>
+<li><p>スイッチに対してethtool操作を照会する: ステータス、リンク状態、Wake-on-LAN、レジスタダンプなど</p></li>
+<li><p>外部/内部PHY管理: リンク、オートネゴシエーションなど</p></li>
+</ul>
+<p>これらのスレーブネットワークデバイスは、net_device_opsおよびethtool_opsのカスタム関数ポインタを持ち、DSAがネットワークスタック/ethtoolとスイッチドライバ実装の間にレイヤーを導入できるようにします。</p>
+<p>これらのスレーブネットワークデバイスからフレームを送信する際、DSAはこれらのネットワークデバイスに現在登録されているスイッチタグプロトコルを検索し、関連するスイッチタグをイーサネットフレームに追加する特定の送信ルーチンを呼び出します。</p>
+<p>これらのフレームはマスターネットワークデバイスを使用して送信キューに並べられます
+<code class="docutils literal notranslate"><span class="pre">ndo_start_xmit()</span></code> これらのフレームはスイッチングインターフェースから適切なスイッチタグを含んでいるため、イーサネットスイッチがこれらのフレームを処理し、物理スイッチポートに配信できます。</p>
+</section>
+<section id="graphical-representation">
+<h3>グラフィカルな表現<a class="headerlink" href="#graphical-representation" title="この見出しへのパーマリンク">¶</a></h3>
+<p>要約すると、これはネットワークデバイスの観点からのDSAの概要です:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>        |---------------------------
+        | CPU network device (eth0)|
+        ----------------------------
+        | &lt;tag added by switch     |
+        |                          |
+        |                          |
+        |        tag added by CPU&gt; |
+|--------------------------------------------|
+|            Switch driver                   |
+|--------------------------------------------|
+          ||        ||         ||
+      |-------|  |-------|  |-------|
+      | sw0p0 |  | sw0p1 |  | sw0p2 |
+      |-------|  |-------|  |-------|
+</pre></div>
+</div>
+</section>
+<section id="slave-mdio-bus">
+<h3>スレーブMDIOバス<a class="headerlink" href="#slave-mdio-bus" title="この見出しへのパーマリンク">¶</a></h3>
+<p>スイッチ内蔵のPHYにアクセスするため、DSAはスレーブMDIOバスを作成し、特定のスイッチドライバが特定のPHYアドレスに対してMDIO読み書きを転送・ interceptions できます。ほとんどのMDIO接続スイッチでは、これらの機能は直接または間接的なPHYアドレッシングモードを使用して、スイッチ内蔵PHYから標準MIIレジスタを返し、PHYライブラリおよび/またはリンク状態、リンクパートナーのページ、オートネゴシエーション結果などを返します。</p>
+<p>外部および内部のMDIOバスを持つイーサネットスイッチでは、スレーブMIIバスを使用して、スイッチに接続されている内部または外部MDIOデバイス（内部PHY、外部PHY、または外部スイッチなど）へのMDIO読み書きを多重/分離できます。</p>
+</section>
+<section id="data-structures">
+<h3>データ構造<a class="headerlink" href="#data-structures" title="この見出しへのパーマリンク">¶</a></h3>
+<p>DSAデータ構造は以下で定義されています <code class="docutils literal notranslate"><span class="pre">include/net/dsa.h</span></code> および
+<code class="docutils literal notranslate"><span class="pre">net/dsa/dsa_priv.h</span></code>:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">dsa_chip_data</span></code>: プラットフォームデータ構成は特定のスイッチデバイスのためのもので、この構造体はスイッチデバイスの親デバイス、そのアドレス、およびポートの各種プロパティ（名前/ラベル）を記述し、最後にルーティングテーブルの指示（スイッチのカスケード時）を含みます</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">dsa_platform_data</span></code>: プラットフォームデバイス構成データで、複数のスイッチがカスケードされる場合にdsa_chip_data構造体のコレクションを参照できます。このスイッチツリーが接続されているマスターネットワークデバイスを参照する必要があります</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">dsa_switch_tree</span></code>: マスターネットワークデバイスに割り当てられた構造体
+<code class="docutils literal notranslate"><span class="pre">dsa_ptr</span></code>, この構造体はdsa_platform_data構造体およびスイッチツリーがサポートするタギングプロトコルを参照し、受信/送信機能のフックが呼び出される必要があります。また、直接接続されたスイッチに関する情報（CPUポート）も提供されています。最後に、ツリー内の個々のスイッチを参照するdsa_switchのコレクションが含まれます</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">dsa_switch</span></code>: ツリー内のスイッチデバイスを記述する構造体で、以下を参照しています <code class="docutils literal notranslate"><span class="pre">dsa_switch_tree</span></code> バックポインタとして、スレーブネットワークデバイス、マスターネットワークデバイス、およびバックイングのdsa_switch_opsへの参照</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">dsa_switch_ops</span></code>: 関数ポインタを参照する構造体、詳細な説明は以下にあります</p></li>
+</ul>
+</section>
+</section>
+<section id="design-limitations">
+<h2>設計制限<a class="headerlink" href="#design-limitations" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="limits-on-the-number-of-devices-and-ports">
+<h3>デバイスおよびポート数の制限<a class="headerlink" href="#limits-on-the-number-of-devices-and-ports" title="この見出しへのパーマリンク">¶</a></h3>
+<p>DSAは現在、1つのツリー内の最大スイッチ数を4に制限しています（<code class="docutils literal notranslate"><span class="pre">DSA_MAX_SWITCHES</span></code>）、およびスイッチごとのポート数を12に制限しています（<code class="docutils literal notranslate"><span class="pre">DSA_MAX_PORTS</span></code>）。これらの制限は必要に応じてより大きな構成をサポートするよう拡張可能です</p>
+</section>
+<section id="lack-of-cpu-dsa-network-devices">
+<h3>CPU/DSAネットワークデバイスの欠如<a class="headerlink" href="#lack-of-cpu-dsa-network-devices" title="この見出しへのパーマリンク">¶</a></h3>
+<p>DSAは現在、CPUまたはDSAポート用のスレーブネットワークデバイスを生成していません（前述の通り）。これは以下のケースで問題になる可能性があります：</p>
+<ul class="simple">
+<li><p>ethtoolを使用してスイッチCPUポートの統計カウンタを取得できず、xMIIインターフェースで接続されたMDIOスイッチのデバッグが難しくなる可能性があります</p></li>
+<li><p>Ethernetコントローラーが接続されているCPUポートのリンクパラメータを設定できない： <a class="reference external" href="http://patchwork.ozlabs.org/patch/509806/">http://patchwork.ozlabs.org/patch/509806/</a></p></li>
+<li><p>カスケード設定を使用する際、スイッチ間で特定のVLAN ID/トラッキングVLANを設定できない：</p></li>
+</ul>
+</section>
+<section id="common-pitfalls-using-dsa-setups">
+<h3>DSAの設定でよくある間違い<a class="headerlink" href="#common-pitfalls-using-dsa-setups" title="この見出しへのパーマリンク">¶</a></h3>
+<p>マスターネットワークデバイスがDSAを使用して設定され（dev-&gt;dsa_ptrがNULLでない）、スイッチのタギングプロトコルが期待される場合、このネットワークインターフェースは排他的にコンディションインターフェースとしてしか使用できません。このインターフェースを通じてパケットを直接送信する（例：このインターフェースを使用してソケットを開く）と、タギングプロトコルの送信関数を通らないため、タグを期待するもう一方のイーサネットスイッチはこのフレームを通常ドロップします</p>
+<p>スレーブネットワークデバイスは、マスターネットワークデバイスが起動していることを確認した後、管理者がこれらのスレーブネットワークデバイスを操作して起動するのを許可します。一般的な構成ミスとして、マスターネットワークデバイスを最初に起動するのを忘れることが挙げられます。</p>
+</section>
+</section>
+<section id="interactions-with-other-subsystems">
+<h2>他のサブシステムとの相互作用<a class="headerlink" href="#interactions-with-other-subsystems" title="この見出しへのパーマリンク">¶</a></h2>
+<p>DSAは現在、以下のサブシステムを活用しています:</p>
+<ul class="simple">
+<li><p>MDIO/PHYライブラリ: <code class="docutils literal notranslate"><span class="pre">drivers/net/phy/phy.c</span></code>, <code class="docutils literal notranslate"><span class="pre">mdio_bus.c</span></code></p></li>
+<li><p>Switchdev:<code class="docutils literal notranslate"><span class="pre">net/switchdev/*</span></code></p></li>
+<li><p>各種of_*機能のためのDevice Tree</p></li>
+</ul>
+<section id="mdio-phy-library">
+<h3>MDIO/PHYライブラリ<a class="headerlink" href="#mdio-phy-library" title="この見出しへのパーマリンク">¶</a></h3>
+<p>DSAによって露出されるスレーブネットワークデバイスは、PHYデバイスとインターフェースしているかどうかは不明です（<code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">phy_device</span></code> として定義されています <code class="docutils literal notranslate"><span class="pre">include/linux/phy.h)</span></code>ですが、DSAサブシステムはすべての可能性を扱います:</p>
+<ul class="simple">
+<li><p>内部PHYデバイス、イーサネットスイッチハードウェアに組み込まれたもの</p></li>
+<li><p>外部PHYデバイス、内部または外部MDIOバス経由で接続されたもの</p></li>
+<li><p>内部PHYデバイス、内部MDIOバス経由で接続されたもの</p></li>
+<li><p>特殊な、自己交渉しないまたはMDIO管理されないPHYデバイス：SFP、MoCA；いわゆる固定PHY</p></li>
+</ul>
+<p>PHYの設定は <code class="docutils literal notranslate"><span class="pre">dsa_slave_phy_setup()</span></code> 関数によって行われ、論理的には以下のようになります:</p>
+<ul class="simple">
+<li><p>Device Treeが使用されている場合、PHYデバイスは標準の「phy-handle」プロパティを使用して検索され、見つかった場合、このPHYデバイスは <code class="docutils literal notranslate"><span class="pre">of_phy_connect()</span></code></p></li>
+<li><p>関数を使用して作成され登録されます。Device Treeが使用され、PHYデバイスが「固定」である、つまり、MDIO管理されないPHYとして定義された
+<code class="docutils literal notranslate"><span class="pre">Documentation/devicetree/bindings/net/fixed-link.txt</span></code>に準拠する場合、特別な固定MDIOバスドライバを使用してPHYが透明に登録され接続されます</p></li>
+<li><p>最後に、PHYがスイッチに組み込まれている場合（スタンドアロンスイッチパッケージでは非常に一般的です）、DSAによって作成されたスレーブMIIバスを使用してPHYが検出されます</p></li>
+</ul>
+</section>
+<section id="switchdev">
+<h3>SWITCHDEV<a class="headerlink" href="#switchdev" title="この見出しへのパーマリンク">¶</a></h3>
+<p>DSAはブリッジレイヤーとインターフェースする際、SWITCHDEVを直接利用し、特にVLANフィルタリングの部分でVLANをポートごとにスレーブネットワークデバイス上に構成する際、その機能を活用します。DSAは主にMDIO接続スイッチを扱いますが、必ずしも専用ではありません。SWITCHDEVのprepare/abort/commitフェーズは、しばしばDSAスイッチドライバが操作をサポートするかを確認するprepareフェーズと、変更を適用するcommitフェーズに簡略化されます。</p>
+<p>今日までに、DSAがサポートしているSWITCHDEVオブジェクトはFDBおよびVLANオブジェクトのみです。</p>
+</section>
+<section id="device-tree">
+<h3>Device Tree<a class="headerlink" href="#device-tree" title="この見出しへのパーマリンク">¶</a></h3>
+<p>DSAは標準化されたバインディングを備えており、これは
+<code class="docutils literal notranslate"><span class="pre">Documentation/devicetree/bindings/net/dsa/dsa.txt</span></code>に記載されています。PHY/MDIOライブラリヘルパ関数、例えば <code class="docutils literal notranslate"><span class="pre">of_get_phy_mode()</span></code>, <code class="docutils literal notranslate"><span class="pre">of_phy_connect()</span></code> は、ポートごとのPHY固有の詳細（インターフェース接続、MDIOバスの位置など）を照会するためにも使用されます。</p>
+</section>
+</section>
+<section id="driver-development">
+<h2>ドライバ開発<a class="headerlink" href="#driver-development" title="この見出しへのパーマリンク">¶</a></h2>
+<p>DSAスイッチドライバは、以下の記述を含むdsa_switch_ops構造体を実装する必要があります。</p>
+<p><code class="docutils literal notranslate"><span class="pre">register_switch_driver()</span></code> このdsa_switch_opsを内部ドライバリストに登録します。 <code class="docutils literal notranslate"><span class="pre">unregister_switch_driver()</span></code> これは逆を行います。</p>
+<p>priv_size メンバーを設定することにより、異なる要求が行われない限り、DSAはドライバ専用のコンテキスト領域を割り当てません。</p>
+<section id="switch-configuration">
+<h3>スイッチの設定<a class="headerlink" href="#switch-configuration" title="この見出しへのパーマリンク">¶</a></h3>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">tag_protocol</span></code>：サポートされるタグ付けプロトコルの種類を示します。有効な値でなければなりません。 <code class="docutils literal notranslate"><span class="pre">dsa_tag_protocol</span></code> enum</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">probe</span></code>：DSAプラットフォームデバイスが登録時にスイッチデバイスの存在/不存在をテストするために呼び出されるプローブルーチンです。MDIOデバイスの場合、スイッチの擬似PHYを使用して内部レジスタに読み込みを行い、サポートされているデバイスかどうかを返すことが推奨されます。他のバスの場合、NULLでない文字列を返します。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">setup</span></code>：スイッチのセットアップ関数。この関数は、スイッチを設定するために責任を負います。 <code class="docutils literal notranslate"><span class="pre">dsa_switch_ops</span></code> プライベート構造体をすべての必要な要素（レジスタマップ、割込み、ミューテックス、ロックなど）で設定する責任があります。この関数は、ネットワークインターフェースをすべて隔離するようにスイッチを適切に設定することも期待されています。つまり、スイッチハードウェア自体がそれらを隔離し、各ポートにポートベースのVLAN IDを作成し、CPUポートと特定のポートのみがフォワーディングベクターに含まれるようにする必要があります。プラットフォームで使用されないポートは無効化する必要があります。この関数以降、スイッチは完全に設定され、すべての種類のリクエストに応答できる状態でなければなりません。このセットアップ関数でスイッチをソフトウェアリセットを行うことが推奨されます。これにより、ブートローダーやファームウェアなどの以前のソフトウェアエージェントが設定した内容に依存することを避けることができます。</p></li>
+</ul>
+</section>
+<section id="phy-devices-and-link-management">
+<h3>PHYデバイスとリンク管理<a class="headerlink" href="#phy-devices-and-link-management" title="この見出しへのパーマリンク">¶</a></h3>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">get_phy_flags</span></code>：いくつかのスイッチはさまざまな種類のイーサネットPHYにインターフェースされています。PHYライブラリのPHYドライバが自身では取得できない情報（例：スイッチのメモリマップレジスタからの情報）を知る必要がある場合、この関数はスイッチドライバとイーサネットPHYドライバ間でプライベートな「フラグ」の32ビットビットマスクを返す必要があります。 <code class="docutils literal notranslate"><span class="pre">drivers/net/phy/\*</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">phy_read</span></code>：DSAスレーブMDIOバスがスイッチポートMDIOレジスタを読み込むときに呼び出される関数です。利用不可の場合は、各読み込みに対して0xffffを返します。組み込みスイッチイーサネットPHYの場合、この関数はリンクステータス、オートネゴシエーション結果、リンクパートナーのページなど、読み込みを許可する必要があります。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">phy_write</span></code>：DSAスレーブMDIOバスがスイッチポートMDIOレジスタに書き込むときに呼び出される関数です。利用不可の場合は、負のエラーコードを返します。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">adjust_link</span></code>：PHYライブラリがスレーブネットワークデバイスがPHYデバイスに接続されたときに呼び出される関数です。この関数は、スイッチポートのリンクパラメータ（速度、フル duplex、pause）を適切に設定する責任があります。 <code class="docutils literal notranslate"><span class="pre">phy_device</span></code> 提供しています。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">fixed_link_update</span></code>PHYライブラリによって呼び出される関数で、特に固定PHYドライバーがMDIOを通じてPHYレジスタを読み取ることで取得できないリンクパラメータを、スイッチドライバーに問い合わせる際に使用されます。これはQSGMII、MoCA、またはその他のMDIO管理されていないPHYのような特定のハードウェアで、オフバンドリンク情報を取得するために特に有用です</p></li>
+</ul>
+</section>
+<section id="ethtool-operations">
+<h3>Ethtool操作<a class="headerlink" href="#ethtool-operations" title="この見出しへのパーマリンク">¶</a></h3>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">get_strings</span></code>ドライバの文字列を照会するためのethtool関数で、通常は統計文字列やプライベートフラグ文字列などを返します</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">get_ethtool_stats</span></code>ポートごとの統計情報を照会し、その値を返すethtool関数です。DSAオーバレイスレーブネットワークデバイスの一般的な統計情報: ネットワークデバイスからのRX/TXカウンタと、スイッチドライバー固有のポートごとの統計情報</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">get_sset_count</span></code>統計項目数を照会するethtool関数</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">get_wol</span></code>ポートごとのWake-on-LAN設定を取得するethtool関数です。特定の実装では、このインターフェースがWake-on-LANに参加する必要がある場合、マスターネットワークデバイスのWake-on-LAN設定も照会する場合があります</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">set_wol</span></code>ポートごとのWake-on-LAN設定を構成するethtool関数で、set_wolと同様の制限を持つ直接の対応関数です</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">set_eee</span></code>スイッチポートのEEE（グリーンイーサネット）設定を構成するethtool関数で、必要に応じてPHYライブラリを呼び出してPHYレベルでEEEを有効化できます。この関数はスイッチポートのMACコントローラーおよびデータ処理ロジックでEEEを有効化する必要があります</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">get_eee</span></code>スイッチポートのEEE設定を照会するethtool関数で、この関数はスイッチポートのMACコントローラーおよびデータ処理ロジックのEEE状態を返すとともに、PHYの現在のEEE設定を照会します</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">get_eeprom_len</span></code>指定されたスイッチのEEPROM長さ/サイズ（バイト単位）を返すethtool関数</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">get_eeprom</span></code>指定されたスイッチのEEPROM内容を返すethtool関数</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">set_eeprom</span></code>指定されたスイッチのEEPROMに指定されたデータを書き込むethtool関数</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">get_regs_len</span></code>指定されたスイッチのレジスタ長さを返すethtool関数</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">get_regs</span></code>イーサネットスイッチの内部レジスタ内容を返すethtool関数。この関数はユーザー領域のethtoolコードでレジスタ値やレジスタを整形して表示する必要がある場合があります</p></li>
+</ul>
+</section>
+<section id="power-management">
+<h3>電源管理<a class="headerlink" href="#power-management" title="この見出しへのパーマリンク">¶</a></h3>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">suspend</span></code>システムがスリープ状態に入るときにDSAプラットフォームデバイスによって呼び出される関数で、すべてのイーサネットスイッチ活動を停止する必要がありますが、Wake-on-LANに参加しているポートやサポートされている追加の wakeupロジックをアクティブに維持する必要があります</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">resume</span></code>システムが再開する際、DSAプラットフォームデバイスによって呼び出される関数で、すべてのイーサネットスイッチのアクティビティを再開し、スイッチを完全にアクティブな状態に戻す必要があります</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">port_enable</span></code>DSAスレーブネットワークデバイスのndo_open関数がポートを管理者が起動させた際に呼び出される関数で、指定されたスイッチポートを完全に有効にする必要があります。DSAはポートを
+<code class="docutils literal notranslate"><span class="pre">BR_STATE_BLOCKING</span></code> そのポートがブリッジのメンバーである場合、または <code class="docutils literal notranslate"><span class="pre">BR_STATE_FORWARDING</span></code> それ以前にそうではなかった場合でも、ハードウェアにこれらの変更を伝播する必要があります</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">port_disable</span></code>ポートが管理者が停止させた際に呼び出されるDSAスレーブネットワークデバイスのndo_close関数で、指定されたスイッチポートを完全に無効にする必要があります。DSAはポートを
+<code class="docutils literal notranslate"><span class="pre">BR_STATE_DISABLED</span></code> ブリッジのメンバーである状態でポートが無効化される場合、ハードウェアに変更を伝播する必要があります</p></li>
+</ul>
+</section>
+<section id="bridge-layer">
+<h3>ブリッジレイヤー<a class="headerlink" href="#bridge-layer" title="この見出しへのパーマリンク">¶</a></h3>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">port_bridge_join</span></code>スイッチポートがブリッジに追加される際に呼び出されるブリッジレイヤー関数で、スイッチレベルで必要な処理を行い、ポートが関連する論理的なドメインに追加され、他のブリッジメンバーとのトラフィックの流入/流出が可能になるようにする必要があります</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">port_bridge_leave</span></code>スイッチポートがブリッジから削除される際に呼び出されるブリッジレイヤー関数で、スイッチレベルで必要な処理を行い、離脱するポートが残りのブリッジメンバーとのトラフィックの流入/流出を拒否するようにする必要があります。ポートがブリッジから離脱する際には、スイッチハードウェアでポートを年齢化（aging）し、スイッチがこのポートの背後にあるMACアドレスを再学習できるようにする必要があります</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">port_stp_state_set</span></code>スイッチポートのSTP状態がブリッジレイヤーによって計算され、スイッチハードウェアに伝播される際に呼び出されるブリッジレイヤー関数です。スイッチドライバは現在のパラメータと要求されたパラメータに基づきSTP状態の変化を計算し、交差結果に基づいて関連する年齢化処理を実行する責任があります</p></li>
+</ul>
+</section>
+<section id="bridge-vlan-filtering">
+<h3>ブリッジVLANフィルタリング<a class="headerlink" href="#bridge-vlan-filtering" title="この見出しへのパーマリンク">¶</a></h3>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">port_vlan_filtering</span></code>ブリッジがVLANフィルタリングを有効または無効にする設定が行われた際に呼び出されるブリッジレイヤー関数です。ハードウェアレベルで特に処理が必要でない場合、このコールバック関数は実装する必要がありません。VLANフィルタリングが有効になると、ハードウェアにプログラミングされ、VLAN IDがプログラミングされた許可されたVLAN IDマップ/ルールの外にある802.1Qフレームは拒否される必要があります。スイッチポートにPVIDがプログラミングされていない場合、未タグ付けされたフレームも拒否される必要があります。無効化された場合、スイッチはすべてのVLAN IDを持つ802.1Qフレームを受信し、未タグ付けされたフレームも許可する必要があります</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">port_vlan_prepare</span></code>ブリッジレイヤー関数は、ブリッジが指定されたポートでVLANの設定を準備するときに呼び出されます。ハードウェアがこの操作をサポートしない場合、この関数は返却してブリッジコードにソフトウェア実装へのフォールバックを通知する必要があります。 <code class="docutils literal notranslate"><span class="pre">-EOPNOTSUPP</span></code> ハードウェアの設定はこの関数内で行う必要はありません。この関連情報および詳細については、port_vlan_addを参照してください。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">port_vlan_add</span></code>ブリッジレイヤー関数は、指定されたスイッチポートでVLAN（タグ付きまたはタグなし）が設定されるときに呼び出されます。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">port_vlan_del</span></code>ブリッジレイヤー関数は、指定されたスイッチポートからVLANが削除されるときに呼び出されます。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">port_vlan_dump</span></code>ブリッジレイヤー関数は、ドライバが指定されたポートが属する各VLANに対して呼び出す必要のあるswitchdevコールバック関数とともに呼び出されます。switchdevオブジェクトはVID（VLAN ID）とブリッジフラグを運搬します。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">port_fdb_add</span></code>ブリッジレイヤー関数は、ブリッジがフォワーディングデータベースにアドレスをインストールしようとするときに呼び出されます。スイッチハードウェアは、指定されたVLAN IDに関連するフォワーディングデータベースで指定されたアドレスを設定する必要があります。この操作がサポートされない場合、この関数は返却してブリッジコードにソフトウェア実装へのフォールバックを通知する必要があります。 <code class="docutils literal notranslate"><span class="pre">-EOPNOTSUPP</span></code> ブリッジコードにソフトウェア実装へのフォールバックを通知します。</p></li>
+</ul>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>VLAN ID 0はポートプライベートデータベースに対応し、DSAの文脈ではポートベースのVLANとして扱われ、関連するブリッジデバイスによって使用されます。</p>
+</div>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">port_fdb_del</span></code>ブリッジレイヤー関数は、ブリッジがフォワーディングデータベースからアドレスを削除しようとするときに呼び出されます。スイッチハードウェアは、指定されたVLAN IDに関連するフォワーディングデータベースにマッピングされていた指定されたMACアドレスを削除する必要があります。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">port_fdb_dump</span></code>ブリッジレイヤー関数は、ドライバが指定されたポートの後方にあるすべてのMACアドレスに対して呼び出す必要のあるswitchdevコールバック関数とともに呼び出されます。switchdevオブジェクトはVIDとFDB情報（フォワーディングデータベース情報）を運搬します。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">port_mdb_prepare</span></code>ブリッジレイヤー関数は、ブリッジがマルチキャストデータベースエントリのインストールを準備するときに呼び出されます。この操作がサポートされない場合、この関数は返却してブリッジコードにソフトウェア実装へのフォールバックを通知する必要があります。 <code class="docutils literal notranslate"><span class="pre">-EOPNOTSUPP</span></code> ブリッジコードにソフトウェア実装へのフォールバックを通知します。この関数内でハードウェアの設定は行う必要はありません。参照してください <code class="docutils literal notranslate"><span class="pre">port_fdb_add</span></code> この関連情報および詳細についてはこちら。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">port_mdb_add</span></code>ブリッジレイヤー関数は、ブリッジがマルチキャストデータベースエントリをインストールしようとするときに呼び出されます。スイッチハードウェアは、指定されたVLAN IDに関連するフォワーディングデータベースで指定されたアドレスを設定する必要があります。</p></li>
+</ul>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>VLAN ID 0はポートプライベートデータベースに対応し、DSAの文脈ではポートベースのVLANとして扱われ、関連するブリッジデバイスによって使用されます。</p>
+</div>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">port_mdb_del</span></code>ブリッジレイヤー関数は、ブリッジがマルチキャストデータベースエントリを削除しようとするときに呼び出されます。スイッチハードウェアは、指定されたVLAN IDに関連するフォワーディングデータベースにマッピングされていた指定されたMACアドレスを削除する必要があります。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">port_mdb_dump</span></code>switchdevコールバック関数を使用してブリッジレイヤー関数が呼び出され、ドライバーがそのポートに接続されているMACアドレスごとに呼び出す必要があります。VIDおよびMDB情報を伝達するためにswitchdevオブジェクトが使用されます。</p></li>
+</ul>
+</section>
+</section>
+<section id="todo">
+<h2>TODO<a class="headerlink" href="#todo" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="making-switchdev-and-dsa-converge-towards-an-unified-codebase">
+<h3>SWITCHDEVとDSAを統一されたコードベースに収束させる<a class="headerlink" href="#making-switchdev-and-dsa-converge-towards-an-unified-codebase" title="この見出しへのパーマリンク">¶</a></h3>
+<p>SWITCHDEVはネットワーキングスタックをオフロード可能なハードウェアで抽象化する点では適切に対応していますが、厳格なスイッチデバイスドライバーモデルを強制しません。一方DSAは比較的厳格なデバイスドライバーモデルを採用しており、スイッチ固有の処理を大部分担当しています。いずれはこれらのサブシステムの統合を検討し、双方の長所を活かすべきです。</p>
+</section>
+<section id="other-hanging-fruits">
+<h3>他の未解決の課題<a class="headerlink" href="#other-hanging-fruits" title="この見出しへのパーマリンク">¶</a></h3>
+<ul class="simple">
+<li><p>ポート数を完全に動的にし、特定の依存関係を排除して <code class="docutils literal notranslate"><span class="pre">DSA_MAX_PORTS</span></code></p></li>
+<li><p>複数のCPU/管理インターフェースを許可する:
+<a class="reference external" href="http://comments.gmane.org/gmane.linux.network/365657">http://comments.gmane.org/gmane.linux.network/365657</a></p></li>
+<li><p>他のベンダーからドライバーを移植する:
+<a class="reference external" href="http://comments.gmane.org/gmane.linux.network/365510">http://comments.gmane.org/gmane.linux.network/365510</a></p></li>
+</ul>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linuxネットワーキングドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../netdev-FAQ.html">netdev FAQ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../af_xdp.html">AF_XDP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bareudp.html">Bare UDPトンネリングモジュールドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../batman-adv.html">batman-adv</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../can.html">SocketCAN - コントローラー・エリア・ネットワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../can_ucan_protocol.html">UCANプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device_drivers/index.html">ハードウェアデバイスドライバ</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">分散スイッチアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../devlink/index.html">Linux Devlinkドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../caif/index.html">CAIF</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ethtool-netlink.html">ethtool用Netlinkインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ieee802154.html">IEEE 802.15.4開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../j1939.html">J1939ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kapi.html">LinuxネットワーキングとネットワークデバイスAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../msg_zerocopy.html">MSG_ZEROCOPY</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../failover.html">フェールオーバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../net_dim.html">Net DIM - ジェネリックネットワークダイナミック割込みモデレーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../net_failover.html">NET_FAILOVER</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../page_pool.html">ページプールAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../phy.html">PHY抽象レイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sfp-phylink.html">phylink</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../alias.html">IPアリアシング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bridge.html">イーサネットブリッジング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../snmp_counter.html">SNMPカウンター</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../checksum-offloads.html">チェックサムオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../segmentation-offloads.html">セグメンテーションオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../scaling.html">Linuxネットワーキングスタックにおけるスケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tls.html">カーネルTLS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tls-offload.html">カーネルTLSオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nfc.html">Linux NFCサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../6lowpan.html">6lowpanインターフェース用Netdevプライベートデータルーム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../6pack.html">6packプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../arcnet-hardware.html">ARCnetハードウェア</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../arcnet.html">ARCnet</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../atm.html">ATM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ax25.html">AX.25</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../bonding.html">LinuxイーサネットボンディングドライバHOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cdc_mbim.html">cdc_mbim - CDC MBIMモバイルブロードバンドモデム用ドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dccp.html">DCCPプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dctcp.html">DCTCP（データセンターTCP）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../decnet.html">Linux DECnetネットワーキングレイヤー情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dns_resolver.html">DNSリゾルバー・モジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../driver.html">Softnetドライバーの問題</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../eql.html">EQLドライバー: シリアルIPロードバランシングガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../fib_trie.html">LC-trie実装ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../filter.html">Linux Socket Filtering（別名Berkeley Packet Filter（BPF））</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../framerelay.html">フレームリレー（FR）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../generic-hdlc.html">ジェネリックHDLCレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../generic_netlink.html">ジェネリックネットリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../gen_stats.html">ネットリンクユーザー向けジェネリックネットワーキング統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../gtp.html">LinuxカーネルGTPトンネリングモジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ila.html">識別子ロケーターアドレスング（ILA）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipddp.html">AppleTalk-IPデカプセル化とAppleTalk-IPエンカプセル化</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ip_dynaddr.html">IPダイナミックアドレスハックポートv0.03</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipsec.html">IPsec</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ip-sysctl.html">IP Sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipv6.html">IPv6</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipvlan.html">IPVLANドライバーガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipvs-sysctl.html">IPvs-sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kcm.html">カーネルコネクションマルチプレクサ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../l2tp.html">L2TP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../lapb-module.html">Linux LAPBモジュールインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mac80211-injection.html">mac80211を使用したパケットインジェクションの使い方</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../mpls-sysctl.html">MPLS Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../multiqueue.html">マルチキューネットワークデバイスサポートガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../netconsole.html">Netconsole</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../netdev-features.html">ネットデバイス機能の混乱とその解決方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../netdevices.html">ネットワークデバイス、カーネル、そしてあなた！</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../netfilter-sysctl.html">Netfilter Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../netif-msg.html">NETIFメッセージレベル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nf_conntrack-sysctl.html">Netfilter Conntrack Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nf_flowtable.html">Netfilterのフローテーブルインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../openvswitch.html">Open vSwitch datapath開発者ドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../operstates.html">運用状態</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../packet_mmap.html">パケットMMAP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../phonet.html">Linux Phonetプロトコルファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../pktgen.html">Linuxパケットジェネレーターガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../plip.html">PLIP: 平行線インターネットプロトコルデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ppp_generic.html">PPPジェネリックドライバーおよびチャネルインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../proc_net_tcp.html">proc/net/tcpおよびproc/net/tcp6変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../radiotap-headers.html">radiotapヘッダの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html">概要</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#rds-architecture">RDSアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#socket-interface">ソケットインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#rdma-for-rds">RDS用RDMA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#congestion-notifications">コンゲスト通知</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#rds-protocol">RDSプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#rds-transport-layer">RDSトランスポートレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#rds-kernel-structures">RDSカーネル構造体</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#connection-management">接続管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#the-send-path">送信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#the-recv-path">受信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rds.html#multipath-rds-mprds">マルチパスRDS (mprds)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../regulatory.html">Linuxワイヤレス規制ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rxrpc.html">RxRPC ネットワークプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rxrpc.html#socket-options">ソケットオプション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rxrpc.html#security">セキュリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../rxrpc.html#example-client-usage">例: クライアントの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sctp.html">LinuxカーネルSCTP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../secid.html">LSM/SeLinux secid</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../seg6-sysctl.html">Seg6 Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../statistics.html">インターフェース統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../strparser.html">ストリームパーサー (strparser)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../switchdev.html">イーサネットスイッチデバイスドライバモデル (switchdev)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sysfs-tagging.html">Sysfsタグ付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tc-actions-env-rules.html">TCアクション - 環境ルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tcp-thin.html">スリムストリームとTCP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../team.html">チーム (Team)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../timestamping.html">タイムスタンピング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tproxy.html">透過プロキシサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tuntap.html">ユニバーサルTUN/TAPデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../udplite.html">UDP-Liteプロトコル (RFC 3828)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vrf.html">仮想ルーティングおよびフォワーディング (VRF)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vxlan.html">仮想拡張ローカルエリアネットワーキングドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../x25-iface.html">パケットレイヤーからデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../x25-iface.html#device-driver-to-packet-layer">デバイスドライバからパケットレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../x25.html">Linux X.25プロジェクト</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xfrm_device.html">XFRMデバイス - IPsec計算のオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xfrm_proc.html">XFRMプロセス - /proc/net/xfrm_*ファイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xfrm_sync.html">XFRM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../xfrm_sysctl.html">XFRMシステムコール</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linuxネットワーキングドキュメント</a><ul>
+<li><a href="index.html">分散スイッチアーキテクチャ</a><ul>
+<li>前へ: <a href="index.html" title="前章">分散スイッチアーキテクチャ</a></li>
+<li>次へ: <a href="b53.html" title="次章">Broadcom RoboSwitch Ethernet switch driver</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/networking/dsa/dsa.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

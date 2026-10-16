@@ -1,0 +1,521 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>イーサネットスイッチデバイスドライバモデル（switchdev）— Linuxカーネルドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="sysfs-tagging.html" rel="next" title="Sysfsタグ付け"/>
+<link href="strparser.html" rel="prev" title="ストリームパーサー (strparser)"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="ethernet-switch-device-driver-model-switchdev">
+<h1>イーサネットスイッチデバイスドライバモデル (switchdev)<a class="headerlink" href="#ethernet-switch-device-driver-model-switchdev" title="この見出しへのパーマリンク">¶</a></h1>
+<p>著作権 © 2014 Jiri Pirko &lt;<a class="reference external" href="mailto:jiri%40resnulli.us">jiri<span>@</span>resnulli<span>.</span>us</a>&gt;</p>
+<p>著作権 © 2014-2015 Scott Feldman &lt;<a class="reference external" href="mailto:sfeldma%40gmail.com">sfeldma<span>@</span>gmail<span>.</span>com</a>&gt;</p>
+<p>イーサネットスイッチデバイスドライバモデル（switchdev）は、カーネル内に実装されたスイッチデバイス用のドライバモデルであり、転送（データ）平面をカーネルからオフロードするものです。</p>
+<p>図1は、データセンタークラスのスイッチASICチップを使用した例の設定におけるswitchdevモデルのコンポーネントを示すブロック図です。SR-IOVやソフトウェアスイッチ（例: OVS）を用いた他の設定も可能です。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>                       User-space tools
+
+ user space                   |
++-------------------------------------------------------------------+
+ kernel                       | Netlink
+                              |
+               +--------------+-------------------------------+
+               |         Network stack                        |
+               |           (Linux)                            |
+               |                                              |
+               +----------------------------------------------+
+
+                     sw1p2     sw1p4     sw1p6
+                sw1p1  +  sw1p3  +  sw1p5  +          eth1
+                  +    |    +    |    +    |            +
+                  |    |    |    |    |    |            |
+               +--+----+----+----+----+----+---+  +-----+-----+
+               |         Switch driver         |  |    mgmt   |
+               |        (this document)        |  |   driver  |
+               |                               |  |           |
+               +--------------+----------------+  +-----------+
+                              |
+ kernel                       | HW bus (eg PCI)
++-------------------------------------------------------------------+
+ hardware                     |
+               +--------------+----------------+
+               |         Switch device (sw1)   |
+               |  +----+                       +--------+
+               |  |    v offloaded data path   | mgmt port
+               |  |    |                       |
+               +--|----|----+----+----+----+---+
+                  |    |    |    |    |    |
+                  +    +    +    +    +    +
+                 p1   p2   p3   p4   p5   p6
+
+                       front-panel ports
+
+
+                              Fig 1.
+</pre></div>
+</div>
+<section id="include-files">
+<h2>インクルードファイル<a class="headerlink" href="#include-files" title="この見出しへのパーマリンク">¶</a></h2>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#include &lt;linux/netdevice.h&gt;
+#include &lt;net/switchdev.h&gt;
+</pre></div>
+</div>
+</section>
+<section id="configuration">
+<h2>設定<a class="headerlink" href="#configuration" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ドライバのKconfigに「depends NET_SWITCHDEV」を指定することで、switchdevモデルのサポートがドライバに組み込まれることを確保してください。</p>
+</section>
+<section id="switch-ports">
+<h2>スイッチポート<a class="headerlink" href="#switch-ports" title="この見出しへのパーマリンク">¶</a></h2>
+<p>switchdevドライバの初期化時に、ドライバは各列挙された物理スイッチポートに対して
+<a class="reference internal" href="kapi.html#c.net_device" title="net_device"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">net_device</span></code></a> (using <a class="reference internal" href="kapi.html#c.register_netdev" title="register_netdev"><code class="xref c c-func docutils literal notranslate"><span class="pre">register_netdev()</span></code></a>)を割り当てて登録します。ポートnetdevは物理ポートのソフトウェア表現であり、コントローラー（カーネル）とネットワーク間の制御トラフィックの経路を提供し、ブリッジ、ボンド、VLAN、トンネル、L3ルーターなどの上位構造のアンカーとなるポイントです。標準のnetdevツール（iproute2、ethtoolなど）を使用すると、ポートnetdevはユーザーにスイッチポートの物理的な特性（PHYリンク状態やI/O統計など）へのアクセスを提供します。</p>
+<p>（現在は）スイッチに対してはポートnetdevを超えるより上位のカーネルオブジェクトはありません。すべてのswitchdevドライバ操作はnetdev操作またはswitchdev操作です。</p>
+<p>スイッチ管理ポートはswitchdevドライバモデルの範囲外です。通常、管理ポートはオフロードされたデータ平面に参加せず、管理ポートデバイス上で異なるドライバ（例: NICドライバ）がロードされます。</p>
+<section id="switch-id">
+<h3>スイッチID<a class="headerlink" href="#switch-id" title="この見出しへのパーマリンク">¶</a></h3>
+<p>switchdevドライバは、各ポートnetdevに対してnet_device操作ndo_get_port_parent_idを実装しなければなりません。これにより、スイッチの各ポートに対して同じ物理IDが返されます。IDは同じシステム内のスイッチ間で一意でなければなりませんが、異なるシステムのスイッチ間では一意である必要はありません。</p>
+<p>スイッチIDは、スイッチ上のポートを特定するためのものであり、集約されたポートが同じスイッチに属するかどうかを判断するために使用されます。</p>
+</section>
+<section id="port-netdev-naming">
+<h3>ポートnetdevの命名<a class="headerlink" href="#port-netdev-naming" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ポートnetdevの命名にはudevルールを使用し、ポートの一部のユニークな属性（例: ポートMACアドレスやポートPHYS名）をキーとして使用してください。ドライバ内でカーネルnetdev名をハードコードするのは推奨されません。カーネルがデフォルトのnetdev名を選択し、udevがポート属性に基づいて最終的な名前を設定するようにしてください。</p>
+<p>ポートの物理名（ndo_get_phys_port_name）を使用する方法は、外部設定に基づいてデバイスがポートを名前付ける動的ポートにおいて特に有用です。たとえば、物理的な40Gポートが論理的に4つの10Gポートに分割され、4つのポートnetdevが生成される場合、デバイスはポート PHYS 名を使用して各ポートに一意の名前を付けることができます。udev ルールは以下のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>SUBSYSTEM=="net", ACTION=="add", ATTR{phys_switch_id}=="&lt;phys_switch_id&gt;", \
+        ATTR{phys_port_name}!="", NAME="swX$attr{phys_port_name}"
+</pre></div>
+</div>
+<p>推奨される命名規則は「swXpYsZ」です。ここで、Xはスイッチ名またはID、Yはポート名またはID、Zはサブポート名またはIDを表します。たとえば、sw1p1s0はスイッチ1のポート1のサブポート0を表します。</p>
+</section>
+<section id="port-features">
+<h3>ポート機能<a class="headerlink" href="#port-features" title="この見出しへのパーマリンク">¶</a></h3>
+<p>NETIF_F_NETNS_LOCAL</p>
+<p>スイッチdevドライバー（およびデバイス）がデフォルトのネットワークネームスペース（netns）のみをオフロードサポートする場合、ドライバーはこの機能フラグを設定して、ポートnetdevがデフォルトnetnsから外れることを防ぐ必要があります。ネットネームスペースを意識したドライバー／デバイスはこのフラグを設定せず、ハードウェアをパーティション化してnetnsの包含性を維持する責任があります。これは、ハードウェアが1つのnetns内のポートから別のnetns内のポートへのトラフィックの転送を実行できないことを意味します。</p>
+</section>
+<section id="port-topology">
+<h3>ポートのトポロジー<a class="headerlink" href="#port-topology" title="この見出しへのパーマリンク">¶</a></h3>
+<p>物理スイッチポートを表すポートnetdevは、より高レベルのスイッチング構造に整理できます。デフォルトでは、L3フォワーディングをオフロードするためのスタンドアロンのルーターポートが使用されます。2つ以上のポートをバウンドしてLAGを形成することも、2つ以上のポート（またはLAG）をブリッジしてL2ネットワークをブリッジすることもできます。VLANはL2ネットワークをサブディビジョンできます。L2オーバーL3トンネルはポート上に構築できます。これらの構造は、ブリッジドライバー、バウンド／チームドライバー、netlinkベースのツール（例：iproute2）などの標準的なLinuxツールを使用して構築されます。</p>
+<p>スイッチdevドライバーは、NETDEV_CHANGEUPPER通知を監視することで、特定のポートのトポロジーアクセス位置を把握できます。たとえば、ポートがバウンドに移動すると、その上位マスターが変更されます。そのバウンドがブリッジに移動すると、バウンドの上位マスターが変更されます。このような移動をドライバーが追跡することで、ネットデバイスイベントを登録し、NETDEV_CHANGEUPPERに応じて、全体のトポロジーでのポートの位置を把握できます。</p>
+</section>
+</section>
+<section id="l2-forwarding-offload">
+<h2>L2フォワーディングオフロード<a class="headerlink" href="#l2-forwarding-offload" title="この見出しへのパーマリンク">¶</a></h2>
+<p>L2データフォワーディング（スイッチング）パスをカーネルからスイッチdevデバイスにオフロードするためのアイデアは、ブリッジFDBエントリをデバイスにミラーリングすることです。FDBエントリは、{ポート、MAC、VLAN}の組み合わせでフォワーディング先を示します。</p>
+<p>L2ブリッジングのオフロードには、switchdevドライバー／デバイスが次の機能をサポートする必要があります：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>ブリッジポートにインストールされた静的FDBエントリ</p></li>
+<li><p>デバイスから学習／忘れられた送信元MAC／VLANの通知</p></li>
+<li><p>ポートのSTP状態の変化</p></li>
+<li><p>マルチキャスト/ブロードキャストおよび未登録のユニキャストパケットのVLANフロッディング</p></li>
+</ul>
+</div></blockquote>
+<section id="static-fdb-entries">
+<h3>静的FDBエントリ<a class="headerlink" href="#static-fdb-entries" title="この見出しへのパーマリンク">¶</a></h3>
+<p>switchdevドライバは、静的FDBエントリをデバイスにインストールするため、ndo_fdb_add、ndo_fdb_delおよびndo_fdb_dumpを実装する必要があります。静的ブリッジFDBエントリは、iproute2のブリッジコマンドを使用してインストールされます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>bridge fdb add ADDR dev DEV [vlan VID] [self]
+</pre></div>
+</div>
+<p>ドライバはswitchdev_port_fdb_xxx opsを使用してndo_fdb_xxx opsを処理し、SWITCHDEV_OBJ_ID_PORT_FDBオブジェクトの追加/削除/ダンプをswitchdev_port_obj_xxx opsを使用して処理する必要があります。</p>
+<p>XXX: オフローディングルールがハードウェアに適用できない場合（例：ハードウェアテーブルの容量が満杯の場合）には何をすべきですか？</p>
+<p>注意: デフォルトではブリッジはVLANフィルタリングを行わず、タグ付けされていないトラフィックのみブリッジします。VLANサポートを有効にするには、VLANフィルタリングを有効にしてください:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo 1 &gt;/sys/class/net/&lt;bridge&gt;/bridge/vlan_filtering
+</pre></div>
+</div>
+</section>
+<section id="notification-of-learned-forgotten-source-mac-vlans">
+<h3>学習/忘れられたソースMAC/VLANの通知<a class="headerlink" href="#notification-of-learned-forgotten-source-mac-vlans" title="この見出しへのパーマリンク">¶</a></h3>
+<p>スイッチデバイスはイングレスパケットでソースMACアドレス/VLANを学習/忘れ、mac/vlan/portの組み合わせをスイッチドライバに通知します。スイッチドライバは、switchdevノティファイコールを使用してブリッジドライバに通知します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>err = call_switchdev_notifiers(val, dev, info, extack);
+</pre></div>
+</div>
+<p>valは学習時にSWITCHDEV_FDB_ADD、忘れ時にSWITCHDEV_FDB_DELになります。infoはstruct switchdev_notifier_fdb_infoを指します。SWITCHDEV_FDB_ADDの場合、ブリッジドライバはFDBエントリをブリッジのFDBにインストールし、エントリをNTF_EXT_LEARNEDとしてマークします。iproute2のブリッジコマンドはこれらのエントリを「オフロード」とラベル付けします:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ bridge fdb
+52:54:00:12:35:01 dev sw1p1 master br0 permanent
+00:02:00:00:02:00 dev sw1p1 master br0 offload
+00:02:00:00:02:00 dev sw1p1 self
+52:54:00:12:35:02 dev sw1p2 master br0 permanent
+00:02:00:00:03:00 dev sw1p2 master br0 offload
+00:02:00:00:03:00 dev sw1p2 self
+33:33:00:00:00:01 dev eth0 self permanent
+01:00:5e:00:00:01 dev eth0 self permanent
+33:33:ff:00:00:00 dev eth0 self permanent
+01:80:c2:00:00:0e dev eth0 self permanent
+33:33:00:00:00:01 dev br0 self permanent
+01:00:5e:00:00:01 dev br0 self permanent
+33:33:ff:12:35:01 dev br0 self permanent
+</pre></div>
+</div>
+<p>ブリッジコマンドを使用してポートの学習を無効化する必要があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>bridge link set dev DEV learning off
+</pre></div>
+</div>
+<p>デバイスポートの学習および学習同期を有効にする必要があります。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>bridge link set dev DEV learning on self
+bridge link set dev DEV learning_sync on self
+</pre></div>
+</div>
+<p>学習同期属性は、学習/忘れられたFDBエントリをブリッジのFDBに同期します。デバイスポートとブリッジポートの学習を有効にし、学習同期を無効にするのは可能ですが、最適ではありません。</p>
+<p>学習をサポートするため、ドライバはSWITCHDEV_ATTR_PORT_ID_{PRE}_BRIDGE_FLAGSを処理するswitchdev_port_attr_setを実装します。</p>
+</section>
+<section id="fdb-ageing">
+<h3>FDBエイジング<a class="headerlink" href="#fdb-ageing" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ブリッジはNTF_EXT_LEARNEDでマークされたFDBエントリのエイジングをスキップします。これらのエントリのエイジングはポートドライバ/デバイスの責任です。デバイスがエイジングをサポートする場合、FDBエントリが期限切れになると、ドライバが通知し、ブリッジにSWITCHDEV_FDB_DELを通知します。デバイスがエイジングをサポートしない場合、ドライバはガベージコレクションタイマーやFDBエントリを監視するタイマーモードでエイジングをシミュレートできます。期限切れのエントリはSWITCHDEV_FDB_DELでブリッジに通知されます。rockerドライバはエイジングタイマーモードを実行するドライバの例です。</p>
+<p>NTF_EXT_LEARNEDエントリを「有効」に保つには、ドライバーがcall_switchdev_notifiers(SWITCHDEV_FDB_ADD, …)を呼び出してFDBエントリを更新する必要があります。この通知により、FDBエントリの最後に使用された時間は現在にリセットされます。ドライバーは、リフレッシュ通知を制限する必要があります（例：1秒に1回まで）。(最後に使用された時間はbridge -s fdbオプションを使用して確認できます）。</p>
+</section>
+<section id="stp-state-change-on-port">
+<h3>ポートにおけるSTPの状態変化<a class="headerlink" href="#stp-state-change-on-port" title="この見出しへのパーマリンク">¶</a></h3>
+<p>内部的にもしくは第三者のSTPプロトコル実装（例：mstpd）を使用して、ブリッジドライバーがポートのSTP状態を管理し、switchdev_op switchdev_attr_port_setを使用してSWITCHDEV_ATTR_PORT_ID_STP_UPDATEを介してSTP状態変化をスイッチドライバーに通知します。</p>
+<p>状態はBR_STATE_*のいずれかです。スイッチドライバーはSTP状態の更新を用いて、ポートのイングレスパケットフィルタリストを更新できます。例えば、ポートがDISABLEDの場合、パケットは通過すべきではありませんが、ポートがBLOCKEDに移行した場合、STP BPDUsやIEEE 01:80:c2:xx:xx:xxのリンクローカルマルチキャストパケットが通過できます。</p>
+<p>STP BPDUsはラベルなしで送信され、STP状態はポート上のすべてのVLANに適用されるため、ラベルなしとラベルありのVLANでパケットフィルタを一貫して適用する必要があります。</p>
+</section>
+<section id="flooding-l2-domain">
+<h3>L2ドメインにおけるフロッディング<a class="headerlink" href="#flooding-l2-domain" title="この見出しへのパーマリンク">¶</a></h3>
+<p>特定のL2 VLANドメインにおいて、ポートの現在のSTP状態が許可する限り、スイッチデバイスはそのドメイン内のすべてのポートにマルチキャスト/ブロードキャストおよび未知のユニキャストパケットをフロッディングする必要があります。スイッチドライバーは、どのポートがどのVLAN L2ドメインに属するかを把握しており、スイッチデバイスにフロッディングを設定できます。パケットはブリッジドライバーによって処理されるポートnetdevに送信される可能性があります。ブリッジは、デバイスがフロッディングしたポートに再フロッディングしないようにする必要があります。そうしないと、ワイヤー上に重複パケットが発生します。</p>
+<p>重複パケットを避けるため、スイッチドライバーはskb-&gt;offload_fwd_markビットを設定してパケットをすでに転送済みとマークする必要があります。ブリッジドライバーはイングレスブリッジポートのマークを使用してskbをマークし、同じマークを持つすべてのブリッジポートを介して転送を防ぎます。</p>
+<p>スイッチデバイスがフロッディングを処理せず、ブリッジドライバーにパケットを上位に押し上げてフロッディングする可能性があります。これはL2ドメインのポート数が増えるにつれてソフトウェアよりもデバイスが効率的にパケットをフロッディングできるため、理想的ではありません。</p>
+<p>デバイスがサポートする場合、フロッディング制御をオフロードして、特定のnetdevがFDBエントリがない場合のユニキャストトラフィックをフロッディングしないようにできます。</p>
+</section>
+<section id="igmp-snooping">
+<h3>IGMPスヌープ<a class="headerlink" href="#igmp-snooping" title="この見出しへのパーマリンク">¶</a></h3>
+<p>IGMP snoopingをサポートするため、ポートnetdevはすべてのIGMP joinおよびleaveメッセージをブリッジドライバーにトラップする必要があります。ブリッジマルチキャストモジュールは、マルチキャストグループが変更されたときに、そのグループが静的設定か動的に参加/離脱かを含めてポートnetdevに通知します。ハードウェア実装では、登録されたマルチキャストトラフィックグループをのみ、設定されたポートに転送する必要があります。</p>
+</section>
+</section>
+<section id="l3-routing-offload">
+<h2>L3ルーティングオフロード<a class="headerlink" href="#l3-routing-offload" title="この見出しへのパーマリンク">¶</a></h2>
+<p>L3ルーティングのオフロードには、デバイスにカーネルからのFIBエントリをプログラミングし、デバイスがFIB検索と転送を行う必要があります。デバイスはFIBエントリのルートプレフィックスと一致する最も長いプレフィックス一致（LPM）を行い、パケットを一致したFIBエントリのnexthop（出力ポート）に転送します。</p>
+<p>デバイスをプログラミングするには、ドライバーはregister_fib_notifierを使用してFIB notifierハンドラを登録する必要があります。以下のイベントが利用可能です：</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 27%"/>
+<col style="width: 73%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>FIB_EVENT_ENTRY_ADD</p></td>
+<td><p>新しいFIBエントリをデバイスに追加するか、既存のエントリを変更する場合に使用されます。</p></td>
+</tr>
+<tr class="row-even"><td><p>FIB_EVENT_ENTRY_DEL</p></td>
+<td><p>FIBエントリを削除する場合に使用されます。</p></td>
+</tr>
+<tr class="row-odd"><td><p>FIB_EVENT_RULE_ADD,</p></td>
+<td></td>
+</tr>
+<tr class="row-even"><td><p>FIB_EVENT_RULE_DEL</p></td>
+<td><p>FIBルールの変更を伝播する場合に使用されます。</p></td>
+</tr>
+</tbody>
+</table>
+<p>FIB_EVENT_ENTRY_ADDおよびFIB_EVENT_ENTRY_DELイベントは以下の情報を渡します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct fib_entry_notifier_info {
+        struct fib_notifier_info info; /* must be first */
+        u32 dst;
+        int dst_len;
+        struct fib_info *fi;
+        u8 tos;
+        u8 type;
+        u32 tb_id;
+        u32 nlflags;
+};
+</pre></div>
+</div>
+<p>table tb_idにIPv4 dst/dest_lenプレフィックスを追加/変更/削除する場合。The <code class="docutils literal notranslate"><span class="pre">*fi</span></code>
+構造体はルートとそのルートのnexthopsの詳細を保持しています。  <code class="docutils literal notranslate"><span class="pre">*dev</span></code> ルートのnexthopリストに記載されているポートnetdevの一つです。</p>
+<p>デバイスにオフロードされたルートは、ip routeリストで「offload」とラベル付けされます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ ip route show
+default via 192.168.0.2 dev eth0
+11.0.0.0/30 dev sw1p1  proto kernel  scope link  src 11.0.0.2 offload
+11.0.0.4/30 via 11.0.0.1 dev sw1p1  proto zebra  metric 20 offload
+11.0.0.8/30 dev sw1p2  proto kernel  scope link  src 11.0.0.10 offload
+11.0.0.12/30 via 11.0.0.9 dev sw1p2  proto zebra  metric 20 offload
+12.0.0.2  proto zebra  metric 30 offload
+        nexthop via 11.0.0.1  dev sw1p1 weight 1
+        nexthop via 11.0.0.9  dev sw1p2 weight 1
+12.0.0.3 via 11.0.0.1 dev sw1p1  proto zebra  metric 20 offload
+12.0.0.4 via 11.0.0.9 dev sw1p2  proto zebra  metric 20 offload
+192.168.0.0/24 dev eth0  proto kernel  scope link  src 192.168.0.15
+</pre></div>
+</div>
+<p>少なくとも一つのデバイスがFIBエントリをオフロードしている場合、「offload」フラグが設定されます。</p>
+<p>XXX: IPv6 FIB APIの追加/変更/削除</p>
+<section id="nexthop-resolution">
+<h3>nexthopの解決<a class="headerlink" href="#nexthop-resolution" title="この見出しへのパーマリンク">¶</a></h3>
+<p>FIBエントリのnexthopリストには（ゲートウェイ、dev）のタプルが含まれていますが、スイッチデバイスが正しいdst macアドレスでパケットを転送するには、nexthopゲートウェイを隣接ノードのmacアドレスに解決する必要があります。隣接macアドレスの発見はARP（またはND）プロセスを通じて行われ、arp_tbl隣接テーブルで利用可能です。ルートのnexthopゲートウェイを解決するには、ドライバーはカーネルの隣接解決プロセスをトリガーする必要があります。rockerドライバーのrocker_port_ipv4_resolve関数を参照してください。</p>
+<p>ドライバーはnetevent notifier NETEVENT_NEIGH_UPDATEを使用してarp_tblの更新を監視できます。arp_tblの更新に応じて、デバイスにルートの解決済みnexthopをプログラミングできます。ドライバーはndo_neigh_destroyを実装して、ポートからarp_tbl隣接エントリが削除されたときに通知を受けます。</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxネットワーキングドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="netdev-FAQ.html">netdev FAQ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="af_xdp.html">AF_XDP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bareudp.html">Bare UDPトンネリングモジュールドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="batman-adv.html">batman-adv</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can.html">SocketCAN - コントローラー・エリア・ネットワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can_ucan_protocol.html">UCANプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="device_drivers/index.html">ハードウェアデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dsa/index.html">分散スイッチアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="devlink/index.html">Linux Devlinkドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="caif/index.html">CAIF</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ethtool-netlink.html">ethtool用Netlinkインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ieee802154.html">IEEE 802.15.4開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="j1939.html">J1939ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kapi.html">LinuxネットワーキングとネットワークデバイスAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="msg_zerocopy.html">MSG_ZEROCOPY</a></li>
+<li class="toctree-l2"><a class="reference internal" href="failover.html">フェールオーバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="net_dim.html">Net DIM - ジェネリックネットワークダイナミック割込みモデレーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="net_failover.html">NET_FAILOVER</a></li>
+<li class="toctree-l2"><a class="reference internal" href="page_pool.html">ページプールAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phy.html">PHY抽象レイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sfp-phylink.html">phylink</a></li>
+<li class="toctree-l2"><a class="reference internal" href="alias.html">IPアリアシング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bridge.html">イーサネットブリッジング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="snmp_counter.html">SNMPカウンター</a></li>
+<li class="toctree-l2"><a class="reference internal" href="checksum-offloads.html">チェックサムオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="segmentation-offloads.html">セグメンテーションオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="scaling.html">Linuxネットワーキングスタックにおけるスケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tls.html">カーネルTLS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tls-offload.html">カーネルTLSオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nfc.html">Linux NFCサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6lowpan.html">6lowpanインターフェース用Netdevプライベートデータルーム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6pack.html">6packプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet-hardware.html">ARCnetハードウェア</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet.html">ARCnet</a></li>
+<li class="toctree-l2"><a class="reference internal" href="atm.html">ATM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ax25.html">AX.25</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bonding.html">LinuxイーサネットボンディングドライバHOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cdc_mbim.html">cdc_mbim - CDC MBIMモバイルブロードバンドモデム用ドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dccp.html">DCCPプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dctcp.html">DCTCP（データセンターTCP）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="decnet.html">Linux DECnetネットワーキングレイヤー情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dns_resolver.html">DNSリゾルバー・モジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="driver.html">Softnetドライバーの問題</a></li>
+<li class="toctree-l2"><a class="reference internal" href="eql.html">EQLドライバー: シリアルIPロードバランシングガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="fib_trie.html">LC-trie実装ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="filter.html">Linux Socket Filtering（別名Berkeley Packet Filter（BPF））</a></li>
+<li class="toctree-l2"><a class="reference internal" href="framerelay.html">フレームリレー（FR）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic-hdlc.html">ジェネリックHDLCレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic_netlink.html">ジェネリックネットリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gen_stats.html">ネットリンクユーザー向けジェネリックネットワーキング統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gtp.html">LinuxカーネルGTPトンネリングモジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ila.html">識別子ロケーターアドレスング（ILA）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipddp.html">AppleTalk-IPデカプセル化とAppleTalk-IPエンカプセル化</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip_dynaddr.html">IPダイナミックアドレスハックポートv0.03</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipsec.html">IPsec</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip-sysctl.html">IP Sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipv6.html">IPv6</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvlan.html">IPVLANドライバーガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvs-sysctl.html">IPvs-sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kcm.html">カーネルコネクションマルチプレクサ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="l2tp.html">L2TP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lapb-module.html">Linux LAPBモジュールインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mac80211-injection.html">mac80211を使用したパケットインジェクションの使い方</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mpls-sysctl.html">MPLS Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="multiqueue.html">マルチキューネットワークデバイスサポートガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netconsole.html">Netconsole</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdev-features.html">ネットデバイス機能の混乱とその解決方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdevices.html">ネットワークデバイス、カーネル、そしてあなた！</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netfilter-sysctl.html">Netfilter Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netif-msg.html">NETIFメッセージレベル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_conntrack-sysctl.html">Netfilter Conntrack Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_flowtable.html">Netfilterのフローテーブルインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="openvswitch.html">Open vSwitch datapath開発者ドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="operstates.html">運用状態</a></li>
+<li class="toctree-l2"><a class="reference internal" href="packet_mmap.html">パケットMMAP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phonet.html">Linux Phonetプロトコルファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pktgen.html">Linuxパケットジェネレーターガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="plip.html">PLIP: 平行線インターネットプロトコルデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ppp_generic.html">PPPジェネリックドライバーおよびチャネルインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="proc_net_tcp.html">proc/net/tcpおよびproc/net/tcp6変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="radiotap-headers.html">radiotapヘッダの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html">概要</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-architecture">RDSアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#socket-interface">ソケットインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rdma-for-rds">RDS用RDMA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#congestion-notifications">コンゲスト通知</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-protocol">RDSプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-transport-layer">RDSトランスポートレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-kernel-structures">RDSカーネル構造体</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#connection-management">接続管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#the-send-path">送信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#the-recv-path">受信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#multipath-rds-mprds">マルチパスRDS (mprds)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="regulatory.html">Linuxワイヤレス規制ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html">RxRPC ネットワークプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#socket-options">ソケットオプション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#security">セキュリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#example-client-usage">例: クライアントの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sctp.html">LinuxカーネルSCTP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="secid.html">LSM/SeLinux secid</a></li>
+<li class="toctree-l2"><a class="reference internal" href="seg6-sysctl.html">Seg6 Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="statistics.html">インターフェース統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="strparser.html">ストリームパーサー (strparser)</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">イーサネットスイッチデバイスドライバモデル (switchdev)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysfs-tagging.html">Sysfsタグ付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tc-actions-env-rules.html">TCアクション - 環境ルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tcp-thin.html">スリムストリームとTCP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="team.html">チーム (Team)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="timestamping.html">タイムスタンピング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tproxy.html">透過プロキシサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tuntap.html">ユニバーサルTUN/TAPデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="udplite.html">UDP-Liteプロトコル (RFC 3828)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vrf.html">仮想ルーティングおよびフォワーディング (VRF)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vxlan.html">仮想拡張ローカルエリアネットワーキングドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html">パケットレイヤーからデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html#device-driver-to-packet-layer">デバイスドライバからパケットレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25.html">Linux X.25プロジェクト</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_device.html">XFRMデバイス - IPsec計算のオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_proc.html">XFRMプロセス - /proc/net/xfrm_*ファイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sync.html">XFRM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sysctl.html">XFRMシステムコール</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxネットワーキングドキュメント</a><ul>
+<li>前へ: <a href="strparser.html" title="前章">ストリームパーサー (strparser)</a></li>
+<li>次へ: <a href="sysfs-tagging.html" title="次章">Sysfsタグ付け</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/networking/switchdev.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

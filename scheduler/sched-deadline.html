@@ -1,0 +1,732 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>期限付きタスクスケジューリング — The Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="sched-design-CFS.html" rel="next" title="CFSスケジューラ"/>
+<link href="sched-bwc.html" rel="prev" title="CFS帯域制御"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="deadline-task-scheduling">
+<h1>期限ベースタスクスケジューリング<a class="headerlink" href="#deadline-task-scheduling" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="warning">
+<h2>0. 警告<a class="headerlink" href="#warning" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><p>これらの設定をいじると、予測不能なまたはシステムの不安定な動作を引き起こす可能性があります。-rt（グループ）スケジューリングについては、rootユーザーが正しい操作を理解していると想定されます。</p>
+</div></blockquote>
+</section>
+<section id="overview">
+<h2>1. 概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><p>sched_dlスケジューリングクラス内に含まれるSCHED_DEADLINEポリシーは、定常的な帯域幅サーバー（CBS）メカニズムを組み合わせた、最も早い期限優先（EDF）スケジューリングアルゴリズムの実装です。これにより、タスク間での動作の隔離が可能になります。</p>
+</div></blockquote>
+</section>
+<section id="scheduling-algorithm">
+<h2>2. スケジューリングアルゴリズム<a class="headerlink" href="#scheduling-algorithm" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="main-algorithm">
+<h3>2.1 メインアルゴリズム<a class="headerlink" href="#main-algorithm" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>SCHED_DEADLINE [18] は、「runtime」、「period」、「deadline」の3つのパラメータを使用してタスクをスケジューリングします。SCHED_DEADLINEタスクは、「period」マイクロ秒ごとに「runtime」マイクロ秒の実行時間を確保し、この「runtime」マイクロ秒は「deadline」マイクロ秒の期間内に利用可能です。この動作を実装するため、タスクが起動するたびに、スケジューラはCBS[2,3]アルゴリズムを使用して「スケジューリングデッドライン」を計算します。その後、これらのスケジューリングデッドラインに基づき、EDF[1]アルゴリズムでタスクをスケジューリングします（最も早いスケジューリングデッドラインを持つタスクが実行されます）。注意点として、適切な「アドミッションコントロール」戦略（第4節「帯域幅管理」を参照）が使用されている場合、タスクは「deadline」内に「runtime」時間単位を実際に受け取るようになります（システムが過負荷の場合、この保証は守られません）。</p>
+<p>まとめると、CBS[2,3]アルゴリズムは、各タスクが1周期ごとに最大で「runtime」時間単位を実行し、異なるタスク間の干渉を防ぐ（帯域幅の隔離）ようにスケジューリングデッドラインを割り当てます。一方、EDF[1]アルゴリズムは、最も早いスケジューリングデッドラインを持つタスクを次の実行タスクとして選択します。この機能により、従来のリアルタイムタスクモデル（第3節を参照）に厳密に準拠しないタスクも新しいポリシーを有効に利用できます。</p>
+<p>詳しく説明すると、CBSアルゴリズムはタスクにスケジューリングデッドラインを以下のように割り当てる方法です：</p>
+<blockquote>
+<div><ul>
+<li><p>各SCHED_DEADLINEタスクは、「runtime」、「deadline」、「period」という3つのパラメータで特徴付けられます;</p></li>
+<li><p>タスクの状態は、「スケジューリングデッドライン」と「残りの実行時間」の2つのパラメータで記述されます。これら2つのパラメータは初期値として0に設定されます;</p></li>
+<li><p>SCHED_DEADLINEタスクが起動して（実行準備完了）した際、スケジューラは以下の条件を確認します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>         remaining runtime                  runtime
+----------------------------------    &gt;    ---------
+scheduling deadline - current time           period
+</pre></div>
+</div>
+<p>次に、スケジューリングデッドラインが現在時刻よりも小さい場合、またはこの条件が確認された場合、スケジューリングデッドラインと残り実行時間は再初期化されます。</p>
+<blockquote>
+<div><p>スケジューリングデッドライン = 現在時刻 + デッドライン残り時間 = 実行時間</p>
+</div></blockquote>
+<p>それ以外の場合、スケジューリングデッドラインと残り実行時間は変更されません。</p>
+</li>
+<li><p>SCHED_DEADLINEタスクが時間tの間実行されると、その残り実行時間は以下のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>remaining runtime = remaining runtime - t
+</pre></div>
+</div>
+<p>（技術的には、タスクが再スケジューリングされるか、プリエンプションされるたびに実行時間が減少します）</p>
+</li>
+<li><p>残り実行時間が0以下になると、タスクは「制限される」と言えます（リアルタイム文献では「枯渇」とも呼ばれます）。このタスクはスケジューリングデッドラインまでスケジューリングされません。このタスクの「補充時間」（次の項目を参照）は、現在のスケジューリングデッドラインの値に設定されます。</p></li>
+<li><p>制限されたタスクの現在時刻が補充時間に等しい場合、スケジューリングデッドラインと残り実行時間は以下のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>scheduling deadline = scheduling deadline + period
+remaining runtime = remaining runtime + runtime
+</pre></div>
+</div>
+</li>
+</ul>
+</div></blockquote>
+<p>sched_attrのsched_flagsフィールドにあるSCHED_FLAG_DL_OVERRUNフラグは、SIGXCPUシグナルの送信を通じてタスクに実行時間の超過を通知します。</p>
+</div></blockquote>
+</section>
+<section id="bandwidth-reclaiming">
+<h3>2.2 帯域幅の回収<a class="headerlink" href="#bandwidth-reclaiming" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>デッドラインタスクの帯域幅の回収はGRUB（Greedy Reclamation of Unused Bandwidth）アルゴリズム[15, 16, 17]に基づいており、SCHED_FLAG_RECLAIMフラグが設定されているときに有効になります。</p>
+<p>以下のダイアグラムは、GRUBで処理されるタスクの状態名を示しています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>                    ------------
+        (d)        |   Active   |
+     -------------&gt;|            |
+     |             | Contending |
+     |              ------------
+     |                A      |
+ ----------           |      |
+|          |          |      |
+| Inactive |          |(b)   | (a)
+|          |          |      |
+ ----------           |      |
+     A                |      V
+     |              ------------
+     |             |   Active   |
+     --------------|     Non    |
+        (c)        | Contending |
+                    ------------
+</pre></div>
+</div>
+<p>タスクは以下の状態のいずれかにあります：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>ActiveContending：実行可能（または実行中）の場合</p></li>
+<li><p>ActiveNonContending：ブロック状態になったばかりで、0ラグ時間に達していない場合</p></li>
+<li><p>Inactive：ブロック状態で、0ラグ時間に達した場合</p></li>
+</ul>
+</div></blockquote>
+<p>状態の遷移：</p>
+<blockquote>
+<div><ol class="loweralpha">
+<li><p>タスクがブロック状態になると、すぐにInactive状態にはなりません。なぜなら、リアルタイム保証を破る可能性があるからです。そのため、タスクは一時的な状態であるActiveNonContendingに移行します。スケジューラーは「インアクティブタイマ」を0ラグ時間に設定し、タスクの帯域幅をリアルタイム保証を破らないように回収します。</p>
+<p>ActiveNonContending状態に入ったタスクの0ラグ時間は以下の式で計算されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>           (runtime * dl_period)
+deadline - ---------------------
+                dl_runtime
+</pre></div>
+</div>
+<p>ここで、runtimeは残り実行時間、dl_runtimeとdl_periodは予約パラメータです。</p>
+</li>
+<li><p>タスクがインアクティブタイマが起動する前に目覚めると、タスクは再びアクティブコンテントイング状態に戻り、「インアクティブタイマ」はキャンセルされます。さらに、タスクが別のランキューで目覚めた場合、そのタスクの利用率は前のランキューのアクティブ利用率から削除され、新しいランキューのアクティブ利用率に追加される必要があります。タスクがランキューで目覚める間に別のCPUで「インアクティブタイマ」が実行されている場合、競合を避けるために「dl_non_contending」フラグが使用され、タスクがランキューにないがアクティブな状態であることを示します（タスクがブロックするときにフラグが設定され、「インアクティブタイマ」が起動するかタスクが目覚めるときにクリアされます）。</p></li>
+<li><p>「インアクティブタイマ」が起動すると、タスクはインアクティブ状態に移行し、その利用率はランキューのアクティブ利用率から削除されます。</p></li>
+<li><p>インアクティブなタスクが目覚めると、アクティブコンテントイング状態に移行し、その利用率はそのタスクが登録されたランキューのアクティブ利用率に追加されます。</p></li>
+</ol>
+</div></blockquote>
+<p>各ランキューに対して、アルゴリズムGRUBは2つの異なるバンド幅を追跡します：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>アクティブバンド幅（running_bw）：これは、アクティブ状態（つまり、アクティブコンテントイングまたはアクティブノンコンテントイング）にあるすべてのタスクのバンド幅の合計です。</p></li>
+<li><p>トータルバンド幅（this_bw）：これは、ランキューに「所属」しているすべてのタスクのバンド幅の合計であり、インアクティブ状態にあるタスクも含まれます。</p></li>
+</ul>
+</div></blockquote>
+<p>アルゴリズムはインアクティブ状態にあるタスクのバンド幅を回収します。これは、実行中のタスクTiの実行時間を、以下の速度で減らすことで実現されます：</p>
+<blockquote>
+<div><p>dq = -max{ Ui / Umax, (1 - Uinact - Uextra) } dt</p>
+</div></blockquote>
+<p>where:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>UiはタスクTiのバンド幅です；</p></li>
+<li><p>Umaxは最大回収可能な利用率（RTスロットリング制限に従います）です；</p></li>
+<li><p>Uinactは（各ランキューごと）インアクティブ利用率で、(this_bq - running_bw)で計算されます；</p></li>
+<li><p>Uextraは（各ランキューごと）追加の回収可能な利用率（RTスロットリング制限に従います）です。</p></li>
+</ul>
+</div></blockquote>
+<p>では、2つの期限を持つタスクの簡単な例を見てみましょう。実行時間は4、周期は8（つまり、バンド幅は0.5）です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>       A            Task T1
+       |
+       |                               |
+       |                               |
+       |--------                       |----
+       |       |                       V
+       |---|---|---|---|---|---|---|---|---------&gt;t
+       0   1   2   3   4   5   6   7   8
+
+
+       A            Task T2
+       |
+       |                               |
+       |                               |
+       |       ------------------------|
+       |       |                       V
+       |---|---|---|---|---|---|---|---|---------&gt;t
+       0   1   2   3   4   5   6   7   8
+
+
+       A            running_bw
+       |
+     1 -----------------               ------
+       |               |               |
+    0.5-               -----------------
+       |                               |
+       |---|---|---|---|---|---|---|---|---------&gt;t
+       0   1   2   3   4   5   6   7   8
+
+
+- Time t = 0:
+
+  Both tasks are ready for execution and therefore in ActiveContending state.
+  Suppose Task T1 is the first task to start execution.
+  Since there are no inactive tasks, its runtime is decreased as dq = -1 dt.
+
+- Time t = 2:
+
+  Suppose that task T1 blocks
+  Task T1 therefore enters the ActiveNonContending state. Since its remaining
+  runtime is equal to 2, its 0-lag time is equal to t = 4.
+  Task T2 start execution, with runtime still decreased as dq = -1 dt since
+  there are no inactive tasks.
+
+- Time t = 4:
+
+  This is the 0-lag time for Task T1. Since it didn't woken up in the
+  meantime, it enters the Inactive state. Its bandwidth is removed from
+  running_bw.
+  Task T2 continues its execution. However, its runtime is now decreased as
+  dq = - 0.5 dt because Uinact = 0.5.
+  Task T2 therefore reclaims the bandwidth unused by Task T1.
+
+- Time t = 8:
+
+  Task T1 wakes up. It enters the ActiveContending state again, and the
+  running_bw is incremented.
+</pre></div>
+</div>
+</div></blockquote>
+</section>
+<section id="energy-aware-scheduling">
+<h3>2.3 エネルギー効率的なスケジューリング<a class="headerlink" href="#energy-aware-scheduling" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>cpufreqのschedutilガバナーが選択されている場合、SCHED_DEADLINEはGRUB-PA [19] アルゴリズムを実装し、CPUの動作周波数を期限を満たすために必要な最小値にまで下げます。この動作は現在、ARMアーキテクチャにのみ実装されています。</p>
+<p>周波数変更に必要な時間が予約期間と同程度の場合には、特に注意が必要です。このような場合、固定のCPU周波数を設定すると、期限の超過がより多く発生します。</p>
+</div></blockquote>
+</section>
+</section>
+<section id="scheduling-real-time-tasks">
+<h2>3. 実時間タスクのスケジューリング<a class="headerlink" href="#scheduling-real-time-tasks" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p>このセクションには、古典的な期限スケジューリング理論の概要と、SCHED_DEADLINEへの適用についての（不完全な）まとめが含まれています。セクション4にのみ興味がある場合は、「安全に」スキップできます。ただし、技術的な詳細を完全に理解するために、テストの欲求が満たされたら（:P）必ずここに戻ってきて続きを読みましょう。</p>
+</div>
+<p>この新しいスケジューリングディスパッチングを活用できるタスクの種類には制限がありません。ただし、特に周期的または偶発的な実時間タスク（タイミングの保証が必要な場合）に適しています。たとえば、マルチメディア、ストリーミング、制御アプリケーションなどです。</p>
+</div></blockquote>
+<section id="definitions">
+<h3>3.1 定義<a class="headerlink" href="#definitions" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>典型的な実時間タスクは、周期的または偶発的なパターンで繰り返される計算フェーズ（タスクインスタンス、またはジョブ）から構成されます。各ジョブJ_j（タスクのj番目のジョブ）は、開始時間r_j（ジョブの開始時刻）、完了に必要な計算時間c_j、およびジョブの絶対期限d_j（ジョブが完了すべき時間）で特徴付けられます。最大実行時間max{c_j}は「最悪ケース実行時間（WCET）」と呼ばれます。実時間タスクは、r_{j+1} = r_j + Pの条件で周期的であればPを周期とし、r_{j+1} &gt;= r_j + Pの条件で偶発的であればPを最小到着間隔とします。最後に、d_j = r_j + Dで、Dはタスクの相対期限です。まとめると、実時間タスクは以下のようになります</p>
+<blockquote>
+<div><p>タスク = (WCET, D, P)</p>
+</div></blockquote>
+<p>実時間タスクの利用率は、そのWCETと周期（または最小到着間隔）の比率で定義され、タスクを実行するために必要なCPU時間の割合を表します。</p>
+<p>総利用率 U = sum(WCET_i/P_i) が CPU の数 M よりも大きい場合、スケジューラはすべての期限を満たすことができません。注意点として、総利用率はシステム内のすべてのリアルタイムタスクの WCET_i/P_i の合計として定義されています。複数のリアルタイムタスクを考慮する場合、i 番目のタスクのパラメータは「_i」サフィックスで示されます。さらに、総利用率が M よりも大きい場合、リアルタイムタスクによって非リアルタイムタスクが starvation（処理不能状態）になるリスクがあります。逆に、総利用率が M よりも小さい場合、非リアルタイムタスクは starvation されず、システムがすべての期限を満たす可能性があります。実際には、この場合、遅延（タスクの完了時刻と絶対期限の差の最大値と 0 の大きい方）の上界を提供することが可能です。より正確には、グローバル EDF スケジューラを使用すれば、各タスクの最大遅延が以下の式で表されることが証明されています。</p>
+<blockquote>
+<div><p>((M − 1) · WCET_max − WCET_min)/(M − (M − 2) · U_max) + WCET_max</p>
+</div></blockquote>
+<p>ここで WCET_max = max{WCET_i} は最大 WCET、WCET_min=min{WCET_i} は最小 WCET、U_max = max{WCET_i/P_i} は最大利用率[12]です。</p>
+</div></blockquote>
+</section>
+<section id="schedulability-analysis-for-uniprocessor-systems">
+<h3>3.2 単一プロセッサシステムのスケジュール可能性解析<a class="headerlink" href="#schedulability-analysis-for-uniprocessor-systems" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>M=1（単一プロセッサシステム）の場合、またはパーティションスケジューリング（各リアルタイムタスクが静的に1つのCPUに割り当てられる）の場合、すべての期限が満たされているかを形式的に確認できます。すべてのタスクで D_i = P_i である場合、CPU 上で実行されるタスクの総利用率が 1 以下であれば、EDF はすべてのタスクの期限を満たすことができます。一部のタスクで D_i != P_i である場合、タスクの密度を WCET_i/min{D_i, P_i} として定義し、CPU 上で実行されるタスクの密度の合計が 1 以下であれば、EDF はすべてのタスクの期限を満たすことができます：</p>
+<blockquote>
+<div><p>sum(WCET_i / min{D_i, P_i}) &lt;= 1</p>
+</div></blockquote>
+<p>この条件は十分条件であり、必要条件ではないことに注意することが重要です。スケジューリング可能なタスクセットがこの条件を満たさない場合もあります。たとえば、タスクセット {Task_1, Task_2} を考えてみましょう。Task_1=(50ms, 50ms, 100ms) と Task_2=(10ms, 100ms, 100ms) で構成されています。EDF（Earliest Deadline First）は、両方のタスクを期限を守ってスケジューリングできることを明らかにしています（Task_1 はリリース直後にスケジューリングされ、期限を厳守します。Task_2 は Task_1 の直後にスケジューリングされるため、応答時間は 50ms + 10ms = 60ms 以下になります）。ただし、</p>
+<blockquote>
+<div><p>50 / min{50,100} + 10 / min{100, 100} = 50 / 50 + 10 / 100 = 1.1</p>
+</div></blockquote>
+<p>もちろん、D_i ≠ P_i のタスクの正確なスケジューリング可能性をテストする（十分かつ必要条件を満たす条件を確認する）ことは可能です。しかし、総利用率や密度を定数と比較することはできません。代わりに、「プロセッサ需要（processor demand）」というアプローチが用いられます。これは、時間区間 t 内にすべてのタスクが期限を守るために必要なCPU時間 h(t) を計算し、この時間と区間 t の長さを比較します。すべての t の値に対して h(t) &lt; t （つまり、t の区間内でタスクが要する時間は区間の長さより短い）であれば、EDFはすべてのタスクの期限を守ってスケジューリング可能です。ただし、すべての t の値に対してこの検証を行うことは不可能です。そのため、文献[4,5,6]で示されているように、t の値を 0 から最大値 L までの範囲で検証するだけで十分です。引用された論文には数学的詳細が含まれており、h(t) と L の計算方法について説明されています。いずれにしても、この種の分析はオンラインで実行するには複雑かつ時間がかかるため、Linux ではセクション4で説明したように、タスクの利用率に基づいたアドミッションテストが採用されています。</p>
+</div></blockquote>
+</section>
+<section id="schedulability-analysis-for-multiprocessor-systems">
+<h3>3.3 マルチプロセッサシステムにおけるスケジューリング可能性分析<a class="headerlink" href="#schedulability-analysis-for-multiprocessor-systems" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>グローバルなEDFスケジューリング（非パーティション型）を持つマルチプロセッサシステムでは、スケジューリング可能性を検証するための十分条件は利用率や密度に基づくことはできません。D_i = P_i であっても、利用率が1をわずかに超えるタスクセットは、CPUの数に関係なく期限を満たすことができないことが示されています。</p>
+<p>M+1個のタスクの集合 {Task_1,…Task_{M+1}} を、Mコアのシステム上で考えます。最初のタスク Task_1=(P,P,P) は、周期、相対期限、ワーストケース実行時間（WCET）がすべて P です。残りの M 個のタスク Task_i=(e,P-1,P-1) は、ワーストケース実行時間（ここでは「e」と表記）が非常に小さく、最初のタスクの周期より小さい周期を持っています。したがって、すべてのタスクが同じ時間 t にアクティブになった場合、グローバルEDF（Earliest Deadline First）はこれらの M 個のタスクをまずスケジュールします（絶対期限が t + P - 1 であり、Task_1 の絶対期限 t + P より小さいため）。結果として、Task_1 は t + e の時間にスケジュールされ、t + e + P の時間に完了しますが、その絶対期限を過ぎています。タスク集合の総利用率 U は U = M · e / (P - 1) + P / P = M · e / (P - 1) + 1 であり、e が非常に小さい場合、これは 1 に非常に近づきます。これは「ダールの効果」として知られています[7]。注意：ここではダールの論文の例をやや簡略化しています（例えば、ダールはより正確に lim_{e-&gt;0}U を計算しています）。</p>
+<p>グローバルEDF に関するより複雑なスケジュール可能テストは、リアルタイム文献で開発されています[8,9]。しかし、これらは総利用率（または密度）と固定定数の単純な比較に基づいていません。すべてのタスクが D_i = P_i を満たす場合、スケジュール可能条件は以下のように単純に表されます：</p>
+<blockquote>
+<div><p>sum(WCET_i / P_i) &lt;= M - (M - 1) · U_max</p>
+</div></blockquote>
+<p>ここで U_max = max{WCET_i / P_i}[10] です。U_max = 1 の場合、M - (M - 1) · U_max は M - M + 1 = 1 となり、このスケジュール可能条件はダールの効果を再確認しています。マルチプロセッサリアルタイムスケジューリングに関するスケジュール可能テストに関するより詳細な文献調査は [11] にあります。</p>
+<p>以上のように、総利用率が M より小さいことを強制しても、グローバルEDF が期限をすべて満たしてタスクをスケジュールする保証はされません（つまり、グローバルEDF は最適なスケジューリングアルゴリズムではありません）。しかし、総利用率が M より小さいことは、非リアルタイムタスクがCPUリソースを奪われず、リアルタイムタスクの遅延が上界を持つことを保証します[12]（以前に述べた通り）。リアルタイムタスクが経験する最大遅延に関するさまざまな上界は、複数の論文で開発されています[13,14]。SCHED_DEADLINE にとって重要な理論的結果は、総利用率が M 以下であればタスクの応答時間に制限があることです。</p>
+</div></blockquote>
+</section>
+<section id="relationship-with-sched-deadline-parameters">
+<h3>3.4 SCHED_DEADLINE パラメータとの関係<a class="headerlink" href="#relationship-with-sched-deadline-parameters" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>最後に、セクション2で説明したSCHED_DEADLINEスケジューリングパラメータ（実行時間、期限、周期）と、このセクションで説明したリアルタイムタスクのパラメータ（WCET、D、P）の関係を理解することが重要です。注意してください。タスクの時間制約は、上記で説明した絶対期限d_j = r_j + Dによって表されます。一方、SCHED_DEADLINEはスケジューリング期限に基づいてタスクをスケジューリングします（セクション2を参照）。もしアダミッションテストを使用してスケジューリング期限が遵守されることを保証する場合、SCHED_DEADLINEはすべてのタスクのジョブの期限が遵守されることを保証するリアルタイムタスクのスケジューリングに使用できます。これを実現するには、タスクを以下の設定でスケジューリングする必要があります：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>実行時間 &gt;= WCET</p></li>
+<li><p>期限 = D</p></li>
+<li><p>周期 &lt;= P</p></li>
+</ul>
+</div></blockquote>
+<p>つまり、実行時間 &gt;= WCETかつ周期 &lt;= Pの場合、スケジューリング期限と絶対期限（d_j）は一致するため、適切なアダミッション制御によりこのタスクのジョブの絶対期限が遵守されます（これは「ハードスケジュール可能プロパティ」と呼ばれ、論文[2]の補題1の拡張です）。注意してください。実行時間が期限より大きい場合、アダミッション制御は必ずこのタスクを拒否します。なぜなら、その時間制約を遵守できないからです。</p>
+<p>参照:</p>
+<blockquote>
+<div><dl class="simple">
+<dt>1 - C. L. Liu and J. W. Layland. Scheduling algorithms for multiprogram-</dt><dd><p>ming in a hard-real-time environment. Journal of the Association for Computing Machinery, 20(1), 1973.</p>
+</dd>
+<dt>2 - L. Abeni , G. Buttazzo. Integrating Multimedia Applications in Hard</dt><dd><p>Real-Time Systems. Proceedings of the 19th IEEE Real-time Systems Symposium, 1998. <a class="reference external" href="http://retis.sssup.it/~giorgio/paps/1998/rtss98-cbs.pdf">http://retis.sssup.it/~giorgio/paps/1998/rtss98-cbs.pdf</a></p>
+</dd>
+<dt>3 - L. Abeni. Server Mechanisms for Multimedia Applications. ReTiS Lab</dt><dd><p>Technical Report. <a class="reference external" href="http://disi.unitn.it/~abeni/tr-98-01.pdf">http://disi.unitn.it/~abeni/tr-98-01.pdf</a></p>
+</dd>
+<dt>4 - J. Y. Leung and M.L. Merril. A Note on Preemptive Scheduling of</dt><dd><p>Periodic, Real-Time Tasks. Information Processing Letters, vol. 11, no. 3, pp. 115-118, 1980.</p>
+</dd>
+<dt>5 - S. K. Baruah, A. K. Mok and L. E. Rosier. Preemptively Scheduling</dt><dd><p>Hard-Real-Time Sporadic Tasks on One Processor. Proceedings of the 11th IEEE Real-time Systems Symposium, 1990.</p>
+</dd>
+<dt>6 - S. K. Baruah, L. E. Rosier and R. R. Howell. Algorithms and Complexity</dt><dd><p>Concerning the Preemptive Scheduling of Periodic Real-Time tasks on One Processor. Real-Time Systems Journal, vol. 4, no. 2, pp 301-324, 1990.</p>
+</dd>
+<dt>7 - S. J. Dhall and C. L. Liu. On a real-time scheduling problem. Operations</dt><dd><p>research, vol. 26, no. 1, pp 127-140, 1978.</p>
+</dd>
+<dt>8 - T. Baker. Multiprocessor EDF and Deadline Monotonic Schedulability</dt><dd><p>Analysis. Proceedings of the 24th IEEE Real-Time Systems Symposium, 2003.</p>
+</dd>
+<dt>9 - T. Baker. An Analysis of EDF Schedulability on a Multiprocessor.</dt><dd><p>IEEE Transactions on Parallel and Distributed Systems, vol. 16, no. 8, pp 760-768, 2005.</p>
+</dd>
+<dt>10 - J. Goossens, S. Funk and S. Baruah, Priority-Driven Scheduling of</dt><dd><p>Periodic Task Systems on Multiprocessors. Real-Time Systems Journal, vol. 25, no. 2–3, pp. 187–205, 2003.</p>
+</dd>
+<dt>11 - R. Davis and A. Burns. A Survey of Hard Real-Time Scheduling for</dt><dd><p>Multiprocessor Systems. ACM Computing Surveys, vol. 43, no. 4, 2011.
+<a class="reference external" href="http://www-users.cs.york.ac.uk/~robdavis/papers/MPSurveyv5.0.pdf">http://www-users.cs.york.ac.uk/~robdavis/papers/MPSurveyv5.0.pdf</a></p>
+</dd>
+<dt>12 - U. C. Devi and J. H. Anderson. Tardiness Bounds under Global EDF</dt><dd><p>Scheduling on a Multiprocessor. Real-Time Systems Journal, vol. 32, no. 2, pp 133-189, 2008.</p>
+</dd>
+<dt>13 - P. Valente and G. Lipari. An Upper Bound to the Lateness of Soft</dt><dd><p>Real-Time Tasks Scheduled by EDF on Multiprocessors. Proceedings of the 26th IEEE Real-Time Systems Symposium, 2005.</p>
+</dd>
+<dt>14 - J. Erickson, U. Devi and S. Baruah. Improved tardiness bounds for</dt><dd><p>Global EDF. Proceedings of the 22nd Euromicro Conference on Real-Time Systems, 2010.</p>
+</dd>
+<dt>15 - G. Lipari, S. Baruah, Greedy reclamation of unused bandwidth in</dt><dd><p>constant-bandwidth servers, 12th IEEE Euromicro Conference on Real-Time Systems, 2000.</p>
+</dd>
+<dt>16 - L. Abeni, J. Lelli, C. Scordino, L. Palopoli, Greedy CPU reclaiming for</dt><dd><p>SCHED DEADLINE. In Proceedings of the Real-Time Linux Workshop (RTLWS), Dusseldorf, Germany, 2014.</p>
+</dd>
+<dt>17 - L. Abeni, G. Lipari, A. Parri, Y. Sun, Multicore CPU reclaiming: parallel</dt><dd><p>or sequential?. In Proceedings of the 31st Annual ACM Symposium on Applied Computing, 2016.</p>
+</dd>
+<dt>18 - J. Lelli, C. Scordino, L. Abeni, D. Faggioli, Deadline scheduling in the</dt><dd><p>Linux kernel, Software: Practice and Experience, 46(6): 821-839, June 2016.</p>
+</dd>
+<dt>19 - C. Scordino, L. Abeni, J. Lelli, Energy-Aware Real-Time Scheduling in</dt><dd><p>the Linux Kernel, 33rd ACM/SIGAPP Symposium On Applied Computing (SAC 2018), Pau, France, April 2018.</p>
+</dd>
+</dl>
+</div></blockquote>
+</div></blockquote>
+</section>
+</section>
+<section id="bandwidth-management">
+<h2>4. 帯域幅管理<a class="headerlink" href="#bandwidth-management" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><p>前述したように、-期限スケジューリングが有効で有用である（つまり、"ランタイム"時間単位を"期限"内に提供できる）ためには、各タスクに割り当てられるCPU時間の可用割合を制御する方法が必要です。これは通常"アドミッション制御"と呼ばれます。この制御を行わない場合、-期限タスクの実際のスケジューリングに関する保証は得られません。</p>
+<p>3節で既に述べたように、リアルタイムタスクのセットを正しくスケジュールするためには、総利用量がMよりも小さいことが必要条件です。-deadlineタスクについて話す場合、これはすべてのタスクの実行時間と周期の比率の合計がMよりも小さいことを意味します。注意してください。実行時間/周期の比率は、「伝統的」なリアルタイムタスクの利用率に等しく、しばしば「帯域幅」とも呼ばれます。-deadlineタスクに割り当て可能なCPU帯域幅を制御するインターフェースは、既に-rtタスクのリアルタイムグループスケジューリング（通称RT-throttling - 詳細は以下のリンクを参照）で使用されているインターフェースと似ています。
+<a class="reference internal" href="sched-rt-group.html"><span class="doc">リアルタイムグループスケジューリング</span></a>システム全体の設定には、/proc仮想ファイルシステム内に配置された読み込み/書き込み可能な制御ファイルが使用されます。注意してください。グループごとの設定（cgroupfsを介して制御）は、-deadlineタスクにおいてまだ定義されていません。これは、タスクグループレベルでのSCHED_DEADLINE帯域幅の管理方法を決定するためのさらなる議論が必要なためです。</p>
+<p>期限帯域幅管理とRT-throttlingの主な違いは、-deadlineタスクが独自の帯域幅を持ち（-rtタスクは持ちません！）、したがってより上位の制限メカニズムを用いずとも望ましい帯域幅を強制できる点です。言い換えれば、インターフェースパラメータはアドミッションコントロールのタイミング（つまり、ユーザーがsched_setattr()を呼び出すとき）にのみ使用されます。スケジューリングは実際のタスクのパラメータを考慮して行われ、CPU帯域幅がSCHED_DEADLINEタスクの粒度に応じて割り当てられます。したがって、このシンプルなインターフェースを用いることで、-deadlineタスクの総利用量を制限（つまり、Sum (runtime_i / period_i) &lt; global_dl_utilization_cap）できます。</p>
+</div></blockquote>
+<section id="system-wide-settings">
+<h3>4.1 システム全体の設定<a class="headerlink" href="#system-wide-settings" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>システム全体の設定は/proc仮想ファイルシステムの下で構成されます。</p>
+<p>現時点では、-rt調整パラメータが-deadlineアドミッションコントロールに使用され、-deadlineの実行時間は-rtの実行時間に算入されます。これは完全に望ましいとは言えないものの、現時点ではインターフェースを小さくして今後簡単に変更できるようにする方が良いと考えています。理想的な状況（5節参照）は、-rtタスクを-deadlineサーバーから実行することです。その場合、-rt帯域幅はdl_bwの直接のサブセットになります。</p>
+<p>これは、root_domainがMコアを含む場合、-deadlineタスクが作成される際、その帯域幅の合計が以下の条件を満たす必要があります：</p>
+<blockquote>
+<div><p>M * (sched_rt_runtime_us / sched_rt_period_us)</p>
+</div></blockquote>
+<p>帯域幅管理ロジックを無効化することも可能であり、これによりシステムを任意のレベルまで過負荷することなく自由に利用できる。これは、/proc/sys/kernel/sched_rt_runtime_us に -1 を書き込むことで実現される。</p>
+</div></blockquote>
+</section>
+<section id="task-interface">
+<h3>4.2 タスクインターフェース<a class="headerlink" href="#task-interface" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>指定された周期的/非周期的なタスクが、各インスタンスごとに所定の実行時間を維持し、自身のタイミング制約の緊急性に基づいてスケジューリングされる場合、一般的に以下の方法で宣言する必要がある:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>a (最大/典型的) インスタンス実行時間、</p></li>
+<li><p>連続するインスタンス間の最小間隔、</p></li>
+<li><p>各インスタンスが完了しなければならない時間制約。</p></li>
+</ul>
+</div></blockquote>
+<p>したがって：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>必要なすべてのフィールドを含む新しい struct sched_attr が提供されている;</p></li>
+<li><p>この構造体を操作する新しいスケジューリング関連のシステムコール、つまり sched_setattr() および sched_getattr() が実装されている。</p></li>
+</ul>
+</div></blockquote>
+<p>デバッグ目的で、SCHED_DEADLINE タスクの残り実行時間と絶対期限は、/proc/&lt;pid&gt;/sched（エントリ dl.runtime および dl.deadline、両方の値は ns 単位）から取得可能である。これらの値を生産コードから取得するためのプログラム的手段について議論中である。</p>
+</div></blockquote>
+</section>
+<section id="default-behavior">
+<h3>4.3 デフォルト動作<a class="headerlink" href="#default-behavior" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>SCHED_DEADLINE 帯域幅のデフォルト値は、rt_runtime が 950000 に設定される。rt_period が 1000000 に設定されている場合、デフォルトでは -deadline タスクがルートドメインの構成する CPU の数に応じて最大で 95% の CPU 時間を占有できる。これは、非 -deadline タスクが少なくとも 5% の CPU 時間を確保され、-deadline タスクが「期限」パラメータに対して保証された最悪の遅延で実行時間を確保されることを意味する。もし「期限」が「周期」と等しく、cpuset メカニズムを用いてパーティションスケジューリングを実装している（セクション 5 参照）場合、この帯域幅管理の単純な設定により、-deadline タスクが各周期内で実行時間を確実に確保できる。</p>
+<p>最後に、アドミッションコントロールを危険にさらさないため、-deadline タスクはフォークを実行できない。</p>
+</div></blockquote>
+</section>
+<section id="behavior-of-sched-yield">
+<h3>4.4 sched_yield() の動作<a class="headerlink" href="#behavior-of-sched-yield" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>SCHED_DEADLINE タスクが sched_yield() を呼び出すと、残りの実行時間を放棄し、直ちに制限される。次の周期まで待機すると、実行時間が補充される（sched_yield() 呼び出し後に制限と実行時間補充を正しく処理するため、特別なフラグ dl_yielded が設定される）</p>
+<p>sched_yield()のこの挙動により、タスクが次の周期の開始時に正確に起動します。また、今後、帯域再取得メカニズムで利用される可能性があり、sched_yield()は残りの実行時間を他のSCHED_DEADLINEタスクが再取得できるようにします。</p>
+</div></blockquote>
+</section>
+</section>
+<section id="tasks-cpu-affinity">
+<h2>5. タスクのCPUアフィニティ<a class="headerlink" href="#tasks-cpu-affinity" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><p>- SCHED_DEADLINEタスクは、作成されたroot_domain全体より小さいアフィニティマスクを持つことはできません。ただし、cpusetファシリティを通じてアフィニティを指定することが可能です（<a class="reference internal" href="../admin-guide/cgroup-v1/cpusets.html"><span class="doc">CPUSETS</span></a>).</p>
+</div></blockquote>
+<section id="sched-deadline-and-cpusets-howto">
+<h3>5.1 SCHED_DEADLINEとcpusetsの導入ガイド<a class="headerlink" href="#sched-deadline-and-cpusets-howto" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>簡単な設定例（SCHED_DEADLINEタスクをCPU0に固定）は以下の通りです（rt-appを使用してSCHED_DEADLINEタスクを作成します）：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>mkdir /dev/cpuset
+mount -t cgroup -o cpuset cpuset /dev/cpuset
+cd /dev/cpuset
+mkdir cpu0
+echo 0 &gt; cpu0/cpuset.cpus
+echo 0 &gt; cpu0/cpuset.mems
+echo 1 &gt; cpuset.cpu_exclusive
+echo 0 &gt; cpuset.sched_load_balance
+echo 1 &gt; cpu0/cpuset.cpu_exclusive
+echo 1 &gt; cpu0/cpuset.mem_exclusive
+echo $$ &gt; cpu0/tasks
+rt-app -t 100000:10000:d:0 -D5 # it is now actually superfluous to specify
+                               # task affinity
+</pre></div>
+</div>
+</div></blockquote>
+</section>
+</section>
+<section id="future-plans">
+<h2>6. 今後の計画<a class="headerlink" href="#future-plans" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><p>まだ実装されていない機能：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>現在の実行時間と絶対期限を取得するためのプログラミング的な方法</p></li>
+<li><p>期限継承の改善、特に非相互タスク間で帯域分離を維持する可能性について。これは理論的および実用的な観点から研究されており、早ければデモンストレーションコードの実装が可能になるでしょう；</p></li>
+<li><p>(cgroupベースの帯域管理、およびスケジューリング；</p></li>
+<li><p>非rootユーザーに対するアクセス制御（および関連するセキュリティ上の懸念）は、メカニズムの非特権利用を許可する最適な方法、および非rootユーザーがシステムを不正に操作するのを防ぐ方法です？</p></li>
+</ul>
+</div></blockquote>
+<p>すでに議論した通り、この作業をEDF制限パッチ [<a class="reference external" href="https://lkml.org/lkml/2010/2/23/239">https://lkml.org/lkml/2010/2/23/239</a>] と統合する計画ですが、統合は初期段階であり、方向性を決定するためのフィードバックを強く求めています。</p>
+</div></blockquote>
+</section>
+<section id="appendix-a-test-suite">
+<h2>付録A. テストスイート<a class="headerlink" href="#appendix-a-test-suite" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><p>SCHED_DEADLINEポリシーは、Linuxスケジューラ検証スイートに含まれる2つのアプリケーションを使用することで簡単にテスト可能です。このスイートはGitHubリポジトリとして利用可能です： <a class="reference external" href="https://github.com/scheduler-tools">https://github.com/scheduler-tools</a>.</p>
+<p>最初のテストアプリケーションはrt-appと呼ばれ、特定のパラメータを持つ複数のスレッドを起動するためのものです。rt-appはSCHED_{OTHER,FIFO,RR,DEADLINE}スケジューリングポリシーおよび関連パラメータ（例：niceness、優先度、実行時間/期限/周期）をサポートしています。rt-appは合成的なワークロード（実際の使用ケースを模倣する可能性がある）を再現し、スケジューラの挙動を評価するための貴重なツールです。このようにして、結果は簡単に再現可能です。rt-appは以下から利用可能です： <a class="reference external" href="https://github.com/scheduler-tools/rt-app">https://github.com/scheduler-tools/rt-app</a>.</p>
+<p>スレッドパラメータはコマンドラインから指定でき、以下のような形式になります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># rt-app -t 100000:10000:d -t 150000:20000:f:10 -D5
+</pre></div>
+</div>
+<p>上記のコードは2つのスレッドを作成します。1つ目のスレッドはSCHED_DEADLINEによってスケジュールされ、100msごとに10ms実行します。2つ目のスレッドはSCHED_FIFO優先度10でスケジュールされ、150msごとに20ms実行します。テストは合計5秒間実行されます。</p>
+<p>より興味深いことに、設定はこのようなJSONファイルで記述でき、rt-appに入力として渡すことができます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># rt-app my_config.json
+</pre></div>
+</div>
+<p>2番目の方法で指定可能なパラメータはコマンドラインオプションのサブセットです。詳細についてはrt-appのドキュメンテーションを参照してください（<cite>&lt;rt-app-sources&gt;/doc/*.json</cite>).</p>
+<p>2番目のテストアプリケーションはschedtoolの変更版で、schedtool-dlと呼ばれ、特定のpid/アプリケーションのSCHED_DEADLINEパラメータを設定するのに使用できます。schedtool-dlは以下から入手可能です：
+<a class="reference external" href="https://github.com/scheduler-tools/schedtool-dl.git">https://github.com/scheduler-tools/schedtool-dl.git</a>.</p>
+<p>使用方法は簡単です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># schedtool -E -t 10000000:100000000 -e ./my_cpuhog_app
+</pre></div>
+</div>
+<p>これにより、my_cpuhog_appは100msごとに10msのSCHED_DEADLINE予約内で実行されます（パラメータはマイクロ秒単位で指定されます）。すでに実行中のアプリケーションの予約を作成することも可能です（そのpidを知っている場合）：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># schedtool -E -t 10000000:100000000 my_app_pid
+</pre></div>
+</div>
+</div></blockquote>
+</section>
+<section id="appendix-b-minimal-main">
+<h2>付録B. 最小限のmain()<a class="headerlink" href="#appendix-b-minimal-main" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><p>以下に、リアルタイムアプリケーション開発者がSCHED_DEADLINE予約を作成する方法を示すシンプル（汚い）な自前で動作するコードスニペットを提供します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#define _GNU_SOURCE
+#include &lt;unistd.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;time.h&gt;
+#include &lt;linux/unistd.h&gt;
+#include &lt;linux/kernel.h&gt;
+#include &lt;linux/types.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;pthread.h&gt;
+
+#define gettid() syscall(__NR_gettid)
+
+#define SCHED_DEADLINE       6
+
+/* XXX use the proper syscall numbers */
+#ifdef __x86_64__
+#define __NR_sched_setattr           314
+#define __NR_sched_getattr           315
+#endif
+
+#ifdef __i386__
+#define __NR_sched_setattr           351
+#define __NR_sched_getattr           352
+#endif
+
+#ifdef __arm__
+#define __NR_sched_setattr           380
+#define __NR_sched_getattr           381
+#endif
+
+static volatile int done;
+
+struct sched_attr {
+     __u32 size;
+
+     __u32 sched_policy;
+     __u64 sched_flags;
+
+     /* SCHED_NORMAL, SCHED_BATCH */
+     __s32 sched_nice;
+
+     /* SCHED_FIFO, SCHED_RR */
+     __u32 sched_priority;
+
+     /* SCHED_DEADLINE (nsec) */
+     __u64 sched_runtime;
+     __u64 sched_deadline;
+     __u64 sched_period;
+};
+
+int sched_setattr(pid_t pid,
+               const struct sched_attr *attr,
+               unsigned int flags)
+{
+     return syscall(__NR_sched_setattr, pid, attr, flags);
+}
+
+int sched_getattr(pid_t pid,
+               struct sched_attr *attr,
+               unsigned int size,
+               unsigned int flags)
+{
+     return syscall(__NR_sched_getattr, pid, attr, size, flags);
+}
+
+void *run_deadline(void *data)
+{
+     struct sched_attr attr;
+     int x = 0;
+     int ret;
+     unsigned int flags = 0;
+
+     printf("deadline thread started [%ld]\n", gettid());
+
+     attr.size = sizeof(attr);
+     attr.sched_flags = 0;
+     attr.sched_nice = 0;
+     attr.sched_priority = 0;
+
+     /* This creates a 10ms/30ms reservation */
+     attr.sched_policy = SCHED_DEADLINE;
+     attr.sched_runtime = 10 * 1000 * 1000;
+     attr.sched_period = attr.sched_deadline = 30 * 1000 * 1000;
+
+     ret = sched_setattr(0, &amp;attr, flags);
+     if (ret &lt; 0) {
+             done = 0;
+             perror("sched_setattr");
+             exit(-1);
+     }
+
+     while (!done) {
+             x++;
+     }
+
+     printf("deadline thread dies [%ld]\n", gettid());
+     return NULL;
+}
+
+int main (int argc, char **argv)
+{
+     pthread_t thread;
+
+     printf("main thread [%ld]\n", gettid());
+
+     pthread_create(&amp;thread, NULL, run_deadline, NULL);
+
+     sleep(10);
+
+     done = 1;
+     pthread_join(thread, NULL);
+
+     printf("main dies [%ld]\n", gettid());
+     return 0;
+}
+</pre></div>
+</div>
+</div></blockquote>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxスケジューラ</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="completion.html">完了 - 「完了を待つ」バリアAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-arch.html">アーキテクチャ固有コードにおけるCPUスケジューラ実装ヒント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-bwc.html">CFS帯域制御</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">期限ベースタスクスケジューリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-design-CFS.html">CFSスケジューラ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-domains.html">スケジューラドメイン</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-capacity.html">容量感知スケジューリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-energy.html">エネルギー感知スケジューリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-nice-design.html">スケジューラ・ニース設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-rt-group.html">リアルタイムグループスケジューリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-stats.html">スケジューラ統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="text_files.html">スケジューラ pelt C プログラム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxスケジューラ</a><ul>
+<li>前へ: <a href="sched-bwc.html" title="前章">CFS帯域制御</a></li>
+<li>次へ: <a href="sched-design-CFS.html" title="次章">CFSスケジューラ</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/scheduler/sched-deadline.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

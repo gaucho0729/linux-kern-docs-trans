@@ -1,0 +1,434 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>vfio-ccw: 基本インフラストラクチャ — Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="zfcpdump.html" rel="next" title="s390 SCSI ダンプツール (zfcpdump)"/>
+<link href="vfio-ap.html" rel="prev" title="添付プロセッサ (AP) ファシリティ"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="vfio-ccw-the-basic-infrastructure">
+<h1>vfio-ccw: 基本的なインフラストラクチャ<a class="headerlink" href="#vfio-ccw-the-basic-infrastructure" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ここでは、Linux/s390用のI/Oサブチャネルデバイスに対するvfioのサポートについて説明します。vfio-ccwの動機は、仮想マシンにサブチャネルを透過することであり、vfioがその手段です。</p>
+<p>他のハードウェアアーキテクチャとは異なり、s390では統合されたI/Oアクセスメソッドが定義されており、これをチャネルI/Oと呼びます。これは独自のアクセスパターンを持ちます：</p>
+<ul class="simple">
+<li><p>チャネルプログラムは、別個の（共通）プロセッサ上で非同期に実行されます。</p></li>
+<li><p>チャネルサブシステムは、チャネルプログラムで呼び出し元が指定した任意のメモリを直接アクセスします。つまり、IOMMUは関与しません。</p></li>
+</ul>
+<p>したがって、これらのデバイスに対するvfioサポートを導入する際には、mediated device（mdev）実装で実現します。vfio mdevはiommuグループに追加され、vfioフレームワークによって管理可能になります。また、特殊なvfio I/O領域に対して読み書きコールバックを追加し、mdevから親デバイス（実際のI/Oサブチャネルデバイス）にチャネルプログラムを渡して、さらにアドレス変換を行いI/O指令を実行します。</p>
+<p>このドキュメントはs390 I/Oアーキテクチャの詳細な説明は意図していません。より詳しい情報や参照は以下をご覧ください：</p>
+<ul class="simple">
+<li><p>チャネルI/Oの一般的な理解のための良い出発点：
+<a class="reference external" href="https://en.wikipedia.org/wiki/Channel_I/O">https://en.wikipedia.org/wiki/Channel_I/O</a></p></li>
+<li><p>s390アーキテクチャ: s390 Principles of Operationマニュアル（IBM Form. No. SA22-7832）</p></li>
+<li><p>既存のQEMUコードで実装されたシンプルなエミュレートチャネルサブシステムも、良い参照になります。これにより、フローを追跡しやすくなります。qemu/hw/s390x/css.c</p></li>
+</ul>
+<p>vfio mediated deviceフレームワーク: - <a class="reference internal" href="../driver-api/vfio-mediated-device.html"><span class="doc">VFIO メディエイテッドデバイス</span></a></p>
+</section>
+<section id="motivation-of-vfio-ccw">
+<h2>vfio-ccwの動機<a class="headerlink" href="#motivation-of-vfio-ccw" title="この見出しへのパーマリンク">¶</a></h2>
+<p>通常、s390でQEMU/KVMを介して仮想化されたゲストは、「Virtio Over Channel I/O（virtio-ccw）」トランスポート経由でパラバーチャライズドなvirtioデバイスを認識します。これにより、チャネルデバイスの標準OSアルゴリズムでvirtioデバイスを検出可能になります。</p>
+<p>しかし、これだけでは不十分です。s390で標準のチャネルI/Oベースメカニズムを使用するほとんどのデバイスにおいて、QEMU仮想マシンに透過させる機能も必要です。これは、virtio対応がないデバイス（例：テープドライブ）や、ゲストが利用したい特定の特性を持つデバイスも含まれます。</p>
+<p>デバイスをゲストに透過させる際には、他のすべてのデバイスと同じインターフェース、つまりvfioを使用したいです。これを実現するため、チャネルデバイスのvfioサポートはvfio mediated deviceフレームワークとサブチャネルデバイスドライバー「vfio_ccw」を通じて実装します。</p>
+</section>
+<section id="access-patterns-of-ccw-devices">
+<h2>CCWデバイスのアクセスパターン<a class="headerlink" href="#access-patterns-of-ccw-devices" title="この見出しへのパーマリンク">¶</a></h2>
+<p>s390アーキテクチャは、システムに物理的に接続されているデバイスの統一されたビューを提供する「チャネルサブシステム」と呼ばれる機能を実装しています。s390ハードウェアプラットフォームは、ディスクデバイス（DASDsを含む）、テープ、通信コントローラーなど、さまざまな外付けデバイスを認識しています。これらはすべて、明確に定義されたアクセスメソッドでアクセス可能であり、I/O完了は統一された方法で提供されます：I/O割込み。</p>
+<p>すべてのI/O操作にはチャネルコマンドワード（CCW）が必要です。CCWは、専用のI/Oチャネルプロセッサへの指令です。チャネルプログラムは、CCWのシーケンスであり、I/Oチャネルサブシステムによって実行されます。チャネルサブシステムにチャネルプログラムを実行させるには、操作要求ブロック（ORB）を構築する必要があります。ORBは、CCWの形式やその他の制御情報をシステムに伝えるための指針となります。オペレーティングシステムはSSCH（サブチャネル開始）指令を介してI/Oチャネルサブシステムにチャネズルプログラムの実行を指示します。その後、中央プロセッサはI/O指令を中断されるまで非I/O指令の処理に専念できます。I/O完了結果は、割込みハンドラによって中断応答ブロック（IRB）として取得されます。</p>
+<p>vfio-ccwに戻ると、要約すると：</p>
+<ul class="simple">
+<li><p>ORBおよびチャネルプログラムはゲストカーネル内で構築され（ゲスト物理アドレスで）、</p></li>
+<li><p>ORBおよびチャネルプログラムはホストカーネルに渡されます。</p></li>
+<li><p>ホストカーネルはゲスト物理アドレスを実際のアドレスに変換し、特権チャネルI/O指令（例：SSCH）を発行してI/Oを開始します。</p></li>
+<li><p>チャネルプログラムは別個のプロセッサで非同期に実行されます。</p></li>
+<li><p>I/O完了はI/O割込みによってホストに通知され、その後ユーザー空間にIRBとしてコピーされてゲストに返されます。</p></li>
+</ul>
+</section>
+<section id="physical-vfio-ccw-device-and-its-child-mdev">
+<h2>物理vfio ccwデバイスとその子mdev<a class="headerlink" href="#physical-vfio-ccw-device-and-its-child-mdev" title="この見出しへのパーマリンク">¶</a></h2>
+<p>上記のように、vfio-ccwはmdev実装によって実現されています。</p>
+<p>チャネルI/OはIOMMUハードウェアサポートがありませんので、物理vfio ccwデバイスはIOMMUレベルの翻訳や隔離機能を持ちません。</p>
+<p>サブチャネルI/O指令はすべて特権指令です。I/O指令の検出処理において、vfio-ccwはソフトウェアによるポリシングと翻訳を行い、チャネルプログラムがハードウェアに送信される前にその構成をチェックします。</p>
+<p>この実装では、2種類のデバイス用に2つのドライバがあります：</p>
+<ul class="simple">
+<li><p>物理サブチャネルデバイス用のvfio_ccwドライバー。これは、実際のサブチャネルデバイス用のI/Oサブチャネルドライバーです。このドライバーは、mdevフレームワークに親（物理）デバイスとしてコールバック群とレジストレーションを実装し、提供します。その結果、mdevはvfio_ccwに対してsysfsを介した汎用的なインターフェースを提供し、mdevデバイスの作成を可能にします。vfio_ccwによってvfio mdevが作成され、mediatedバスに追加されることが可能です。これはIOMMUグループおよびvfioグループに追加されたvfioデバイスです。vfio_ccwはさらに、ユーザー空間からのチャネルプログラムリクエストを受け入れるI/O領域を提供し、ユーザー空間がI/O割込み結果を取得できるようにします。I/O完了をユーザー空間に通知するためには、イベントfd fdを設定するインターフェースを提供します。</p></li>
+<li><p>媒介されたvfio ccwデバイス用のvfio_mdevドライバー。これはmdevフレームワークによって提供されます。これはvfio_ccwによって作成されたmdev用のvfioデバイスドライバーです。このドライバーはvfioデバイスドライバーのコールバック群を実装し、自身をvfioグループに追加し、mdevフレームワークにmdevドライバーとしてレジストレーションします。これは既存のマッピングとアンマッピングioctlを用いるvfio iommuバックエンドを使用しますが、デバイスのIOMMUにプログラミングするのではなく、後続のリクエストで使用するための翻訳情報を単純に保存します。これにより、ゲスト物理アドレスでプログラミングされたデバイスは、vfioカーネルがそのアドレスをプロセス仮想アドレスに変換し、ページをピン止めし、ホスト物理アドレスでハードウェアをプログラミングする1ステップで動作します。mdevの場合、vfio iommuバックエンドはVFIO_IOMMU_MAP_DMA ioctl中にページをピン止めしません。mdevフレームワークはこの操作でiova&lt;-&gt;vaddrマッピングのデータベースのみを維持します。さらに、物理デバイスが需要に基づいてページをピン止め・アンピンするため、vfio_pin_pagesおよびvfio_unpin_pagesインターフェースをvfio iommuバックエンドからエクスポートします。</p></li>
+</ul>
+<p>以下にハイレベルブロック図を示します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+-------------+
+|             |
+| +---------+ | mdev_register_driver() +--------------+
+| |  Mdev   | +&lt;-----------------------+              |
+| |  bus    | |                        | vfio_mdev.ko |
+| | driver  | +-----------------------&gt;+              |&lt;-&gt; VFIO user
+| +---------+ |    probe()/remove()    +--------------+    APIs
+|             |
+|  MDEV CORE  |
+|   MODULE    |
+|   mdev.ko   |
+| +---------+ | mdev_register_device() +--------------+
+| |Physical | +&lt;-----------------------+              |
+| | device  | |                        |  vfio_ccw.ko |&lt;-&gt; subchannel
+| |interface| +-----------------------&gt;+              |     device
+| +---------+ |       callback         +--------------+
++-------------+
+</pre></div>
+</div>
+<p>これらがどのように協力するかのプロセス。</p>
+<ol class="arabic simple">
+<li><p>vfio_ccw.koは物理I/Oサブチャネルを駆動し、コールバック付きの物理デバイスをmdevフレームワークに登録します。vfio_ccwがサブチャネルデバイスをプローブする際、mdevフレームワークにデバイスポインタとコールバックを登録します。sysfsのデバイスノード下にサブチャネルデバイス用のmdev関連ファイルノードが作成されます。つまり、「mdev_create」、「mdev_destroy」、「mdev_supported_types」です。</p></li>
+<li><p>媒介されたvfio ccwデバイスを作成します。'mdev_create' sysfsファイルを使用して、手動で1つ（この場合、1つだけ）の媒介デバイスを作成する必要があります。</p></li>
+<li><p>vfio_mdev.koはmediated ccwデバイスを駆動します。vfio_mdevはまたvfioデバイスドライバーでもあります。mdevを検出し、iommu_groupとvfio_groupに追加します。これによりゲストにmdevを透過的に提供できます。</p></li>
+</ol>
+</section>
+<section id="vfio-ccw-regions">
+<h2>VFIO-CCW レギオン<a class="headerlink" href="#vfio-ccw-regions" title="この見出しへのパーマリンク">¶</a></h2>
+<p>vfio-ccwドライバーは、ユーザー空間からのリクエストを受け入れ、結果を返すためのMMIOレギオンを公開します。</p>
+</section>
+<section id="vfio-ccw-i-o-region">
+<h2>vfio-ccw I/Oレギオン<a class="headerlink" href="#vfio-ccw-i-o-region" title="この見出しへのパーマリンク">¶</a></h2>
+<p>I/Oレギオンは、ユーザー空間からのチャネルプログラムリクエストを受け入れ、ユーザー空間が取得できるI/O割込み結果を保存します。このレギオンの定義は以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct ccw_io_region {
+#define ORB_AREA_SIZE 12
+        __u8    orb_area[ORB_AREA_SIZE];
+#define SCSW_AREA_SIZE 12
+        __u8    scsw_area[SCSW_AREA_SIZE];
+#define IRB_AREA_SIZE 96
+        __u8    irb_area[IRB_AREA_SIZE];
+        __u32   ret_code;
+} __packed;
+</pre></div>
+</div>
+<p>このレギオンは常に利用可能です。</p>
+<p>I/Oリクエストを開始する際、orb_areaにはゲストのORBを、scsw_areaには仮想サブチャネルのSCSWを設定する必要があります。</p>
+<p>irb_areaはI/O結果を保存します。</p>
+<p>ret_codeはこのレギオンの各アクセスに対して戻りコードを保存します。以下の値が発生する可能性があります：</p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">0</span></code></dt><dd><p>操作が成功しました。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">-EOPNOTSUPP</span></code></dt><dd><p>orbで指定されたトランスポートモードや未識別IDAW形式、またはscswで指定された機能が開始機能以外だった場合。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">-EIO</span></code></dt><dd><p>デバイスがリクエストを受け入れる準備ができていない状態だった場合、または内部エラーが発生した場合。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">-EBUSY</span></code></dt><dd><p>サブチャネルがステータス保留中やビジー状態だった、またはリクエストが既にアクティブだった場合。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">-EAGAIN</span></code></dt><dd><p>リクエストが処理中で、呼び出し元は再試行する必要があります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">-EACCES</span></code></dt><dd><p>I/Oに使用されたチャネルパスが運用不可能であることが判明した場合。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">-ENODEV</span></code></dt><dd><p>デバイスが運用不可能であることが判明した場合。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">-EINVAL</span></code></dt><dd><p>orbで指定されたチェーンが255を超えるccwだった、または内部エラーが発生した場合。</p>
+</dd>
+</dl>
+</section>
+<section id="vfio-ccw-cmd-region">
+<h2>vfio-ccw コマンドレギオン<a class="headerlink" href="#vfio-ccw-cmd-region" title="この見出しへのパーマリンク">¶</a></h2>
+<p>vfio-ccw コマンドレギオンは、ユーザー空間からの非同期指令を受け入れるために使用されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#define VFIO_CCW_ASYNC_CMD_HSCH (1 &lt;&lt; 0)
+#define VFIO_CCW_ASYNC_CMD_CSCH (1 &lt;&lt; 1)
+struct ccw_cmd_region {
+       __u32 command;
+       __u32 ret_code;
+} __packed;
+</pre></div>
+</div>
+<p>このレギオンは、レギオンタイプVFIO_REGION_SUBTYPE_CCW_ASYNC_CMDを介して公開されます。</p>
+<p>現在、CLEAR SUBCHANNELおよびHALT SUBCHANNELはこのレギオンを使用しています。</p>
+<p>commandは実行するコマンドを指定し、ret_codeはこのレギオンの各アクセスに対して戻りコードを保存します。以下の値が発生する可能性があります：</p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">0</span></code></dt><dd><p>操作が成功しました。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">-ENODEV</span></code></dt><dd><p>デバイスが運用不可能であることが判明した場合。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">-EINVAL</span></code></dt><dd><p>haltまたはclear以外のコマンドが指定された場合。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">-EIO</span></code></dt><dd><p>デバイスがリクエストを受け入れる準備ができていない状態でリクエストが発行された場合。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">-EAGAIN</span></code></dt><dd><p>リクエストが処理中で、呼び出し元は再試行する必要があります。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">-EBUSY</span></code></dt><dd><p>haltリクエストを処理中にサブチャネルがステータス保留中やビジー状態だった場合。</p>
+</dd>
+</dl>
+</section>
+<section id="vfio-ccw-schib-region">
+<h2>vfio-ccw schibレギオン<a class="headerlink" href="#vfio-ccw-schib-region" title="この見出しへのパーマリンク">¶</a></h2>
+<p>vfio-ccw schibレギオンは、サブチャネル情報ブロック（SCHIB）データをユーザー空間に返すために使用されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct ccw_schib_region {
+#define SCHIB_AREA_SIZE 52
+       __u8 schib_area[SCHIB_AREA_SIZE];
+} __packed;
+</pre></div>
+</div>
+<p>このレギオンは、レギオンタイプVFIO_REGION_SUBTYPE_CCW_SCHIBを介して公開されます。</p>
+<p>このレギオンを読み込むと、関連するハードウェアにSTORE SUBCHANNELが発行されます。</p>
+</section>
+<section id="vfio-ccw-crw-region">
+<h2>vfio-ccw crwレギオン<a class="headerlink" href="#vfio-ccw-crw-region" title="この見出しへのパーマリンク">¶</a></h2>
+<p>vfio-ccw crwレギオンは、チャネルレポートワード（CRW）データをユーザー空間に返すために使用されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct ccw_crw_region {
+       __u32 crw;
+       __u32 pad;
+} __packed;
+</pre></div>
+</div>
+<p>このレギオンは、レギオンタイプVFIO_REGION_SUBTYPE_CCW_CRWを介して公開されます。</p>
+<p>この領域を読み込むと、このサブチャネルに関連するCRW（例えば、チャネルパス状態の変化を報告しているもの）が待機中であればCRWを返し、待機していない場合はすべてゼロを返します。複数のCRWが待機中である場合（連鎖している可能性を含む）、この領域を再度読み込むと次のCRWが返されます。待機中のCRWがなくなるまでこのプロセスは続き、最終的にゼロが返されます。これはSTORE CHANNEL REPORT WORDの動作と似ています。</p>
+</section>
+<section id="vfio-ccw-operation-details">
+<h2>vfio-ccwの操作詳細<a class="headerlink" href="#vfio-ccw-operation-details" title="この見出しへのパーマリンク">¶</a></h2>
+<p>vfio-ccwはs390プラットフォームにおけるvfio-pciの動作を継承し、vfio-iommu-type1をvfio iommuバックエンドとして使用します。</p>
+<ul>
+<li><p>CCW翻訳API グループのAPI（cp_で始まる）を使用してCCWの翻訳を行います。ユーザー空間のプログラムから渡されるCCWはゲスト物理メモリアドレスで組織化されています。これらのAPIはCCWをカーネル空間にコピーし、ゲスト物理アドレスをホスト物理アドレスに置き換えることで実行可能なカーネルチャネルプログラムを構築します。注意点として、直接アクセスのCCWでもIDALを使用する必要があります。参照されるメモリはどこにでも存在する可能性があり、2Gを超える領域にも含まれるからです。 <cite>cp_</cite>)でCCWの翻訳を行います。ユーザー空間のプログラムから渡されたCCWはゲスト物理メモリアドレスで組織化されています。これらのAPIはCCWをカーネル空間にコピーし、ゲスト物理アドレスをホスト物理アドレスに置き換えることで実行可能なカーネルチャネルプログラムを構築します。注意点として、直接アクセスのCCWでもIDALを使用する必要があります。参照されるメモリはどこにでも存在する可能性があり、2Gを超える領域にも含まれるからです。</p></li>
+<li><p>vfio_ccwデバイスドライバー このドライバーはCCW翻訳APIを利用し、vfio_ccwというI/Oサブチャネルデバイスを透過的に使用するドライバーを導入します。vfio_ccwは以下のvfio ioctlsを実装します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>VFIO_DEVICE_GET_INFO
+VFIO_DEVICE_GET_IRQ_INFO
+VFIO_DEVICE_GET_REGION_INFO
+VFIO_DEVICE_RESET
+VFIO_DEVICE_SET_IRQS
+</pre></div>
+</div>
+<p>これによりユーザー空間のプログラムがカーネルにチャネルプログラムを渡すI/O領域が提供され、実際のデバイスに送信する前にCCWの翻訳が行われます。また、SET_IRQ ioctlsによりイベント通知を設定し、I/O完了を非同期でユーザー空間のプログラムに通知します。</p>
+</li>
+</ul>
+<p>vfio-ccwの使用はQEMUに限らず、QEMUはこれらのパッチがどのように動作するかを理解するための良い例です。以下にQEMUゲストによってトリガーされるI/Oリクエストがどのように処理されるか（エラー処理は省略）を詳しく説明します。</p>
+<p>説明：</p>
+<ul class="simple">
+<li><p>Q1-Q7: QEMU側の処理。</p></li>
+<li><p>K1-K5: カーネル側の処理。</p></li>
+</ul>
+<dl class="simple">
+<dt>Q1.</dt><dd><p>初期化時にI/O領域情報を取得します。</p>
+</dd>
+<dt>Q2.</dt><dd><p>I/O完了を処理するイベント通知とハンドラを設定します。</p>
+</dd>
+</dl>
+<p>… …</p>
+<dl>
+<dt>Q3.</dt><dd><p>ssch命令をインターセプトします。</p>
+</dd>
+<dt>Q4.</dt><dd><p>ゲストチャネルプログラムとORBをI/O領域に書き込みます。</p>
+<dl class="simple">
+<dt>K1.</dt><dd><p>ゲストからカーネルへのコピーを行います。</p>
+</dd>
+<dt>K2.</dt><dd><p>ゲストチャネルプログラムをホストカーネル空間のチャネルプログラムに翻訳し、実際のデバイスで実行可能な状態にします。</p>
+</dd>
+<dt>K3.</dt><dd><p>QEMUから渡されたORBに含まれる必要な情報をもとに、デバイスにccwchainを送信します。</p>
+</dd>
+<dt>K4.</dt><dd><p>ssch CCコードを返します。</p>
+</dd>
+</dl>
+</dd>
+<dt>Q5.</dt><dd><p>CCコードをゲストに返します。</p>
+</dd>
+</dl>
+<p>… …</p>
+<blockquote>
+<div><dl class="simple">
+<dt>K5.</dt><dd><p>割込みハンドラがI/O結果を取得し、I/O領域に結果を書き込みます。</p>
+</dd>
+<dt>K6.</dt><dd><p>QEMUに結果の取得を通知します。</p>
+</dd>
+</dl>
+</div></blockquote>
+<dl class="simple">
+<dt>Q6.</dt><dd><p>シグナルを取得し、イベントハンドラがI/O領域から結果を読み出します。</p>
+</dd>
+<dt>Q7.</dt><dd><p>ゲスト用のIRBを更新します。</p>
+</dd>
+</dl>
+</section>
+<section id="limitations">
+<h2>制限<a class="headerlink" href="#limitations" title="この見出しへのパーマリンク">¶</a></h2>
+<p>現在のvfio-ccwの実装は、DASD/ECKDデバイスのブロックデバイス機能（読み込み/書き込み）を実装するために必要な基本コマンドのみをサポートしています。今後、パスグループに関連するなど一部のコマンドは特別な処理が必要になる可能性があります。</p>
+<p>DASDは一種のストレージデバイスです。ECKDはデータ記録形式です。DASDおよびECKDに関する詳細情報は以下にあります：
+<a class="reference external" href="https://en.wikipedia.org/wiki/Direct-access_storage_device">https://en.wikipedia.org/wiki/Direct-access_storage_device</a>
+<a class="reference external" href="https://en.wikipedia.org/wiki/Count_key_data">https://en.wikipedia.org/wiki/Count_key_data</a></p>
+<p>QEMUでの対応作業と組み合わせることで、ゲスト内で透過的に提供されたDASD/ECKDデバイスをブロックデバイスとして利用可能にすることが出来ます。</p>
+<p>現在のコードにより、ゲストはSTART SUBCHANNELを通じてチャネルプログラムを開始し、HALT SUBCHANNEL、CLEAR SUBCHANNEL、STORE SUBCHANNELを発行できます。</p>
+<p>現在、すべてのチャネルプログラムがpビットの設定に関係なくプリフェッチされます。これにより、自己修正可能なチャネルプログラムはサポートされていません。このため、IPLはユーザー空間/ゲストプログラムによって特別な処理が必要であり、これはQEMU 4.1以降のs390-ccw BIOSで実装されています。</p>
+<p>vfio-ccwは古典的（コマンドモード）のチャネルI/Oのみをサポートしています。トランスポートモード（HPF）はサポートされていません。</p>
+<p>QDIOサブチャネルは現在サポートされていません。DASD/ECKD以外の古典的なデバイスは動作する可能性がありますが、テストされていません。</p>
+</section>
+<section id="reference">
+<h2>参照<a class="headerlink" href="#reference" title="この見出しへのパーマリンク">¶</a></h2>
+<ol class="arabic simple">
+<li><p>ESA/s390 Principles of Operationマニュアル（IBM フォーム番号 SA22-7832）</p></li>
+<li><p>ESA/390 Common I/O Device Commandsマニュアル（IBM フォーム番号 SA22-7204）</p></li>
+<li><p><a class="reference external" href="https://en.wikipedia.org/wiki/Channel_I/O">https://en.wikipedia.org/wiki/Channel_I/O</a></p></li>
+<li><p><a class="reference internal" href="cds.html"><span class="doc">S/390 および zSeries 用 Linux</span></a></p></li>
+<li><p><a class="reference internal" href="../driver-api/vfio.html"><span class="doc">VFIO - 「仮想ファンクション I/O」 </span></a></p></li>
+<li><p><a class="reference internal" href="../driver-api/vfio-mediated-device.html"><span class="doc">VFIO メディエイテッドデバイス</span></a></p></li>
+</ol>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">s390アーキテクチャ</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="cds.html">S/390 および zSeries 用 Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="3270.html">IBM 3270 ディスプレイシステムのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="driver-model.html">S/390ドライバモデルインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="monreader.html">z/VM モニターレコードへの読み取りアクセス用 Linux API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="qeth.html">IBM s390 QDIO イーサネットドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="s390dbf.html">S390 デバッグ機能</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vfio-ap.html">添付プロセッサ (AP) ファシリティ</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">vfio-ccw: 基本的なインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="zfcpdump.html">s390 SCSI ダンプツール (zfcpdump)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="common_io.html">S/390 共通 I/O レイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pci.html">S/390 PCI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="text_files.html">IBM 3270 チェンジログ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="text_files.html#ibm-3270-config3270-sh">IBM 3270 config3270.sh</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">s390アーキテクチャ</a><ul>
+<li>前へ: <a href="vfio-ap.html" title="前章">添付プロセッサ (AP) ファシリティ</a></li>
+<li>次へ: <a href="zfcpdump.html" title="次章">s390 SCSI ダンプツール (zfcpdump)</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/s390/vfio-ccw.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

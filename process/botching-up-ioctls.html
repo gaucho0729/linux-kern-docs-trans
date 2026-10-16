@@ -1,0 +1,275 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>（回避方法）ioctlのミスを防ぐ — Linuxカーネルドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="clang-format.html" rel="next" title="clang-format"/>
+<link href="volatile-considered-harmful.html" rel="prev" title="なぜ「volatile」型クラスは使用すべきではないか"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="how-to-avoid-botching-up-ioctls">
+<h1>(ioctlsの誤操作を避ける方法)<a class="headerlink" href="#how-to-avoid-botching-up-ioctls" title="この見出しへのパーマリンク">¶</a></h1>
+<p>From: <a class="reference external" href="https://blog.ffwll.ch/2013/11/botching-up-ioctls.html">https://blog.ffwll.ch/2013/11/botching-up-ioctls.html</a></p>
+<p>By: ダニエル・ベッター, Copyright © 2013 Intel Corporation</p>
+<p>過去数年間、カーネルグラフィックスハッカーが得た明確な洞察は、完全に異なるGPUで実行ユニットとメモリを管理するための統一インターフェースを作成する試みは徒労であるということです。そのため、現代ではドライバごとに独自のioctlセットでメモリを割り当ててGPUに作業を送信する仕組みが採用されています。これは良い点で、偽の汎用的なインターフェースではなく、実際には一度しか使われないインターフェースの混乱がなくなったためです。ただし、明確なデメリットとして、ミスの可能性が大幅に高まっている点があります。</p>
+<p>同じ間違いを繰り返さないため、drm/i915ドライバの作業中に得た教訓をまとめました。これらの多くは技術的な細かい点に焦点を当てており、コマンド送信ioctlが正確にどのような形でなければならないかといった大枠の問題には触れていないでしょう。このような教訓を学ぶことは、すべてのGPUドライバが独自にやらなければならないことです。</p>
+<section id="prerequisites">
+<h2>前提条件<a class="headerlink" href="#prerequisites" title="この見出しへのパーマリンク">¶</a></h2>
+<p>まず前提条件です。これらを守らないとすでに失敗しています。なぜなら、32ビット互換レイヤーを追加する必要がありますから。</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>固定サイズの整数のみを使用してください。ユーザー空間のtypedefと衝突を避けるため、カーネルは__u32、__s64などの特別な型を使用しています。それらを使用してください。</p></li>
+<li><p>すべてを自然なサイズに合わせて整列させ、明示的なパディングを使用してください。32ビットプラットフォームでは64ビット値が64ビット境界に整列しない場合がありますが、64ビットプラットフォームでは整列します。そのため、自然なサイズにパディングを加える必要があります。</p></li>
+<li><p>構造体に64ビットの倍数にパディングを加えてください。構造体に64ビット型が含まれる場合、32ビットと64ビットで構造体のサイズが異なります。配列の構造体をカーネルに渡す際や、カーネルが構造体サイズをチェックする場合（例：drmコア）など、構造体サイズの違いは問題になります。</p></li>
+<li><p>ポインタは__u64で、ユーザー空間ではuintprt_tからキャストし、カーネルではvoid __user *にキャストします。この変換を遅らせたり、raw __u64をコード内でいじったりしないようにしてください。そうすることで、sparseなどのチェックツールが提供する検査が低下します。カーネルではu64_to_user_ptrマクロを使用して、整数とポインタのサイズが異なる警告を回避できます。</p></li>
+</ul>
+</div></blockquote>
+</section>
+<section id="basics">
+<h2>基本<a class="headerlink" href="#basics" title="この見出しへのパーマリンク">¶</a></h2>
+<p>互換レイヤーの書く楽しさを避けて、基本的なミスの例を見てみましょう。これらを無視すると後方および前方互換性が大変な問題になります。最初の試行で間違えるのは必然なので、どのインターフェースでも二回目の実行や少なくとも拡張が必要になるでしょう。</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>ユーザー空間が、特定のカーネルで新しいioctlまたはioctl拡張機能がサポートされているかを判断できるようにする明確な方法を用意してください。古いカーネルが新しいフラグ/モードやioctlを拒否するのを信頼できない場合（過去にはこの処理が誤って実装された例があります）、ドライバの機能フラグやバージョン番号などの手段が必要です。</p></li>
+<li><p>ioctlを新しいフラグや構造体末尾の新しいフィールドで拡張するための計画を立ててください。drmコアは各ioctl呼び出しで渡されたサイズを確認し、カーネルとユーザー空間の不一致部分をゼロ埋めします。これはある程度有効ですが、完全な解決策ではありません。なぜなら、古いカーネル上の新しいユーザー空間は末尾に追加されたフィールドが無視されていることに気づかないからです。そのため、新しいドライバ機能フラグが必要です。</p></li>
+<li><p>未使用のフィールドやフラグ、パディングがゼロであることを確認し、それ以外の場合はioctlを拒否してください。そうしないと、今後の拡張計画が破綻します。なぜなら、誰かが未使用の部分にランダムなスタックゴミを含むioctl構造体を送信する可能性があるからです。これにより、そのフィールドが他の用途で使用できないABIが確定してしまいます。これはまた、すべての構造体を明示的にパディングする必要がある理由でもあります（配列で使用しない場合でも）。</p></li>
+<li><p>上記すべてに対してシンプルなテストケースを用意してください。</p></li>
+</ul>
+</div></blockquote>
+</section>
+<section id="fun-with-error-paths">
+<h2>エラーパスの実験<a class="headerlink" href="#fun-with-error-paths" title="この見出しへのパーマリンク">¶</a></h2>
+<p>現代では、drmドライバがrootエクスプロイットのような小さな実装で済むことはもうありません。これは、入力検証の完全性とエラーハンドリングの信頼性が必須です。GPUはいずれかの極端なケースで破壊される可能性があるからです。</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>ioctlは配列オーバーフローをチェックする必要があります。また、整数値のオーバーフロー/アンダーフローおよびクリッピング問題もチェックしてください。典型的な例は、ハードウェアに直接渡されるスプライト位置値で、ハードウェアが12ビット程度しか扱えない場合です。これでうまくいくのは、表示サーバーがクリッピングを忘れるとカーソルが画面を巻き戻すまでです。</p></li>
+<li><p>ioctlのすべての入力検証失敗ケースに対してシンプルなテストケースを用意してください。エラーコードが予期通りであることを確認し、最終的に各サブテストで1つのエラーパスのみをテストするようにしてください（他のデータは完全に有効な状態で）。これがないと、以前のチェックでioctlが拒否されてしまい、テストしたいコードパスが隠蔽され、バグやリグレッションが発生します。</p></li>
+<li><p>すべてのioctlを再開可能にします。まず、Xは信号をとても好むし、次にこれによりメインテストスイートを常に信号で中断することで、エラーハンドリングの90％のパスをテストできます。Xが信号を好むおかげで、グラフィックドライバーのすべてのエラーパスに対する優れた基本的なカバレッジがほぼ無料で得られます。また、ioctlの再開処理を一貫して行う必要があります。たとえば、drmはユーザースペースライブラリに小さなdrmIoctlヘルパがあります。しかし、i915ドライバーはset_tiling ioctlでこれを間違えてしまい、今ではカーネルとユーザースペースの両方で何らかの複雑なセマンティクスに永遠に縛られています。</p></li>
+<li><p>特定のコードパスを再開可能にできない場合は、少なくとも停止したタスクを終了可能にします。GPUは単純に死んでしまうため、Xプロセスでユーザーのデバイス全体を停止させることでユーザーがより好きになることはありません。状態回復がまだ複雑すぎる場合は、ハードウェアが異常な状態になった場合の最終手段としてタイムアウトやハングチェックの安全網を設けましょう。</p></li>
+<li><p>エラーリカバリーコードの本当に難しい端的なケースにテストケースを用意してください。ハングチェックコードとウェイトラーの間でデッドロックを引き起こすのは非常に簡単です。</p></li>
+</ul>
+</div></blockquote>
+</section>
+<section id="time-waiting-and-missing-it">
+<h2>時間、待機とその欠如<a class="headerlink" href="#time-waiting-and-missing-it" title="この見出しへのパーマリンク">¶</a></h2>
+<p>GPUはほぼすべての処理を非同期で行うため、操作のタイミングを計り、未完了の処理を待つ必要があります。これは本当に難しい作業です。現在、drm/i915でサポートされているioctlはすべてこの点で完全には正しくありません。つまり、ここにはまだ多くの学びがあるということです。</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>常にCLOCK_MONOTONICを参照時間として使用してください。これは現在、alsa、drm、v4lがデフォルトで使用しています。ただし、ユーザースペースにどのタイムスタンプがどのクロックドメイン（例：カーネルが提供するメインシステム時計や別の場所にある独立したハードウェアカウンターなど）から生成されたかを通知してください。クロックはよく見ればずれますが、パフォーマンス測定ツールがこの情報を持っていると少なくとも補正は可能になります。ユーザースペースがいくつかのクロックのraw値（例：コマンドストリームパフォーマンスカウンタサンプリング指令を通じて）を取得できる場合は、それらも公開してください。</p></li>
+<li><p>__s64秒と__u64ナノ秒を時間指定に使用してください。これは最も便利な時間指定ではありませんが、ほぼ標準です。</p></li>
+<li><p>入力時間値が正規化されているか確認し、正規化されていない場合は拒否してください。注意点として、カーネルのネイティブ構造体ktimeは秒とナノ秒の両方を符号付き整数で扱うため、ここに注意してください。</p></li>
+<li><p>タイムアウトの場合は、絶対時間を使うべきです。あなたが良い同僚であれば、ioctlによる再起動可能な相対タイムアウトはあまり精度が高く、各再起動時の四捨五入により待機時間を無限に延長してしまう傾向があります。特に参照クロックがディスプレイフレームカウンタなどの非常に遅いものである場合、この問題は顕著です。規格法務の帽子をかぶった場合、これはバグではなく、タイムアウトは常に延長可能なので、ユーザーがアニメーションがちらつくことにより不満を抱くことは避けられないでしょう。</p></li>
+<li><p>同期的な待機ioctlとタイムアウトを持つものはすべて廃止し、代わりにポール可能なファイル記述子で非同期イベントを通知する方が、イベント駆動型アプリケーションのメインループに非常に合います。</p></li>
+<li><p>端末ケースのテストケースを用意してください。特に、すでに完了したイベントの戻り値、成功した待機の戻り値、タイムアウトした待機の戻り値がすべてあなたの要件に合っているかを確認してください。</p></li>
+</ul>
+</div></blockquote>
+</section>
+<section id="leaking-resources-not">
+<h2>リソースのリーク、しない<a class="headerlink" href="#leaking-resources-not" title="この見出しへのパーマリンク">¶</a></h2>
+<p>完全なdrmドライバは基本的に小さなOSを実装していますが、特定のGPUプラットフォームに特化しています。これにより、ドライバはユーザー空間にさまざまなオブジェクトやリソースのハンドルを多数公開する必要があります。これを正しく実装するには独自のセットの陥りやすいミスがあります：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>動的に生成したリソースの寿命をファイル記述子の寿命に常に結びつけます。リソースがプロセス間で共有される必要がある場合は1:1のマッピングを使用してください。unixドメインソケットを介したfdの渡し方はユーザー空間での寿命管理を簡素化します。</p></li>
+<li><p>常にO_CLOEXECのサポートを提供してください。</p></li>
+<li><p>異なるクライアント間の隔離を十分に確保してください。デフォルトではプライベートなper-fd名前空間を選択し、共有は明示的に実行する必要があります。オブジェクトが本当にデバイス固有である場合のみ、よりグローバルなper-device名前空間を使用してください。drmモードセットインターフェースの例では、モードセットオブジェクト（コネクタなど）とフレームバッファオブジェクトが同じ名前空間を共有していますが、実際にはほとんど共有されていません。フレームバッファにはプライベートな名前空間がより適切でした。</p></li>
+<li><p>ユーザー空間のハンドルにおける一意性の要件について考えましょう。たとえば、ほとんどのDRMドライバーでは、同じコマンド送信ioctlで同じオブジェクトを2回送信することはユーザー空間のバグとみなされます。ただし、オブジェクトが共有可能である場合、ユーザー空間は別のプロセスからインポートされたオブジェクトをすでに見たかどうかを把握する必要があります。新しいオブジェクトのクラスがなければ自分自身で試していませんが、共有ファイルディスクリプタにinode番号を使用して一意な識別子として利用する方法を検討してください。これは実際のファイルを区別する方法でもあります。ただし、これはカーネル内に完全な仮想ファイルシステムを実装する必要があります。</p></li>
+</ul>
+</div></blockquote>
+</section>
+<section id="last-but-not-least">
+<h2>最後に、最も重要です<a class="headerlink" href="#last-but-not-least" title="この見出しへのパーマリンク">¶</a></h2>
+<p>すべての問題が新しいioctlを必要とするわけではありません:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>本当にドライバ専用インターフェースが必要かどうかよく考えましょう。もちろん、ドライバ専用インターフェースを実装するのは長時間の議論に参加するよりもはるかに速いです。また、新たな概念を先導するために一時的に専用インターフェースを実装する必要がある場合もあります。しかし最終的には、汎用インターフェースが登場すると、2つのインターフェースを維持する必要があります。それは永遠に続くでしょう。</p></li>
+<li><p>ioctl以外のインターフェースを検討してください。デバイスごとの設定にはsysfs属性がはるかに適しています。また、比較的静的なライフタイムを持つ子オブジェクト（例: DRMにおける出力コネクタで、すべての検出オーバーライド属性を持つもの）にも適しています。あるいは、テストスイートだけがこのインターフェースを必要とする場合、そのABIが安定していないことを免責するdebugfsがより適切です。</p></li>
+</ul>
+</div></blockquote>
+<p>結論として、最初の試行で正しい実装を目指すことが重要です。なぜなら、ドライバが人気になり、ハードウェアプラットフォームが長寿命である場合、特定のioctlにほぼ永遠に縛られることになるからです。新しいハードウェアバージョンで恐ろしいioctlを非推奨にしようと努力しても、通常これには数年かかります。そして、最後のユーザーがリグレッションについて文句を言うまでにまた数年かかるでしょう。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">カーネル開発コミュニティとの協働</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="license-rules.html">Linuxカーネルライセンス規則</a></li>
+<li class="toctree-l2"><a class="reference internal" href="howto.html">Linuxカーネル開発のHOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="code-of-conduct.html">コントリビュータークレジットコード・オブ・コンダクット</a></li>
+<li class="toctree-l2"><a class="reference internal" href="code-of-conduct-interpretation.html">Linuxカーネルコントリビュータークレジットコード・オブ・コンダクット解釈</a></li>
+<li class="toctree-l2"><a class="reference internal" href="development-process.html">カーネル開発プロセスのガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="submitting-patches.html">パッチの送信: コードをカーネルに取り込むためのエッセンシャルガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="programming-language.html">プログラミング言語</a></li>
+<li class="toctree-l2"><a class="reference internal" href="coding-style.html">Linux Kernelのコーディングスタイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="maintainer-pgp-guide.html">カーネルメンテナ用PGPガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="email-clients.html">Linux用メールクライアント情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kernel-enforcement-statement.html">Linuxカーネル実施声明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kernel-driver-statement.html">カーネルドライバ声明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="changes.html">カーネルをコンパイルするための最小限の要件</a></li>
+<li class="toctree-l2"><a class="reference internal" href="submitting-drivers.html">Linux Kernel用ドライバの提出</a></li>
+<li class="toctree-l2"><a class="reference internal" href="stable-api-nonsense.html">Linuxカーネルドライバインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="management-style.html">Linuxカーネル管理スタイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="stable-kernel-rules.html">Linux -stableリリースについて知りたいすべての情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="submit-checklist.html">Linux Kernelパッチ提出チェックリスト</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kernel-docs.html">Linuxカーネルの書籍</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deprecated.html">非推奨インターフェース、言語機能、属性、および慣例</a></li>
+<li class="toctree-l2"><a class="reference internal" href="embargoed-hardware-issues.html">制限されたハードウェアの問題</a></li>
+<li class="toctree-l2"><a class="reference internal" href="maintainers.html">メンテナ一覧とカーネルの変更を提出する方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="applying-patches.html">Linuxカーネルへのパッチ適用</a></li>
+<li class="toctree-l2"><a class="reference internal" href="adding-syscalls.html">新しいシステムコールの追加</a></li>
+<li class="toctree-l2"><a class="reference internal" href="magic-number.html">Linuxマジックナンバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="volatile-considered-harmful.html">なぜ「volatile」型クラスは使用すべきではないか</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">(ioctlsの誤操作を避ける方法)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="clang-format.html">clang-format</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../riscv/patch-acceptance.html">開発者向けのarch/riscvメンテナンスガイドライン</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core-api/unaligned-memory-access.html">アライメントされていないメモリアクセス</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">カーネル開発コミュニティとの協働</a><ul>
+<li>前へ: <a href="volatile-considered-harmful.html" title="前章">なぜ「volatile」型クラスは使用すべきではないか</a></li>
+<li>次へ: <a href="clang-format.html" title="次章">clang-format</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/process/botching-up-ioctls.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

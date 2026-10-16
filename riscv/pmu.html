@@ -1,0 +1,335 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>RISC-VプラットフォームにおけるPMUのサポート — Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="../s390/index.html" rel="next" title="s390アーキテクチャ"/>
+<link href="boot-image-header.html" rel="prev" title="RISC-V Linux のブートイメージヘッダー"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="supporting-pmus-on-risc-v-platforms">
+<h1>RISC-V プラットフォームにおける PMU のサポート<a class="headerlink" href="#supporting-pmus-on-risc-v-platforms" title="この見出しへのパーマリンク">¶</a></h1>
+<p>Alan Kao &lt;<a class="reference external" href="mailto:alankao%40andestech.com">alankao<span>@</span>andestech<span>.</span>com</a>&gt;, 2018年3月</p>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>本執筆時点でのRISC-V ISAプライベート版バージョン1.10で記載されているperf_event関連の機能は以下の通りです（詳細はマニュアルを参照してください）:</p>
+<ul class="simple">
+<li><p>[m|s]counteren</p></li>
+<li><p>mcycle[h], cycle[h]</p></li>
+<li><p>minstret[h], instret[h]</p></li>
+<li><p>mhpeventx, mhpcounterx[h]</p></li>
+</ul>
+<p>このような機能セットだけでは、perfの移植には多くの作業が必要です。これは以下の一般的なアーキテクチャ性能モニタリング機能が欠如しているためです:</p>
+<ul class="simple">
+<li><p>カウンタの有効/無効化 カウンタは常に自由に動作しています。</p></li>
+<li><p>カウンタオーバーフローによる割り込み プライベート版仕様にはこの機能はありません。</p></li>
+<li><p>割り込みインジケータ カウンタごとに割り込みポートを用意するのは現実的ではありませんので、ソフトウェアがどのカウンタがオーバーフローしたかを通知するための割り込みインジケータが必要です。</p></li>
+<li><p>カウンタへの書き込み カーネルがカウンタを変更できないため、SBIを用いてサポートする予定です[1]。代替案として、一部のベンダーはM-S-Uモデルマシン向けにハードウェア拡張を実装してカウンタを直接書き込む方法を検討しています。</p></li>
+</ul>
+<p>このドキュメントは、開発者にカーネルでのPMUサポートの簡単なガイドを提供することを目的としています。以下のセクションではperfのメカニズムと実装すべきタスクを簡潔に説明します。</p>
+<p>以前の議論はここで確認できます[1][2]。また、関連するカーネル構造体については付録を参照すると役立つかもしれません。</p>
+</section>
+<section id="initialization">
+<h2>1. 初期化<a class="headerlink" href="#initialization" title="この見出しへのパーマリンク">¶</a></h2>
+<p><em>riscv_pmu</em> は型 <em>struct riscv_pmu</em>のグローバルポインタであり、perfの内部規約とPMU固有のパラメータを含みます。PMUを表すインスタンスを宣言する必要があります。デフォルトでは、
+<em>riscv_pmu</em> は定数構造体 <em>riscv_base_pmu</em>を指しており、ベースラインのQEMUモデルに非常に基本的なサポートを提供しています。</p>
+<p>その後、インスタンスのポインタを <em>riscv_pmu</em> に割り当てることで既存の最小限の実装ロジックを活用できます。あるいは、自前の <em>riscv_init_platform_pmu</em> は常に有効な文字列を返すため、また、不要にdestバッファの末尾をゼロに強制しないからです。ゼロ化が必要な場合は、</p>
+<p>を実装することも可能です。つまり、既存の <em>riscv_base_pmu</em> は参考実装に過ぎず、開発者はどの部分を活用するかを柔軟に決定できます。最悪の場合、すべての関数を必要に応じてカスタマイズすることも可能です。</p>
+</section>
+<section id="event-initialization">
+<h2>2. イベント初期化<a class="headerlink" href="#event-initialization" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ユーザーがperfコマンドでイベントを監視する際、まずユーザー空間のperfツールが複数の <em>perf_event_open</em>
+システムコールに解釈され、それぞれが前のステップで割り当てられた <em>event_init</em>
+メンバ関数の本体を呼び出します。 <em>riscv_base_pmu</em>の場合、それは <em>riscv_event_init</em>.</p>
+<p>この関数の主な目的は、ユーザーが提供したイベントをビットマップに変換し、ハードウェア関連の制御レジスタやカウンターを直接操作できるようにすることです。この変換は、以下のマッピングとメソッドに基づいて行われます。
+<em>riscv_pmu</em>.</p>
+<p>注意: 一部の機能はこの段階でも実行可能です:</p>
+<ol class="arabic">
+<li><p>割込み設定（次のセクションで説明されています）;</p></li>
+<li><p>特権レベル設定（ユーザー空間のみ、カーネル空間のみ、両方）;</p></li>
+<li><p>デストラクタ設定。通常は以下の関数を適用するだけで十分です <em>riscv_destroy_event</em>;</p></li>
+<li><p>非サンプリングイベントの調整、以下の関数などによって利用されます
+<em>perf_adjust_period</em>, 通常は以下のようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>if (!is_sampling_event(event)) {
+        hwc-&gt;sample_period = x86_pmu.max_period;
+        hwc-&gt;last_period = hwc-&gt;sample_period;
+        local64_set(&amp;hwc-&gt;period_left, hwc-&gt;sample_period);
+}
+</pre></div>
+</div>
+</li>
+</ol>
+<p>以下のケースでは <em>riscv_base_pmu</em>, 現在は(3)のみが提供されています。</p>
+</section>
+<section id="interrupt">
+<h2>3. 割込み<a class="headerlink" href="#interrupt" title="この見出しへのパーマリンク">¶</a></h2>
+<p>3.1. 割込み初期化</p>
+<p>これは通常、以下のメソッドの開始時に発生します。 <em>event_init</em> メソッド。一般的な実装では、以下のようなコードセグメントになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int x86_reserve_hardware(void)
+{
+      int err = 0;
+
+      if (!atomic_inc_not_zero(&amp;pmc_refcount)) {
+              mutex_lock(&amp;pmc_reserve_mutex);
+              if (atomic_read(&amp;pmc_refcount) == 0) {
+                      if (!reserve_pmc_hardware())
+                              err = -EBUSY;
+                      else
+                              reserve_ds_buffers();
+              }
+              if (!err)
+                      atomic_inc(&amp;pmc_refcount);
+              mutex_unlock(&amp;pmc_reserve_mutex);
+      }
+
+      return err;
+}
+</pre></div>
+</div>
+<p>そして、魔法は以下の <em>reserve_pmc_hardware</em>、通常はアトミック操作を行い、実装されたIRQをグローバルな関数ポインタからアクセス可能にします。
+<em>release_pmc_hardware</em> は逆の目的を持ち、前節で説明したイベントデストラクタで使用されます。</p>
+<p>(注意: すべてのアーキテクチャにおける実装では、 <em>reserve/release</em>
+ペアは常にIRQ設定であり、 <em>pmc_hardware</em> この表現はどこか誤解を招くように感じられます。これはイベントと物理カウンターのバインディングを扱うものではなく、次のセクションで紹介される内容です。</p>
+<p>3.2. IRQ構造</p>
+<p>基本的に、IRQは以下の擬似コードを実行します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>for each hardware counter that triggered this overflow
+
+    get the event of this counter
+
+    // following two steps are defined as *read()*,
+    // check the section Reading/Writing Counters for details.
+    count the delta value since previous interrupt
+    update the event-&gt;count (# event occurs) by adding delta, and
+               event-&gt;hw.period_left by subtracting delta
+
+    if the event overflows
+        sample data
+        set the counter appropriately for the next overflow
+
+        if the event overflows again
+            too frequently, throttle this event
+        fi
+    fi
+
+end for
+</pre></div>
+</div>
+<p>しかし、現在のところRISC-Vの実装にはパフォーマンス用の割り込みを設計したものはありませんので、詳細は今後完成する予定です。</p>
+</section>
+<section id="reading-writing-counters">
+<h2>4. カウンターの読み書き<a class="headerlink" href="#reading-writing-counters" title="この見出しへのパーマリンク">¶</a></h2>
+<p>これらは対称的に見えるものの、perfでは非常に異なる扱いをします。読み取りに関しては、 <em>読み取り</em> インターフェースが <em>struct pmu</em>内にありますが、これは単なる読み取りにとどまらず、文脈により <em>読み取り</em> 関数はイベント-&gt;countの内容を読み取りつつ、次の割り込み用にイベント-&gt;hw.period_leftを更新します。</p>
+<p>しかし、perfのコアはカウンターへの直接書き込みは必要ありません。カウンターの書き込みは1) <em>pmu-&gt;start</em>という抽象化の背後で行われます。つまり、カウンターを次の割り込み用に適切な値に設定する必要があり、2) IRQ内では同じ適切な値に設定する必要があります。</p>
+<p>RISC-Vでは読み取りは問題ありませんが、書き込みにはいくつかの努力が必要です。カウンターはSモードでの書き込みが許可されていないからです。</p>
+</section>
+<section id="add-del-start-stop">
+<h2>5. add()/del()/start()/stop()<a class="headerlink" href="#add-del-start-stop" title="この見出しへのパーマリンク">¶</a></h2>
+<p>基本的な考え方は、add()/del()がPMUにイベントを追加/削除し、 <a class="reference internal" href="../networking/ieee802154.html#c.start" title="start"><code class="xref c c-func docutils literal notranslate"><span class="pre">start()</span></code></a>/<a class="reference internal" href="../networking/ieee802154.html#c.stop" title="停止"><code class="xref c c-func docutils literal notranslate"><span class="pre">stop()</span></code></a>
+PMU内の特定のイベントのカウンターを開始/停止します。これらすべては同じ引数を取ります: <em>struct perf_event *event</em> および <em>int flag</em>.</p>
+<p>perfを状態機械として考えると、これらの関数はこれらの状態間の状態遷移プロセスとして機能します。3つの状態(event-&gt;hw.state)が定義されています:</p>
+<ul class="simple">
+<li><p>PERF_HES_STOPPED: カウンターが停止している状態</p></li>
+<li><p>PERF_HES_UPTODATE: event-&gt;countが最新である状態</p></li>
+<li><p>PERF_HES_ARCH: アーキテクチャ依存の使用方法… 今回は必要ありません</p></li>
+</ul>
+<p>これらの状態遷移の通常のフローは以下の通りです:</p>
+<ul class="simple">
+<li><p>ユーザーがperfイベントを起動すると、以下のように呼び出されます <em>event_init</em>.</p></li>
+<li><p>コンテキストスイッチイン時に <em>追加</em> perfコアによってPERF_EF_STARTフラグで呼び出され、イベントが追加後に起動されるべきです。この段階で、一般的なイベントは物理カウンターにバインドされます（必要があれば）。状態はPERF_HES_STOPPEDとPERF_HES_UPTODATEに変更され、現在停止しており、ソフトウェアイベントカウントの更新も必要ありません。</p>
+<ul>
+<li><p><em>start</em> その後、呼び出され、カウンターが有効になります。PERF_EF_RELOADフラグが含まれる場合、カウンターに適切な値を書き込みます（詳細は前節を参照）。PERF_EF_RELOADフラグが含まれない場合は何も書きません。この時点で状態は停止も更新もされていないため、初期状態に戻ります。</p></li>
+</ul>
+</li>
+<li><p>コンテキストスイッチアウト時に <em>リスナーが停止したときに呼ばれます</em> 呼び出されます。その後、PMU内のすべてのイベントを確認し、 <em>停止</em> を呼び出してカウントを更新します。</p>
+<ul>
+<li><p><em>停止</em> は <em>リスナーが停止したときに呼ばれます</em>
+によって呼び出され、PERF_EF_UPDATEフラグとともにperfコアによって呼び出されます。これは通常、 <em>読み取り</em> と同じサブルーチンを共有し、同じロジックを用います。状態は再びPERF_HES_STOPPEDとPERF_HES_UPTODATEになります。</p></li>
+<li><p>これらの2つのペアのライフサイクル: <em>追加</em> および <em>リスナーが停止したときに呼ばれます</em> タスクがインとアウトするたびに繰り返し呼び出されます; <em>start</em> および <em>停止</em> perfコアが迅速な停止と再開が必要な場合にも呼び出されます。たとえば、割り込み期間が調整されるときなど。</p></li>
+</ul>
+</li>
+</ul>
+<p>現在の実装は十分で、今後追加の機能に簡単に拡張可能です。</p>
+</section>
+<section id="a-related-structures">
+<h2>A. 関連する構造体<a class="headerlink" href="#a-related-structures" title="この見出しへのパーマリンク">¶</a></h2>
+<ul>
+<li><p>struct pmu: include/linux/perf_event.h</p></li>
+<li><p>struct riscv_pmu: arch/riscv/include/asm/perf_event.h</p>
+<p>これらの構造体は読み取り専用として設計されています。</p>
+<p><em>struct pmu</em> いくつかの関数ポインタインターフェースを定義し、多くは
+<em>struct perf_event</em> をメインの引数として使用し、perfの内部状態機械に従ってperfイベントを処理します（詳細はkernel/events/core.cを参照）。</p>
+<p><em>struct riscv_pmu</em> PMU固有のパラメータを定義します。命名規則は他のすべてのアーキテクチャと同じです。</p>
+</li>
+<li><p>struct perf_event: include/linux/perf_event.h</p></li>
+<li><p>struct hw_perf_event</p>
+<p>一般的なperfイベントを表し、ハードウェア関連の詳細を含む汎用構造体です。</p>
+</li>
+<li><p>struct riscv_hw_events: arch/riscv/include/asm/perf_event.h</p>
+<p>イベントの状態を保持する構造体は、固定されたメンバとしてイベントの数とイベントの配列の2つの要素を持っています。</p>
+</li>
+</ul>
+</section>
+<section id="references">
+<h2>参考文献<a class="headerlink" href="#references" title="この見出しへのパーマリンク">¶</a></h2>
+<p>[1] <a class="reference external" href="https://github.com/riscv/riscv-linux/pull/124">https://github.com/riscv/riscv-linux/pull/124</a></p>
+<p>[2] <a class="reference external" href="https://groups.google.com/a/groups.riscv.org/forum/#!topic/sw-dev/f19TmCNP6yA">https://groups.google.com/a/groups.riscv.org/forum/#!topic/sw-dev/f19TmCNP6yA</a></p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">RISC-Vアーキテクチャ</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="boot-image-header.html">RISC-V Linux のブートイメージヘッダー</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">RISC-V プラットフォームにおける PMU のサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="patch-acceptance.html">開発者向けのarch/riscvメンテナンスガイドライン</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">RISC-Vアーキテクチャ</a><ul>
+<li>前へ: <a href="boot-image-header.html" title="前章">RISC-V Linux のブートイメージヘッダー</a></li>
+<li>次へ: <a href="../s390/index.html" title="次章">s390アーキテクチャ</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/riscv/pmu.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

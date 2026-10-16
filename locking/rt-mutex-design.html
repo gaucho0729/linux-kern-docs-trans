@@ -1,0 +1,486 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>RT-mutex実装設計 — The Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="rt-mutex.html" rel="next" title="PIサポート付きRTミューテックスサブシステム"/>
+<link href="mutex-design.html" rel="prev" title="ジェネリックミューテックスサブシステム"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="rt-mutex-implementation-design">
+<h1>RTミューテックスの実装設計<a class="headerlink" href="#rt-mutex-implementation-design" title="この見出しへのパーマリンク">¶</a></h1>
+<p>Copyright (c) 2006 Steven Rostedt</p>
+<p>GNU Free Documentation License, Version 1.2 に基づいてライセンスされています</p>
+<p>このドキュメントはrtmutex.cの実装設計について説明を試みています。rtmutex.cが存在する理由については説明していません。その点については
+<a class="reference internal" href="rt-mutex.html"><span class="doc">PIサポート付きRTミューテックスサブシステム</span></a>。このドキュメントはこのコードがない場合に発生する問題を説明していますが、コードが実際に何をしているかを理解するための概念として説明しています。</p>
+<p>このドキュメントの目的は、優先度継承（PI）アルゴリズムの仕組みや、PIをこのように実装した理由について理解を助けることです。</p>
+<section id="unbounded-priority-inversion">
+<h2>無限優先度逆転<a class="headerlink" href="#unbounded-priority-inversion" title="この見出しへのパーマリンク">¶</a></h2>
+<p>優先度逆転とは、低優先度のプロセスが実行されている間に高優先度のプロセスが実行を待っている状態を指します。これはいくつかの理由で発生しますが、ほとんどの場合回避できません。高優先度のプロセスが低優先度のプロセスが所有しているリソース（例えばミューテックス）を使用したい場合、高優先度のプロセスは低優先度のプロセスがリソースを解放するまで待つ必要があります。これは優先度逆転です。防ぎたいのは「無限優先度逆転」と呼ばれる状態で、高優先度のプロセスが低優先度のプロセスによって不定期に実行を妨げられる状態です。</p>
+<p>無限優先度逆転の典型的な例は、3つのプロセス（A、B、C）がある場合です。Aは最高優先度、Cは最低優先度、Bはその間の優先度です。AがCが所有するロックを取得しようとすると、Cがロックを解放するまで待つ必要があります。その間、Bが実行され、Bの優先度がCより高いのでCを中断しますが、実際にはAというより高い優先度のプロセスを中断しています。Aがロックを解放するまでどれだけ待つのかは予測できません。なぜなら、BがCPUを大量に消費している可能性があり、Cがロックを解放する機会を与えてくれないからです。このような状態を無限優先度逆転と呼びます。</p>
+<p>問題を示すためのASCIIアートを以下に示します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>   grab lock L1 (owned by C)
+     |
+A ---+
+        C preempted by B
+          |
+C    +----+
+
+B         +--------&gt;
+                B now keeps A from running.
+</pre></div>
+</div>
+</section>
+<section id="priority-inheritance-pi">
+<h2>優先度継承（PI）<a class="headerlink" href="#priority-inheritance-pi" title="この見出しへのパーマリンク">¶</a></h2>
+<p>この問題を解決する方法はいくつかありますが、他の方法についてはこのドキュメントの範囲外です。ここではPIのみを説明します。</p>
+<p>PIとは、他のプロセスが現在のプロセスが所有するロックにブロックしている場合、そのプロセスが他のプロセスの優先度を継承する仕組みです。この説明をより理解しやすくするために、以前の例に戻ります。</p>
+<p>今回は、AがCが所有するロックをブロックしている場合、CはAの優先度を継承します。そのため、Bが実行可能になったとしても、Cは現在Aの高い優先度を保っているため、Cを優先して実行しません。Cがロックを解放した瞬間、継承した優先度を失い、その後AはCが保持していたリソースを再び利用できます。</p>
+</section>
+<section id="terminology">
+<h2>用語<a class="headerlink" href="#terminology" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このドキュメントでは、設計を説明するために使用される用語について説明します。</p>
+<dl>
+<dt>PI chain</dt><dd><ul class="simple">
+<li><p>PI chainは、プロセスが前のプロセスのロックにブロックされている際に優先度を継承するロックとプロセスの順序付きシリーズです。このドキュメントの後述でより詳しく説明します。</p></li>
+</ul>
+</dd>
+<dt>mutex</dt><dd><ul class="simple">
+<li><p>このドキュメントでは、PIを実装するロックとPIコードで使用されるスピンロックを区別するために、以降PIロックはmutexと呼びます。</p></li>
+</ul>
+</dd>
+<dt>lock</dt><dd><ul class="simple">
+<li><p>このドキュメントでは、PIアルゴリズムを保護するために使用されるスピンロックを指す際には「lock」という用語を使用します。これらのロックはUP（CONFIG_PREEMPTが有効の場合）でプリエマプションを無効にし、SMPでは複数のCPUが同時にクリティカルセクションに入らないようにします。</p></li>
+</ul>
+</dd>
+<dt>スピンロック</dt><dd><ul class="simple">
+<li><p>上記のlockと同じです。</p></li>
+</ul>
+</dd>
+<dt>待機中のプロセス</dt><dd><ul>
+<li><p>waiterは、ブロックされているプロセスのスタック上に保存される構造体です。waiterのスコープはミューテックスにブロックされているプロセスのコード内に限定されているため、プロセスのスタック（ローカル変数）にwaiterを割り当てても問題ありません。この構造体はタスクへのポインタと、タスクがブロックされているミューテックスを保持しており、さらにrbtreeノード構造体を含み、ミューテックスのwaiters rbtreeおよびミューテックス所有タスクのpi_waiters rbtreeにタスクを配置します（以下で説明します）。</p>
+<p>waiterは、ミューテックスを待っているタスクを指す場合もあります。これはwaiter-&gt;taskと同じです。</p>
+</li>
+</ul>
+</dd>
+<dt>待機者</dt><dd><ul class="simple">
+<li><p>ミューテックスにブロックされているプロセスの一覧です。</p></li>
+</ul>
+</dd>
+<dt>top waiter</dt><dd><ul class="simple">
+<li><p>特定のミューテックスに待機している最高優先度のプロセスです。</p></li>
+</ul>
+</dd>
+<dt>top pi waiter</dt><dd><ul class="simple">
+<li><p>特定のプロセスが所有するミューテックスのうちの1つに待機している最高優先度のプロセスです。</p></li>
+</ul>
+</dd>
+<dt>注意:</dt><dd><p>このドキュメントでは、記述している2つのプロセスを区別するためにtaskとprocessを使い分けます。</p>
+</dd>
+</dl>
+</section>
+<section id="pi-chain">
+<h2>PI chain<a class="headerlink" href="#pi-chain" title="この見出しへのパーマリンク">¶</a></h2>
+<p>PI chainは、優先度継承が発生する可能性のあるプロセスとミューテックスのリストです。複数のチェーンが合流することもありますが、チェーンは一度分岐しません。なぜなら、プロセスが一度に複数のミューテックスにブロックされることがないからです。</p>
+<p>例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Process:  A, B, C, D, E
+Mutexes:  L1, L2, L3, L4
+
+A owns: L1
+        B blocked on L1
+        B owns L2
+               C blocked on L2
+               C owns L3
+                      D blocked on L3
+                      D owns L4
+                             E blocked on L4
+</pre></div>
+</div>
+<p>チェーンは以下のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>E-&gt;L4-&gt;D-&gt;L3-&gt;C-&gt;L2-&gt;B-&gt;L1-&gt;A
+</pre></div>
+</div>
+<p>2つのチェーンが合流する場所を示すために、別のプロセスFと別のミューテックスL5を追加します。BがL5を所有し、FがL5にブロックされているとします。</p>
+<p>Fのチェーンは以下のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>F-&gt;L5-&gt;B-&gt;L1-&gt;A
+</pre></div>
+</div>
+<p>プロセスが複数のミューテックスを所有する可能性があるが、一度にブロックされるのは1つだけであるため、チェーンは統合されます。</p>
+<p>ここでは両方のチェーンを示します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>E-&gt;L4-&gt;D-&gt;L3-&gt;C-&gt;L2-+
+                    |
+                    +-&gt;B-&gt;L1-&gt;A
+                    |
+              F-&gt;L5-+
+</pre></div>
+</div>
+<p>PIが機能するためには、これらのチェーンの右端にあるプロセス（あるいはこれを「チェーンの先頭」と呼ぶこともできます）の優先度が、チェーンの左または下にあるプロセスの優先度以上でなければなりません。</p>
+<p>また、ミューテックスが複数のプロセスにブロックされる可能性があるため、ミューテックスで複数のチェーンが統合されることがあります。新たにプロセスGがミューテックスL2にブロックされる場合:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>G-&gt;L2-&gt;B-&gt;L1-&gt;A
+</pre></div>
+</div>
+<p>そして再び、チェーンがどのように成長するかを示すために、マージされたチェーンを示します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>E-&gt;L4-&gt;D-&gt;L3-&gt;C-+
+                +-&gt;L2-+
+                |     |
+              G-+     +-&gt;B-&gt;L1-&gt;A
+                      |
+                F-&gt;L5-+
+</pre></div>
+</div>
+<p>プロセスGがチェーン内で最高の優先度を持つ場合、チェーン上にあるすべてのタスク（この例ではAとB）の優先度をGの優先度に引き上げる必要があります。</p>
+</section>
+<section id="mutex-waiters-tree">
+<h2>ミューテックス・ウェイターツリー<a class="headerlink" href="#mutex-waiters-tree" title="この見出しへのパーマリンク">¶</a></h2>
+<p>すべてのミューテックスは、自身にブロックされているウェイターを追跡します。ミューテックスは、優先度でウェイターツリーを保持するためのrbtreeを持ち、このツリーはミューテックス構造体内のスピンロックで保護されます。このロックはwait_lockと呼ばれます。</p>
+</section>
+<section id="task-pi-tree">
+<h2>タスクPIツリー<a class="headerlink" href="#task-pi-tree" title="この見出しへのパーマリンク">¶</a></h2>
+<p>PIチェーンを追跡するため、各プロセスは独自のPI rbtreeを持ちます。これは、プロセスが所有するミューテックスのすべてのトップウェイターのツリーです。注意点として、このツリーはすべてのブロックされているウェイターではなく、プロセスが所有するミューテックスにブロックされているトップウェイターのみを保持します。</p>
+<p>タスクのPIツリーの先頭は、タスクが所有するミューテックスに待機している最高優先度のタスクです。タスクが継承した優先度を持つ場合でも、このツリーの先頭は常にそのタスクの優先度になります。</p>
+<p>このツリーは、プロセスのタスク構造体内でpi_waitersというrbtreeとして保存され、タスク構造体内のスピンロックpi_lockで保護されます。このロックは割り込みコンテキストでも取得可能なので、pi_lockをロックする際は割り込みを無効化する必要があります。</p>
+</section>
+<section id="depth-of-the-pi-chain">
+<h2>PIチェーンの深さ<a class="headerlink" href="#depth-of-the-pi-chain" title="この見出しへのパーマリンク">¶</a></h2>
+<p>PIチェーンの最大深さは動的ではなく、実際には定義可能です。しかし、すべてのミューテックスのネスト構造に依存するため、非常に複雑です。3つのミューテックスL1、L2、L3と4つの関数func1、func2、func3、func4を持つ例を見てみましょう。以下の例ではL1→L2→L3のロック順序が示されていますが、実際に直接ネストされているとは限りません:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void func1(void)
+{
+      mutex_lock(L1);
+
+      /* do anything */
+
+      mutex_unlock(L1);
+}
+
+void func2(void)
+{
+      mutex_lock(L1);
+      mutex_lock(L2);
+
+      /* do something */
+
+      mutex_unlock(L2);
+      mutex_unlock(L1);
+}
+
+void func3(void)
+{
+      mutex_lock(L2);
+      mutex_lock(L3);
+
+      /* do something else */
+
+      mutex_unlock(L3);
+      mutex_unlock(L2);
+}
+
+void func4(void)
+{
+      mutex_lock(L3);
+
+      /* do something again */
+
+      mutex_unlock(L3);
+}
+</pre></div>
+</div>
+<p>次に、これらの関数をそれぞれ実行する4つのプロセスA、B、C、Dを追加します。Dが最初に実行され、Aが最後に実行され、Dがfunc4の「do something again」領域でプリエンプションされる場合、以下のロック順序になります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>D owns L3
+       C blocked on L3
+       C owns L2
+              B blocked on L2
+              B owns L1
+                     A blocked on L1
+
+And thus we have the chain A-&gt;L1-&gt;B-&gt;L2-&gt;C-&gt;L3-&gt;D.
+</pre></div>
+</div>
+<p>これによりPI深度が4（4つのプロセス）になりますが、個々の関数を確認すると、最大でロック深度が2にしかなさそうに見えます。したがって、ロック深度はコンパイル時に定義されていますが、その深度の可能性を見つけるのは依然として非常に困難です。</p>
+<p>mutexはユーザー領域のアプリケーションによって定義されるため、DOS型のアプリケーションが大量のmutexをネストしてPIチェーンを長くし、大量のデータを確認しながらスピンロックを保持するのを防ぎたいです。そのため、実装では最大ロック深度だけでなく、PIチェーンを歩く際には一度に最大2つの異なるロックのみを保持するようにしています。以下で詳しく説明します。</p>
+</section>
+<section id="mutex-owner-and-flags">
+<h2>ミューテックス所有者とフラグ<a class="headerlink" href="#mutex-owner-and-flags" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ミューテックス構造体にはミューテックスの所有者へのポインタが含まれています。ミューテックスが所有されていない場合、所有者はNULLに設定されます。すべてのアーキテクチャでタスク構造体が少なくとも2バイトアライメント（この条件が満たされない場合、rtmutex.cコードは破損します）を確保しているため、最下位ビットをフラグとして使用できます。ビット0は「待機中のプロセスがある」フラグとして使用され、ミューテックスに待機中のプロセスがあるときに設定されます。</p>
+<p>参照 <a class="reference internal" href="rt-mutex.html"><span class="doc">PIサポート付きRTミューテックスサブシステム</span></a> を参照してください。</p>
+</section>
+<section id="cmpxchg-tricks">
+<h2>cmpxchgのトリック<a class="headerlink" href="#cmpxchg-tricks" title="この見出しへのパーマリンク">¶</a></h2>
+<p>一部のアーキテクチャではアトミックなcmpxchg（Compare and Exchange）が実装されています。この機能は、必要に応じてミューテックスの取得と解放の高速パスを短くするために使用されます。</p>
+<p>cmpxchgは基本的に以下の関数をアトミックに実行します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>unsigned long _cmpxchg(unsigned long *A, unsigned long *B, unsigned long *C)
+{
+      unsigned long T = *A;
+      if (*A == *B) {
+              *A = *C;
+      }
+      return T;
+}
+#define cmpxchg(a,b,c) _cmpxchg(&amp;a,&amp;b,&amp;c)
+</pre></div>
+</div>
+<p>これは非常に便利です。変数を更新する際、変数が予期する値である場合にのみ更新できるため、返値（Aの古い値）がBと等しいかどうかで成功を確認できます。</p>
+<p>rt_mutex_cmpxchgマクロはミューテックスのロックとアンロックを試みるために使用されます。アーキテクチャがCMPXCHGをサポートしない場合、このマクロは常に失敗します。CMPXCHGをサポートする場合、高速パスを短くするのに非常に役立ちます。</p>
+<p>rt_mutex_cmpxchgマクロは、所有者のフラグフィールドと組み合わせて使用され、CMPXCHGをサポートするアーキテクチャ向けにシステムを最適化します。この点については後述します。</p>
+</section>
+<section id="priority-adjustments">
+<h2>優先度調整<a class="headerlink" href="#priority-adjustments" title="この見出しへのパーマリンク">¶</a></h2>
+<p>rtmutex.cにおけるPIコードの実装では、プロセスが優先度を調整する必要がある場所がいくつかあります。プロセスのpi_waitersを活用することで、調整が必要な項目を簡単に把握できます。</p>
+<p>タスク調整を実装する関数はrt_mutex_adjust_prioとrt_mutex_setprioです。rt_mutex_setprioはrt_mutex_adjust_prio内でのみ使用されます。</p>
+<p>rt_mutex_adjust_prioはタスクの優先度と、タスクが所有するミューテックスのいずれかに待機している最高優先度のプロセスを検査します。タスクのpi_waitersは、タスクが所有するすべてのミューテックスのトップウェイターを優先度順に保持しているため、タスクの通常/デッドライン優先度とトップpiウェイターを比較し、高い方を採用するだけで十分です。その後、rt_mutex_setprioが呼び出され、タスクの優先度が新しい優先度に調整されます。注意点として、rt_mutex_setprioはkernel/sched/core.cで定義されており、実際の優先度変更を実装しています。</p>
+<dl class="simple">
+<dt>注意:</dt><dd><p>task_structの「prio」フィールドでは、数字が小さいほど優先度が高いです。「prio」が5のタスクは、「prio」が10のタスクよりも高い優先度を持ちます。</p>
+</dd>
+</dl>
+<p>rt_mutex_adjust_prioはタスクの優先度を上げたり下げたりする可能性があります。タスクが所有するミューテックスに高い優先度のプロセスが新たにブロックした場合、この関数はタスクの優先度を上げます。しかし、高い優先度のタスクが何らかの理由でミューテックスを離れた場合（タイムアウトやシグナル）、この関数はタスクの優先度を下げます。これはpi_waitersが常にタスクが所有するミューテックスに待機している最高優先度のタスクを保持しているため、タスクの通常優先度とトップpiウェイターの優先度を比較するだけで十分だからです。</p>
+</section>
+<section id="high-level-overview-of-the-pi-chain-walk">
+<h2>PIチェーンのウォークの高レベルな概要<a class="headerlink" href="#high-level-overview-of-the-pi-chain-walk" title="この見出しへのパーマリンク">¶</a></h2>
+<p>PIチェーンのウォークは関数rt_mutex_adjust_prio_chainによって実装されています。</p>
+<p>この実装は複数のイテレーションを経て、現在のところ最も効率的な形に落ち着いています。1回の処理で最大2つのロックを取得し、非常に効率的な処理が可能です。</p>
+<p>rt_mutex_adjust_prio_chainはプロセスの優先度を上げたり下げたりするための関数として使用できます。</p>
+<p>この関数は、PI（デ）ブーストを検討するタスク（プロセスがブロックしているミューテックスの所有者）、デッドロック検出をチェックするフラグ、タスクが所有するミューテックス、プロセスのウェイターストラクチャをブロックしているミューテックスへのポインタ（デブーストの場合はこのパラメータがNULLになる可能性あり）、タスクがブロックされているミューテックスへのポインタ、そしてミューテックスのトップタスク（トップウェイター）を引数として呼び出されます。</p>
+<p>この説明ではデッドロック検出については触れません。説明は高レベルに留めます。</p>
+<p>この関数が呼び出される際にはロックが保持されていません。これにより、関数に入った時点で所有者とロックの状態が変化する可能性があります。</p>
+<p>この関数が呼び出される前には、タスクに対してrt_mutex_adjust_prioがすでに実行されています。これは、タスクが正しい優先度に設定されていることを意味しますが、タスクのwaiterのrbtreeノードは新しい優先度に更新されておらず、このタスクがブロックされているpi_waitersとwaitersツリーの適切な位置にない可能性があります。この関数は、こうした問題をすべて解決します。</p>
+<p>この関数の主な処理は、Thomas Gleixnerがrtmutex.cで説明した通りです。詳細については、「チェーンウォークの基本と保護範囲」のコメントを参照してください。</p>
+</section>
+<section id="taking-of-a-mutex-the-walk-through">
+<h2>ミューテックスの取得（ウォークスルー）<a class="headerlink" href="#taking-of-a-mutex-the-walk-through" title="この見出しへのパーマリンク">¶</a></h2>
+<p>はい、ではミューテックスを取得する際の詳細なウォークスルーを見てみましょう。</p>
+<p>最初に試されるのはミューテックスの高速取得です。CMPXCHGが有効になっている場合（それ以外の場合、高速取得は自動的に失敗します）にのみ実行されます。ミューテックスのownerフィールドがNULLの場合のみ、CMPXCHGでロックを取得でき、それ以外の処理は必要ありません。</p>
+<p>ロックに競合がある場合、遅いパス（rt_mutex_slowlock）を処理します。</p>
+<p>遅いパスの関数では、タスクのwaiter構造体がスタック上に作成されます。これは、この関数のスコープにのみ必要なためです。waiter構造体は、タスクをミューテックスのwaitersツリーに登録するためのノードを保持し、必要に応じて所有者のpi_waitersツリーにも登録します。</p>
+<p>ミューテックスのwait_lockを取得します。ミューテックスのロック解除の遅いパスもこのロックを取得するためです。</p>
+<p>次にtry_to_take_rt_mutexを呼び出します。これは、CMPXCHGを実装していないアーキテクチャでは、競合がない場合に常にロックを取得する処理です。</p>
+<p>try_to_take_rt_mutexは、タスクが遅いパスでミューテックスを取得するたびに使用されます。ここではまず、ミューテックスのownerフィールドの「待機中のタスクがいる」フラグをアトミックに設定します。このフラグを設定することで、現在のミューテックスの所有者はこのコードを遅いアンロックパスで解放しなければならず、wait_lockを取得する必要があります。これにより、現在の所有者はこのコードと同期するよう強制されます。</p>
+<p>以下の条件がすべて真である場合、ロックを取得できます：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>ロックに所有者はいません</p></li>
+<li><p>現在のタスクがロックの他のすべての待機者よりも高い優先度です</p></li>
+</ol>
+</div></blockquote>
+<p>タスクがロックを取得成功した場合、タスクをロックの所有者に設定し、ロックにまだ待機者がいる場合は、ロックを待っている最高優先度のタスク（top_waiter）をこのタスクのpi_waitersツリーに追加します。</p>
+<p>try_to_take_rt_mutex()でロックが取得されなかった場合、task_blocks_on_rt_mutex()関数が呼び出されます。これにより、タスクがロックの待機木に追加され、ロックのPIチェーンが伝播され、ロックの所有者のpi_waiters木も更新されます。これは次のセクションで詳しく説明します。</p>
+</section>
+<section id="task-blocks-on-mutex">
+<h2>タスクがミューテックスをブロックする<a class="headerlink" href="#task-blocks-on-mutex" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ミューテックスおよびプロセスのアカウントは、プロセスのウェイターストラクチャによって行われます。"task"フィールドはプロセスに設定され、"lock"フィールドはミューテックスに設定されます。ウェイターのRBツリーのノードは、プロセスの現在の優先度で初期化されます。</p>
+<p>slow lockのエントリでwait_lockが取得されているため、タスクをタスクのウェイターツリーに安全に追加できます。現在のプロセスがこのミューテックスを待機しているプロセスの中で最優先度の場合、所有者のpi_waitersから前のトップウェイタープロセス（存在すれば）を削除し、現在のプロセスをそのツリーに追加します。所有者のpi_waiterが変更されたため、所有者に対してrt_mutex_adjust_prioを呼び出して、所有者が優先度を調整する必要があるか確認します。</p>
+<p>所有者が別のロックにブロックされており、pi_waitersが変更された（またはデッドロックチェックが有効）場合、ミューテックスのwait_lockをアンロックし、前述のように所有者に対してrt_mutex_adjust_prio_chainを実行します。</p>
+<p>すべてのロックが解放され、現在のプロセスがまだミューテックスを待機している場合（ウェイターの"task"フィールドがNULLでない場合）、スリープ状態に移行します（scheduleを呼び出します）。</p>
+</section>
+<section id="waking-up-in-the-loop">
+<h2>ループ内で目覚める<a class="headerlink" href="#waking-up-in-the-loop" title="この見出しへのパーマリンク">¶</a></h2>
+<dl class="simple">
+<dt>タスクは以下の理由で目覚めることがあります：</dt><dd><ol class="arabic simple">
+<li><p>前のロック所有者がロックを解放したため、タスクがトップウェイターになった</p></li>
+<li><p>シグナルまたはタイムアウトを受けた</p></li>
+</ol>
+</dd>
+</dl>
+<p>いずれの場合も、タスクは再びロックを取得しようと試みます。成功すると、待機木から自身を外し、TASK_RUNNING状態に戻します。</p>
+<p>最初の場合、このタスクがロックを取得する前に他のタスクがロックを取得していた場合、タスクは再びスリープ状態に戻り、再度目覚めるのを待つことになります。</p>
+<p>2番目のケースは、シグナルまたはタイムアウトによりロック取得前に目覚めることが可能なミューテックスを取得しようとしているタスクにのみ適用されます（例：rt_mutex_timed_futex_lock()）。目覚めた場合、再びロックを取得しようと試みます。成功するとロックを保持して戻り、失敗した場合はシグナルで目覚めた場合は-EINTR、タイムアウトで終了した場合は-ETIMEDOUTを返します。</p>
+</section>
+<section id="unlocking-the-mutex">
+<h2>ミューテックスのアンロック<a class="headerlink" href="#unlocking-the-mutex" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ミュートックスのアンロックにも、CMPXCHGを持つアーキテクチャ向けに高速なパスがあります。ミュートックスの所有者が競合状態でミュートックスを取得した際には常に「Waitersが存在する」フラグが設定されるため、このフラグをもってアンロック時に高速パスを採用するかどうかを判断します。ミュートックスに待機中のプロセスがいない場合、ミュートックスの所有者フィールドは現在のプロセスと一致し、所有者フィールドをNULLに置き換えることでミュートックスをアンロックできます。</p>
+<p>所有者フィールドに「Waitersが存在する」ビットが設定されている（またはCMPXCHGが利用できない）場合、遅いアンロックパスが採用されます。</p>
+<p>遅いアンロックパスの最初の処理は、ミュートックスのwait_lockを取得することです。これによりミュートックスのロックとアンロックが同期されます。</p>
+<p>ミュートックスに待機中のプロセスがいるかを確認します。CMPXCHGを持たないアーキテクチャでは、この確認はミュートックスの所有者が待機プロセスを起こす必要があるかどうかを判断する場所です。CMPXCHGを持つアーキテクチャではこの確認は高速パスで行われますが、遅いパスでも必要です。所有者が高速パスのCMPXCHGチェックで失敗した後、wait_lockを取得する間に待機プロセスがシグナルやタイムアウトで起こった場合、ミュートックスに待機プロセスがいない可能性があるため、所有者はこの確認を再度行う必要があります。待機プロセスがなければ、ミュートックスの所有者フィールドをNULLに設定し、wait_lockを解放して処理を終了します。</p>
+<p>待機プロセスがある場合、1つを起こす必要があります。</p>
+<p>起こす処理では、現在の所有者のpi_lockを取得します。ロックの上位待機プロセスを特定し、ミュートックスの待機ツリーから削除するとともに、現在の所有者のpi_waitersツリーからも削除します。「Waitersが存在する」ビットを設定して、低優先度タスクがロックを奪うのを防ぎます。</p>
+<p>最後に、保留中の所有者のpi_lockをアンロックして起こします。</p>
+</section>
+<section id="contact">
+<h2>お問い合わせ<a class="headerlink" href="#contact" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このドキュメントの更新情報については、Steven Rostedt までメールでご連絡ください &lt;<a class="reference external" href="mailto:rostedt%40goodmis.org">rostedt<span>@</span>goodmis<span>.</span>org</a>&gt;</p>
+</section>
+<section id="credits">
+<h2>貢献者<a class="headerlink" href="#credits" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Author: Steven Rostedt &lt;<a class="reference external" href="mailto:rostedt%40goodmis.org">rostedt<span>@</span>goodmis<span>.</span>org</a>&gt;</p>
+<p>Updated: Alex Shi &lt;<a class="reference external" href="mailto:alex.shi%40linaro.org">alex<span>.</span>shi<span>@</span>linaro<span>.</span>org</a>&gt; - 7/6/2017</p>
+<dl class="simple">
+<dt>Original Reviewers:</dt><dd><p>Ingo Molnar, Thomas Gleixner, Thomas Duetsch, and Randy Dunlap</p>
+</dd>
+</dl>
+<p>Update (7/6/2017) Reviewers: Steven Rostedt and Sebastian Siewior</p>
+</section>
+<section id="updates">
+<h2>更新<a class="headerlink" href="#updates" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このドキュメントは当初2.6.17-rc3-mm1向けに書かれ、4.12で更新されました</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">ロック</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="locktypes.html">ロックの種類とそのルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lockdep-design.html">ランタイムロックの正しさを検証するツール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lockstat.html">ロック統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="locktorture.html">カーネルロックのトラウトテスト操作</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mutex-design.html">ジェネリックミューテックスサブシステム</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">RTミューテックスの実装設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rt-mutex.html">PIサポート付きRTミューテックスサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="seqlock.html">シーケンスカウンタとシーケンシャルロック</a></li>
+<li class="toctree-l2"><a class="reference internal" href="spinlocks.html">ロックの教訓</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ww-mutex-design.html">Wound/Wait Deadlock-Proof Mutex Design</a></li>
+<li class="toctree-l2"><a class="reference internal" href="preempt-locking.html">プリエンプティブカーネルでの適切なロック: カーネルコードのプリエンプ安全性を保つ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pi-futex.html">軽量PIフェイクス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="futex-requeue-pi.html">フェイクス再配置PI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hwspinlock.html">ハードウェアスピンロックフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="percpu-rw-semaphore.html">ペルCPU読み取り専用セマフォ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="robust-futexes.html">ロバストフェイクスの説明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="robust-futex-ABI.html">The robust futex ABI</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">ロック</a><ul>
+<li>前へ: <a href="mutex-design.html" title="前章">ジェネリックミューテックスサブシステム</a></li>
+<li>次へ: <a href="rt-mutex.html" title="次章">PIサポート付きRTミューテックスサブシステム</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/locking/rt-mutex-design.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

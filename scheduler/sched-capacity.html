@@ -1,0 +1,477 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>容量を考慮したスケジューリング — The Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="sched-energy.html" rel="next" title="エネルギー感知スケジューリング"/>
+<link href="sched-domains.html" rel="prev" title="スケジューラドメイン"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="capacity-aware-scheduling">
+<h1>容量感知スケジューリング<a class="headerlink" href="#capacity-aware-scheduling" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="cpu-capacity">
+<h2>1. CPU容量<a class="headerlink" href="#cpu-capacity" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="introduction">
+<h3>1.1 はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h3>
+<p>従来の同質なSMPプラットフォームは、完全に同一のCPUで構成されています。一方、異質なプラットフォームは、性能特性が異なるCPUで構成されており、このようなプラットフォームでは、すべてのCPUを同一視できません。</p>
+<p>CPU容量は、システム内の最もパフォーマンスの高いCPUに対して正規化された値で、CPUが達成可能な性能を示します。異質なシステムは、異なる容量を持つCPUを含むため、非対称CPU容量システムと呼ばれます。</p>
+<p>最大達成可能な性能（つまり最大CPU容量）の差異は、以下の2つの要因に起因します：</p>
+<ul class="simple">
+<li><p>すべてのCPUが同じマイクロアーキテクチャ（µarch）を持つとは限りません。</p></li>
+<li><p>動的電圧周波数スケーリング（DVFS）により、すべてのCPUが物理的に高い作業パフォーマンスポイント（OPP）を達成できるとは限りません。</p></li>
+</ul>
+<p>ARM big.LITTLEシステムは、この2つの例です。big CPUはLITTLE CPUよりもパフォーマンス志向であり（より多くのパイプラインステージ、より大きなキャッシュ、よりスマートな予測など）、通常LITTLE CPUよりも高いOPPを達成できます。</p>
+<p>CPUのパフォーマンスは、通常、毎秒百万命令（MIPS）で表現され、Hzごとの達成可能な命令数として表現することもできます。これにより以下の式が得られます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>capacity(cpu) = work_per_hz(cpu) * max_freq(cpu)
+</pre></div>
+</div>
+</section>
+<section id="scheduler-terms">
+<h3>1.2 スケジューラの用語<a class="headerlink" href="#scheduler-terms" title="この見出しへのパーマリンク">¶</a></h3>
+<p>スケジューラ内で2つの異なる容量値が使用されます。CPUの
+<code class="docutils literal notranslate"><span class="pre">capacity_orig</span></code> は、そのCPUの最大達成可能な容量、つまり最大達成可能なパフォーマンスレベルを示します。CPUの <code class="docutils literal notranslate"><span class="pre">capacity</span></code> は、そのCPUの <code class="docutils literal notranslate"><span class="pre">capacity_orig</span></code> に、利用可能なパフォーマンスの一部（例：IRQの処理に費やす時間）が引かれた値を示します。</p>
+<p>注意：CPUの <code class="docutils literal notranslate"><span class="pre">capacity</span></code> は、CFSクラス専用に使用されるのに対し、 <code class="docutils literal notranslate"><span class="pre">capacity_orig</span></code> はクラスに依存しません。このドキュメントの残りの部分では、 <code class="docutils literal notranslate"><span class="pre">capacity</span></code> と <code class="docutils literal notranslate"><span class="pre">capacity_orig</span></code> を簡潔さのため使い分けずに使用します。</p>
+</section>
+<section id="platform-examples">
+<h3>1.3 プラットフォームの例<a class="headerlink" href="#platform-examples" title="この見出しへのパーマリンク">¶</a></h3>
+<section id="identical-opps">
+<h4>1.3.1 同じOPP<a class="headerlink" href="#identical-opps" title="この見出しへのパーマリンク">¶</a></h4>
+<p>仮想的な2コア非対称CPU容量システムを想定し、</p>
+<ul class="simple">
+<li><p>work_per_hz(CPU0) = W</p></li>
+<li><p>work_per_hz(CPU1) = W/2</p></li>
+<li><p>すべてのCPUが同じ固定周波数で動作している場合、</p></li>
+</ul>
+<p>上記の容量の定義に基づき：</p>
+<ul class="simple">
+<li><p>capacity(CPU0) = C</p></li>
+<li><p>capacity(CPU1) = C/2</p></li>
+</ul>
+<p>ARM big.LITTLEと対応すると、CPU0はbig、CPU1はLITTLEと対応します。</p>
+<p>固定量の作業を定期的に実行するワークロードでは、実行トレースは以下のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>CPU0 work ^
+          |     ____                ____                ____
+          |    |    |              |    |              |    |
+          +----+----+----+----+----+----+----+----+----+----+-&gt; time
+
+CPU1 work ^
+          |     _________           _________           ____
+          |    |         |         |         |         |
+          +----+----+----+----+----+----+----+----+----+----+-&gt; time
+</pre></div>
+</div>
+<p>CPU0はシステム内の最大容量（C）を持ち、固定量の作業WをT単位の時間で完了します。一方、CPU1はCPU0の半分の容量を持ち、そのためT単位の時間でW/2しか完了しません。</p>
+</section>
+<section id="different-max-opps">
+<h4>1.3.2 異なる最大OPP<a class="headerlink" href="#different-max-opps" title="この見出しへのパーマリンク">¶</a></h4>
+<p>通常、容量値が異なるCPUは最大OPPも異なります。上記と同じCPU（つまり同じwork_per_hz()を持つ）を以下のように考慮します：</p>
+<ul class="simple">
+<li><p>max_freq(CPU0) = F</p></li>
+<li><p>max_freq(CPU1) = 2/3 * F</p></li>
+</ul>
+<p>これにより、</p>
+<ul class="simple">
+<li><p>capacity(CPU0) = C</p></li>
+<li><p>capacity(CPU1) = C/3</p></li>
+</ul>
+<p>1.3.1節で説明した同じワークロードを、各CPUが最大周波数で実行する場合、以下のように結果します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>CPU0 work ^
+          |     ____                ____                ____
+          |    |    |              |    |              |    |
+          +----+----+----+----+----+----+----+----+----+----+-&gt; time
+
+                           workload on CPU1
+CPU1 work ^
+          |     ______________      ______________      ____
+          |    |              |    |              |    |
+          +----+----+----+----+----+----+----+----+----+----+-&gt; time
+</pre></div>
+</div>
+</section>
+</section>
+<section id="representation-caveat">
+<h3>1.4 表現に関する注意点<a class="headerlink" href="#representation-caveat" title="この見出しへのパーマリンク">¶</a></h3>
+<p>注意すべきは、ある <em>単一の</em> 値でCPU性能の違いを表すことが、ある程度の議論の的です。2つの異なるマイクロアーキテクチャ間の相対的なパフォーマンス差は、整数演算ではX%、浮動小数点演算ではY%、ブランチではZ%など異なります。それでも、この単純なアプローチで得られた結果はこれまで十分でした。</p>
+</section>
+</section>
+<section id="task-utilization">
+<h2>2. タスク利用率<a class="headerlink" href="#task-utilization" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="id1">
+<h3>2.1 はじめに<a class="headerlink" href="#id1" title="この見出しへのパーマリンク">¶</a></h3>
+<p>容量を考慮したスケジューリングでは、タスクのCPU容量に関する要件を表現する必要があります。各スケジューラークラスはこれを異なる方法で表現でき、タスク利用率はCFSに特有ですが、より一般的な概念を紹介するためにここに記述するのは便利です。</p>
+<p>タスク利用率は、タスクのスループット要件を表すパーセンテージです。これはタスクのディューティーサイクルで簡易に近似できます。つまり：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>task_util(p) = duty_cycle(p)
+</pre></div>
+</div>
+<p>固定周波数のSMPシステムでは、100%の利用率はタスクが忙しいループであることを示します。逆に、10%の利用率は、実行よりも睡眠時間が長い小さな周期タスクであることを示唆します。変動するCPU周波数や非対称なCPU容量はこれの複雑さを多少増しますが、次のセクションで詳しく説明します。</p>
+</section>
+<section id="frequency-invariance">
+<h3>2.2 周波数不変性<a class="headerlink" href="#frequency-invariance" title="この見出しへのパーマリンク">¶</a></h3>
+<p>考慮すべき問題は、ワークロードのディューティーサイクルが現在のCPUが実行しているOPPに直接影響されることです。特定の周波数Fで周期的なワークロードを実行する場合を考えてみましょう：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>CPU work ^
+         |     ____                ____                ____
+         |    |    |              |    |              |    |
+         +----+----+----+----+----+----+----+----+----+----+-&gt; time
+</pre></div>
+</div>
+<p>これにより、duty_cycle(p) == 25%になります。</p>
+<p>次に、以下のようなワークロードを実行する場合を考えてみましょう： <em>同じ</em> 周波数F/2で実行する場合：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>CPU work ^
+         |     _________           _________           ____
+         |    |         |         |         |         |
+         +----+----+----+----+----+----+----+----+----+----+-&gt; time
+</pre></div>
+</div>
+<p>これにより、duty_cycle(p) == 50%になります。タスクの動作はどちらの実行でも完全に同じ（つまり同じ量の作業を実行）であるにもかかわらずです。</p>
+<p>次の式を用いることで、タスク利用率信号は周波数不変性を持つことができます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>task_util_freq_inv(p) = duty_cycle(p) * (curr_frequency(cpu) / max_frequency(cpu))
+</pre></div>
+</div>
+<p>上記の2つの例にこの式を適用すると、周波数不変性を持つタスク利用率は25%になります。</p>
+</section>
+<section id="cpu-invariance">
+<h3>2.3 CPU不変性<a class="headerlink" href="#cpu-invariance" title="この見出しへのパーマリンク">¶</a></h3>
+<p>CPU容量はタスク利用率に類似した影響を与えます。容量値が異なるCPUで同一のワークロードを実行すると、異なるディューティーサイクルが生じます。</p>
+<p>1.3.2節で説明したシステムを考えてみましょう、つまり：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>- capacity(CPU0) = C
+- capacity(CPU1) = C/3
+</pre></div>
+</div>
+<p>各CPUが最大周波数で実行する場合、特定の周期ワークロードを実行すると以下のように結果します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>CPU0 work ^
+          |     ____                ____                ____
+          |    |    |              |    |              |    |
+          +----+----+----+----+----+----+----+----+----+----+-&gt; time
+
+CPU1 work ^
+          |     ______________      ______________      ____
+          |    |              |    |              |    |
+          +----+----+----+----+----+----+----+----+----+----+-&gt; time
+</pre></div>
+</div>
+<p>つまり、</p>
+<ul class="simple">
+<li><p>duty_cycle(p) == 25% となるのは、p が CPU0 で最大周波数で実行される場合</p></li>
+<li><p>duty_cycle(p) == 75% となるのは、p が CPU1 で最大周波数で実行される場合</p></li>
+</ul>
+<p>タスク利用率は以下の式により CPU 不変性を実現できます</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>task_util_cpu_inv(p) = duty_cycle(p) * (capacity(cpu) / max_capacity)
+</pre></div>
+</div>
+<p>with <code class="docutils literal notranslate"><span class="pre">max_capacity</span></code> システム内の最高 CPU 容量値を表します。この式を先ほどの例に適用すると、CPU 不変性を持つタスク利用率は 25% となります</p>
+</section>
+<section id="invariant-task-utilization">
+<h3>2.4 不変タスク利用率<a class="headerlink" href="#invariant-task-utilization" title="この見出しへのパーマリンク">¶</a></h3>
+<p>周波数および CPU の不変性を両方適用する必要があります。タスク利用率が CPU および周波数不変性を持つ場合の擬似式は、タスク p に対して以下のようになります</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>                                   curr_frequency(cpu)   capacity(cpu)
+task_util_inv(p) = duty_cycle(p) * ------------------- * -------------
+                                   max_frequency(cpu)    max_capacity
+</pre></div>
+</div>
+<p>言い換えれば、不変タスク利用率とは、タスクがシステム内の最高容量 CPU で最大周波数で実行されているかのように振る舞うことを表します</p>
+<p>以下のセクションで言及するタスク利用率はすべてその不変形式を指します</p>
+</section>
+<section id="utilization-estimation">
+<h3>2.5 利用率推定<a class="headerlink" href="#utilization-estimation" title="この見出しへのパーマリンク">¶</a></h3>
+<p>クリスタルボールを持たない限り、タスクの挙動（したがってタスク利用率）はタスクが最初に実行可能になる瞬間には正確に予測できません。CFS クラスは、Per-Entity Load Tracking (PELT) メカニズムに基づいて少数の CPU およびタスク信号を保持しており、そのうちの一つが <em>平均</em> 利用率（瞬時とは異なります）を提供します</p>
+<p>これは、容量を考慮したスケジューリング基準が「真の」タスク利用率（クリスタルボールを用いて）を考慮して記述されるものの、実装では常にその推定値しか使用できないことを意味します</p>
+</section>
+</section>
+<section id="capacity-aware-scheduling-requirements">
+<h2>3. 容量を考慮したスケジューリング要件<a class="headerlink" href="#capacity-aware-scheduling-requirements" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="id2">
+<h3>3.1 CPU 容量<a class="headerlink" href="#id2" title="この見出しへのパーマリンク">¶</a></h3>
+<p>Linux は現在 CPU 容量を自動で判別することはできず、この情報は外部から提供する必要があります。アーキテクチャは arch_scale_cpu_capacity() を定義する必要があります</p>
+<p>ARM および ARM64 アーキテクチャは、この機能を arch_topology ドライバの CPU スケーリングデータに直接マッピングしており、これは capacity-dmips-mhz CPU バインディングから導出されます。詳細は Documentation/devicetree/bindings/arm/cpu-capacity.txt を参照してください</p>
+</section>
+<section id="id3">
+<h3>3.2 周波数不変性<a class="headerlink" href="#id3" title="この見出しへのパーマリンク">¶</a></h3>
+<p>2.2 で述べたように、容量を考慮したスケジューリングには周波数不変なタスク利用率が必要です。アーキテクチャは arch_scale_freq_capacity(cpu) を定義する必要があります</p>
+<p>この関数を実装するには、各 CPU がどの周波数で実行されているかを判別する必要があります。実装方法の一つは、CPU の現在の周波数に比例してインクリメントするハードウェアカウンタ（x86 では APERF/MPERF、ARM64 では AMU）を活用することです。もう一つの方法は、カーネルが切り替わった周波数を認識しているときに cpufreq の周波数遷移に直接ハックする方法です（ARM/ARM64 でもこの方法が使用されています）</p>
+</section>
+</section>
+<section id="scheduler-topology">
+<h2>4. スケジューラトポロジー<a class="headerlink" href="#scheduler-topology" title="この見出しへのパーマリンク">¶</a></h2>
+<p>スケジューラドメインの構築中に、スケジューラがシステムが非対称CPU容量を示しているかどうかを判断します。その場合、</p>
+<ul class="simple">
+<li><p>sched_asym_cpucapacity静的キーフラグが有効になります。</p></li>
+<li><p>SD_ASYM_CPUCAPACITYフラグが、すべてのユニークなCPU容量値をカバーする最低限のsched_domainレベルで設定されます。</p></li>
+</ul>
+<p>sched_asym_cpucapacity静的キーフラグは、非対称CPU容量システム向けのコードセクションを保護するためのものです。ただし、このキーフラグは
+<em>システム全体で</em>。cpusetsを用いた以下の設定を想像してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>capacity    C/2          C
+          ________    ________
+         /        \  /        \
+CPUs     0  1  2  3  4  5  6  7
+         \__/  \______________/
+cpusets   cs0         cs1
+</pre></div>
+</div>
+<p>これは以下の方法で作成できます：</p>
+<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>mkdir /sys/fs/cgroup/cpuset/cs0
+<span class="nb">echo</span> <span class="m">0</span>-1 &gt; /sys/fs/cgroup/cpuset/cs0/cpuset.cpus
+<span class="nb">echo</span> <span class="m">0</span> &gt; /sys/fs/cgroup/cpuset/cs0/cpuset.mems
+
+mkdir /sys/fs/cgroup/cpuset/cs1
+<span class="nb">echo</span> <span class="m">2</span>-7 &gt; /sys/fs/cgroup/cpuset/cs1/cpuset.cpus
+<span class="nb">echo</span> <span class="m">0</span> &gt; /sys/fs/cgroup/cpuset/cs1/cpuset.mems
+
+<span class="nb">echo</span> <span class="m">0</span> &gt; /sys/fs/cgroup/cpuset/cpuset.sched_load_balance
+</pre></div>
+</div>
+<p>システムにCPU容量の非対称性があるため、 <em>通常のRCU読み込み側クリティカルセクションは、条件付きでスリープロックを取得することが許容されます（例として</em> sched_asym_cpucapacity静的キーフラグが有効になります。ただし、CPU 0-1のsched_domain階層は単一の容量値をカバーしており、SD_ASYM_CPUCAPACITYフラグはその階層に設定されていません。これはSMP島を表しており、それとして扱う必要があります。</p>
+<p>したがって、非対称CPU容量を対象としたコードパスを保護するための「標準的な」パターンは以下の通りです：</p>
+<ul class="simple">
+<li><p>sched_asym_cpucapacity静的キーフラグを確認する</p></li>
+<li><p>有効な場合、sched_domain階層にSD_ASYM_CPUCAPACITYフラグが存在するかを確認する必要があります（必要に応じて、コードパスが特定のCPUまたはグループを対象としている場合）</p></li>
+</ul>
+</section>
+<section id="capacity-aware-scheduling-implementation">
+<h2>5. 容量を意識したスケジューリングの実装<a class="headerlink" href="#capacity-aware-scheduling-implementation" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="cfs">
+<h3>5.1 CFS<a class="headerlink" href="#cfs" title="この見出しへのパーマリンク">¶</a></h3>
+<section id="capacity-fitness">
+<h4>5.1.1 容量フィットネス<a class="headerlink" href="#capacity-fitness" title="この見出しへのパーマリンク">¶</a></h4>
+<p>CFSの主な容量スケジューリング基準は以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>task_util(p) &lt; capacity(task_cpu(p))
+</pre></div>
+</div>
+<p>これは一般的に「容量フィットネス基準」と呼ばれます。つまり、CFSはタスクが自身のCPUに「フィット」することを保証しなければなりません。これが破られると、タスクはCPUが提供できる以上の作業を実行する必要があります。その結果、CPUバインドになります。</p>
+<p>さらに、uclampはユーザー空間がタスクに対して最小および最大の利用率値を指定できるようにします。これはsched_setattr()経由で、またはcgroupインターフェース経由で指定できます（参照
+<a class="reference internal" href="../admin-guide/cgroup-v2.html"><span class="doc">Control Group v2</span></a>）。この名前の通り、この機能は前の基準におけるtask_util()を制限するために使用できます。</p>
+</section>
+<section id="wakeup-cpu-selection">
+<h4>5.1.2 ワークアップCPU選択<a class="headerlink" href="#wakeup-cpu-selection" title="この見出しへのパーマリンク">¶</a></h4>
+<p>CFSタスクのワークアップCPU選択は、上記の容量フィットネス基準に従います。さらに、uclampはタスクの利用率値を制限するために使用され、ユーザー空間がCFSタスクのCPU選択により多くの影響力を与えることができます。つまり、CFSのワークアップCPU選択は以下の条件を満たすCPUを探します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>clamp(task_util(p), task_uclamp_min(p), task_uclamp_max(p)) &lt; capacity(cpu)
+</pre></div>
+</div>
+<p>uclampを使用することで、ユーザー空間は例えば、低uclamp.max値を指定して忙しいループ（100%利用率）をどのCPUでも実行可能にしたり、高uclamp.min値を指定して小さな周期タスク（例：10%利用率）を最高性能のCPUで実行させることができます。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>CFSのワークアップCPU選択は、エネルギー意識スケジューリング（EAS）によって上書きされることがあります。これは以下の通り説明されています： <a class="reference internal" href="sched-energy.html"><span class="doc">エネルギー感知スケジューリング</span></a>.</p>
+</div>
+</section>
+<section id="load-balancing">
+<h4>5.1.3 ロードバランシング<a class="headerlink" href="#load-balancing" title="この見出しへのパーマリンク">¶</a></h4>
+<p>ウェイクアップCPU選択において、タスクがほとんど眠らない場合（場合によってはまったく眠らない場合）に発生する病理的なケースがあります。その結果、タスクがほとんど起動しない（場合によってはまったく起動しない）ため、以下のように考えます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>w == wakeup event
+
+capacity(CPU0) = C
+capacity(CPU1) = C / 3
+
+                         workload on CPU0
+CPU work ^
+         |     _________           _________           ____
+         |    |         |         |         |         |
+         +----+----+----+----+----+----+----+----+----+----+-&gt; time
+              w                   w                   w
+
+                         workload on CPU1
+CPU work ^
+         |     ____________________________________________
+         |    |
+         +----+----+----+----+----+----+----+----+----+----+-&gt;
+              w
+</pre></div>
+</div>
+<p>このワークロードはCPU0で実行すべきですが、タスクが以下のいずれかの場合、</p>
+<ul class="simple">
+<li><p>開始時点で不適切にスケジュールが設定された（初期利用効率の推定が不正確だった）</p></li>
+<li><p>開始時点で適切にスケジュールが設定されたが、急に処理能力が必要になった</p></li>
+</ul>
+<p>場合、タスクはCPUに依存する状態（CPUバウンド）になる可能性があります。つまり、 <code class="docutils literal notranslate"><span class="pre">task_util(p)</span> <span class="pre">&gt;</span> <span class="pre">capacity(task_cpu(p))</span></code>CPU容量スケジューリング基準が破られているため、ウェイクアップイベントがなくなると、ウェイクアップCPU選択によってこの問題を修正できなくなる可能性があります。</p>
+<p>このような状況にあるタスクは「misfit（不適合）タスク」と呼ばれ、これを処理するメカニズムも同名です。misfitタスクの移動はCFSロードバランサーを活用しており、特にアクティブなロードバランス部分（現在実行中のタスクの移動を担当）を用います。ロードバランスが発生した際、misfitタスクが現在のCPUよりも容量の大きいCPUに移動可能であれば、misfitアクティブロードバランスがトリガーされます。</p>
+</section>
+</section>
+<section id="rt">
+<h3>5.2 RT<a class="headerlink" href="#rt" title="この見出しへのパーマリンク">¶</a></h3>
+<section id="id4">
+<h4>5.2.1 ウェイクアップCPU選択<a class="headerlink" href="#id4" title="この見出しへのパーマリンク">¶</a></h4>
+<p>RTタスクのウェイクアップCPU選択では、以下の条件を満たすCPUを探します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>task_uclamp_min(p) &lt;= capacity(task_cpu(cpu))
+</pre></div>
+</div>
+<p>通常の優先度制約を依然として遵守しながら。候補となるCPUがこの容量基準を満たさない場合、厳格な優先度に基づくスケジューリングが実行され、CPU容量は無視されます。</p>
+</section>
+</section>
+<section id="dl">
+<h3>5.3 DL<a class="headerlink" href="#dl" title="この見出しへのパーマリンク">¶</a></h3>
+<section id="id5">
+<h4>5.3.1 ウェイクアップCPU選択<a class="headerlink" href="#id5" title="この見出しへのパーマリンク">¶</a></h4>
+<p>DLタスクのウェイクアップCPU選択では、以下の条件を満たすCPUを探します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>task_bandwidth(p) &lt; capacity(task_cpu(p))
+</pre></div>
+</div>
+<p>通常の帯域幅および期限制約を依然として尊重しながら。候補となるCPUがこの容量基準を満たさない場合、タスクは現在のCPUに留まります。</p>
+</section>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxスケジューラ</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="completion.html">完了 - 「完了を待つ」バリアAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-arch.html">アーキテクチャ固有コードにおけるCPUスケジューラ実装ヒント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-bwc.html">CFS帯域制御</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-deadline.html">期限ベースタスクスケジューリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-design-CFS.html">CFSスケジューラ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-domains.html">スケジューラドメイン</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">容量感知スケジューリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-energy.html">エネルギー感知スケジューリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-nice-design.html">スケジューラ・ニース設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-rt-group.html">リアルタイムグループスケジューリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sched-stats.html">スケジューラ統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="text_files.html">スケジューラ pelt C プログラム</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxスケジューラ</a><ul>
+<li>前へ: <a href="sched-domains.html" title="前章">スケジューラドメイン</a></li>
+<li>次へ: <a href="sched-energy.html" title="次章">エネルギー感知スケジューリング</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/scheduler/sched-capacity.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

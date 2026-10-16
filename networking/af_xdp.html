@@ -1,0 +1,564 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>AF_XDP — Linux カーネルドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="bareudp.html" rel="next" title="Bare UDPトンネリングモジュールドキュメンテーション"/>
+<link href="netdev-FAQ.html" rel="prev" title="netdev FAQ"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="af-xdp">
+<h1>AF_XDP<a class="headerlink" href="#af-xdp" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="overview">
+<h2>概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>AF_XDP は高性能パケット処理に最適化されたアドレスファミリです。</p>
+<p>このドキュメントは、読者にBPFとXDPについての知識があることを前提としています。そうでない場合は、Ciliumプロジェクトの優れたリファレンスガイドをご参照ください。
+<a class="reference external" href="http://cilium.readthedocs.io/en/latest/bpf/">http://cilium.readthedocs.io/en/latest/bpf/</a>.</p>
+<p>XDPプログラムからXDP_REDIRECTアクションを使用して、イングレスフレームを他のXDP有効なネットデバイスにリダイレクトできます。bpf_redirect_map()関数を使用します。AF_XDPソケットは、XDPプログラムがユーザー空間アプリケーション内のメモリバッファにフレームをリダイレクトする可能性を可能にします。</p>
+<p>AF_XDPソケット（XSK）は通常のsocket()システムコールで作成されます。各XSKに関連付けられているのは2つのリング、RXリングとTXリングです。ソケットはRXリングでパケットを受信し、TXリングでパケットを送信できます。これらのリングはsetsockoptsでXDP_RX_RINGとXDP_TX_RINGで登録され、サイズが設定されます。各ソケットには少なくとも1つのこれらのリングが必要です。RXまたはTXディスクリプタリングはUMEM（User Memory）というメモリ領域内のデータバッファを指します。RXとTXは同じUMEMを共有することで、パケットがRXとTX間でコピーされる必要がなくなります。さらに、再送が必要なパケットがある場合、そのパケットを指すディスクリプタを別のパケットに変更してすぐに再利用できるため、データのコピーを回避できます。</p>
+<p>UMEMは等しいサイズのチャンクから構成されています。リング内のディスクリプタはフレームのaddrを参照します。addrはUMEM全体内のオフセットです。ユーザー空間はmalloc、mmap、huge pagesなど、適切な方法でUMEMのメモリを確保します。このメモリ領域はnew setsockopt XDP_UMEM_REGでカーネルに登録されます。UMEMにはFILLリングとCOMPLETIONリングという2つのリングがあります。FILLリングはアプリケーションがカーネルにRXパケットデータを埋め込むためのaddrを送信するためのもので、各パケットが受信されるとRXリングにフレームの参照が現れます。一方、COMPLETIONリングには、カーネルが完全に送信したフレームのaddrが含まれており、ユーザー空間がTXまたはRXで再利用できます。したがって、COMPLETIONリングに現れるaddrは以前にTXリングで送信されたaddrです。要約すると、RXとFILLリングはRXパスで使用され、TXとCOMPLETIONリングはTXパスで使用されます。</p>
+<p>ソケットは最終的に、デバイスとそのデバイス上の特定のキューIDにbind()呼び出しによってバインドされ、トラフィックが開始されるのはbind()が完了した後です。</p>
+<p>UMEMは必要に応じてプロセス間で共有できます。プロセスがこれを実行したい場合、UMEMの登録と対応する2つのリングの設定をスキップし、bind呼び出しでXDP_SHARED_UMEMフラグを設定して、共有したいプロセスのXSKと自身の新規に作成したXSKソケットをサブミットします。新しいプロセスは、自身のRXリングにこの共有UMEMを指すフレームアドレス参照を受信します。注意点として、リング構造はパフォーマンスのためシングルコンシューマー/シングルプロデューサーであり、他のプロセスと共有することはできませんので、新しいプロセスは独自のソケットと関連するRXおよびTXリングを持つ必要があります。これはUMEMごとにFILLおよびCOMPLETIONリングが1セットしかない理由でもあります。UMEMの管理は単一のプロセスの責任です。</p>
+<p>では、XDPプログラムがパケットをどのXSKに配信するのでしょうか？XSKMAPというBPFマップが存在します（完全な名前はBPF_MAP_TYPE_XSKMAP）。ユーザー空間アプリケーションはこのマップの任意の場所にXSKを配置できます。XDPプログラムはこのマップの特定のインデックスにパケットをリダイレクトし、この時点でXDPがそのマップ内のXSKが実際にそのデバイスとリング番号にバインドされているかを検証します。検証に失敗した場合、パケットは破棄されます。また、そのインデックスが空の場合も同様に破棄されます。これは、現在、XDPプログラムがロードされており（かつXSKMAPに少なくとも1つのXSKが存在する）場合にのみ、ユーザー空間へトラフィックを取得できるという点も意味します。</p>
+<p>AF_XDPはXDP_SKBとXDP_DRVの2つのモードで動作します。ドライバがXDPをサポートしていない場合、またはXDP_SKBが明示的に選択された場合、XDP_SKBモードが使用され、SKBと一般的なXDPサポートを組み合わせてデータをユーザー空間へコピーします。これはどのネットワークデバイスでも動作するバックアップモードです。一方で、ドライバがXDPをサポートしている場合、AF_XDPコードがそれを使用してパフォーマンスを向上させますが、データのコピーは依然としてユーザー空間へ行われます。</p>
+</section>
+<section id="concepts">
+<h2>概念<a class="headerlink" href="#concepts" title="この見出しへのパーマリンク">¶</a></h2>
+<p>AF_XDPソケットを使用するには、いくつかの関連オブジェクトを設定する必要があります。以下では、これらのオブジェクトとそのオプションについて説明します。</p>
+<p>AF_XDPの動作を把握するには、2018年のLinux Plumbersに関する論文も参照してください：
+<a class="reference external" href="http://vger.kernel.org/lpc_net2018_talks/lpc18_paper_af_xdp_perf-v2.pdf">http://vger.kernel.org/lpc_net2018_talks/lpc18_paper_af_xdp_perf-v2.pdf</a>2017年の『AF_PACKET v4』に関する論文には相談しないでください。AF_XDPの最初の試みです。それ以来、ほぼすべてが変化しています。Jonathan CorbetはLWNで『AF_XDPによるネットワーク加速』という優れた記事を書いているので、参照してください。その記事は以下にあります。 <a class="reference external" href="https://lwn.net/Articles/750845/">https://lwn.net/Articles/750845/</a>.</p>
+<section id="umem">
+<h3>UMEM<a class="headerlink" href="#umem" title="この見出しへのパーマリンク">¶</a></h3>
+<p>UMEMは、仮想的な連続メモリ領域で、等しいサイズのフレームに分割されています。UMEMはnetdevとそのnetdevの特定のキューIDに関連付けられます。XDP_UMEM_REG setsockoptシステムコールを使用して作成・設定（チャンクサイズ、ヘッドルーム、開始アドレスおよびサイズ）されます。UMEMはbind()システムコールを通じてnetdevとキューIDにバインドされます。</p>
+<p>AF_XDPソケットは単一のUMEMにリンクされていますが、1つのUMEMは複数のAF_XDPソケットを持つことができます。ソケットAで作成されたUMEMを共有するには、ソケットBがstruct sockaddr_xdpのsxdp_flagsメンバにXDP_SHARED_UMEMフラグを設定し、sxdp_shared_umem_fdメンバにAのファイルディスクリプタを渡します。</p>
+<p>UMEMには、カーネルとユーザースペースアプリケーション間でUMEMフレームの所有権を転送するためのシングルプロデューサ/シングルコンシューラリングが2つあります。</p>
+</section>
+<section id="rings">
+<h3>リング<a class="headerlink" href="#rings" title="この見出しへのパーマリンク">¶</a></h3>
+<p>4種類のリングがあります：FILL、COMPLETION、RX、TX。すべてのリングはシングルプロデューサ/シングルコンシューラリングであり、ユーザースペースアプリケーションは複数のプロセス/スレッドがこれらに読み書きする際の明示的な同期が必要です。</p>
+<p>UMEMはFILLリングとCOMPLETIONリングの2つのリングを使用します。UMEMに関連付けられた各ソケットにはRXキュー、TXキュー、または両方のキューが必要です。たとえば、4つのソケット（すべてTXとRXを行います）がある場合、1つのFILLリング、1つのCOMPLETIONリング、4つのTXリング、4つのRXリングがあります。</p>
+<p>リングはプロデューサ（ヘッド）/コンシューラ（テール）ベースのリングです。プロデューサはstruct xdp_ringのproducerメンバが指すインデックスにデータリングを書き込み、プロデューサインデックスを増加させます。コンシューラはstruct xdp_ringのconsumerメンバが指すインデックスからデータリングを読み込み、コンシューラインデックスを増加させます。</p>
+<p>リングは_RING setsockoptシステムコールを通じて設定および作成され、適切なオフセットを用いてmmap()でユーザースペースにマッピングされます（XDP_PGOFF_RX_RING、XDP_PGOFF_TX_RING、XDP_UMEM_PGOFF_FILL_RINGおよびXDP_UMEM_PGOFF_COMPLETION_RING）。</p>
+<p>リングのサイズは2の累乗でなければなりません。</p>
+<section id="umem-fill-ring">
+<h4>UMEM フィルリング<a class="headerlink" href="#umem-fill-ring" title="この見出しへのパーマリンク">¶</a></h4>
+<p>FILLリングは、ユーザースペースからカーネルスペースへUMEMフレームの所有権を転送するために使用されます。UMEMアドレスはリングを通じて渡されます。たとえば、UMEMが64KBで各チャンクが4KBの場合、UMEMには16のチャンクがあり、0から64KBのアドレス範囲を渡すことができます。</p>
+<p>カーネルに渡されるフレームはイングレスパス（RXリング）に使用されます。</p>
+<p>ユーザー アプリケーションはこのリングにUMEMアドレスを生成します。注意点として、アライメントされたチャンクモードでアプリケーションを実行している場合、カーネルは入力アドレスをマスクします。例えば、チャンクサイズが2KBの場合、log2(2048)ビットのLSBがマスクされ、2048、2050、3000は同じチャンクを指します。ユーザー アプリケーションがアライメントされていないチャンクモードで実行されている場合、入力アドレスは変更されません。</p>
+</section>
+<section id="umem-completion-ring">
+<h4>UMEM 完了リング<a class="headerlink" href="#umem-completion-ring" title="この見出しへのパーマリンク">¶</a></h4>
+<p>COMPLETION リングは、カーネル空間からユーザー空間へUMEMフレームの所有権を移管するために使用されます。FILLリングと同様に、UMEMインデックスが使用されます。</p>
+<p>カーネルからユーザー空間へ渡されるフレームは、送信されたフレーム（TXリング）であり、ユーザー空間で再利用できます。</p>
+<p>ユーザー アプリケーションはこのリングからUMEMアドレスを消費します。</p>
+</section>
+<section id="rx-ring">
+<h4>RX リング<a class="headerlink" href="#rx-ring" title="この見出しへのパーマリンク">¶</a></h4>
+<p>RX リングはソケットの受信側です。リングの各エントリはstruct xdp_descのディスクリプタです。ディスクリプタにはUMEMオフセット（アドレス）とデータ長（len）が含まれます。</p>
+<p>FILLリングを介してカーネルにフレームが渡されていない場合、RXリングにはディスクリプタが（またはできる）現れません。</p>
+<p>ユーザー アプリケーションはこのリングからstruct xdp_descディスクリプタを消費します。</p>
+</section>
+<section id="tx-ring">
+<h4>TX リング<a class="headerlink" href="#tx-ring" title="この見出しへのパーマリンク">¶</a></h4>
+<p>TX リングはフレームを送信するために使用されます。struct xdp_descディスクリプタにインデックス、長さ、オフセットを設定し、リングに渡します。</p>
+<p>転送を開始するにはsendmsg()システムコールが必要です。今後はこの制限が緩和される可能性があります。</p>
+<p>ユーザー アプリケーションはこのリングにstruct xdp_descディスクリプタを生成します。</p>
+</section>
+</section>
+</section>
+<section id="libbpf">
+<h2>Libbpf<a class="headerlink" href="#libbpf" title="この見出しへのパーマリンク">¶</a></h2>
+<p>LibbpfはeBPFおよびXDPの補助ライブラリで、これらの技術をより簡単に利用できるようにします。また、tools/lib/bpf/xsk.hにはAF_XDPの利用を支援する特定のヘルパーファンクションが含まれています。このライブラリには2つの種類の関数があります：AF_XDPソケットの設定を簡単にする関数と、データプレーンでリングを安全かつ高速にアクセスするための関数です。このAPIの使用例を確認するには、samples/bpf/xdpsock_usr.cにあるサンプルアプリケーションをご覧ください。このアプリケーションは設定とデータプレーンの操作の両方にlibbpfを使用しています。</p>
+<p>Power userでない限り、このライブラリを使用することをお勧めします。これにより、プログラムが大幅に簡略化されます。</p>
+</section>
+<section id="xskmap-bpf-map-type-xskmap">
+<h2>XSKMAP / BPF_MAP_TYPE_XSKMAP<a class="headerlink" href="#xskmap-bpf-map-type-xskmap" title="この見出しへのパーマリンク">¶</a></h2>
+<p>XDP側では、BPF_MAP_TYPE_XSKMAP（XSKMAP）というBPFマップタイプが使用され、bpf_redirect_map()と併せてイングレスフレームをソケットに渡します。</p>
+<p>ユーザー アプリケーションはbpf()システムコールを介してソケットをこのマップに挿入します。</p>
+<p>XDPプログラムが、キュー構成とnetdevに一致しないソケットにリダイレクトしようとすると、フレームは破棄されます。例えば、AF_XDPソケットがnetdev eth0とキュー17にバインドされている場合、eth0とキュー17で実行されるXDPプログラムのみがデータをソケットに成功的に転送します。詳しくは、サンプルアプリケーション（samples/bpf/）を参照してください。</p>
+</section>
+<section id="configuration-flags-and-socket-options">
+<h2>設定フラグとソケットオプション<a class="headerlink" href="#configuration-flags-and-socket-options" title="この見出しへのパーマリンク">¶</a></h2>
+<p>これらはAF_XDPソケットの動作を制御およびモニタリングするために使用できるさまざまな設定フラグです。</p>
+<section id="xdp-copy-and-xdp-zero-copy-bind-flags">
+<h3>XDP_COPYおよびXDP_ZERO_COPYバインドフラグ<a class="headerlink" href="#xdp-copy-and-xdp-zero-copy-bind-flags" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ソケットにバインドする際、カーネルはまずゼロコピーを試みます。ゼロコピーがサポートされない場合、コピーモード（すべてのパケットをユーザー空間にコピー）にフォールバックします。ただし、特定のモードを強制的に使用したい場合、以下のフラグを使用できます。XDP_COPYフラグをバインド呼び出しに渡すと、カーネルがコピーモードに強制されます。コピーモードが使用できない場合、バインド呼び出しはエラーで失敗します。逆に、XDP_ZERO_COPYフラグはゼロコピーモードに強制するか、失敗します。</p>
+</section>
+<section id="xdp-shared-umem-bind-flag">
+<h3>XDP_SHARED_UMEMバインドフラグ<a class="headerlink" href="#xdp-shared-umem-bind-flag" title="この見出しへのパーマリンク">¶</a></h3>
+<p>このフラグは、複数のソケットが同じUMEMにバインドされるようにします。同じキューID、キューID間、netdev/デバイス間で動作します。このモードでは、各ソケットは通常通りRXとTXリングを持ちますが、1つまたは複数のFILLおよびCOMPLETIONリングペアを用意する必要があります。バインドする各netdevとキューIDの組み合わせに対して、これらのペアを1つずつ作成する必要があります。</p>
+<p>同じnetdevとキューIDにバインドされたソケット間でUMEMを共有するケースを想定します。UMEM（最初に作成されたソケットに紐づく）には、唯一のFILLリングとCOMPLETIONリングがあります。これは、バインドしているnetdevとキューIDの組み合わせが唯一だからです。このモードを使用するには、まず1つ目のソケットを作成し、通常通りバインドします。2つ目のソケットを作成し、RXとTXリング（少なくとも1つは必要）を作成しますが、FILLやCOMPLETIONリングは作成しません（1つ目のソケットのそれらが使用されます）。バインド呼び出しでXDP_SHARED_UMEMオプションを設定し、sxdp_shared_umem_fdフィールドに初期ソケットのfdを指定します。この方法で任意の数の追加ソケットを接続できます。</p>
+<p>パケットがどのソケットに到達するか？これはXDPプログラムによって決定されます。すべてのソケットをXSK_MAPに配置し、配列内のどのインデックスにパケットを送信するかを指定します。下記はパケットをラウンドロビンで配分する簡単な例です：</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;linux/bpf.h&gt;</span><span class="cp"></span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">"bpf_helpers.h"</span><span class="cp"></span>
+
+<span class="cp">#define MAX_SOCKS 16</span>
+
+<span class="k">struct</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">     </span><span class="n">__uint</span><span class="p">(</span><span class="n">type</span><span class="p">,</span><span class="w"> </span><span class="n">BPF_MAP_TYPE_XSKMAP</span><span class="p">);</span><span class="w"></span>
+<span class="w">     </span><span class="n">__uint</span><span class="p">(</span><span class="n">max_entries</span><span class="p">,</span><span class="w"> </span><span class="n">MAX_SOCKS</span><span class="p">);</span><span class="w"></span>
+<span class="w">     </span><span class="n">__uint</span><span class="p">(</span><span class="n">key_size</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="kt">int</span><span class="p">));</span><span class="w"></span>
+<span class="w">     </span><span class="n">__uint</span><span class="p">(</span><span class="n">value_size</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="kt">int</span><span class="p">));</span><span class="w"></span>
+<span class="p">}</span><span class="w"> </span><span class="n">xsks_map</span><span class="w"> </span><span class="n">SEC</span><span class="p">(</span><span class="s">".maps"</span><span class="p">);</span><span class="w"></span>
+
+<span class="k">static</span><span class="w"> </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">rr</span><span class="p">;</span><span class="w"></span>
+
+<span class="n">SEC</span><span class="p">(</span><span class="s">"xdp_sock"</span><span class="p">)</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">xdp_sock_prog</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">xdp_md</span><span class="w"> </span><span class="o">*</span><span class="n">ctx</span><span class="p">)</span><span class="w"></span>
+<span class="p">{</span><span class="w"></span>
+<span class="w">     </span><span class="n">rr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">rr</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="p">(</span><span class="n">MAX_SOCKS</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span><span class="w"></span>
+
+<span class="w">     </span><span class="k">return</span><span class="w"> </span><span class="n">bpf_redirect_map</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xsks_map</span><span class="p">,</span><span class="w"> </span><span class="n">rr</span><span class="p">,</span><span class="w"> </span><span class="n">XDP_DROP</span><span class="p">);</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</pre></div>
+</div>
+<p>注意してください。FILLリングとCOMPLETIONリングは1セットのみ存在し、これらは単一のプロデューサーと単一のコンシューマーのリングです。そのため、複数のプロセスまたはスレッドがこれらのリングを同時に使用しないようにする必要があります。現時点ではlibbpfコードには、複数のユーザーを保護するための同期プリミティブが含まれていません。</p>
+<p>libbpfは、同じUMEMにバインドされた複数のソケットを生成する場合にこのモードを使用します。ただし、xsk_socket__create呼び出しでXSK_LIBBPF_FLAGS__INHIBIT_PROG_LOADというlibbpfフラグを指定し、自らXDPプログラムをロードする必要があります。libbpfには自動的にトラフィックをルーティングするための組み込みのXDPプログラムは含まれていません。</p>
+<p>2番目のケースは、異なるキューIDおよび/またはネットデバイスにバインドされたソケット間でUMEMを共有する場合です。この場合、各一意のnetdev,queue_idペアに対して1つのFILLリングと1つのCOMPLETIONリングを作成する必要があります。たとえば、同じnetdev上の2つの異なるキューIDにバインドする2つのソケットを作成する場合、まず1つ目のソケットを作成し通常の方法でバインドします。2つ目のソケットを作成し、RXおよびTXリング、または少なくともそのうちの1つを生成し、その後でこのソケット用のFILLリングとCOMPLETIONリングを作成します。バインド呼び出しでXDP_SHARED_UMEMオプションを設定し、sxdp_shared_umem_fdフィールドに初期ソケットのfdを提供します（そのソケットでUMEMを登録した場合）。これにより、2つのソケットは同じUMEMを共有します。</p>
+<p>前のケースのように、同じキューIDとデバイスにバインドされたソケットに対してXDPプログラムを提供する必要はありません。代わりに、NICのパケットステアリング機能を使用してパケットを正しいキューにリダイレクトします。前の例では、ソケット間で共有される1つのキューしか存在しないため、NICはこのステアリングを実行できません。NICはキュー間でのみステアリングを実行可能です。</p>
+<p>libbpfでは、xsk_socket__create_shared() APIを使用する必要があります。これは、共有UMEMにバインドされるため、あなたが作成するFILLリングとCOMPLETIONリングへの参照を取得します。すべてのソケットに対してこの関数を使用するか、2番目以降のソケットに対してこの関数を使用し、最初のソケットにはxsk_socket__create()を使用する方法のどちらも同じ結果をもたらします。</p>
+<p>同一のキューIDとデバイス間、または同一のデバイス内のキュー間、さらには同一のデバイス間でUMEMがソケット間で共有されることがあります。</p>
+</section>
+<section id="xdp-use-need-wakeup-bind-flag">
+<h3>XDP_USE_NEED_WAKEUP バインドフラグ<a class="headerlink" href="#xdp-use-need-wakeup-bind-flag" title="この見出しへのパーマリンク">¶</a></h3>
+<p>このオプションは、FILLリングとTXリング（ユーザー空間がプロデューサーとなるリング）に存在する新しいフラグneed_wakeupのサポートを追加します。このオプションをbindコールで設定すると、カーネルがシステムコールによって明示的に起動される必要がある場合にneed_wakeupフラグが設定されます。フラグがゼロの場合、システムコールは必要ありません。</p>
+<p>FILLリングにフラグが設定されている場合、アプリケーションはpoll()を呼び出して、RXリングでのパケット受信を継続する必要があります。これはたとえば、カーネルがFILLリングにバッファがなくなったことや、NICのRX HWリングにもバッファが残っていないと検出した場合に発生します。この場合、割り込みが無効化され、NICがパケットを受信できなくなり（バッファが存在しないため）、need_wakeupフラグが設定されるため、ユーザー空間がFILLリングにバッファを配置し、その後poll()を呼び出してカーネルドライバーがHWリングにバッファを配置し、パケット受信を開始できるようになります。</p>
+<p>TXリングにフラグが設定されている場合、アプリケーションはTXリングに配置されたパケットを送信するためにカーネルに明示的に通知する必要があります。これはRXパスと同じようにpoll()コールで実現できますが、sendto()コールでも可能です。</p>
+<p>このフラグの使用例はsamples/bpf/xdpsock_user.cにあります。libbpfヘルパを用いた例はTXパスの場合、以下のように表示されます:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">xsk_ring_prod__needs_wakeup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">my_tx_ring</span><span class="p">))</span><span class="w"></span>
+<span class="w">   </span><span class="n">sendto</span><span class="p">(</span><span class="n">xsk_socket__fd</span><span class="p">(</span><span class="n">xsk_handle</span><span class="p">),</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">MSG_DONTWAIT</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span><span class="w"></span>
+</pre></div>
+</div>
+<p>つまり、フラグが設定されている場合に限りシステムコールを使用してください。</p>
+<p>このモードを常に有効にすることをお勧めします。これはアプリケーションとドライバーが同じコアで実行される場合でも、パフォーマンス向上に寄与します。また、アプリケーションとカーネルドライバーが異なるコアで動作する場合でも、TXパスのシステムコール回数を減らすため、効果的です。</p>
+</section>
+<section id="xdp-rx-tx-umem-fill-umem-completion-ring-setsockopts">
+<h3>XDP_{RX|TX|UMEM_FILL|UMEM_COMPLETION}_RING setsockopts<a class="headerlink" href="#xdp-rx-tx-umem-fill-umem-completion-ring-setsockopts" title="この見出しへのパーマリンク">¶</a></h3>
+<p>これらのsetsockoptsは、RX、TX、FILL、およびCOMPLETIONリングそれぞれが持つべきディスクリプタの数を設定します。少なくともRXまたはTXリングのサイズを設定する必要があります。両方を設定するとアプリケーションからトラフィックを受信および送信できるようになりますが、一方のみを実行したい場合は、リソースを節約するために一方のみを設定する方が効率的です。FILLリングとCOMPLETIONリングは必須であり、ソケットにUMEMを関連付ける必要があります。ただし、XDP_SHARED_UMEMフラグが使用されている場合、最初のソケット以外のものはUMEMを持たず、その場合はFILLまたはCOMPLETIONリングは作成しないでください（共有UMEMのものを利用します）。注意として、リングは単一プロデューサー単一コンシューマーであり、複数のプロセスから同時にアクセスしないでください。XDP_SHARED_UMEMセクションを参照してください。</p>
+<p>libbpfでは、rxとtx引数にNULLを指定することで、Rx専用およびTx専用のソケットを作成できます。</p>
+<p>Tx専用ソケットを作成する場合、fillリングにパケットを配置しないことを推奨します。これを行うと、ドライバが受信するつもりだと誤って認識し、実際には受信しない可能性があり、パフォーマンスに悪影響を及ぼすことがあります。</p>
+</section>
+<section id="xdp-umem-reg-setsockopt">
+<h3>XDP_UMEM_REG setsockopt<a class="headerlink" href="#xdp-umem-reg-setsockopt" title="この見出しへのパーマリンク">¶</a></h3>
+<p>このsetsockoptはUMEMをソケットに登録します。これはパケットが待機するすべてのバッファを含む領域です。この関数は、この領域の開始ポインタとサイズを指定します。また、chunk_sizeというパラメータがあり、UMEMが分割されるサイズを示します。現在は2Kまたは4Kのみが許容されます。UMEM領域が128Kでchunk_sizeが2Kの場合、最大で128K / 2K = 64パケットを保持でき、最大パケットサイズは2Kとなります。</p>
+<p>UMEM内の各バッファのheadroomを設定するオプションもあります。この値をNバイトに設定すると、パケットはバッファのNバイト目から開始し、最初のNバイトはアプリケーションが使用できます。最後のオプションはflagsフィールドですが、各UMEMフラグについて別セクションで説明します。</p>
+</section>
+<section id="xdp-statistics-getsockopt">
+<h3>XDP_STATISTICS getsockopt<a class="headerlink" href="#xdp-statistics-getsockopt" title="この見出しへのパーマリンク">¶</a></h3>
+<p>デバッグ目的に有用なソケットのドロップ統計を取得します。サポートされている統計は以下の通りです：</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">struct</span><span class="w"> </span><span class="nc">xdp_statistics</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">       </span><span class="n">__u64</span><span class="w"> </span><span class="n">rx_dropped</span><span class="p">;</span><span class="w"> </span><span class="cm">/* Dropped for reasons other than invalid desc */</span><span class="w"></span>
+<span class="w">       </span><span class="n">__u64</span><span class="w"> </span><span class="n">rx_invalid_descs</span><span class="p">;</span><span class="w"> </span><span class="cm">/* Dropped due to invalid descriptor */</span><span class="w"></span>
+<span class="w">       </span><span class="n">__u64</span><span class="w"> </span><span class="n">tx_invalid_descs</span><span class="p">;</span><span class="w"> </span><span class="cm">/* Dropped due to invalid descriptor */</span><span class="w"></span>
+<span class="p">};</span><span class="w"></span>
+</pre></div>
+</div>
+</section>
+<section id="xdp-options-getsockopt">
+<h3>XDP_OPTIONS getsockopt<a class="headerlink" href="#xdp-options-getsockopt" title="この見出しへのパーマリンク">¶</a></h3>
+<p>XDPソケットのオプションを取得します。現在サポートされているのはXDP_OPTIONS_ZEROCOPYのみで、ゼロコピーが有効かどうかを示します。</p>
+</section>
+</section>
+<section id="usage">
+<h2>使い方<a class="headerlink" href="#usage" title="この見出しへのパーマリンク">¶</a></h2>
+<p>AF_XDPソケットを使用するには、2つの要素が必要です。ユーザー空間アプリケーションとXDPプログラムです。完全な設定および使用例については、サンプルアプリケーションを参照してください。ユーザー空間側はxdpsock_user.cで、XDP側はlibbpfの一部です。</p>
+<p>tools/lib/bpf/xsk.cに含まれるXDPコードのサンプルは以下の通りです：</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="n">SEC</span><span class="p">(</span><span class="s">"xdp_sock"</span><span class="p">)</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">xdp_sock_prog</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">xdp_md</span><span class="w"> </span><span class="o">*</span><span class="n">ctx</span><span class="p">)</span><span class="w"></span>
+<span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">index</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ctx</span><span class="o">-&gt;</span><span class="n">rx_queue_index</span><span class="p">;</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// A set entry here means that the corresponding queue_id</span>
+<span class="w">    </span><span class="c1">// has an active AF_XDP socket bound to it.</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">bpf_map_lookup_elem</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xsks_map</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">index</span><span class="p">))</span><span class="w"></span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">bpf_redirect_map</span><span class="p">(</span><span class="o">&amp;</span><span class="n">xsks_map</span><span class="p">,</span><span class="w"> </span><span class="n">index</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span><span class="w"></span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">XDP_PASS</span><span class="p">;</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</pre></div>
+</div>
+<p>シンプルですがパフォーマンスがやや劣るリングデキューおよびエンキューは以下のように見えます：</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="c1">// struct xdp_rxtx_ring {</span>
+<span class="c1">//  __u32 *producer;</span>
+<span class="c1">//  __u32 *consumer;</span>
+<span class="c1">//  struct xdp_desc *desc;</span>
+<span class="c1">// };</span>
+
+<span class="c1">// struct xdp_umem_ring {</span>
+<span class="c1">//  __u32 *producer;</span>
+<span class="c1">//  __u32 *consumer;</span>
+<span class="c1">//  __u64 *desc;</span>
+<span class="c1">// };</span>
+
+<span class="c1">// typedef struct xdp_rxtx_ring RING;</span>
+<span class="c1">// typedef struct xdp_umem_ring RING;</span>
+
+<span class="c1">// typedef struct xdp_desc RING_TYPE;</span>
+<span class="c1">// typedef __u64 RING_TYPE;</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">dequeue_one</span><span class="p">(</span><span class="n">RING</span><span class="w"> </span><span class="o">*</span><span class="n">ring</span><span class="p">,</span><span class="w"> </span><span class="n">RING_TYPE</span><span class="w"> </span><span class="o">*</span><span class="n">item</span><span class="p">)</span><span class="w"></span>
+<span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="n">__u32</span><span class="w"> </span><span class="n">entries</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">*</span><span class="n">ring</span><span class="o">-&gt;</span><span class="n">producer</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="o">*</span><span class="n">ring</span><span class="o">-&gt;</span><span class="n">consumer</span><span class="p">;</span><span class="w"></span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">entries</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"></span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">-1</span><span class="p">;</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// read-barrier!</span>
+
+<span class="w">    </span><span class="o">*</span><span class="n">item</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ring</span><span class="o">-&gt;</span><span class="n">desc</span><span class="p">[</span><span class="o">*</span><span class="n">ring</span><span class="o">-&gt;</span><span class="n">consumer</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="p">(</span><span class="n">RING_SIZE</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">)];</span><span class="w"></span>
+<span class="w">    </span><span class="p">(</span><span class="o">*</span><span class="n">ring</span><span class="o">-&gt;</span><span class="n">consumer</span><span class="p">)</span><span class="o">++</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">enqueue_one</span><span class="p">(</span><span class="n">RING</span><span class="w"> </span><span class="o">*</span><span class="n">ring</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="n">RING_TYPE</span><span class="w"> </span><span class="o">*</span><span class="n">item</span><span class="p">)</span><span class="w"></span>
+<span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="n">u32</span><span class="w"> </span><span class="n">free_entries</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">RING_SIZE</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="n">ring</span><span class="o">-&gt;</span><span class="n">producer</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="o">*</span><span class="n">ring</span><span class="o">-&gt;</span><span class="n">consumer</span><span class="p">);</span><span class="w"></span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">free_entries</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"></span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">-1</span><span class="p">;</span><span class="w"></span>
+
+<span class="w">    </span><span class="n">ring</span><span class="o">-&gt;</span><span class="n">desc</span><span class="p">[</span><span class="o">*</span><span class="n">ring</span><span class="o">-&gt;</span><span class="n">producer</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="p">(</span><span class="n">RING_SIZE</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">)]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">*</span><span class="n">item</span><span class="p">;</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// write-barrier!</span>
+
+<span class="w">    </span><span class="p">(</span><span class="o">*</span><span class="n">ring</span><span class="o">-&gt;</span><span class="n">producer</span><span class="p">)</span><span class="o">++</span><span class="p">;</span><span class="w"></span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</pre></div>
+</div>
+<p>ただし、libbpfの関数を使用してください。これらは最適化され、即座に使用可能で、あなたの作業を楽にします。</p>
+</section>
+<section id="sample-application">
+<h2>サンプルアプリケーション<a class="headerlink" href="#sample-application" title="この見出しへのパーマリンク">¶</a></h2>
+<p>AF_XDPソケットをプライベートUMEMを使用して使用する方法を示すxdpsockベンチマーク/テストアプリケーションが含まれています。例えば、ポート4242からのUDPトラフィックをキュー16に集約したい場合、AF_XDPを有効にするために以下のようにethtoolを使用します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>ethtool -N p3p2 rx-flow-hash udp4 fn
+ethtool -N p3p2 flow-type udp4 src-port 4242 dst-port 4242 \
+    action 16
+</pre></div>
+</div>
+<p>XDP_DRVモードでrxdropベンチマークを実行するには、以下のようにします：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>samples/bpf/xdpsock -i p3p2 -q 16 -r -N
+</pre></div>
+</div>
+<p>XDP_SKBモードの場合は、'-N'の代わりに'-S'を使用し、'-h'で通常通りすべてのオプションを表示できます。</p>
+<p>このサンプルアプリケーションはlibbpfを使用してAF_XDPの設定と使用を簡略化しています。AF_XDPのraw uapiをより高度な用途に応用する方法を知りたい場合は、tools/lib/bpf/xsk.[ch]にあるlibbpfコードを確認してください。</p>
+</section>
+<section id="faq">
+<h2>よくある質問<a class="headerlink" href="#faq" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Q: ソケットにトラフィックが表示されません。何が間違っているのでしょうか？</p>
+<dl>
+<dt>A: 物理NICのネットデバイスが初期化されるとき、Linuxは通常、</dt><dd><p>コアごとに1つのRXおよびTXキュー・ペアを割り当てます。8コアのシステムでは、キューID 0から7が割り当てられ、それぞれ1つずつです。AF_XDPのバインド呼び出しまたはxsk_socket__create libbpf関数呼び出しで、特定のキューIDにバインドし、そのキューに向けたトラフィックのみがソケットに届きます。上記の例では、キュー0にバインドした場合、キュー1〜7に分散されたトラフィックは取得できません。幸運にもトラフィックが見えるかもしれませんが、通常はバインドしていないキューに届いてしまいます。</p>
+<p>望むトラフィックをバインドしたキューIDに届くようにするための解決策はいくつかあります。すべてのトラフィックを確認したい場合は、ネットデバイスに1つのキューID（キュー0）のみを割り当て、キュー0にバインドします。ethtoolを使用してこれを行うことができます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>sudo ethtool -L &lt;interface&gt; combined 1
+</pre></div>
+</div>
+<p>一部のトラフィックのみを確認したい場合は、ethtoolを通じてNICをプログラミングして、特定のキューIDにトラフィックをフィルタリングします。以下は、ポート4242へのUDPトラフィックをキュー2に送信する例です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>sudo ethtool -N &lt;interface&gt; rx-flow-hash udp4 fn
+sudo ethtool -N &lt;interface&gt; flow-type udp4 src-port 4242 dst-port \
+4242 action 2
+</pre></div>
+</div>
+<p>NICの能力に応じて、さまざまな方法が可能です。</p>
+</dd>
+<dt>Q: XSKMAPを使用して、コピーモードで異なるumems間のスイッチを実装できますか</dt><dd><p>コピーモードでは？</p>
+</dd>
+<dt>A: 短い答えを言えばいいですが、現在はサポートされていません。XSKMAPは、キューID Xで入力するトラフィックを、同じキューID Xにバインドされたソケットにのみ転送できます。XSKMAPには、キューID XとYにバインドされたソケットを含めることができます。たとえば、キューID Yで入力するトラフィックのみを、同じキューID Yにバインドされたソケットに転送できます。ゼロコピーモードでは、NICのスイッチや他の配分メカニズムを使用して、正しいキューIDとソケットにトラフィックを誘導する必要があります。</dt><dd><p>ゼロコピーモードでは、NICのスイッチや他の配分メカニズムを使用して、正しいキューIDとソケットにトラフィックを誘導する必要があります。</p>
+</dd>
+</dl>
+<p>Q: パケットが時折破損しているのですが、問題はどこにあるのでしょうか？</p>
+<dl class="simple">
+<dt>A: UMEM内の同じバッファを同時に複数のリングに送信しないように注意する必要があります。</dt><dd><p>例えば、同じバッファをFILLリングとTXリングの両方に同時に送信すると、NICがバッファにデータを読み込むタイミングで同時に送信してしまう可能性があります。これにより、一部のパケットが破損する原因になります。また、XDP_SHARED_UMEMフラグでバインドされた異なるキューIDやnetdevに属するFILLリングに同じバッファを送信することも同様の問題を引き起こします。</p>
+</dd>
+</dl>
+</section>
+<section id="credits">
+<h2>貢献者<a class="headerlink" href="#credits" title="この見出しへのパーマリンク">¶</a></h2>
+<ul class="simple">
+<li><p>Björn Töpel (AF_XDP core)</p></li>
+<li><p>Magnus Karlsson (AF_XDP core)</p></li>
+<li><p>Alexander Duyck</p></li>
+<li><p>Alexei Starovoitov</p></li>
+<li><p>Daniel Borkmann</p></li>
+<li><p>Jesper Dangaard Brouer</p></li>
+<li><p>John Fastabend</p></li>
+<li><p>Jonathan Corbet (LWN coverage)</p></li>
+<li><p>Michael S. Tsirkin</p></li>
+<li><p>Qi Z Zhang</p></li>
+<li><p>Willem de Bruijn</p></li>
+</ul>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxネットワーキングドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="netdev-FAQ.html">netdev FAQ</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">AF_XDP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bareudp.html">Bare UDPトンネリングモジュールドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="batman-adv.html">batman-adv</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can.html">SocketCAN - コントローラー・エリア・ネットワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can_ucan_protocol.html">UCANプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="device_drivers/index.html">ハードウェアデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dsa/index.html">分散スイッチアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="devlink/index.html">Linux Devlinkドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="caif/index.html">CAIF</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ethtool-netlink.html">ethtool用Netlinkインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ieee802154.html">IEEE 802.15.4開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="j1939.html">J1939ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kapi.html">LinuxネットワーキングとネットワークデバイスAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="msg_zerocopy.html">MSG_ZEROCOPY</a></li>
+<li class="toctree-l2"><a class="reference internal" href="failover.html">フェールオーバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="net_dim.html">Net DIM - ジェネリックネットワークダイナミック割込みモデレーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="net_failover.html">NET_FAILOVER</a></li>
+<li class="toctree-l2"><a class="reference internal" href="page_pool.html">ページプールAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phy.html">PHY抽象レイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sfp-phylink.html">phylink</a></li>
+<li class="toctree-l2"><a class="reference internal" href="alias.html">IPアリアシング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bridge.html">イーサネットブリッジング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="snmp_counter.html">SNMPカウンター</a></li>
+<li class="toctree-l2"><a class="reference internal" href="checksum-offloads.html">チェックサムオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="segmentation-offloads.html">セグメンテーションオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="scaling.html">Linuxネットワーキングスタックにおけるスケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tls.html">カーネルTLS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tls-offload.html">カーネルTLSオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nfc.html">Linux NFCサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6lowpan.html">6lowpanインターフェース用Netdevプライベートデータルーム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6pack.html">6packプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet-hardware.html">ARCnetハードウェア</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet.html">ARCnet</a></li>
+<li class="toctree-l2"><a class="reference internal" href="atm.html">ATM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ax25.html">AX.25</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bonding.html">LinuxイーサネットボンディングドライバHOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cdc_mbim.html">cdc_mbim - CDC MBIMモバイルブロードバンドモデム用ドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dccp.html">DCCPプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dctcp.html">DCTCP（データセンターTCP）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="decnet.html">Linux DECnetネットワーキングレイヤー情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dns_resolver.html">DNSリゾルバー・モジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="driver.html">Softnetドライバーの問題</a></li>
+<li class="toctree-l2"><a class="reference internal" href="eql.html">EQLドライバー: シリアルIPロードバランシングガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="fib_trie.html">LC-trie実装ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="filter.html">Linux Socket Filtering（別名Berkeley Packet Filter（BPF））</a></li>
+<li class="toctree-l2"><a class="reference internal" href="framerelay.html">フレームリレー（FR）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic-hdlc.html">ジェネリックHDLCレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic_netlink.html">ジェネリックネットリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gen_stats.html">ネットリンクユーザー向けジェネリックネットワーキング統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gtp.html">LinuxカーネルGTPトンネリングモジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ila.html">識別子ロケーターアドレスング（ILA）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipddp.html">AppleTalk-IPデカプセル化とAppleTalk-IPエンカプセル化</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip_dynaddr.html">IPダイナミックアドレスハックポートv0.03</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipsec.html">IPsec</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip-sysctl.html">IP Sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipv6.html">IPv6</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvlan.html">IPVLANドライバーガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvs-sysctl.html">IPvs-sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kcm.html">カーネルコネクションマルチプレクサ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="l2tp.html">L2TP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lapb-module.html">Linux LAPBモジュールインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mac80211-injection.html">mac80211を使用したパケットインジェクションの使い方</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mpls-sysctl.html">MPLS Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="multiqueue.html">マルチキューネットワークデバイスサポートガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netconsole.html">Netconsole</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdev-features.html">ネットデバイス機能の混乱とその解決方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdevices.html">ネットワークデバイス、カーネル、そしてあなた！</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netfilter-sysctl.html">Netfilter Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netif-msg.html">NETIFメッセージレベル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_conntrack-sysctl.html">Netfilter Conntrack Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_flowtable.html">Netfilterのフローテーブルインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="openvswitch.html">Open vSwitch datapath開発者ドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="operstates.html">運用状態</a></li>
+<li class="toctree-l2"><a class="reference internal" href="packet_mmap.html">パケットMMAP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phonet.html">Linux Phonetプロトコルファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pktgen.html">Linuxパケットジェネレーターガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="plip.html">PLIP: 平行線インターネットプロトコルデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ppp_generic.html">PPPジェネリックドライバーおよびチャネルインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="proc_net_tcp.html">proc/net/tcpおよびproc/net/tcp6変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="radiotap-headers.html">radiotapヘッダの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html">概要</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-architecture">RDSアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#socket-interface">ソケットインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rdma-for-rds">RDS用RDMA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#congestion-notifications">コンゲスト通知</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-protocol">RDSプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-transport-layer">RDSトランスポートレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-kernel-structures">RDSカーネル構造体</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#connection-management">接続管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#the-send-path">送信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#the-recv-path">受信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#multipath-rds-mprds">マルチパスRDS (mprds)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="regulatory.html">Linuxワイヤレス規制ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html">RxRPC ネットワークプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#socket-options">ソケットオプション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#security">セキュリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#example-client-usage">例: クライアントの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sctp.html">LinuxカーネルSCTP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="secid.html">LSM/SeLinux secid</a></li>
+<li class="toctree-l2"><a class="reference internal" href="seg6-sysctl.html">Seg6 Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="statistics.html">インターフェース統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="strparser.html">ストリームパーサー (strparser)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="switchdev.html">イーサネットスイッチデバイスドライバモデル (switchdev)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysfs-tagging.html">Sysfsタグ付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tc-actions-env-rules.html">TCアクション - 環境ルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tcp-thin.html">スリムストリームとTCP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="team.html">チーム (Team)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="timestamping.html">タイムスタンピング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tproxy.html">透過プロキシサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tuntap.html">ユニバーサルTUN/TAPデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="udplite.html">UDP-Liteプロトコル (RFC 3828)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vrf.html">仮想ルーティングおよびフォワーディング (VRF)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vxlan.html">仮想拡張ローカルエリアネットワーキングドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html">パケットレイヤーからデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html#device-driver-to-packet-layer">デバイスドライバからパケットレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25.html">Linux X.25プロジェクト</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_device.html">XFRMデバイス - IPsec計算のオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_proc.html">XFRMプロセス - /proc/net/xfrm_*ファイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sync.html">XFRM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sysctl.html">XFRMシステムコール</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxネットワーキングドキュメント</a><ul>
+<li>前へ: <a href="netdev-FAQ.html" title="前章">netdev FAQ</a></li>
+<li>次へ: <a href="bareudp.html" title="次章">Bare UDPトンネリングモジュールドキュメンテーション</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/networking/af_xdp.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

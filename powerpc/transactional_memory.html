@@ -1,0 +1,354 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>トランザクショナルメモリのサポート — Linux Kernel ドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="ultravisor.html" rel="next" title="保護実行ファシリティ"/>
+<link href="syscall64-abi.html" rel="prev" title="Power Architecture 64 ビット Linux システムコール ABI"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="transactional-memory-support">
+<h1>トランザクショナルメモリのサポート<a class="headerlink" href="#transactional-memory-support" title="この見出しへのパーマリンク">¶</a></h1>
+<p>POWER カーネルでのこの機能のサポートは、現在ユーザーのプログラムでの使用をサポートするだけです。カーネル自身は現在この機能を使用していません。</p>
+<p>このファイルは、Linux がこの機能をどのようにサポートしているか、およびユーザーのプログラムが期待できる動作についてまとめています。</p>
+<section id="basic-overview">
+<h2>基本概要<a class="headerlink" href="#basic-overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ハードウェアトランザクショナルメモリは POWER8 プロセッサでサポートされており、異なる形式のアトミックなメモリアクセスを可能にする機能です。トランザクションの境界を定義する新しい複数の命令が導入され、トランザクションは、他のトランザクショナルまたは非トランザクショナルアクセスと競合がない場合にのみ一括して完了するか、ロールバックして部分的な変更を元に戻します。</p>
+<p>シンプルなトランザクションは次のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>begin_move_money:
+  tbegin
+  beq   abort_handler
+
+  ld    r4, SAVINGS_ACCT(r3)
+  ld    r5, CURRENT_ACCT(r3)
+  subi  r5, r5, 1
+  addi  r4, r4, 1
+  std   r4, SAVINGS_ACCT(r3)
+  std   r5, CURRENT_ACCT(r3)
+
+  tend
+
+  b     continue
+
+abort_handler:
+  ... test for odd failures ...
+
+  /* Retry the transaction if it failed because it conflicted with
+   * someone else: */
+  b     begin_move_money
+</pre></div>
+</div>
+<p>「tbegin」命令はトランザクションの開始点を示し、「tend」は終了点を示します。これらの点の間ではプロセッサは「トランザクショナル」状態にあり、システム内での他のトランザクショナルまたは非トランザクショナルアクセスと競合がない場合、メモリ参照は一括して完了します。この例では、他のプロセッサが SAVINGS_ACCT(r3) または CURRENT_ACCT(r3) にアクセスしていない場合、通常のストレートコードのようにトランザクションが完了し、現在の口座から貯金口座への金額のアトミックな移動が実行されます。通常の ld/std 命令（lwarx/stwcx ではなく）が使用されているにもかかわらず、 <em>両方を組み合わせます</em> SAVINGS_ACCT(r3) と CURRENT_ACCT(r3) はどちらも更新されるか、どちらも更新されません。</p>
+<p>トランザクションが実行中にアクセスしている場所と競合が発生した場合、CPU がトランザクションを中止します。レジスタおよびメモリ状態は「tbegin」時点に戻され、制御は「tbegin+4」から継続します。アボートハンドラへの分岐が再度実行され、アボートハンドラは失敗の原因を確認し、再試行できます。</p>
+<p>チェックポイントされたレジスタにはすべての GPRs、FPRs、VRs/VSRs、LR、CCR/CR、CTR、FPCSR およびいくつかのその他のステータス/フラグレジスタが含まれます。詳細については ISA を参照してください。</p>
+</section>
+<section id="causes-of-transaction-aborts">
+<h2>トランザクションアボートの原因<a class="headerlink" href="#causes-of-transaction-aborts" title="この見出しへのパーマリンク">¶</a></h2>
+<ul class="simple">
+<li><p>他のプロセッサが使用するキャッシュラインとの競合</p></li>
+<li><p>シグナル</p></li>
+<li><p>コンテキストスイッチ</p></li>
+<li><p>トランザクションを中止するすべての要因については ISA を参照してください。</p></li>
+</ul>
+</section>
+<section id="syscalls">
+<h2>システムコール<a class="headerlink" href="#syscalls" title="この見出しへのパーマリンク">¶</a></h2>
+<p>アクティブなトランザクション内からシステムコールが呼び出されると、システムコールは実行されず、カーネルが TM_CAUSE_SYSCALL | TM_CAUSE_PERSISTENT の失敗コードでトランザクションを破棄します。</p>
+<p>スリープ中のトランザクション内で実行されるシステムコールは通常通り行われ、カーネルによって明示的に失敗（doomed）されることはありません。ただし、カーネルがシステムコールを実行する際に行う処理が、ハードウェアによってトランザクションが失敗（doomed）される可能性があります。システムコールはスリープモードで実行されるため、副作用はトランザクションの成功や失敗に関係なく永続的になります。カーネルはどのシステムコールがトランザクションの成功に影響を与えるかについて保証は提供しません。</p>
+<p>アクティブなトランザクション中にシステムコールが実行され、その結果トランザクションが中止されることが依存している場合、ライブラリ経由で呼び出す際には注意が必要です。ライブラリは値をキャッシュする（成功の見せかけになる可能性がある）か、カーネルに入る前にトランザクションの失敗を引き起こす操作を行うことがあります（異なる失敗コードを生成する可能性がある）。例として、glibcのgetpid()やラズィーなシンボル解決が挙げられます。</p>
+</section>
+<section id="signals">
+<h2>シグナル<a class="headerlink" href="#signals" title="この見出しへのパーマリンク">¶</a></h2>
+<p>トランザクション中にシグナル（同期・非同期を問わず）が届くと、2番目のスレッド状態（ucontext/mcontext）がトランザクションのレジスタ状態を表します。シグナルの配信は「treclaim」によって両方のレジスタ状態をキャプチャするため、シグナルはトランザクションを中止します。通常のucontext_tはシグナルハンドラに渡され、チェックポイントされた/元のレジスタ状態を表します。シグナルは「tbegin+4」で発生したように見えます。</p>
+<p>sighandlerのucontextがuc_linkが設定されている場合、2番目のucontextが配信されています。将来の互換性を考慮し、MSR.TSフィールドを確認してトランザクショナルな状態を判定する必要があります。MSR.TSフィールドが設定されている場合、uc-&gt;uc_link内の2番目のucontextはシグナル発生時のアクティブなトランザクショナルなレジスタを表します。</p>
+<p>64ビットプロセスの場合、uc-&gt;uc_mcontext.regs-&gt;msrは完全な64ビットのMSRであり、TSフィールドがトランザクショナルなモードを示します。</p>
+<p>32ビットプロセスの場合、mcontextのMSRレジスタは32ビットのみで、上位32ビットは2番目のucontextのMSRに格納されます。つまり、uc-&gt;uc_link-&gt;uc_mcontext.regs-&gt;msrに保存され、上位ワードにはトランザクショナルな状態TSが含まれます。</p>
+<p>ただし、基本的なシグナルハンドラはトランザクションを意識する必要がなく、ハンドラからただ戻すだけで問題は正しく処理されます。</p>
+<p>トランザクションを意識したシグナルハンドラは、2番目のucontextからトランザクショナルなレジスタ状態を読み取ることができます。これは、たとえばSIGSEGVの原因となった命令のアドレスを特定するためにクラッシュハンドラが行う必要があります。</p>
+<p>シグナルハンドラの例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>  void crash_handler(int sig, siginfo_t *si, void *uc)
+  {
+    ucontext_t *ucp = uc;
+    ucontext_t *transactional_ucp = ucp-&gt;uc_link;
+
+    if (ucp_link) {
+      u64 msr = ucp-&gt;uc_mcontext.regs-&gt;msr;
+      /* May have transactional ucontext! */
+#ifndef __powerpc64__
+      msr |= ((u64)transactional_ucp-&gt;uc_mcontext.regs-&gt;msr) &lt;&lt; 32;
+#endif
+      if (MSR_TM_ACTIVE(msr)) {
+         /* Yes, we crashed during a transaction.  Oops. */
+ fprintf(stderr, "Transaction to be restarted at 0x%llx, but "
+                         "crashy instruction was at 0x%llx\n",
+                         ucp-&gt;uc_mcontext.regs-&gt;nip,
+                         transactional_ucp-&gt;uc_mcontext.regs-&gt;nip);
+      }
+    }
+
+    fix_the_problem(ucp-&gt;dar);
+  }
+</pre></div>
+</div>
+<p>アクティブなトランザクション内でシグナルを取得する際、スタックの扱いには注意が必要です。tbeginの後でスタックが戻っている可能性があります。典型的なケースは、tbeginが関数内で呼び出され、tendよりも前に戻る場合です。この場合、スタックはチェックポイントされたトランザクショナルメモリ状態の一部です。トランザクショナルにない状態でこのスタックを上書きしたり、一時停止中に上書きすると、tm abortが発生した際にプログラムカウンターやスタックポインタがtbeginに戻る一方で、メモリ内のスタックが無効になるため、問題が発生します。</p>
+<p>このような問題を回避するため、アクティブなトランザクション内でシグナルを取得する際は、チェックポイントされた状態のスタックポインタを使用する必要があります。これにより、シグナルコンテキスト（tm一時停止中に書かれたもの）がロールバックに必要なスタックよりも下に書かれるため、トランザクションはtreclaimのため中止されます。したがって、tbeginとシグナルの間に書かれたメモリは自動的にロールバックされます。</p>
+<p>非TMモードまたは一時停止モードで取得されたシグナルについては、通常の/チェックポイントされていないスタックポインタを使用します。</p>
+<p>シグナルハンドラ内で開始され、シグナルハンドラからカーネルに戻る際の一時停止中に起動されたトランザクションは、再取得され削除されます。</p>
+</section>
+<section id="failure-cause-codes-used-by-kernel">
+<h2>カーネルが使用する失敗原因コード<a class="headerlink" href="#failure-cause-codes-used-by-kernel" title="この見出しへのパーマリンク">¶</a></h2>
+<p>&lt;asm/reg.h&gt;で定義されており、カーネルがトランザクションを中止した理由を区別しています。</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 41%"/>
+<col style="width: 59%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>TM_CAUSE_RESCHED</p></td>
+<td><p>スレッドが再スケジューリングされました。</p></td>
+</tr>
+<tr class="row-even"><td><p>TM_CAUSE_TLBI</p></td>
+<td><p>ソフトウェアTLB無効。</p></td>
+</tr>
+<tr class="row-odd"><td><p>TM_CAUSE_FAC_UNAV</p></td>
+<td><p>FP/VEC/VSX利用不可トラップ。</p></td>
+</tr>
+<tr class="row-even"><td><p>TM_CAUSE_SYSCALL</p></td>
+<td><p>アクティブなトランザクションからのシステムコール。</p></td>
+</tr>
+<tr class="row-odd"><td><p>TM_CAUSE_SIGNAL</p></td>
+<td><p>シグナルが届けられました。</p></td>
+</tr>
+<tr class="row-even"><td><p>TM_CAUSE_MISC</p></td>
+<td><p>現在は使用されていません。</p></td>
+</tr>
+<tr class="row-odd"><td><p>TM_CAUSE_ALIGNMENT</p></td>
+<td><p>アライメントエラー。</p></td>
+</tr>
+<tr class="row-even"><td><p>TM_CAUSE_EMULATE</p></td>
+<td><p>メモリにアクセスするエミュレーション。</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>これらはユーザープログラムの中止ハンドラでTEXASR[0:7]として確認できます。ビット7が設定されている場合、エラーが永続的なものとみなされます。たとえばTM_CAUSE_ALIGNMENTは永続的ですが、TM_CAUSE_RESCHEDはそうではありません。</p>
+</section>
+<section id="gdb">
+<h2>GDB<a class="headerlink" href="#gdb" title="この見出しへのパーマリンク">¶</a></h2>
+<p>GDBとptraceは現在TMを意識していません。トランザクション中に停止すると、トランザクションが開始したかのように見えます（チェックポイントされた状態が表示されます）。その後、トランザクションを再開できず、失敗ハンドラの処理に進みます。さらに、トランザクショナルな2番目のレジスタ状態はアクセスできません。GDBはTMを使用するプログラムに現在は使用できますが、トランザクション内では適切ではありません。</p>
+</section>
+<section id="power9">
+<h2>POWER9<a class="headerlink" href="#power9" title="この見出しへのパーマリンク">¶</a></h2>
+<p>POWER9のTMではレジスタ状態を完全に保存する問題があります。これはこのコミットで説明されています：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>commit 4bb3c7a0208fc13ca70598efd109901a7cd45ae7
+Author: Paul Mackerras &lt;paulus@ozlabs.org&gt;
+Date:   Wed Mar 21 21:32:01 2018 +1100
+KVM: PPC: Book3S HV: Work around transactional memory bugs in POWER9
+</pre></div>
+</div>
+<p>この違いを考慮し、POWER9のチップによってTMが有効化される方法が異なります。</p>
+<p>POWER9N DD2.01以下の場合はTMが無効になっています。つまりHWCAP2[PPC_FEATURE2_HTM]は設定されていません。</p>
+<p>POWER9N DD2.1ではファームウェアがTMを常にトランザクションの中断時に中断するように構成しています。そのためtsuspendが発生するとトランザクションが中断されロールバックされます。カーネル例外もトランザクションを中断・ロールバックさせ、例外は発生しなくなります。ユーザースペースでsigcontextを構築してTMスリープを有効化すると、カーネルがsigcontextを拒否します。このモードはHWCAP2[PPC_FEATURE2_HTM_NO_SUSPEND]が設定されているユーザーに宣伝されます。このモードではHWCAP2[PPC_FEATURE2_HTM]は設定されていません。</p>
+<p>POWER9N DD2.2以上ではKVMおよびPOWERVMがゲストに対してTMをエミュレートします（commit 4bb3c7a0208fに記載されている通り）。そのためゲストではTMが有効になります。つまりHWCAP2[PPC_FEATURE2_HTM]がゲストユーザースペースで設定されます。ゲストがTMスリープ（tsuspendまたはカーネルスリープ）を重く使用するとハイパーコアへのトラップが発生し、パフォーマンスの低下が生じます。ホストユーザースペースではTMが無効になっています（HWCAP2[PPC_FEATURE2_HTM]は設定されていません）。ただし将来、エミュレーションをホストユーザースペースコンテキストスイッチングに導入する場合にTMを有効化する予定です。</p>
+<p>POWER9C DD1.2以上はPOWERVMのみで利用可能であり、Linuxはゲストとしてのみ動作します。これらのシステムではPOWER9N DD2.2と同様にTMがエミュレートされます。</p>
+<p>POWER8からPOWER9へのゲスト移行はPOWER9N DD2.2およびPOWER9C DD1.2で動作します。ただし以前のPOWER9プロセッサはTMエミュレーションをサポートしていないため、POWER8からPOWER9への移行はサポートされていません。</p>
+</section>
+<section id="kernel-implementation">
+<h2>カーネルの実装<a class="headerlink" href="#kernel-implementation" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="h-rfid-mtmsrd-quirk">
+<h3>h/rfid mtmsrd クイック<a class="headerlink" href="#h-rfid-mtmsrd-quirk" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ISAで定義されているrfidには、早期例外処理で有用なクイックがあります。ユーザースペースのトランザクション中に例外を通じてカーネルに移行するとMSRはTM=0かつTS=01（つまりTMがオフだがTMスリープ中）になります。通常、カーネルはMSRのビットを変更し、rfidを実行します。この場合rfidはSRR0 TM=0かつTS=00（つまりTMオフでトランザクションなし）になり、結果としてMSRは以前のTM=0かつTS=01（つまりスリープ状態）を保持します。これはアーキテクチャのクイックであり、通常TS=01からTS=00への移行（つまりスリープ→非トランザクション）は不正な移行です。</p>
+<p>このクイックはアーキテクチャのrfidの定義で以下のように説明されています：</p>
+<blockquote>
+<div><dl class="simple">
+<dt>if (MSR 29:31 ¬ = 0b010 | SRR1 29:31 ¬ = 0b000) ならば</dt><dd><p>MSR 29:31 &lt;- SRR1 29:31</p>
+</dd>
+</dl>
+</div></blockquote>
+<p>hrfid と mtmsrd は同じクイックを持っています。</p>
+<p>Linux カーネルはこのクイックを早期の例外処理で使用しています。</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">powerpc</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="booting.html">デバイスツリー起動</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bootwrapper.html">PowerPC ブート Wrapper</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cpu_families.html">CPU ファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cpu_features.html">CPU フィーチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cxl.html">コヒーレントアクセラレータインターフェース (CXL)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cxlflash.html">コヒーレントアクセラレータ (CXL) フラッシュ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dawr-power9.html">POWER9 上の DAWR に関する問題</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dscr.html">DSCR (データストリーム制御レジスタ)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="eeh-pci-error-recovery.html">PCIバスEEHエラー回復</a></li>
+<li class="toctree-l2"><a class="reference internal" href="elfnote.html">ELF ノート PowerPC ネームスペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="firmware-assisted-dump.html">ファームウェア支援ダンプ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hvcs.html">HVCS IBM 「ハイパーザーチャー仮想コンソールサーバー」インストールガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="imc.html">IMC (インメモリコレクションカウンタ)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="isa-versions.html">CPU と ISA バージョンマッピング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kaslr-booke32.html">Freescale BookE32 用 KASLR</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mpc52xx.html">Linux 2.6.x における MPC52xx ファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="papr_hcalls.html">ハイパーコール操作コード (hcalls)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pci_iov_resource_on_powernv.html">Powerenv 上の PCI Express I/O ビジュー化リソース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pmu-ebb.html">PMU イベントベースのブランチ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ptrace.html">Ptrace</a></li>
+<li class="toctree-l2"><a class="reference internal" href="qe_firmware.html">Freescale QUICC エンジンファームウェアのアップロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="syscall64-abi.html">Power Architecture 64 ビット Linux システムコール ABI</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">トランザクショナルメモリのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ultravisor.html">保護実行ファシリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vas-api.html">仮想アクセラレータスイッチボード (VAS) ユーザースペース API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vcpudispatch_stats.html">VCPU ディスパッチ統計</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">powerpc</a><ul>
+<li>前へ: <a href="syscall64-abi.html" title="前章">Power Architecture 64 ビット Linux システムコール ABI</a></li>
+<li>次へ: <a href="ultravisor.html" title="次章">保護実行ファシリティ</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/powerpc/transactional_memory.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

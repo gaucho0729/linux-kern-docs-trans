@@ -1,0 +1,274 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>ジェネリックミューテックスサブシステム — The Linux Kernel ドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="rt-mutex-design.html" rel="next" title="RTミューテックスの実装設計"/>
+<link href="locktorture.html" rel="prev" title="カーネルロックのトラウトテスト操作"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="generic-mutex-subsystem">
+<h1>ジェネリックミューテックスサブシステム<a class="headerlink" href="#generic-mutex-subsystem" title="この見出しへのパーマリンク">¶</a></h1>
+<p>Ingo Molnar により開始 &lt;<a class="reference external" href="mailto:mingo%40redhat.com">mingo<span>@</span>redhat<span>.</span>com</a>&gt;</p>
+<p>Davidlohr Bueso &lt;<a class="reference external" href="mailto:davidlohr%40hp.com">davidlohr<span>@</span>hp<span>.</span>com</a>&gt;</p>
+<section id="what-are-mutexes">
+<h2>ミューテックスとは何ですか？<a class="headerlink" href="#what-are-mutexes" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Linuxカーネルでは、ミューテックスとは共有メモリシステムでのシリアル化を強制する特定のロックプリミティブを指し、学術や理論的な教科書で見られる「相互排他」の一般的な用語を指すわけではありません。ミューテックスはスリープロックであり、バイナリセマフォのように動作し、2006年にこれらの代替として導入されました[1]。この新しいデータ構造は、よりシンプルなインターフェースや、当時のコードサイズの小ささ（詳細は「欠点」を参照）などの利点を提供しました。</p>
+<p>[1] <a class="reference external" href="https://lwn.net/Articles/164802/">https://lwn.net/Articles/164802/</a></p>
+</section>
+<section id="implementation">
+<h2>ハードロックアップ検出器は、定期的に実行されるhrtimerによって生成される割込みでウォッチドッグタスクを起動します。ハードロックアップの検出には、「watchdog_thresh」（コンパイル時に初期化され、sysctlの同じ名前で設定可能）秒ごとにNMI perfイベントが生成されます。システム内のどのCPUもその間hrtimer割込みを受けていない場合、ハードロックアップ検出器（NMI perfイベントのハンドラ）がカーネル警告を生成するか、設定に応じてパニックを呼び出します。<a class="headerlink" href="#implementation" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ミューテックスは「struct mutex」として表され、include/linux/mutex.hで定義され、kernel/locking/mutex.cで実装されています。これらのロックは、ロックのライフタイム中にロック状態を追跡するため、アトミック変数（-&gt;owner）を使用します。ownerフィールドは実際に <cite>struct task_struct *</cite> を現在のロック所有者に指し、現在所有されていない場合はNULLです。task_structポインタは少なくともL1_CACHE_BYTESでアライメントされているため、低ビット（3ビット）は待機リストが空でないなどの追加状態を保存するために使用されます。最も基本的な形式では、待機キューとアクセスをシリアル化するスピンロックも含みます。さらに、CONFIG_MUTEX_SPIN_ON_OWNER=yのシステムでは、以下で説明する(ii)に記載のspinner MCSロック（-&gt;osq）が使用されます。</p>
+<p>ミューテックスを取得する際には、ロックの状態に応じて3つの可能なパスがあります：</p>
+<ol class="lowerroman">
+<li><p>高速パス：cmpxchg()を使用して現在のタスクでロックを原子的に取得しようと試みます。これは競合が起きない場合（cmpxchg()が0ULと比較するため、上記の3つの状態ビットがすべて0である必要があります）にのみ動作します。競合が起きている場合は次のパスに移行します。</p></li>
+<li><p>中間パス：もしくは楽観的スピンと呼ばれる方法で、ロック所有者が実行中で他の優先度の高いタスクが待機していない場合にスピンして取得を試みます。理由は、ロック所有者が実行中であれば、すぐにロックを解放する可能性が高いからです。ミューテックススピンナーはMCSロックを使用してキューイングされ、同時に1つのスピンナーだけがミューテックスを競合するようにします。</p>
+<p>MCSロック（Mellor-CrummeyとScottによって提案）は、公平性を持ち、各CPUがローカル変数でロックを取得する試行を繰り返すシンプルなスピンロックです。これは、一般的なテストアンドセットスピンロック実装が引き起こすコストのかかるキャッシュラインのバウンスを回避します。MCSに類似したロックは、スリープ状態でのロック実装に最適化されています。カスタマイズされたMCSロックの重要な特徴は、スピンナーが再スケジューリングが必要な場合にMCSスピンロックキューから抜け出せるという追加の特性です。これにより、再スケジューリングが必要なMCSスピンナーがミューテックス所有者に待機し続けることなく、MCSロックを取得した後すぐにスローパスに移行する状況を回避できます。</p>
+</li>
+<li><p>スローパス: ロックが取得できない場合、タスクは待機キューに追加され、アンロックパスによって起こされるまでスリープします。通常の状況ではTASK_UNINTERRUPTIBLEとしてブロックします。</p></li>
+</ol>
+<p>形式的にはカーネルミューテックスはスリープ可能なロックですが、実際には（ii）の経路によりハイブリッド型とみなされます。タスクを中断せず、数サイクルだけビジー waits する代わりにすぐにスリープしないことで、このロックのパフォーマンスがいくつかのワークロードで大幅に向上することが観察されています。この技術はrwセマフォアにも使用されています。</p>
+</section>
+<section id="semantics">
+<h2>セマンティクス<a class="headerlink" href="#semantics" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ミューテックスサブシステムが確認・強制するルールは以下の通りです:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>一度に1つのタスクしかミューテックスを保持できません。</p></li>
+<li><p>ミューテックスをアンロックできるのは所有者だけです。</p></li>
+<li><p>複数のアンロックは許可されません。</p></li>
+<li><p>再入ロック/アンロックは許可されません。</p></li>
+<li><p>ミューテックスはAPI（以下参照）を介してのみ初期化する必要があります。</p></li>
+<li><p>タスクがミューテックスを保持しながら終了することはできません。</p></li>
+<li><p>保持中のロックが存在するメモリ領域は解放してはなりません。</p></li>
+<li><p>保持中のミューテックスは再初期化してはなりません。</p></li>
+<li><p>タスケットやタイマなどのハードウェアまたはソフトウェア割込みコンテキストではミューテックスを使用してはなりません。</p></li>
+</ul>
+</div></blockquote>
+<p>CONFIG DEBUG_MUTEXESが有効な場合、これらのセマンティクスが完全に強制されます。さらに、ミューテックスのデバッグコードはロックのデバッグをより簡単に・速くするためのいくつかの機能も実装しています:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>デバッグ出力でミューテックスが表示される際には、記号名を使用します。</p></li>
+<li><p>取得位置の追跡、関数名の記号的な検索、システム内のすべてのロックのリスト、それらの表示。</p></li>
+<li><p>所有者追跡。</p></li>
+<li><p>自己再帰ロックを検出し、関連する情報を表示します。</p></li>
+<li><p>マルチタスクの円環デッドロックを検出し、影響を受けたロックとタスク（およびそれらのタスクのみ）を表示します。</p></li>
+</ul>
+</div></blockquote>
+</section>
+<section id="interfaces">
+<h2>インターフェース<a class="headerlink" href="#interfaces" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ミューテックスを静的に定義する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>DEFINE_MUTEX(name);
+</pre></div>
+</div>
+<p>ミューテックスを動的に初期化する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>mutex_init(mutex);
+</pre></div>
+</div>
+<p>ミューテックスを取得する（中断不能）:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void mutex_lock(struct mutex *lock);
+void mutex_lock_nested(struct mutex *lock, unsigned int subclass);
+int  mutex_trylock(struct mutex *lock);
+</pre></div>
+</div>
+<p>中断可能でミューテックスを取得する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int mutex_lock_interruptible_nested(struct mutex *lock,
+                                    unsigned int subclass);
+int mutex_lock_interruptible(struct mutex *lock);
+</pre></div>
+</div>
+<p>カウンターが0になるまで待機して、中断可能でミューテックスを取得する:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int atomic_dec_and_mutex_lock(atomic_t *cnt, struct mutex *lock);
+</pre></div>
+</div>
+<p>ミューテックスをアンロックする:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void mutex_unlock(struct mutex *lock);
+</pre></div>
+</div>
+<p>ミューテックスがロックされているかをテストする:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int mutex_is_locked(struct mutex *lock);
+</pre></div>
+</div>
+</section>
+<section id="disadvantages">
+<h2>欠点<a class="headerlink" href="#disadvantages" title="この見出しへのパーマリンク">¶</a></h2>
+<p>‘struct mutex’は、元の設計目的とは異なり、カーネル内で最も大きなロックの一つです。例えばx86-64では32バイトで、‘struct semaphore’は24バイト、rw_semaphoreは4、40バイトです。構造体サイズが大きいほど、CPUキャッシュとメモリの使用量が増えるため、注意が必要です。</p>
+</section>
+<section id="when-to-use-mutexes">
+<h2>ミューテックスを使用するタイミング<a class="headerlink" href="#when-to-use-mutexes" title="この見出しへのパーマリンク">¶</a></h2>
+<p>mutexの厳密なセマンティクスが不適切で、またはクリティカルセクションがロックを共有できない場合を除き、他のロックプリミティブよりも常に選ぶべきです。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">ロック</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="locktypes.html">ロックの種類とそのルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lockdep-design.html">ランタイムロックの正しさを検証するツール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lockstat.html">ロック統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="locktorture.html">カーネルロックのトラウトテスト操作</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">ジェネリックミューテックスサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rt-mutex-design.html">RTミューテックスの実装設計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rt-mutex.html">PIサポート付きRTミューテックスサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="seqlock.html">シーケンスカウンタとシーケンシャルロック</a></li>
+<li class="toctree-l2"><a class="reference internal" href="spinlocks.html">ロックの教訓</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ww-mutex-design.html">Wound/Wait Deadlock-Proof Mutex Design</a></li>
+<li class="toctree-l2"><a class="reference internal" href="preempt-locking.html">プリエンプティブカーネルでの適切なロック: カーネルコードのプリエンプ安全性を保つ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pi-futex.html">軽量PIフェイクス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="futex-requeue-pi.html">フェイクス再配置PI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hwspinlock.html">ハードウェアスピンロックフレームワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="percpu-rw-semaphore.html">ペルCPU読み取り専用セマフォ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="robust-futexes.html">ロバストフェイクスの説明</a></li>
+<li class="toctree-l2"><a class="reference internal" href="robust-futex-ABI.html">The robust futex ABI</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">ロック</a><ul>
+<li>前へ: <a href="locktorture.html" title="前章">カーネルロックのトラウトテスト操作</a></li>
+<li>次へ: <a href="rt-mutex-design.html" title="次章">RTミューテックスの実装設計</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/locking/mutex-design.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

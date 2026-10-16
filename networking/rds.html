@@ -1,0 +1,554 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>概要 — Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="regulatory.html" rel="next" title="Linuxワイヤレス規制ドキュメンテーション"/>
+<link href="radiotap-headers.html" rel="prev" title="radiotapヘッダの使用方法"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<p>== RDS ===</p>
+<section id="overview">
+<h1>概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h1>
+<p>この README は RDS の方法と理由についての背景情報を提供し、コードを理解するのを助けることを目指しています。</p>
+<p>さらに、RDS の起源についてのこのメールを参照してください:
+<a class="reference external" href="http://oss.oracle.com/pipermail/rds-devel/2007-November/000228.html">http://oss.oracle.com/pipermail/rds-devel/2007-November/000228.html</a></p>
+</section>
+<section id="rds-architecture">
+<h1>RDSアーキテクチャ<a class="headerlink" href="#rds-architecture" title="この見出しへのパーマリンク">¶</a></h1>
+<p>RDS は、クラスター内の任意の 2 つのノード間で単一の信頼性のある接続を使用して、信頼性の高い順序を保つデータグラムの配信を提供します。これにより、アプリケーションはクラスター内の他のプロセスと通信するための単一のソケットを使用できます。クラスターに N 個のプロセスがある場合、N 個のソケットが必要ですが、TCP などの接続志向のソケットトランスポートを使用する場合では N*N 個のソケットが必要になります。</p>
+<p>RDS は Infiniband に特化したものではなく、さまざまなトランスポートをサポートするように設計されています。現在の実装では RDS over TCP および IB をサポートしていました。</p>
+<p>アプリケーションの観点からの RDS の高レベルなセマンティクスは</p>
+<blockquote>
+<div><ul>
+<li><p>アドレス指定</p>
+<p>RDS は IPv4 アドレスと 16 ビットのポート番号を使用して接続の終端ポイントを識別します。カーネルとユーザースペース間でアドレスをやり取りするすべてのソケット操作は一般的に struct sockaddr_in を使用します。</p>
+<p>IPv4 アドレスが使用されているということは、下層のトランスポートが IP ベースである必要があるとは限りません。実際、RDS over IB は信頼性のある IB 接続を使用しており、IP アドレスは遠隔ノードの GID を検索するためにのみ使用されます（指定された IP に対して ARPing によって）。</p>
+<p>ポート空間は UDP、TCP または他のプロトコルとは完全に独立しています。</p>
+</li>
+<li><p>ソケットインターフェース</p>
+<p>RDS ソケットは <em>主に</em> BSD ソケットと同様の動作をします。次のセクションでは詳細を説明します。いずれにせよ、すべての I/O は標準の BSD ソケット API を通じて行われます。ゼロコピーのサポートなどの拡張機能は制御メッセージを通じて実装され、他の拡張機能は getsockopt/setsockopt 呼び出しを使用します。</p>
+<p>データを送信または受信する前にソケットをバインドする必要があります。これは、バインディングによってトランスポートが選択され、ソケットに接続されるためです。バインド後はトランスポートの割り当ては変更されません。RDS は IP が動くのを許容します（例：アクティブアクティブの HA シナリオ）、ただしアドレスが異なるトランスポートに移動しない限りです。</p>
+</li>
+<li><p>sysctls</p>
+<p>RDS は /proc/sys/net/rds に複数の sysctl をサポートしています</p>
+</li>
+</ul>
+</div></blockquote>
+</section>
+<section id="socket-interface">
+<h1>ソケットインターフェース<a class="headerlink" href="#socket-interface" title="この見出しへのパーマリンク">¶</a></h1>
+<blockquote>
+<div><dl>
+<dt>AF_RDS, PF_RDS, SOL_RDS</dt><dd><p>AF_RDS および PF_RDS は socket(2) を使用して RDS ソケットを作成するためのドメインタイプです。SOL_RDS は setsockopt(2) および getsockopt(2) で RDS 特有のソケットオプションを操作するためのソケットレベルです。</p>
+</dd>
+<dt>fd = socket(PF_RDS, SOCK_SEQPACKET, 0);</dt><dd><p>これは新しい、バインドされていない RDS ソケットを作成します。</p>
+</dd>
+<dt>setsockopt(SOL_SOCKET): 送受信バッファサイズ</dt><dd><p>RDSは送信バッファサイズと受信バッファサイズのソケットオプションを尊重します。ソケットにキューに蓄積できる最大バイト数はSO_SNDSIZEに制限されます。sendmsgが呼び出されるとメッセージがキューに追加され、リモートシステムが到達を確認した時点でキューから削除されます。</p>
+<p>SO_RCVSIZEオプションは最大受信キュー長を制御します。これはハード制限ではなくソフト制限です。RDSはキュー長が制限を超えたとしても、受信メッセージを引き続き受け入れてキューに蓄積します。ただし、ポートを「混雑中」とマークし、混雑状態の更新を送信源ノードに通知します。送信源ノードはこの混雑ポートへの送信を制限する必要があります。</p>
+</dd>
+<dt>bind(fd, &amp;sockaddr_in, …)</dt><dd><p>この関数は、ソケットをローカルIPアドレスとポート、およびトランスポートにバインドします。トランスポートがすでにSO_RDS_TRANSPORTオプションで選択されていない場合に有効です。</p>
+</dd>
+<dt>sendmsg(fd, …)</dt><dd><p>指定された宛先にメッセージを送信します。コアが信頼性のある接続が確立されていなければ、自動的にその接続を確立します。</p>
+<p>SO_SNDSIZEを超えるメッセージ送信試行は-EMSGSIZEで失敗します。</p>
+<p>SO_SNDSIZEの閾値を超える総キューのバイト数になるメッセージ送信試行はEAGAINで失敗します。</p>
+<p>「混雑中」とマークされた宛先へのメッセージ送信試行はENOBUFSで失敗します。</p>
+</dd>
+<dt>recvmsg(fd, …)</dt><dd><p>このソケットにキューされているメッセージを受信します。受信キューの計測が調整され、キュー長がSO_SNDSIZEを下回るとポートが「混雑中」から解除され、すべてのピアに混雑状態の更新が送信されます。</p>
+<p>アプリケーションはRDSカーネルモジュールに制御メッセージを通じて通知を受けることができます（例：混雑状態の更新が到達したとき、またはRDMA操作が完了したときなど）。これらの通知はstruct msghdrのmsg.msg_controlバッファを通じて受信され、メッセージの形式はmanpagesで説明されています。</p>
+</dd>
+<dt>poll(fd)</dt><dd><p>RDSはアプリケーションが非同期I/Oを実装できるpollインターフェースをサポートしています。</p>
+<p>POLLINの処理は比較的簡単です。ソケットに受信メッセージがキューイングされているか、または待機中の通知がある場合、POLLINを信号として出力します。</p>
+<p>POLLOUTの処理はやや複雑です。送信先が任意の宛先であるため、RDSは送信キューに空きがある限り（つまり、キューイングされたバイト数が送信バッファサイズを下回る限り）常にPOLLOUTを信号として出力します。</p>
+<p>ただし、カーネルは congested（混雑している）とマークされた宛先へのメッセージを受け入れることを拒否します。この場合、poll に依存して動作を判断すると永遠にループしてしまいます。これは単純な問題ではありませんが、アプリケーションは congestion notifications（混雑通知）を使用し、sendmsg が返す ENOBUFS エラーを確認することでこれを処理できます。</p>
+</dd>
+<dt>setsockopt(SOL_RDS, RDS_CANCEL_SENT_TO, &amp;sockaddr_in)</dt><dd><p>これにより、アプリケーションはこのソケットに特定の宛先にキューイングされているすべてのメッセージを破棄できます。</p>
+<p>アプリケーションがタイムアウトを検出した場合、未完了のメッセージをキャンセルできます。例えば、メッセージを送信したが、リモートホストが到達不可だった場合、RDS は永遠に試行し続けます。アプリケーションがこれに価値を見出さない場合、操作をキャンセルします。この場合、RDS_CANCEL_SENT_TO を使用して待機中のメッセージをすべて破棄します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">setsockopt(fd,</span> <span class="pre">SOL_RDS,</span> <span class="pre">SO_RDS_TRANSPORT,</span> <span class="pre">(int</span> <span class="pre">*)&amp;transport</span> <span class="pre">..),</span> <span class="pre">getsockopt(fd,</span> <span class="pre">SOL_RDS,</span> <span class="pre">SO_RDS_TRANSPORT,</span> <span class="pre">(int</span> <span class="pre">*)&amp;transport</span> <span class="pre">..)</span></code></dt><dd><p>ソケットに使用する下位の輸送プロトコルを定義する整数を設定または取得します。設定する際には、整数引数は RDS_TRANS_TCP または RDS_TRANS_IB のいずれかでなければなりません。取得する際には、未バインドのソケットでは RDS_TRANS_NONE が返されます。このソケットオプションは、bind(2) システムコールでバインドする前に一度だけ設定可能です。すでに SO_RDS_TRANSPORT で明示的に設定済み（SO_RDS_TRANSPORT で設定）または暗黙に設定済み（bind(2) で設定）されている場合、EOPNOTSUPP エラーが返されます。SO_RDS_TRANSPORT を RDS_TRANS_NONE に設定する試みは常に EINVAL エラーを返します。</p>
+</dd>
+</dl>
+</div></blockquote>
+</section>
+<section id="rdma-for-rds">
+<h1>RDS用RDMA<a class="headerlink" href="#rdma-for-rds" title="この見出しへのパーマリンク">¶</a></h1>
+<blockquote>
+<div><p>rds-rdma(7) マニュアルページ（rds-tools に含まれる）を参照</p>
+</div></blockquote>
+</section>
+<section id="congestion-notifications">
+<h1>コンゲスト通知<a class="headerlink" href="#congestion-notifications" title="この見出しへのパーマリンク">¶</a></h1>
+<blockquote>
+<div><p>rds(7) マニュアルページを参照</p>
+</div></blockquote>
+</section>
+<section id="rds-protocol">
+<h1>RDSプロトコル<a class="headerlink" href="#rds-protocol" title="この見出しへのパーマリンク">¶</a></h1>
+<blockquote>
+<div><p>メッセージヘッダー</p>
+<blockquote>
+<div><p>メッセージヘッダーは 'struct rds_header'（rds.h を参照）です：</p>
+<p>フィールド：</p>
+<blockquote>
+<div><dl>
+<dt>h_sequence:</dt><dd><p>パケットごとのシーケンス番号</p>
+</dd>
+<dt>h_ack:</dt><dd><p>最後に受信したパケットの確認応答（piggybacked acknowledgment）</p>
+</dd>
+<dt>h_len:</dt><dd><p>ヘッダーを除くデータの長さ</p>
+</dd>
+<dt>h_sport:</dt><dd><p>送信元ポート</p>
+</dd>
+<dt>h_dport:</dt><dd><p>宛先ポート</p>
+</dd>
+<dt>h_flags:</dt><dd><p>以下が可能です：</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 28%"/>
+<col style="width: 72%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>CONG_BITMAP</p></td>
+<td><p>これは混雑状態のビットマップです</p></td>
+</tr>
+<tr class="row-even"><td><p>ACK_REQUIRED</p></td>
+<td><p>受信側がこのパケットを確認する必要があります</p></td>
+</tr>
+<tr class="row-odd"><td><p>RETRANSMITTED</p></td>
+<td><p>このパケットは以前に送信済みです</p></td>
+</tr>
+</tbody>
+</table>
+</dd>
+<dt>h_credit:</dt><dd><p>接続の他端に送信可能なクレジットがさらにあります（つまり、送信可能領域がさらにあります）を示します</p>
+</dd>
+<dt>h_padding[4]:</dt><dd><p>未使用、今後の拡張用</p>
+</dd>
+<dt>h_csum:</dt><dd><p>ヘッダーのチェックサム</p>
+</dd>
+<dt>h_exthdr:</dt><dd><p>オプションでデータをここに渡せます。現在は RDMA 関連情報を渡すために使用されています。</p>
+</dd>
+</dl>
+</div></blockquote>
+</div></blockquote>
+<p>ACK および再送処理</p>
+<blockquote>
+<div><p>信頼性の高いIB接続があるにもかかわらず、受信したメッセージの確認応答（ack）を必要としないと考えられるかもしれません。問題は、IBハードウェアがメッセージをメモリにDMA（Direct Memory Access）してからではなく、DMAする前にもう一度ackメッセージを生成してしまうことです。これは、HCA（Host Channel Adapter）がack送信後、メッセージがDMAされ処理される前に無効化された場合に、メッセージが失われる可能性を生じさせます。これは、別のHCAがフェールオーバー用に利用可能である場合にのみ、潜在的な問題となります。</p>
+<p>ackを即座に送信することで、送信側は送信メッセージを送信キューから迅速に解放できますが、ackによるトラフィックが過剰になる可能性があります。RDSは送信データパケットにackを乗せて送信します。ackのみのパケットは、同時に飛ばすことを制限し、送信側が送信バッファが満たされるタイミングでackを要求するようにすることで削減されます。すべての再送信もackされます。</p>
+</div></blockquote>
+<p>フロー制御</p>
+<blockquote>
+<div><p>RDSのIBトランスポートは、相手側の受信バッファにデータを追加できるスペースがあることを確認するため、クレジットベースのメカニズムを使用します。これにより、接続におけるハードウェアの再試行は不要になります。</p>
+</div></blockquote>
+<p>混雑</p>
+<blockquote>
+<div><p>受信ソケットの受信キューに待機しているメッセージは、ソケットのSO_RCVBUFオプション値に応じてカウントされます。カウントされるのはメッセージのペイロードバイトのみです。キューに待機しているバイト数がrcvbufに等しいかそれ以上になると、ソケットが混雑しているとみなされます。このソケットのアドレスに対して行われるすべての送信は、ブロックまたは-EWOULDBLOCKを返す必要があります。</p>
+<p>アプリケーションはこの状況が非常にまれに発生するように適切にチューニングされることが期待されます。この「バックプレッシャー」に遭遇するアプリケーションは、バグとみなされます。</p>
+<p>各ノードがバインドされたアドレスのどのポートが混雑しているかを示すビットマップを保持することで実装されます。ビットマップが変更されるたびに、その変更を、ビットマップが変更されたローカルアドレスに終端するすべての接続を通じて送信します。</p>
+<p>ビットマップは接続が起動されるときに割り当てられます。これにより、割り込み処理パスでの割り当てを回避し、ソケットに待機中のスレッドをキューに溜めることを防ぎます。高密度のビットマップは、どのポートに送信するかを確認するための非常に低コストなビットテストを送信側が行うことで、ビットマップの変更ごとに効率的に全体を送信できます。これは、ポートごとの混雑状態をより細かく通信するよりもはるかに実装が簡単です。</p>
+</div></blockquote>
+</div></blockquote>
+</section>
+<section id="rds-transport-layer">
+<h1>RDSトランスポートレイヤー<a class="headerlink" href="#rds-transport-layer" title="この見出しへのパーマリンク">¶</a></h1>
+<blockquote>
+<div><p>上記のように、RDSはIBに特化した技術ではありません。そのコードは一般的なRDSレイヤーとトランスポートレイヤーに分かれています。</p>
+<p>一般的なレイヤーはソケットAPI、混雑処理、ループバック、統計情報、ユーザーメモリのピンニング、接続状態マシンを処理します。</p>
+<p>トランスポート層はトランスポートの詳細を処理します。たとえばIBトランスポートは、すべてのキュー・ペア、ワーク・リクエスト、CMイベントハンドラ、およびその他のInfinibandの詳細を処理します。</p>
+</div></blockquote>
+</section>
+<section id="rds-kernel-structures">
+<h1>RDSカーネル構造体<a class="headerlink" href="#rds-kernel-structures" title="この見出しへのパーマリンク">¶</a></h1>
+<blockquote>
+<div><dl class="simple">
+<dt>struct rds_message</dt><dd><p>「rds_outgoing」として知られる一般的なRDS層は、送信するデータをコピーし、ソケットAPIに基づいてヘッダーフィールドを必要に応じて設定します。これにより、個々の接続にキューイングされ、接続のトランスポートによって送信されます。</p>
+</dd>
+<dt>struct rds_incoming</dt><dd><p>受信データをトランスポートから一般的なコードに渡し、ソケットが起動される間、一般的なコードによってキューイングされるための一般的な構造体です。その後、トランスポートコードに再び渡され、実際のユーザーへのコピー処理が行われます。</p>
+</dd>
+<dt>struct rds_socket</dt><dd><p>各ソケットに関する情報</p>
+</dd>
+<dt>struct rds_connection</dt><dd><p>各接続に関する情報</p>
+</dd>
+<dt>struct rds_transport</dt><dd><p>トランスポート固有の関数へのポインタ</p>
+</dd>
+<dt>struct rds_statistics</dt><dd><p>トランスポート固有でない統計情報</p>
+</dd>
+<dt>struct rds_cong_map</dt><dd><p>raw congestion bitmapをラップし、rbnode、waitqなどを持つ</p>
+</dd>
+</dl>
+</div></blockquote>
+</section>
+<section id="connection-management">
+<h1>接続管理<a class="headerlink" href="#connection-management" title="この見出しへのパーマリンク">¶</a></h1>
+<blockquote>
+<div><p>接続はUP、DOWN、CONNECTING、DISCONNECTING、およびERRORの状態を持つことができます。</p>
+<p>RDSソケットが初めてノードにデータを送信しようとする際、接続が割り当てられ接続されます。その後、接続は永遠に維持されます。トランスポートエラーが発生した場合、接続は切断され再び確立されます。</p>
+<p>パケットがキューイングされている間に接続を切断すると、キューイングされているか部分的に送信されたデータグラムが再送されます。</p>
+</div></blockquote>
+</section>
+<section id="the-send-path">
+<h1>送信経路<a class="headerlink" href="#the-send-path" title="この見出しへのパーマリンク">¶</a></h1>
+<blockquote>
+<div><dl class="simple">
+<dt>rds_sendmsg()</dt><dd><ul class="simple">
+<li><p>インカムデータから構築されたstruct rds_message</p></li>
+<li><p>CMSGが解析される（例: RDMA操作）</p></li>
+<li><p>接続がまだない場合はトランスポート接続が割り当てられ接続される</p></li>
+<li><p>rds_messageが送信キューに配置される</p></li>
+<li><p>送信ワーカーが起動される</p></li>
+</ul>
+</dd>
+<dt>rds_send_worker()</dt><dd><ul class="simple">
+<li><p>キューが空になるまでrds_send_xmit()を呼び出す</p></li>
+</ul>
+</dd>
+<dt>rds_send_xmit()</dt><dd><ul class="simple">
+<li><p>コンゴステーションマップが待機している場合、それを送信する</p></li>
+<li><p>ACK_REQUIREDを設定する可能性がある</p></li>
+<li><p>トランスポートに非RDMAまたはRDMAメッセージ（RDMA操作は再送されない）を送信させる</p></li>
+</ul>
+</dd>
+<dt>rds_ib_xmit()</dt><dd><ul class="simple">
+<li><p>送信リングからワーク・リクエストを割り当てる</p></li>
+<li><p>新しい送信クレジットを相手に送信する（h_credits）</p></li>
+<li><p>rds_messageのsgリストをマッピングする</p></li>
+<li><p>ACKをペイロードに添付する</p></li>
+<li><p>ワーク・リクエストを埋める</p></li>
+<li><p>接続のキュー・ペアに送信をポストする</p></li>
+</ul>
+</dd>
+</dl>
+</div></blockquote>
+</section>
+<section id="the-recv-path">
+<h1>受信経路<a class="headerlink" href="#the-recv-path" title="この見出しへのパーマリンク">¶</a></h1>
+<blockquote>
+<div><dl class="simple">
+<dt>rds_ib_recv_cq_comp_handler()</dt><dd><ul class="simple">
+<li><p>書き込み完了を確認する</p></li>
+<li><p>受信バッファをデバイスからアンマッピングする</p></li>
+<li><p>エラーがなければ、rds_ib_process_recv()を呼び出す</p></li>
+<li><p>recvリングを補充する</p></li>
+</ul>
+</dd>
+<dt>rds_ib_process_recv()</dt><dd><ul class="simple">
+<li><p>ヘッダーチェックサムを検証する</p></li>
+<li><p>新規データグラムの開始であれば、ヘッダーをrds_ib_incoming構造体にコピーする</p></li>
+<li><p>ibincのfraglistに追加する</p></li>
+<li><dl class="simple">
+<dt>完了したデータグラムの場合:</dt><dd><ul>
+<li><p>データグラムがcong更新だった場合、congマップを更新する</p></li>
+<li><p>それ以外の場合、rds_recv_incoming()を呼び出す</p></li>
+<li><p>ACKが必要かどうかを記録する</p></li>
+</ul>
+</dd>
+</dl>
+</li>
+</ul>
+</dd>
+<dt>rds_recv_incoming()</dt><dd><ul class="simple">
+<li><p>重複パケットを破棄する</p></li>
+<li><p>ピング応答を送信する</p></li>
+<li><p>このデータグラムに関連するソケットを検索する</p></li>
+<li><p>ソケットキューに追加する</p></li>
+<li><p>ソケットを起動する</p></li>
+<li><p>コンゴージョン計算を行う</p></li>
+</ul>
+</dd>
+<dt>rds_recvmsg</dt><dd><ul class="simple">
+<li><p>データをユーザーのiovecにコピーする</p></li>
+<li><p>CMSGを処理する</p></li>
+<li><p>アプリケーションに返す</p></li>
+</ul>
+</dd>
+</dl>
+</div></blockquote>
+</section>
+<section id="multipath-rds-mprds">
+<h1>マルチパスRDS (mprds)<a class="headerlink" href="#multipath-rds-mprds" title="この見出しへのパーマリンク">¶</a></h1>
+<blockquote>
+<div><p>Mprdsは複数経路をサポートしたRDSであり、主にRDS-over-TCPを想定している（ただし、他のトランスポートにも拡張可能）。古典的なRDS-over-TCPの実装は、2つのエンドポイント（エンドポイント＝[IPアドレス、ポート]）間の単一のTCPソケットを介して複数のPF_RDSソケットをデマルチプレックスする形態である。この方法には、複数のRDSフローを単一のTCPフローで処理するため、（a）単一フローの帯域幅に上限が設けられ、（b）すべてのRDSソケットでヘッド・オブ・ラインブロッキングが発生するという制限がある。</p>
+<p>固定された小パケットサイズ（MTU）で、より高いスループットを達成するには、各rds/tcp接続に対して複数のTCP/IPフローを用いることが有効である。つまり、複数経路RDS（multipathed RDS: mprds）である。このようなTCP/IPフローは、rds/tcp接続のそれぞれの経路を構成する。RDSソケットは、あるハッシュ（例：ローカルアドレスとRDSポート番号のハッシュ）に基づいて経路にアタッチされ、そのRDSソケットのパケットは、アタッチされた経路を介してTCPを用いて送信され、その経路でRDSデータグラムをセグメント化・再構成する。</p>
+<p>複数経路RDSは、struct rds_connectionを共通部分と、各経路用のstruct rds_conn_pathに分割して実装される。すべてのI/Oワーキングキューおよび再接続スレッドはrds_conn_pathから駆動される。複数経路をサポート可能なトランスポート（例：TCP）は、各rds_conn_pathに対してTCPソケットを設定し、これはトランスポートがtransport private cp_transport_dataポインタを介して管理する。</p>
+<p>トランスポートは、rdsコアモジュールへの登録時にt_mp_capableビットを設定して複数経路をサポート可能であることを宣言する。トランスポートが複数経路をサポート可能な場合、rds_sendmsg()は複数の経路で出力トラフィックをハッシュする。出力ハッシュは、PF_RDSソケットがバインドされているローカルアドレスとポートに基づいて計算される。</p>
+<p>さらに、トランスポートがMP対応である場合でも、ピアリングするノードがmprdsをサポートしていない、またはサポートするパス数が異なる場合があります。その結果、ピアリングノードは接続に使用するパス数を合意する必要があります。これは、最初のデータパケット送信前にコントロールパケットの交換によって行われます。トランスポートがマルチパス対応の場合、rds_sendmsg()での送出ハッシュ完了前にコントロールパケットの交換が完了している必要があります。</p>
+<p>コントロールパケットはRDS pingパケット（つまり、rds宛てポート0へのパケット）であり、pingパケットにはrds拡張ヘッダーオプションとしてRDS_EXTHDR_NPATHSタイプ、長さ2バイト、値が送信元がサポートするパス数を示す必要があります。"probe" pingパケットは、予約されたポートRDS_FLAG_PROBE_PORT（&lt;linux/rds.h&gt;参照）から送信されます。RDS_FLAG_PROBE_PORTからのpingを受信した受信者は、即座に送信元のパス数と受信元のパス数の最小値を計算できます。mprds対応の受信元に対するprobe-pingへの応答として送信されるpongには、受信元のnpathsが含まれるべきです。</p>
+<p>受信元がmprds対応でない場合、pingの拡張ヘッダーは無視されます。この場合、pongには拡張ヘッダーが含まれず、probe-pingを送信した送信者はデフォルトで単一パスのmprdsを使用します。</p>
+</div></blockquote>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxネットワーキングドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="netdev-FAQ.html">netdev FAQ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="af_xdp.html">AF_XDP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bareudp.html">Bare UDPトンネリングモジュールドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="batman-adv.html">batman-adv</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can.html">SocketCAN - コントローラー・エリア・ネットワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can_ucan_protocol.html">UCANプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="device_drivers/index.html">ハードウェアデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dsa/index.html">分散スイッチアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="devlink/index.html">Linux Devlinkドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="caif/index.html">CAIF</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ethtool-netlink.html">ethtool用Netlinkインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ieee802154.html">IEEE 802.15.4開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="j1939.html">J1939ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kapi.html">LinuxネットワーキングとネットワークデバイスAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="msg_zerocopy.html">MSG_ZEROCOPY</a></li>
+<li class="toctree-l2"><a class="reference internal" href="failover.html">フェールオーバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="net_dim.html">Net DIM - ジェネリックネットワークダイナミック割込みモデレーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="net_failover.html">NET_FAILOVER</a></li>
+<li class="toctree-l2"><a class="reference internal" href="page_pool.html">ページプールAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phy.html">PHY抽象レイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sfp-phylink.html">phylink</a></li>
+<li class="toctree-l2"><a class="reference internal" href="alias.html">IPアリアシング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bridge.html">イーサネットブリッジング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="snmp_counter.html">SNMPカウンター</a></li>
+<li class="toctree-l2"><a class="reference internal" href="checksum-offloads.html">チェックサムオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="segmentation-offloads.html">セグメンテーションオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="scaling.html">Linuxネットワーキングスタックにおけるスケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tls.html">カーネルTLS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tls-offload.html">カーネルTLSオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nfc.html">Linux NFCサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6lowpan.html">6lowpanインターフェース用Netdevプライベートデータルーム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6pack.html">6packプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet-hardware.html">ARCnetハードウェア</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet.html">ARCnet</a></li>
+<li class="toctree-l2"><a class="reference internal" href="atm.html">ATM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ax25.html">AX.25</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bonding.html">LinuxイーサネットボンディングドライバHOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cdc_mbim.html">cdc_mbim - CDC MBIMモバイルブロードバンドモデム用ドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dccp.html">DCCPプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dctcp.html">DCTCP（データセンターTCP）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="decnet.html">Linux DECnetネットワーキングレイヤー情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dns_resolver.html">DNSリゾルバー・モジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="driver.html">Softnetドライバーの問題</a></li>
+<li class="toctree-l2"><a class="reference internal" href="eql.html">EQLドライバー: シリアルIPロードバランシングガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="fib_trie.html">LC-trie実装ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="filter.html">Linux Socket Filtering（別名Berkeley Packet Filter（BPF））</a></li>
+<li class="toctree-l2"><a class="reference internal" href="framerelay.html">フレームリレー（FR）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic-hdlc.html">ジェネリックHDLCレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic_netlink.html">ジェネリックネットリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gen_stats.html">ネットリンクユーザー向けジェネリックネットワーキング統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gtp.html">LinuxカーネルGTPトンネリングモジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ila.html">識別子ロケーターアドレスング（ILA）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipddp.html">AppleTalk-IPデカプセル化とAppleTalk-IPエンカプセル化</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip_dynaddr.html">IPダイナミックアドレスハックポートv0.03</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipsec.html">IPsec</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip-sysctl.html">IP Sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipv6.html">IPv6</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvlan.html">IPVLANドライバーガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvs-sysctl.html">IPvs-sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kcm.html">カーネルコネクションマルチプレクサ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="l2tp.html">L2TP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lapb-module.html">Linux LAPBモジュールインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mac80211-injection.html">mac80211を使用したパケットインジェクションの使い方</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mpls-sysctl.html">MPLS Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="multiqueue.html">マルチキューネットワークデバイスサポートガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netconsole.html">Netconsole</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdev-features.html">ネットデバイス機能の混乱とその解決方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdevices.html">ネットワークデバイス、カーネル、そしてあなた！</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netfilter-sysctl.html">Netfilter Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netif-msg.html">NETIFメッセージレベル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_conntrack-sysctl.html">Netfilter Conntrack Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_flowtable.html">Netfilterのフローテーブルインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="openvswitch.html">Open vSwitch datapath開発者ドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="operstates.html">運用状態</a></li>
+<li class="toctree-l2"><a class="reference internal" href="packet_mmap.html">パケットMMAP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phonet.html">Linux Phonetプロトコルファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pktgen.html">Linuxパケットジェネレーターガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="plip.html">PLIP: 平行線インターネットプロトコルデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ppp_generic.html">PPPジェネリックドライバーおよびチャネルインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="proc_net_tcp.html">proc/net/tcpおよびproc/net/tcp6変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="radiotap-headers.html">radiotapヘッダの使用方法</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">概要</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#rds-architecture">RDSアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#socket-interface">ソケットインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#rdma-for-rds">RDS用RDMA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#congestion-notifications">コンゲスト通知</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#rds-protocol">RDSプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#rds-transport-layer">RDSトランスポートレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#rds-kernel-structures">RDSカーネル構造体</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#connection-management">接続管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#the-send-path">送信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#the-recv-path">受信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#multipath-rds-mprds">マルチパスRDS (mprds)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="regulatory.html">Linuxワイヤレス規制ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html">RxRPC ネットワークプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#socket-options">ソケットオプション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#security">セキュリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#example-client-usage">例: クライアントの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sctp.html">LinuxカーネルSCTP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="secid.html">LSM/SeLinux secid</a></li>
+<li class="toctree-l2"><a class="reference internal" href="seg6-sysctl.html">Seg6 Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="statistics.html">インターフェース統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="strparser.html">ストリームパーサー (strparser)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="switchdev.html">イーサネットスイッチデバイスドライバモデル (switchdev)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysfs-tagging.html">Sysfsタグ付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tc-actions-env-rules.html">TCアクション - 環境ルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tcp-thin.html">スリムストリームとTCP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="team.html">チーム (Team)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="timestamping.html">タイムスタンピング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tproxy.html">透過プロキシサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tuntap.html">ユニバーサルTUN/TAPデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="udplite.html">UDP-Liteプロトコル (RFC 3828)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vrf.html">仮想ルーティングおよびフォワーディング (VRF)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vxlan.html">仮想拡張ローカルエリアネットワーキングドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html">パケットレイヤーからデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html#device-driver-to-packet-layer">デバイスドライバからパケットレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25.html">Linux X.25プロジェクト</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_device.html">XFRMデバイス - IPsec計算のオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_proc.html">XFRMプロセス - /proc/net/xfrm_*ファイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sync.html">XFRM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sysctl.html">XFRMシステムコール</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxネットワーキングドキュメント</a><ul>
+<li>前へ: <a href="radiotap-headers.html" title="前章">radiotapヘッダの使用方法</a></li>
+<li>次へ: <a href="regulatory.html" title="次章">Linuxワイヤレス規制ドキュメンテーション</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/networking/rds.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

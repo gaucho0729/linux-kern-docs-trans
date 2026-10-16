@@ -1,0 +1,971 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>L2TP — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="lapb-module.html" rel="next" title="Linux LAPBモジュールインターフェース"/>
+<link href="kcm.html" rel="prev" title="カーネルコネクションマルチプレクサ"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="l2tp">
+<h1>L2TP<a class="headerlink" href="#l2tp" title="この見出しへのパーマリンク">¶</a></h1>
+<p>レイヤー2トンネリングプロトコル（L2TP）は、IPネットワークを介してL2フレームをトンネル化する機能を提供します。</p>
+<p>このドキュメントはカーネルのL2TPサブシステムについて説明しており、L2TPサブシステムを使用するアプリケーション開発者向けのカーネルAPIを記載し、カーネル開発者やメンテナにとって有用な内部実装の技術的詳細も提供しています。</p>
+<section id="overview">
+<h2>概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>カーネルのL2TPサブシステムはL2TPv2およびL2TPv3のデータパスを実装しています。L2TPv2はUDPを、L2TPv3はUDPまたは直接IP（プロトコル115）を介して運ばれます。</p>
+<p>L2TP RFCでは、L2TPパケットを2つの基本的な種類に分類しています：コントロールパケット（「コントロールプレーン」）とデータパケット（「データプレーン」）。カーネルはデータパケットのみを処理し、より複雑なコントロールパケットはユーザー空間で処理されます。</p>
+<p>L2TPトンネルは1つまたは複数のL2TPセッションを運び、各トンネルはソケットと関連付けられ、各セッションは仮想ネットデバイスと関連付けられます。例えば、データフレームがL2TPを介して通過する経路です。 <code class="docutils literal notranslate"><span class="pre">pppN</span></code>, <code class="docutils literal notranslate"><span class="pre">l2tpethN</span></code>L2TPヘッダー内のフィールドはトンネルまたはセッションを識別し、パケットがコントロールパケットかデータパケットかを示します。LinuxカーネルAPIを用いてトンネルとセッションを設定する際には、L2TPデータパスの設定にとどまり、コントロールプロトコルのすべての側面はユーザー空間で処理されます。</p>
+<p>この責任の分離により、トンネルとセッションの確立時に自然な操作の順序が生じます。手順は以下の通りです：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>トンネルソケットを作成し、そのソケットを介してペアとコントロールプロトコルメッセージを交換してトンネルを確立します。</p></li>
+<li><p>コントロールプロトコルメッセージから得た情報を基に、カーネル内でトンネルコンテキストを作成します。</p></li>
+<li><p>トンネルソケットを介してペアとコントロールプロトコルメッセージを交換してセッションを確立します。</p></li>
+<li><p>コントロールプロトコルメッセージから得た情報を基に、カーネル内でセッションコンテキストを作成します。</p></li>
+</ol>
+</div></blockquote>
+</section>
+<section id="l2tp-apis">
+<h2>L2TP API<a class="headerlink" href="#l2tp-apis" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このセクションではL2TPサブシステムの各ユーザー空間APIを記載しています。</p>
+<section id="tunnel-sockets">
+<h3>トンネルソケット<a class="headerlink" href="#tunnel-sockets" title="この見出しへのパーマリンク">¶</a></h3>
+<p>L2TPv2は常にUDPを使用し、L2TPv3はUDPまたはIPカプセル化を使用することがあります。</p>
+<p>L2TP用のトンネルソケットを作成するには、標準的なPOSIXソケットAPIを使用します。</p>
+<p>IPv4アドレスとUDPカプセル化を使用するトンネルの例：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+</pre></div>
+</div>
+<p>IPv6アドレスとIPカプセル化を使用するトンネルの例：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int sockfd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_L2TP);
+</pre></div>
+</div>
+<p>UDPソケットプログラミングについては説明する必要はありません。</p>
+<p>IPPROTO_L2TPはカーネルのL2TPサブシステムで実装されるIPプロトコルタイプです。L2TPIPソケットアドレスは、struct sockaddr_l2tpipおよびstruct sockaddr_l2tpip6で定義されています。
+<a class="reference external" href="../../../include/uapi/linux/l2tp.h">include/uapi/linux/l2tp.h</a>アドレスにはL2TPトンネル（接続）IDが含まれます。L2TP IPエンカプスレーションを使用するには、L2TPv3アプリケーションはローカルに割り当てられたトンネルIDを使用してL2TPIPソケットにバインドする必要があります。ペアのトンネルIDとIPアドレスがわかっている場合、接続を確立する必要があります。</p>
+<p>L2TPアプリケーションがL2TPIPを使用してペアからL2TPv3トンネルのセットアップリクエストを処理する必要がある場合、そのリクエストをリッスンするための専用のL2TPIPソケットを開き、トンネルID 0を使用してソケットにバインドする必要があります。なぜなら、トンネルのセットアップリクエストはトンネルID 0宛てに送信されるからです。</p>
+<p>L2TPトンネルとそのすべてのセッションは、トンネルソケットが閉じられたときに自動的に閉じられます。</p>
+</section>
+<section id="netlink-api">
+<h3>Netlink API<a class="headerlink" href="#netlink-api" title="この見出しへのパーマリンク">¶</a></h3>
+<p>L2TPアプリケーションはNetlinkを使用して、カーネル内のL2TPトンネルおよびセッションインスタンスを管理します。L2TP Netlink APIの定義は
+<a class="reference external" href="../../../include/uapi/linux/l2tp.h">include/uapi/linux/l2tp.h</a>.</p>
+<p>L2TPは <a class="reference external" href="generic_netlink.html">ジェネリックネットリンク</a> (GENL)で定義されています。いくつかのコマンドが定義されています：トンネルおよびセッションインスタンス用の作成、削除、変更、取得など、例えば <code class="docutils literal notranslate"><span class="pre">L2TP_CMD_TUNNEL_CREATE</span></code>APIヘッダーは、各コマンドで使用可能なNetlink属性タイプを一覧しています。</p>
+<p>トンネルおよびセッションインスタンスは、ローカルで一意な32ビットIDで識別されます。L2TPトンネルIDは <code class="docutils literal notranslate"><span class="pre">L2TP_ATTR_CONN_ID</span></code> および
+<code class="docutils literal notranslate"><span class="pre">L2TP_ATTR_PEER_CONN_ID</span></code> 属性で指定され、L2TPセッションIDは <code class="docutils literal notranslate"><span class="pre">L2TP_ATTR_SESSION_ID</span></code> および <code class="docutils literal notranslate"><span class="pre">L2TP_ATTR_PEER_SESSION_ID</span></code>
+属性で指定されます。Netlinkを使用してL2TPv2トンネルおよびセッションインスタンスを管理する場合、L2TPv2の16ビットトンネル/セッションIDがこれらの属性で32ビット値にキャストされます。</p>
+<p>～において、クエリは <code class="docutils literal notranslate"><span class="pre">L2TP_CMD_TUNNEL_CREATE</span></code> コマンド、 <code class="docutils literal notranslate"><span class="pre">L2TP_ATTR_FD</span></code> がカーネルにトンネルソケットのファイル記述子を通知します。指定されない場合、カーネルはIPパラメータを設定した
+<code class="docutils literal notranslate"><span class="pre">L2TP_ATTR_IP[6]_SADDR</span></code>, <code class="docutils literal notranslate"><span class="pre">L2TP_ATTR_IP[6]_DADDR</span></code>,
+<code class="docutils literal notranslate"><span class="pre">L2TP_ATTR_UDP_SPORT</span></code>, <code class="docutils literal notranslate"><span class="pre">L2TP_ATTR_UDP_DPORT</span></code> 属性を使用してトンネル用のカーネルソケットを作成します。カーネルソケットは、未管理のL2TPv3トンネル（iproute2の「ip l2tp」コマンド）を実装するために使用されます。もし <code class="docutils literal notranslate"><span class="pre">L2TP_ATTR_FD</span></code> が指定されている場合、それはすでにバインドおよび接続済みのソケットファイル記述子でなければなりません。このドキュメント後半で未管理トンネルについてさらに詳述します。</p>
+<p><code class="docutils literal notranslate"><span class="pre">L2TP_CMD_TUNNEL_CREATE</span></code> 属性:-</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 25%"/>
+<col style="width: 11%"/>
+<col style="width: 64%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>属性</p></th>
+<th class="head"><p>必須</p></th>
+<th class="head"><p>Use</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>CONN_ID</p></td>
+<td><p>Y</p></td>
+<td><p>トンネル（接続）IDを設定します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>PEER_CONN_ID</p></td>
+<td><p>Y</p></td>
+<td><p>ペアのトンネル（接続）IDを設定します。</p></td>
+</tr>
+<tr class="row-even"><td><p>PROTO_VERSION</p></td>
+<td><p>Y</p></td>
+<td><p>プロトコルバージョン。2または3。</p></td>
+</tr>
+<tr class="row-odd"><td><p>ENCAP_TYPE</p></td>
+<td><p>Y</p></td>
+<td><p>エンカプスレーションタイプ：UDPまたはIP。</p></td>
+</tr>
+<tr class="row-even"><td><p>FD</p></td>
+<td><p>N</p></td>
+<td><p>トンネルソケットファイル記述子。</p></td>
+</tr>
+<tr class="row-odd"><td><p>UDP_CSUM</p></td>
+<td><p>N</p></td>
+<td><p>IPv4 UDPチェックサムを有効にします。FDが設定されていない場合にのみ使用されます。</p></td>
+</tr>
+<tr class="row-even"><td><p>UDP_ZERO_CSUM6_TX</p></td>
+<td><p>N</p></td>
+<td><p>IPv6 UDPチェックサムを送信時にゼロにします。FDが設定されていない場合にのみ使用されます。</p></td>
+</tr>
+<tr class="row-odd"><td><p>UDP_ZERO_CSUM6_RX</p></td>
+<td><p>N</p></td>
+<td><p>IPv6 UDPチェックサムを受信時にゼロにします。FDが設定されていない場合にのみ使用されます。</p></td>
+</tr>
+<tr class="row-even"><td><p>IP_SADDR</p></td>
+<td><p>N</p></td>
+<td><p>IPv4送信元アドレス。FDが設定されていない場合にのみ使用されます。</p></td>
+</tr>
+<tr class="row-odd"><td><p>IP_DADDR</p></td>
+<td><p>N</p></td>
+<td><p>IPv4宛先アドレス。FDが設定されていない場合にのみ使用されます。</p></td>
+</tr>
+<tr class="row-even"><td><p>UDP_SPORT</p></td>
+<td><p>N</p></td>
+<td><p>UDP送信元ポート。FDが設定されていない場合にのみ使用されます。</p></td>
+</tr>
+<tr class="row-odd"><td><p>UDP_DPORT</p></td>
+<td><p>N</p></td>
+<td><p>UDP宛先ポート。FDが設定されていない場合にのみ使用されます。</p></td>
+</tr>
+<tr class="row-even"><td><p>IP6_SADDR</p></td>
+<td><p>N</p></td>
+<td><p>IPv6ソースアドレス。FDが設定されていない場合にのみ使用します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>IP6_DADDR</p></td>
+<td><p>N</p></td>
+<td><p>IPv6宛先アドレス。FDが設定されていない場合にのみ使用します。</p></td>
+</tr>
+<tr class="row-even"><td><p>DEBUG</p></td>
+<td><p>N</p></td>
+<td><p>デバッグフラグ。</p></td>
+</tr>
+</tbody>
+</table>
+<p><code class="docutils literal notranslate"><span class="pre">L2TP_CMD_TUNNEL_DESTROY</span></code> 属性:-</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 27%"/>
+<col style="width: 12%"/>
+<col style="width: 61%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>属性</p></th>
+<th class="head"><p>必須</p></th>
+<th class="head"><p>Use</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>CONN_ID</p></td>
+<td><p>Y</p></td>
+<td><p>破壊するトンネルIDを特定します。</p></td>
+</tr>
+</tbody>
+</table>
+<p><code class="docutils literal notranslate"><span class="pre">L2TP_CMD_TUNNEL_MODIFY</span></code> 属性:-</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 27%"/>
+<col style="width: 12%"/>
+<col style="width: 61%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>属性</p></th>
+<th class="head"><p>必須</p></th>
+<th class="head"><p>Use</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>CONN_ID</p></td>
+<td><p>Y</p></td>
+<td><p>変更するトンネルIDを特定します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>DEBUG</p></td>
+<td><p>N</p></td>
+<td><p>デバッグフラグ。</p></td>
+</tr>
+</tbody>
+</table>
+<p><code class="docutils literal notranslate"><span class="pre">L2TP_CMD_TUNNEL_GET</span></code> 属性:-</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 28%"/>
+<col style="width: 12%"/>
+<col style="width: 60%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>属性</p></th>
+<th class="head"><p>必須</p></th>
+<th class="head"><p>Use</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>CONN_ID</p></td>
+<td><p>N</p></td>
+<td><p>照会するトンネルIDを特定します。DUMPリクエストでは無視されます。</p></td>
+</tr>
+</tbody>
+</table>
+<p><code class="docutils literal notranslate"><span class="pre">L2TP_CMD_SESSION_CREATE</span></code> 属性:-</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 26%"/>
+<col style="width: 12%"/>
+<col style="width: 62%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>属性</p></th>
+<th class="head"><p>必須</p></th>
+<th class="head"><p>Use</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>CONN_ID</p></td>
+<td><p>Y</p></td>
+<td><p>親トンネルID。</p></td>
+</tr>
+<tr class="row-odd"><td><p>SESSION_ID</p></td>
+<td><p>Y</p></td>
+<td><p>セッションIDを設定します。</p></td>
+</tr>
+<tr class="row-even"><td><p>PEER_SESSION_ID</p></td>
+<td><p>Y</p></td>
+<td><p>親セッションIDを設定します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>PW_TYPE</p></td>
+<td><p>Y</p></td>
+<td><p>擬似ワイヤータイプを設定します。</p></td>
+</tr>
+<tr class="row-even"><td><p>DEBUG</p></td>
+<td><p>N</p></td>
+<td><p>デバッグフラグ。</p></td>
+</tr>
+<tr class="row-odd"><td><p>RECV_SEQ</p></td>
+<td><p>N</p></td>
+<td><p>受信データシーケンス番号を有効にします。</p></td>
+</tr>
+<tr class="row-even"><td><p>SEND_SEQ</p></td>
+<td><p>N</p></td>
+<td><p>送信データシーケンス番号を有効にします。</p></td>
+</tr>
+<tr class="row-odd"><td><p>LNS_MODE</p></td>
+<td><p>N</p></td>
+<td><p>LNSモードを有効にします（データシーケンス番号の自動有効化）。</p></td>
+</tr>
+<tr class="row-even"><td><p>RECV_TIMEOUT</p></td>
+<td><p>N</p></td>
+<td><p>受信パケットの再配列を待つタイムアウト。</p></td>
+</tr>
+<tr class="row-odd"><td><p>L2SPEC_TYPE</p></td>
+<td><p>N</p></td>
+<td><p>レイヤー2固有サブレイヤータイプを設定します（L2TPv3専用）。</p></td>
+</tr>
+<tr class="row-even"><td><p>COOKIE</p></td>
+<td><p>N</p></td>
+<td><p>オプションのクッキーを設定します（L2TPv3専用）。</p></td>
+</tr>
+<tr class="row-odd"><td><p>PEER_COOKIE</p></td>
+<td><p>N</p></td>
+<td><p>オプションのペアーブリーフを設定します（L2TPv3専用）。</p></td>
+</tr>
+<tr class="row-even"><td><p>IFNAME</p></td>
+<td><p>N</p></td>
+<td><p>インターフェース名を設定します（L2TPv3専用）。</p></td>
+</tr>
+</tbody>
+</table>
+<p>イーサネットセッションタイプの場合、このパラメータはl2tpeth仮想インターフェースを生成し、必要な設定が可能になります。PPPセッションタイプの場合、PPPoL2TPソケットを開き接続し、新しいセッションにマッピングする必要があります。これは後述の「PPPoL2TPソケット」セクションで説明します。</p>
+<p><code class="docutils literal notranslate"><span class="pre">L2TP_CMD_SESSION_DESTROY</span></code> 属性:-</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 25%"/>
+<col style="width: 11%"/>
+<col style="width: 64%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>属性</p></th>
+<th class="head"><p>必須</p></th>
+<th class="head"><p>Use</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>CONN_ID</p></td>
+<td><p>Y</p></td>
+<td><p>破壊するセッションの親トンネルIDを特定します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>SESSION_ID</p></td>
+<td><p>Y</p></td>
+<td><p>破壊するセッションIDを特定します。</p></td>
+</tr>
+<tr class="row-even"><td><p>IFNAME</p></td>
+<td><p>N</p></td>
+<td><p>インターフェース名でセッションを特定します。設定されている場合、CONN_IDおよびSESSION_ID属性は無視されます。現在はL2TPv3イーサネットセッションのみサポートしています。</p></td>
+</tr>
+</tbody>
+</table>
+<p><code class="docutils literal notranslate"><span class="pre">L2TP_CMD_SESSION_MODIFY</span></code> 属性:-</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 25%"/>
+<col style="width: 11%"/>
+<col style="width: 64%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>属性</p></th>
+<th class="head"><p>必須</p></th>
+<th class="head"><p>Use</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>CONN_ID</p></td>
+<td><p>Y</p></td>
+<td><p>変更するセッションの親トンネルIDを特定します。</p></td>
+</tr>
+<tr class="row-odd"><td><p>SESSION_ID</p></td>
+<td><p>Y</p></td>
+<td><p>変更するセッションIDを特定します。</p></td>
+</tr>
+<tr class="row-even"><td><p>IFNAME</p></td>
+<td><p>N</p></td>
+<td><p>インターフェース名でセッションを特定します。設定されている場合、CONN_IDおよびSESSION_ID属性は無視されます。現在はL2TPv3イーサネットセッションのみサポートしています。</p></td>
+</tr>
+<tr class="row-odd"><td><p>DEBUG</p></td>
+<td><p>N</p></td>
+<td><p>デバッグフラグ。</p></td>
+</tr>
+<tr class="row-even"><td><p>RECV_SEQ</p></td>
+<td><p>N</p></td>
+<td><p>受信データシーケンス番号を有効にします。</p></td>
+</tr>
+<tr class="row-odd"><td><p>SEND_SEQ</p></td>
+<td><p>N</p></td>
+<td><p>送信データシーケンス番号を有効にします。</p></td>
+</tr>
+<tr class="row-even"><td><p>LNS_MODE</p></td>
+<td><p>N</p></td>
+<td><p>LNSモードを有効にします（データシーケンス番号の自動有効化）。</p></td>
+</tr>
+<tr class="row-odd"><td><p>RECV_TIMEOUT</p></td>
+<td><p>N</p></td>
+<td><p>受信パケットの再配列を待つタイムアウト。</p></td>
+</tr>
+</tbody>
+</table>
+<p><code class="docutils literal notranslate"><span class="pre">L2TP_CMD_SESSION_GET</span></code> 属性:-</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 27%"/>
+<col style="width: 12%"/>
+<col style="width: 61%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>属性</p></th>
+<th class="head"><p>必須</p></th>
+<th class="head"><p>Use</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>CONN_ID</p></td>
+<td><p>N</p></td>
+<td><p>照会するトンネルIDを特定します。DUMPリクエストでは無視されます。</p></td>
+</tr>
+<tr class="row-odd"><td><p>SESSION_ID</p></td>
+<td><p>N</p></td>
+<td><p>照会するセッションIDを特定します。DUMPリクエストでは無視されます。</p></td>
+</tr>
+<tr class="row-even"><td><p>IFNAME</p></td>
+<td><p>N</p></td>
+<td><p>インターフェース名によってセッションを識別します。設定されている場合、CONN_IDおよびSESSION_ID属性を上書きします。DUMPリクエストでは無視されます。現在はL2TPv3 Ethernetセッションのみサポートしています。</p></td>
+</tr>
+</tbody>
+</table>
+<p>アプリケーション開発者は以下を参照してください <a class="reference external" href="../../../include/uapi/linux/l2tp.h">include/uapi/linux/l2tp.h</a> netlinkコマンドおよび属性の定義を参照してください。</p>
+<p>libmnlを使用するユーザースペースのサンプルコードは以下の通りです。 <a class="reference external" href="https://www.netfilter.org/projects/libmnl">libmnl</a>:</p>
+<blockquote>
+<div><ul>
+<li><p>L2TP netlinkソケットを開く:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct nl_sock *nl_sock;
+int l2tp_nl_family_id;
+
+nl_sock = nl_socket_alloc();
+genl_connect(nl_sock);
+genl_id = genl_ctrl_resolve(nl_sock, L2TP_GENL_NAME);
+</pre></div>
+</div>
+</li>
+<li><p>トンネルを作成:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct nlmsghdr *nlh;
+struct genlmsghdr *gnlh;
+
+nlh = mnl_nlmsg_put_header(buf);
+nlh-&gt;nlmsg_type = genl_id; /* assigned to genl socket */
+nlh-&gt;nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+nlh-&gt;nlmsg_seq = seq;
+
+gnlh = mnl_nlmsg_put_extra_header(nlh, sizeof(*gnlh));
+gnlh-&gt;cmd = L2TP_CMD_TUNNEL_CREATE;
+gnlh-&gt;version = L2TP_GENL_VERSION;
+gnlh-&gt;reserved = 0;
+
+mnl_attr_put_u32(nlh, L2TP_ATTR_FD, tunl_sock_fd);
+mnl_attr_put_u32(nlh, L2TP_ATTR_CONN_ID, tid);
+mnl_attr_put_u32(nlh, L2TP_ATTR_PEER_CONN_ID, peer_tid);
+mnl_attr_put_u8(nlh, L2TP_ATTR_PROTO_VERSION, protocol_version);
+mnl_attr_put_u16(nlh, L2TP_ATTR_ENCAP_TYPE, encap);
+</pre></div>
+</div>
+</li>
+<li><p>セッションを作成:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct nlmsghdr *nlh;
+struct genlmsghdr *gnlh;
+
+nlh = mnl_nlmsg_put_header(buf);
+nlh-&gt;nlmsg_type = genl_id; /* assigned to genl socket */
+nlh-&gt;nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+nlh-&gt;nlmsg_seq = seq;
+
+gnlh = mnl_nlmsg_put_extra_header(nlh, sizeof(*gnlh));
+gnlh-&gt;cmd = L2TP_CMD_SESSION_CREATE;
+gnlh-&gt;version = L2TP_GENL_VERSION;
+gnlh-&gt;reserved = 0;
+
+mnl_attr_put_u32(nlh, L2TP_ATTR_CONN_ID, tid);
+mnl_attr_put_u32(nlh, L2TP_ATTR_PEER_CONN_ID, peer_tid);
+mnl_attr_put_u32(nlh, L2TP_ATTR_SESSION_ID, sid);
+mnl_attr_put_u32(nlh, L2TP_ATTR_PEER_SESSION_ID, peer_sid);
+mnl_attr_put_u16(nlh, L2TP_ATTR_PW_TYPE, pwtype);
+/* there are other session options which can be set using netlink
+ * attributes during session creation -- see l2tp.h
+ */
+</pre></div>
+</div>
+</li>
+<li><p>セッションを削除:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct nlmsghdr *nlh;
+struct genlmsghdr *gnlh;
+
+nlh = mnl_nlmsg_put_header(buf);
+nlh-&gt;nlmsg_type = genl_id; /* assigned to genl socket */
+nlh-&gt;nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+nlh-&gt;nlmsg_seq = seq;
+
+gnlh = mnl_nlmsg_put_extra_header(nlh, sizeof(*gnlh));
+gnlh-&gt;cmd = L2TP_CMD_SESSION_DELETE;
+gnlh-&gt;version = L2TP_GENL_VERSION;
+gnlh-&gt;reserved = 0;
+
+mnl_attr_put_u32(nlh, L2TP_ATTR_CONN_ID, tid);
+mnl_attr_put_u32(nlh, L2TP_ATTR_SESSION_ID, sid);
+</pre></div>
+</div>
+</li>
+<li><p>トンネルとそのすべてのセッション（存在すれば）を削除:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct nlmsghdr *nlh;
+struct genlmsghdr *gnlh;
+
+nlh = mnl_nlmsg_put_header(buf);
+nlh-&gt;nlmsg_type = genl_id; /* assigned to genl socket */
+nlh-&gt;nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+nlh-&gt;nlmsg_seq = seq;
+
+gnlh = mnl_nlmsg_put_extra_header(nlh, sizeof(*gnlh));
+gnlh-&gt;cmd = L2TP_CMD_TUNNEL_DELETE;
+gnlh-&gt;version = L2TP_GENL_VERSION;
+gnlh-&gt;reserved = 0;
+
+mnl_attr_put_u32(nlh, L2TP_ATTR_CONN_ID, tid);
+</pre></div>
+</div>
+</li>
+</ul>
+</div></blockquote>
+</section>
+<section id="pppol2tp-session-socket-api">
+<h3>PPPoL2TPセッションソケットAPI<a class="headerlink" href="#pppol2tp-session-socket-api" title="この見出しへのパーマリンク">¶</a></h3>
+<p>PPPセッションタイプの場合、PPPoL2TPソケットを開き、L2TPセッションに接続する必要があります。</p>
+<p>PPPoL2TPソケットを作成する際、アプリケーションはソケットconnect()呼び出しを通じてカーネルにトンネルおよびセッションに関する情報を提供します。ソースおよび宛先のトンネルおよびセッションID、UDPまたはL2TPIPソケットのファイルディスクリプタが提供されます。struct pppol2tp_addrについては <a class="reference external" href="../../../include/linux/if_pppol2tp.h">include/linux/if_pppol2tp.h</a>を参照してください。歴史的な理由により、L2TPv2/L2TPv3 IPv4/IPv6トンネルにはやや異なるアドレス構造があります。ユーザースペースは、トンネルソケットのタイプに応じて適切な構造を使用する必要があります。</p>
+<p>ユーザースペースは、PPPoXソケットのsetsockoptおよびioctlを通じてトンネルまたはセッションの動作を制御できます。サポートされるソケットオプションは次の通り:</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 13%"/>
+<col style="width: 87%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>DEBUG</p></td>
+<td><p>デバッグメッセージカテゴリのビットマスク。以下を参照してください。</p></td>
+</tr>
+<tr class="row-even"><td><p>SENDSEQ</p></td>
+<td><ul class="simple">
+<li><p>0 =&gt; シーケンス番号付きのパケットを送信しない</p></li>
+<li><p>1 =&gt; シーケンス番号付きのパケットを送信する</p></li>
+</ul>
+</td>
+</tr>
+<tr class="row-odd"><td><p>RECVSEQ</p></td>
+<td><ul class="simple">
+<li><p>0 =&gt; 受信パケットのシーケンス番号は任意</p></li>
+<li><p>1 =&gt; シーケンス番号のない受信パケットをドロップする</p></li>
+</ul>
+</td>
+</tr>
+<tr class="row-even"><td><p>LNSMODE</p></td>
+<td><ul class="simple">
+<li><p>0 =&gt; LACとして動作する</p></li>
+<li><p>1 =&gt; LNSとして動作する</p></li>
+</ul>
+</td>
+</tr>
+<tr class="row-odd"><td><p>REORDERTO</p></td>
+<td><p>再配列タイムアウト（ミリ秒単位）。0の場合は再配列を試みません。</p></td>
+</tr>
+</tbody>
+</table>
+<p>標準的なPPP ioctlsに加えて、PPPIOCGL2TPSTATSは、適切なトンネルまたはセッションのPPPoXソケットを使用してカーネルからトンネルおよびセッションの統計情報を取得するために提供されています。</p>
+<p>ユーザースペースのサンプルコード:</p>
+<blockquote>
+<div><ul>
+<li><p>セッションPPPoXデータソケットを作成:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct sockaddr_pppol2tp sax;
+int fd;
+
+/* Note, the tunnel socket must be bound already, else it
+ * will not be ready
+ */
+sax.sa_family = AF_PPPOX;
+sax.sa_protocol = PX_PROTO_OL2TP;
+sax.pppol2tp.fd = tunnel_fd;
+sax.pppol2tp.addr.sin_addr.s_addr = addr-&gt;sin_addr.s_addr;
+sax.pppol2tp.addr.sin_port = addr-&gt;sin_port;
+sax.pppol2tp.addr.sin_family = AF_INET;
+sax.pppol2tp.s_tunnel  = tunnel_id;
+sax.pppol2tp.s_session = session_id;
+sax.pppol2tp.d_tunnel  = peer_tunnel_id;
+sax.pppol2tp.d_session = peer_session_id;
+
+/* session_fd is the fd of the session's PPPoL2TP socket.
+ * tunnel_fd is the fd of the tunnel UDP / L2TPIP socket.
+ */
+fd = connect(session_fd, (struct sockaddr *)&amp;sax, sizeof(sax));
+if (fd &lt; 0 ) {
+        return -errno;
+}
+return 0;
+</pre></div>
+</div>
+</li>
+</ul>
+</div></blockquote>
+</section>
+<section id="old-l2tpv2-only-api">
+<h3>旧L2TPv2専用API<a class="headerlink" href="#old-l2tpv2-only-api" title="この見出しへのパーマリンク">¶</a></h3>
+<p>L2TPがLinuxカーネルに最初に導入された2.6.23では、L2TPv2のみを実装しており、netlink APIは含まれていませんでした。代わりに、カーネル内のトンネルおよびセッションインスタンスは、PPPoL2TPソケットを介して直接管理されていました。PPPoL2TPセッションソケットAPIのセクションで説明されているように、PPPoL2TPソケットは接続時に自動的にトンネルおよびセッションインスタンスが作成されるようになりました。</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>トンネルは、専用のPPPoL2TPソケットであるトンネル管理ソケットを使用して管理されます。このソケットは無効なセッションID 0に接続されています。PPPoL2TPトンネル管理ソケットが接続されるとL2TPトンネルインスタンスが作成され、ソケットが閉じるとインスタンスが破棄されます。</p></li>
+<li><p>セッションインスタンスは、PPPoL2TPソケットがゼロでないセッションIDに接続されたときにカーネル内で作成されます。セッションパラメータはsetsockoptを使用して設定されます。ソケットが閉じるとL2TPセッションインスタンスが破棄されます。</p></li>
+</ul>
+</div></blockquote>
+<p>このAPIはまだサポートされていますが、使用は推奨されません。代わりに新しいL2TPv2アプリケーションでは、まずnetlinkを使用してトンネルとセッションを作成し、その後セッション用のPPPoL2TPソケットを作成する必要があります。</p>
+</section>
+<section id="unmanaged-l2tpv3-tunnels">
+<h3>未管理のL2TPv3トンネル<a class="headerlink" href="#unmanaged-l2tpv3-tunnels" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルのL2TPサブシステムは、静的（未管理）なL2TPv3トンネルもサポートしています。未管理トンネルはユーザースペースのトンネルソケットを持たず、ピアとの通信で制御メッセージを交換せずにトンネルを設定します。トンネルの設定は各端で手動で行われ、すべての設定はnetlinkを使用して行われます。この場合、L2TPユーザースペースアプリケーションは必要ありません。カーネルがトンネルソケットを作成し、netlinkリクエストで送信されたパラメータで設定します。
+<code class="docutils literal notranslate"><span class="pre">L2TP_CMD_TUNNEL_CREATE</span></code> netlinkリクエスト。 <code class="docutils literal notranslate"><span class="pre">ip</span></code> ユーティリティの
+<code class="docutils literal notranslate"><span class="pre">iproute2</span></code> 静的L2TPv3トンネルを管理するコマンドを備えています。do <code class="docutils literal notranslate"><span class="pre">ip</span>
+<span class="pre">l2tp</span> <span class="pre">help</span></code> 詳しくは</p>
+</section>
+<section id="debugging">
+<h3>デバッグ<a class="headerlink" href="#debugging" title="この見出しへのパーマリンク">¶</a></h3>
+<p>L2TPサブシステムはdebugfsファイルシステムを通じてさまざまなデバッグインターフェースを提供しています。</p>
+<p>これらのインターフェースにアクセスするには、まずdebugfsファイルシステムをマウントする必要があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># mount -t debugfs debugfs /debug
+</pre></div>
+</div>
+<p>l2tpディレクトリ以下のファイルはアクセス可能となり、カーネル内に存在するトンネルおよびセッションコンテキストの現在の状態を要約しています:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># cat /debug/l2tp/tunnels
+</pre></div>
+</div>
+<p>アプリケーションがL2TPの状態情報を取得するためにdebugfsファイルを使用すべきではありません。ファイル形式は変更される可能性があります。これは問題の診断を支援するための追加のデバッグ情報を提供するための実装です。アプリケーションでは代わりにnetlink APIを使用すべきです。</p>
+<p>さらに、L2TPサブシステムは標準のカーネルイベントトレースAPIを使用してトレースポイントを実装しています。利用可能なL2TPイベントは以下の通り確認できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span># find /debug/tracing/events/l2tp
+</pre></div>
+</div>
+<p>最後に、/proc/net/pppol2tpは元のpppol2tpコードとの後方互換性のために提供されています。これはL2TPv2トンネルおよびセッションに関する情報のみをリストアップします。その使用は推奨されません。</p>
+</section>
+</section>
+<section id="internal-implementation">
+<h2>内部実装<a class="headerlink" href="#internal-implementation" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このセクションはカーネルの開発者およびメンテナナー向けです。</p>
+<section id="sockets">
+<h3>ソケット<a class="headerlink" href="#sockets" title="この見出しへのパーマリンク">¶</a></h3>
+<p>UDPソケットはネットワーキングコアによって実装されています。L2TPトンネルがUDPソケットを使用して作成される場合、UDPソケットにencap_rcvとencap_destroyコールバックを設定することで、エンカプスレーションされたUDPソケットとしてセットアップされます。パケットがソケットで受信されるとl2tp_udp_encap_recvが呼び出され、ユーザー空間がソケットを閉じるときにはl2tp_udp_encap_destroyが呼び出されます。</p>
+<p>L2TPIPソケットは <a class="reference external" href="../../../net/l2tp/l2tp_ip.c">net/l2tp/l2tp_ip.c</a> および
+<a class="reference external" href="../../../net/l2tp/l2tp_ip6.c">net/l2tp/l2tp_ip6.c</a>.</p>
+</section>
+<section id="tunnels">
+<h3>トンネル<a class="headerlink" href="#tunnels" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルはL2TPトンネルごとにstruct l2tp_tunnelコンテキストを保持しています。l2tp_tunnelは常にUDPまたはL2TP/IPソケットと関連付けられ、トンネル内のセッションリストを保持しています。L2TPコアにトンネルが最初に登録される際、ソケットの参照カウントが増加します。これにより、L2TPのデータ構造が参照している間、ソケットが削除されることを防ぎます。</p>
+<p>トンネルは一意のトンネルIDで識別されます。IDはL2TPv2では16ビット、L2TPv3では32ビットです。内部的にはIDは32ビット値として保存されます。</p>
+<p>トンネルはトンネルIDでインデックス化されたネットごとのリストに保持されます。トンネルIDの名前空間はL2TPv2とL2TPv3で共有されています。トンネルコンテキストはソケットのsk_user_dataから導出できます。</p>
+<p>トンネルソケットの閉じ処理はL2TP実装の中で最も複雑な部分かもしれません。ユーザー空間がトンネルソケットを閉じる場合、L2TPトンネルとそのすべてのセッションが閉じられ削除される必要があります。トンネルコンテキストはトンネルソケットに参照を保持しているため、ソケットのsk_destructはトンネルsock_putがソケットを解放するまで呼び出されません。UDPソケットの場合、ユーザー空間がトンネルソケットを閉じると、ソケットのencap_destroyハンドラが呼び出され、L2TPがトンネル閉じアクションを開始します。L2TPIPソケットの場合、ソケットのcloseハンドラが同じトンネル閉じアクションを開始します。すべてのセッションがまず閉じられ、各セッションはトンネル参照をリリースします。トンネル参照がゼロになると、トンネルはソケット参照を解放します。ソケットが最終的に破壊されるとき、sk_destructがL2TPトンネルコンテキストを解放します。</p>
+</section>
+<section id="sessions">
+<h3>セッション<a class="headerlink" href="#sessions" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルは各セッションに対してstruct l2tp_sessionコンテキストを保持しています。各セッションはセッションタイプに特有のデータを保持するプライベートデータを持っています。L2TPv2ではセッションは常にPPPトラフィックを運搬します。L2TPv3ではセッションはイーサネットフレーム（イーサネット擬似ワイヤー）やPPP、ATM、HDLC、フレームリレーなどの他のデータタイプを運搬できます。Linuxでは現在、イーサネットとPPPのセッションタイプのみを実装しています。</p>
+<p>一部のL2TPセッションタイプにはソケット（PPP擬似ワイヤー）があり、他のタイプにはありません（イーサネット擬似ワイヤー）。したがって、ソケット参照カウントをセッションコンテキストの参照カウントとして使用することはできません。L2TPの実装では、セッションコンテキストに独自の内部参照カウントを保持しています。</p>
+<p>トンネル同様に、L2TPセッションは一意のセッションIDで識別されます。トンネルIDと同様に、L2TPv2ではセッションIDが16ビット、L2TPv3では32ビットです。内部的には、IDは32ビットの値として保存されます。</p>
+<p>セッションは親トンネルに参照を保持し、1つ以上のセッションが参照している間、トンネルが存在し続けるようにしています。</p>
+<p>セッションはトンネルごとのリストに保持され、セッションIDでインデックス付けされます。L2TPv3セッションはさらにネットワークごとのリストに保持され、セッションIDでインデックス付けされます。これはL2TPv3セッションIDがすべてのトンネルを越えて一意であり、L2TPv3データパケットにトンネルIDがヘッダーに含まれていないためです。このリストは、トンネルコンテキストがトンネルソケットから導出できない場合に、受信したデータパケットに関連するセッションコンテキストを検索するために必要です。</p>
+<p>L2TPv3 RFCではL2TPv3セッションIDがトンネルスコープ外であると規定していますが、カーネルはL2TPv3 UDPトンネルに対してこの制限をチェックせず、L2TPv3 UDPトンネルのセッションをネットワークごとのセッションリストに追加しません。UDP受信コードでは、トンネルソケットのsk_user_dataを用いてトンネルを特定し、トンネルのセッションリストではなくネットワークごとのセッションリストでセッションを検索する必要があります。</p>
+</section>
+<section id="ppp">
+<h3>PPP<a class="headerlink" href="#ppp" title="この見出しへのパーマリンク">¶</a></h3>
+<p><a class="reference external" href="../../../net/l2tp/l2tp_ppp.c">net/l2tp/l2tp_ppp.c</a> PPP over L2TP（PPPoL2TP）ソケットファミリを実装しています。各PPPセッションにはPPP over L2TPソケットが割り当てられます。</p>
+<p>PPP over L2TPソケットのsk_user_dataはl2tp_sessionを参照しています。</p>
+<p>ユーザースペースはPPP over L2TPソケットを介してL2TPを介してPPPパケットを送受信します。このソケットを介して通過するのはPPPコントロールフレームのみです：PPPデータパケットはカーネルが処理し、L2TPセッションとその関連する <code class="docutils literal notranslate"><span class="pre">pppN</span></code> netdevを介してカーネルPPPサブシステムのPPPチャネルインターフェースを通じて処理されます。</p>
+<p>L2TP PPP実装では、PPPoL2TPソケットの閉じる操作は、対応するL2TPセッションの閉じることで行われます。これはネットリンクセッションの作成/破壊リクエストとpppol2tp_connectによる再接続がセッションの閉じる過程で競合するため複雑です。トンネルとは異なり、PPPセッションは関連するソケットに参照を保持していないため、コードでは必要に応じてsock_holdを呼び出す必要があります。詳細については、コミット3d609342cc04129ff7568e19316ce3d7451a27e8を参照してください。</p>
+</section>
+<section id="ethernet">
+<h3>イーサネット<a class="headerlink" href="#ethernet" title="この見出しへのパーマリンク">¶</a></h3>
+<p><a class="reference external" href="../../../net/l2tp/l2tp_eth.c">net/l2tp/l2tp_eth.c</a> L2TPv3 Ethernetの擬似ワイヤーを実装しています。各セッションに対してnetdevを管理します。</p>
+<p>L2TP Ethernetセッションはnetlinkリクエストによって作成または破棄され、トンネルが破棄されるときに破棄されます。PPPセッションとは異なり、Ethernetセッションには関連するソケットがありません。</p>
+</section>
+</section>
+<section id="miscellaneous">
+<h2>雑項<a class="headerlink" href="#miscellaneous" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="rfcs">
+<h3>RFC<a class="headerlink" href="#rfcs" title="この見出しへのパーマリンク">¶</a></h3>
+<p>カーネルコードは以下のRFCで指定されたデータパス機能を実装しています：</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 12%"/>
+<col style="width: 26%"/>
+<col style="width: 61%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>RFC2661</p></td>
+<td><p>L2TPv2</p></td>
+<td><p><a class="reference external" href="https://tools.ietf.org/html/rfc2661">https://tools.ietf.org/html/rfc2661</a></p></td>
+</tr>
+<tr class="row-even"><td><p>RFC3931</p></td>
+<td><p>L2TPv3</p></td>
+<td><p><a class="reference external" href="https://tools.ietf.org/html/rfc3931">https://tools.ietf.org/html/rfc3931</a></p></td>
+</tr>
+<tr class="row-odd"><td><p>RFC4719</p></td>
+<td><p>L2TPv3 Ethernet</p></td>
+<td><p><a class="reference external" href="https://tools.ietf.org/html/rfc4719">https://tools.ietf.org/html/rfc4719</a></p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="implementations">
+<h3>実装<a class="headerlink" href="#implementations" title="この見出しへのパーマリンク">¶</a></h3>
+<p>複数のオープンソースアプリケーションがL2TPカーネルサブシステムを使用しています：</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 21%"/>
+<col style="width: 79%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>iproute2</p></td>
+<td><p><a class="reference external" href="https://github.com/shemminger/iproute2">https://github.com/shemminger/iproute2</a></p></td>
+</tr>
+<tr class="row-even"><td><p>go-l2tp</p></td>
+<td><p><a class="reference external" href="https://github.com/katalix/go-l2tp">https://github.com/katalix/go-l2tp</a></p></td>
+</tr>
+<tr class="row-odd"><td><p>tunneldigger</p></td>
+<td><p><a class="reference external" href="https://github.com/wlanslovenija/tunneldigger">https://github.com/wlanslovenija/tunneldigger</a></p></td>
+</tr>
+<tr class="row-even"><td><p>xl2tpd</p></td>
+<td><p><a class="reference external" href="https://github.com/xelerance/xl2tpd">https://github.com/xelerance/xl2tpd</a></p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="limitations">
+<h3>制限<a class="headerlink" href="#limitations" title="この見出しへのパーマリンク">¶</a></h3>
+<p>現在の実装にはいくつかの制限があります：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>同じ5つのタプルアドレスを持つ複数のUDPソケットは使用できません。カーネルのトンネルコンテキストはソケットに関連付けられたプライベートデータで識別されるため、各ソケットがアドレスで一意に識別されることが重要です。</p></li>
+<li><p>オープンバーチャルスイッチ(OVS)とのインターフェースはまだ実装されていません。OVSのイーサネットおよびVLANポートをL2TPv3トンネルにマッピングすることができると便利かもしれません。</p></li>
+<li><p>VLAN擬似ワイヤーは <code class="docutils literal notranslate"><span class="pre">l2tpethN</span></code> VLANサブインターフェースで構成されたインターフェースを使用して実装されています。L2TPv3 VLAN擬似ワイヤーは1つのVLANのみを運ぶため、複数のVLANセッションごとに:Mペアを使用するよりも、単一のネットデバイスを使用する方が良いかもしれません。 <code class="docutils literal notranslate"><span class="pre">l2tpethN</span></code> および <code class="docutils literal notranslate"><span class="pre">l2tpethN</span></code>netlink属性
+<code class="docutils literal notranslate"><span class="pre">L2TP_ATTR_VLAN_ID</span></code> はこれのために追加されましたが、実装されていませんでした。</p></li>
+</ol>
+</div></blockquote>
+</section>
+<section id="testing">
+<h3>テスト<a class="headerlink" href="#testing" title="この見出しへのパーマリンク">¶</a></h3>
+<p>未管理のL2TPv3 Ethernet機能はカーネルの組み込み自己テストでテストされます。詳しくは <a class="reference external" href="../../../tools/testing/selftests/net/l2tp.sh">tools/testing/selftests/net/l2tp.sh</a>.</p>
+<p>別のテストスイート <a class="reference external" href="https://github.com/katalix/l2tp-ktest">l2tp-ktest</a>はすべてのL2TP APIとトンネル/セッションタイプをカバーしています。今後、カーネルの組み込みL2TP自己テストに統合される可能性があります。</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxネットワーキングドキュメント</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="netdev-FAQ.html">netdev FAQ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="af_xdp.html">AF_XDP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bareudp.html">Bare UDPトンネリングモジュールドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="batman-adv.html">batman-adv</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can.html">SocketCAN - コントローラー・エリア・ネットワーク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="can_ucan_protocol.html">UCANプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="device_drivers/index.html">ハードウェアデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dsa/index.html">分散スイッチアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="devlink/index.html">Linux Devlinkドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="caif/index.html">CAIF</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ethtool-netlink.html">ethtool用Netlinkインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ieee802154.html">IEEE 802.15.4開発者ガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="j1939.html">J1939ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kapi.html">LinuxネットワーキングとネットワークデバイスAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="msg_zerocopy.html">MSG_ZEROCOPY</a></li>
+<li class="toctree-l2"><a class="reference internal" href="failover.html">フェールオーバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="net_dim.html">Net DIM - ジェネリックネットワークダイナミック割込みモデレーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="net_failover.html">NET_FAILOVER</a></li>
+<li class="toctree-l2"><a class="reference internal" href="page_pool.html">ページプールAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phy.html">PHY抽象レイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sfp-phylink.html">phylink</a></li>
+<li class="toctree-l2"><a class="reference internal" href="alias.html">IPアリアシング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bridge.html">イーサネットブリッジング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="snmp_counter.html">SNMPカウンター</a></li>
+<li class="toctree-l2"><a class="reference internal" href="checksum-offloads.html">チェックサムオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="segmentation-offloads.html">セグメンテーションオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="scaling.html">Linuxネットワーキングスタックにおけるスケーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tls.html">カーネルTLS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tls-offload.html">カーネルTLSオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nfc.html">Linux NFCサブシステム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6lowpan.html">6lowpanインターフェース用Netdevプライベートデータルーム</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6pack.html">6packプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet-hardware.html">ARCnetハードウェア</a></li>
+<li class="toctree-l2"><a class="reference internal" href="arcnet.html">ARCnet</a></li>
+<li class="toctree-l2"><a class="reference internal" href="atm.html">ATM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ax25.html">AX.25</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bonding.html">LinuxイーサネットボンディングドライバHOWTO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cdc_mbim.html">cdc_mbim - CDC MBIMモバイルブロードバンドモデム用ドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dccp.html">DCCPプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dctcp.html">DCTCP（データセンターTCP）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="decnet.html">Linux DECnetネットワーキングレイヤー情報</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dns_resolver.html">DNSリゾルバー・モジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="driver.html">Softnetドライバーの問題</a></li>
+<li class="toctree-l2"><a class="reference internal" href="eql.html">EQLドライバー: シリアルIPロードバランシングガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="fib_trie.html">LC-trie実装ノート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="filter.html">Linux Socket Filtering（別名Berkeley Packet Filter（BPF））</a></li>
+<li class="toctree-l2"><a class="reference internal" href="framerelay.html">フレームリレー（FR）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic-hdlc.html">ジェネリックHDLCレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="generic_netlink.html">ジェネリックネットリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gen_stats.html">ネットリンクユーザー向けジェネリックネットワーキング統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gtp.html">LinuxカーネルGTPトンネリングモジュール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ila.html">識別子ロケーターアドレスング（ILA）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipddp.html">AppleTalk-IPデカプセル化とAppleTalk-IPエンカプセル化</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip_dynaddr.html">IPダイナミックアドレスハックポートv0.03</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipsec.html">IPsec</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ip-sysctl.html">IP Sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipv6.html">IPv6</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvlan.html">IPVLANドライバーガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ipvs-sysctl.html">IPvs-sysctl</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kcm.html">カーネルコネクションマルチプレクサ</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">L2TP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lapb-module.html">Linux LAPBモジュールインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mac80211-injection.html">mac80211を使用したパケットインジェクションの使い方</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mpls-sysctl.html">MPLS Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="multiqueue.html">マルチキューネットワークデバイスサポートガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netconsole.html">Netconsole</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdev-features.html">ネットデバイス機能の混乱とその解決方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netdevices.html">ネットワークデバイス、カーネル、そしてあなた！</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netfilter-sysctl.html">Netfilter Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="netif-msg.html">NETIFメッセージレベル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_conntrack-sysctl.html">Netfilter Conntrack Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nf_flowtable.html">Netfilterのフローテーブルインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="openvswitch.html">Open vSwitch datapath開発者ドキュメント</a></li>
+<li class="toctree-l2"><a class="reference internal" href="operstates.html">運用状態</a></li>
+<li class="toctree-l2"><a class="reference internal" href="packet_mmap.html">パケットMMAP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="phonet.html">Linux Phonetプロトコルファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pktgen.html">Linuxパケットジェネレーターガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="plip.html">PLIP: 平行線インターネットプロトコルデバイス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ppp_generic.html">PPPジェネリックドライバーおよびチャネルインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="proc_net_tcp.html">proc/net/tcpおよびproc/net/tcp6変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="radiotap-headers.html">radiotapヘッダの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html">概要</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-architecture">RDSアーキテクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#socket-interface">ソケットインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rdma-for-rds">RDS用RDMA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#congestion-notifications">コンゲスト通知</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-protocol">RDSプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-transport-layer">RDSトランスポートレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#rds-kernel-structures">RDSカーネル構造体</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#connection-management">接続管理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#the-send-path">送信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#the-recv-path">受信経路</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rds.html#multipath-rds-mprds">マルチパスRDS (mprds)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="regulatory.html">Linuxワイヤレス規制ドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html">RxRPC ネットワークプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#socket-options">ソケットオプション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#security">セキュリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rxrpc.html#example-client-usage">例: クライアントの使用方法</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sctp.html">LinuxカーネルSCTP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="secid.html">LSM/SeLinux secid</a></li>
+<li class="toctree-l2"><a class="reference internal" href="seg6-sysctl.html">Seg6 Sysfs変数</a></li>
+<li class="toctree-l2"><a class="reference internal" href="statistics.html">インターフェース統計</a></li>
+<li class="toctree-l2"><a class="reference internal" href="strparser.html">ストリームパーサー (strparser)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="switchdev.html">イーサネットスイッチデバイスドライバモデル (switchdev)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysfs-tagging.html">Sysfsタグ付け</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tc-actions-env-rules.html">TCアクション - 環境ルール</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tcp-thin.html">スリムストリームとTCP</a></li>
+<li class="toctree-l2"><a class="reference internal" href="team.html">チーム (Team)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="timestamping.html">タイムスタンピング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tproxy.html">透過プロキシサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tuntap.html">ユニバーサルTUN/TAPデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="udplite.html">UDP-Liteプロトコル (RFC 3828)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vrf.html">仮想ルーティングおよびフォワーディング (VRF)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vxlan.html">仮想拡張ローカルエリアネットワーキングドキュメンテーション</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html">パケットレイヤーからデバイスドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25-iface.html#device-driver-to-packet-layer">デバイスドライバからパケットレイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x25.html">Linux X.25プロジェクト</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_device.html">XFRMデバイス - IPsec計算のオフロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_proc.html">XFRMプロセス - /proc/net/xfrm_*ファイル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sync.html">XFRM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="xfrm_sysctl.html">XFRMシステムコール</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxネットワーキングドキュメント</a><ul>
+<li>前へ: <a href="kcm.html" title="前章">カーネルコネクションマルチプレクサ</a></li>
+<li>次へ: <a href="lapb-module.html" title="次章">Linux LAPBモジュールインターフェース</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/networking/l2tp.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

@@ -1,0 +1,859 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Adjunct Processor (AP) ファシリティ — Linux Kernel ドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="vfio-ccw.html" rel="next" title="vfio-ccw: 基本的なインフラストラクチャ"/>
+<link href="s390dbf.html" rel="prev" title="S390 デバッグ機能"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="adjunct-processor-ap-facility">
+<h1>添付プロセッサ (AP) ファシリティ<a class="headerlink" href="#adjunct-processor-ap-facility" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Adjunct Processor (AP) ファシリティは、IBM Zの暗号化ファシリティであり、3つのAP命令と1から256枚までのPCIe暗号化アダプタカードで構成されています。APデバイスは、IBM ZシステムのLPAR内でLinuxシステムに割り当てられたすべてのCPUに対して暗号処理機能を提供します。</p>
+<p>APアダプタカードはAPバス経由でアクセスされます。vfio-apの目的は、VFIO媒体デバイスフレームワークを用いてKVMゲストにAPカードを提供することです。この実装は、s390仮想化ファシリティに大きく依存しており、APデバイスへの直接アクセスの大部分を担当しています。</p>
+</section>
+<section id="ap-architectural-overview">
+<h2>APアーキテクチャ概要<a class="headerlink" href="#ap-architectural-overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>設計の理解を容易にするために、いくつかの定義から始めましょう:</p>
+<ul>
+<li><p>APアダプタ</p>
+<p>APアダプタは、暗号処理機能を実行できるIBM Zアダプタカードです。LPARには0から256枚のアダプタが割り当てられ得ます。Linuxホストが実行されているLPARに割り当てられたアダプタは、Linuxホストに利用可能です。各アダプタは0から255の番号で識別されますが、最大アダプタ番号は機種モデルやアダプタタイプによって決まります。インストール後、APアダプタはAP命令によってアクセスされます。</p>
+<p>APアダプタカードは、システムのアクティベーションプロファイルを通じて特定のLPARに割り当てられます。このプロファイルはHMCで編集可能です。LinuxホストシステムがLPAR内でIPL（Initial Program Load）されると、APバスはLPARに割り当てられたAPアダプタカードを検出し、各アダプタに対してsysfsデバイスを作成します。例えば、APアダプタ4と10（0x0a）がLPARに割り当てられた場合、APバスは以下のsysfsデバイスエントリを作成します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/devices/ap/card04
+/sys/devices/ap/card0a
+</pre></div>
+</div>
+<p>これらのデバイスには、APバスのデバイスサブディレクトリ内にシンボリックリンクも作成されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/bus/ap/devices/[card04]
+/sys/bus/ap/devices/[card04]
+</pre></div>
+</div>
+</li>
+<li><p>APドメイン</p>
+<p>アダプタはドメインに分割されます。アダプタタイプとハードウェア構成によって、アダプタは最大256つのドメインを保持できます。ドメインは0から255の番号で識別されますが、最大ドメイン番号は機種モデルやアダプタタイプによって決まります。ドメインはAPコマンドを処理するために使用されるハードウェアレジスタとメモリのセットと考えることができます。ドメインはセキュアプライベートキーを用いてクリアキー暗号化を行うように設定できます。ドメインはアクセス方法によって2つのカテゴリに分類されます:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>使用ドメインは、AP命令によって処理されるAPコマンドをターゲットにするドメインです。</p></li>
+<li><p>コントロールドメインは、使用ドメインに送信されたAPコマンドによって変更されるドメインであり、たとえばコントロールドメインにセキュアプライベートキーツーを設定するなどします。</p></li>
+</ul>
+</div></blockquote>
+<p>APの使用ドメインとコントロールドメインは、システムのアクティベーションプロファイル（HMCから編集可能）を介して指定されたLPARに割り当てられます。LPAR内でLinuxホストシステムがIPL（起動）されると、APバスモジュールがLPARに割り当てられたAP使用ドメインとコントロールドメインを検出します。各使用ドメインのドメイン番号と各APアダプターのアダプター番号を組み合わせることでAPキューデバイスが作成されます（以下「APキュー」セクションを参照）。各コントロールドメインのドメイン番号はビットマスクとして表現され、sysfsファイル /sys/bus/ap/ap_control_domain_mask に保存されます。マスク内のビットは、最も上位から最も下位の順にドメイン0〜255に対応します。</p>
+</li>
+<li><p>APキュー</p>
+<p>APキューは、特定のアダプター内の使用ドメインにAPコマンドを送信するための手段です。APキューは、APアダプターID（APID）とAPキューインデックス（APQI）を含むタプルで識別されます。APQIはアダプター内の特定の使用ドメイン番号に対応します。このタプルはAPキュー番号（APQN）としてAPキューを一意に識別します。AP指令にはAPQNを含むフィールドがあり、APコマンドが処理されるAPキューを指定します。</p>
+<p>APバスは、APアダプターと使用ドメイン番号のクロス積から導出可能なAPQNごとにsysfsデバイスを作成します。たとえば、アダプター4と10（0x0a）および使用ドメイン6と71（0x47）がLPARに割り当てられた場合、APバスは以下のsysfsエントリを作成します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/devices/ap/card04/04.0006
+/sys/devices/ap/card04/04.0047
+/sys/devices/ap/card0a/0a.0006
+/sys/devices/ap/card0a/0a.0047
+</pre></div>
+</div>
+<p>以下のシンボリックリンクがAPバスデバイスサブディレクトリに作成されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/bus/ap/devices/[04.0006]
+/sys/bus/ap/devices/[04.0047]
+/sys/bus/ap/devices/[0a.0006]
+/sys/bus/ap/devices/[0a.0047]
+</pre></div>
+</div>
+</li>
+<li><p>AP指令:</p>
+<p>AP指令は3種類あります：</p>
+<ul class="simple">
+<li><p>NQAP: キューにAPコマンドリクエストメッセージを追加する</p></li>
+<li><p>DQAP: キューからAPコマンドレスポンスメッセージを取得する</p></li>
+<li><p>PQAP: キューを管理する</p></li>
+</ul>
+<p>AP指令はAPコマンドを処理するターゲットドメインを指定します。これは使用ドメインのいずれかでなければなりません。APコマンドは使用ドメイン以外のドメインを変更する場合がありますが、変更されるドメインはコントロールドメインのいずれかでなければなりません。</p>
+</li>
+</ul>
+</section>
+<section id="ap-and-sie">
+<h2>APとSIE<a class="headerlink" href="#ap-and-sie" title="この見出しへのパーマリンク">¶</a></h2>
+<p>次に、ゲスト上で実行されるAP指令がハードウェアによってどのように解釈されるかを見てみましょう。</p>
+<p>主なハードウェア仮想化コントロールブロックに接続されたサブコントロールブロックである暗号コントロールブロック（CRYCB）があります。CRYCBには、KVMゲストに割り当てられたアダプター、使用ドメイン、コントロールドメインを識別する3つのフィールドが含まれています：</p>
+<ul class="simple">
+<li><p>APマスク（APM）フィールドは、KVMゲストに割り当てられたAPアダプターを識別するビットマスクです。マスクの各ビットは、左から右へ（つまり、ビッグエンディアン順の最上位ビットから最下位ビットへ）対応するAPID（0〜255）を表します。ビットが設定されている場合、対応するアダプターはKVMゲストによって使用可能です。</p></li>
+<li><p>APキュー マスク（AQM）フィールドは、KVMゲストに割り当てられたAP使用ドメインを識別するビットマスクです。マスクの各ビットは、左から右へ（つまり、ビッグエンディアン順の最上位ビットから最下位ビットへ）対応するAPキューインデックス（APQI）（0〜255）を表します。ビットが設定されている場合、対応するキューはKVMゲストによって使用可能です。</p></li>
+<li><p>APドメイン マスクフィールドは、KVMゲストに割り当てられたAP制御ドメインを識別するビットマスクです。ADMビットマスクは、APコマンドリクエストメッセージが使用ドメインからゲストに送信される際、どのドメインが変更可能かを制御します。マスクの各ビットは、左から右へ（つまり、ビッグエンディアン順の最上位ビットから最下位ビットへ）対応するドメイン（0〜255）を表します。ビットが設定されている場合、対応するドメインはAPコマンドリクエストメッセージによって変更可能です。</p></li>
+</ul>
+<p>APキューの説明から思い出してください。APコマンドリクエストメッセージが送信されるAPキュー（NQAPおよびPQAP指令）またはコマンドレスポンスメッセージを受信するAPキュー（DQAP指令）を識別するためのAPQNが含まれています。APQNの有効性は、APMとAQMから計算されたマトリクスによって定義されます。これは、すべての割り当てられたアダプター番号（APM）とすべての割り当てられたキューインデックス（AQM）のクロス積です。たとえば、アダプター1と2、使用ドメイン5と6がゲストに割り当てられた場合、APQN（1,5）、（1,6）、（2,5）および（2,6）はゲストに対して有効です。</p>
+<p>APQNはセキュアなキーファンクションを提供します - つまり、各ドメインごとにアダプター カードにプライベートキーが保存されるため、各APQNは最大1つのゲストまたはLinuxホストに割り当てられます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Example 1: Valid configuration:
+------------------------------
+Guest1: adapters 1,2  domains 5,6
+Guest2: adapter  1,2  domain 7
+
+This is valid because both guests have a unique set of APQNs:
+   Guest1 has APQNs (1,5), (1,6), (2,5), (2,6);
+   Guest2 has APQNs (1,7), (2,7)
+
+Example 2: Valid configuration:
+------------------------------
+Guest1: adapters 1,2 domains 5,6
+Guest2: adapters 3,4 domains 5,6
+
+This is also valid because both guests have a unique set of APQNs:
+   Guest1 has APQNs (1,5), (1,6), (2,5), (2,6);
+   Guest2 has APQNs (3,5), (3,6), (4,5), (4,6)
+
+Example 3: Invalid configuration:
+--------------------------------
+Guest1: adapters 1,2  domains 5,6
+Guest2: adapter  1    domains 6,7
+
+This is an invalid configuration because both guests have access to
+APQN (1,6).
+</pre></div>
+</div>
+</section>
+<section id="the-design">
+<h2>デザイン<a class="headerlink" href="#the-design" title="この見出しへのパーマリンク">¶</a></h2>
+<p>この設計は3つの新しいオブジェクトを導入します:</p>
+<ol class="arabic simple">
+<li><p>APマトリクス デバイス</p></li>
+<li><p>VFIO APデバイスドライバー（vfio_ap.ko）</p></li>
+<li><p>VFIO AP mediatedマトリクス パススルー デバイス</p></li>
+</ol>
+<section id="the-vfio-ap-device-driver">
+<h3>VFIO APデバイスドライバー<a class="headerlink" href="#the-vfio-ap-device-driver" title="この見出しへのパーマリンク">¶</a></h3>
+<p>VFIO AP（vfio_ap）デバイスドライバーは以下の目的を果たします:</p>
+<ol class="arabic simple">
+<li><p>KVMゲストの排他利用のためにセキュアなAPQNインターフェースを提供します。</p></li>
+<li><p>VFIO mediatedデバイスインターフェースを設定し、mediatedマトリクスデバイスを管理し、KVMゲストのマトリクスを構成するアダプター、使用ドメイン、制御ドメインを割り当てるためのsysfsインターフェースを作成します。</p></li>
+<li><p>KVMゲストのSIE状態記述で参照されるCRYCB内のAPM、AQMおよびADMを構成し、ゲストがAPデバイスのマトリクスへのアクセスを許可します</p></li>
+</ol>
+</section>
+<section id="reserve-apqns-for-exclusive-use-of-kvm-guests">
+<h3>KVMゲスト専用のAPQNを予約します<a class="headerlink" href="#reserve-apqns-for-exclusive-use-of-kvm-guests" title="この見出しへのパーマリンク">¶</a></h3>
+<p>次のブロック図はAPQNが予約されるメカニズムを示しています</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>                              +------------------+
+               7 remove       |                  |
+         +--------------------&gt; cex4queue driver |
+         |                    |                  |
+         |                    +------------------+
+         |
+         |
+         |                    +------------------+          +----------------+
+         |  5 register driver |                  | 3 create |                |
+         |   +----------------&gt;   Device core    +----------&gt;  matrix device |
+         |   |                |                  |          |                |
+         |   |                +--------^---------+          +----------------+
+         |   |                         |
+         |   |                         +-------------------+
+         |   | +-----------------------------------+       |
+         |   | |      4 register AP driver         |       | 2 register device
+         |   | |                                   |       |
++--------+---+-v---+                      +--------+-------+-+
+|                  |                      |                  |
+|      ap_bus      +--------------------- &gt;  vfio_ap driver  |
+|                  |       8 probe        |                  |
++--------^---------+                      +--^--^------------+
+6 edit   |                                   |  |
+  apmask |     +-----------------------------+  | 9 mdev create
+  aqmask |     |           1 modprobe           |
++--------+-----+---+           +----------------+-+         +----------------+
+|                  |           |                  |8 create |     mediated   |
+|      admin       |           | VFIO device core |---------&gt;     matrix     |
+|                  +           |                  |         |     device     |
++------+-+---------+           +--------^---------+         +--------^-------+
+       | |                              |                            |
+       | | 9 create vfio_ap-passthrough |                            |
+       | +------------------------------+                            |
+       +-------------------------------------------------------------+
+                   10  assign adapter/domain/control domain
+</pre></div>
+</div>
+<p>APキューをKVMゲストで使用するために予約するプロセスは以下の通りです</p>
+<ol class="arabic simple">
+<li><p>管理者がvfio_apデバイスドライバーをロードします</p></li>
+<li><p>vfio_apドライバーは初期化中にデバイスコアに単一の「matrix」デバイスを登録します。これは、ゲスト向けにAPマトリクスを構成するためのすべての媒介マトリクスデバイスの親デバイスとして機能します</p></li>
+<li><p>/sys/devices/vfio_ap/matrixデバイスはデバイスコアによって作成されます</p></li>
+<li><p>vfio_apドライバーはAPバスにAPキューデバイスのタイプ10以上（CEX4および新し）を登録します。ドライバーはvfio_apドライバーのプローブおよびリムーブコールバックインターフェースを提供します。CEX4キュー以前の古いデバイスはサポートされません。これは将来の短命なデバイスをサポートする必要がなく、テスト用の古いシステムが少ないため、実装を簡素化するためです</p></li>
+<li><p>APバスがvfio_apデバイスドライバーをデバイスコアに登録します</p></li>
+<li><p>管理者がAPアダプタおよびキューのマスクを編集し、vfio_apドライバーで使用するAPキューを予約します</p></li>
+<li><p>APバスがvfio_apドライバーのために予約されたAPキューをデフォルトのzcrypt cex4queueドライバーから削除します</p></li>
+<li><p>APバスがvfio_apドライバーに予約されたキューをバインドするためにプローブします</p></li>
+<li><p>管理者がゲストに使用されるパストスルー型の媒介マトリクスデバイスを作成します</p></li>
+<li><p>管理者がゲスト専用に使用されるアダプタ、使用ドメインおよび制御ドメインを割り当てます</p></li>
+</ol>
+</section>
+<section id="set-up-the-vfio-mediated-device-interfaces">
+<h3>VFIO媒介デバイスインターフェースをセットアップします<a class="headerlink" href="#set-up-the-vfio-mediated-device-interfaces" title="この見出しへのパーマリンク">¶</a></h3>
+<p>VFIO APデバイスドライバーはVFIO媒介デバイスコアドライバーの共通インターフェースを利用して以下の操作を行います</p>
+<ul class="simple">
+<li><p>AP媒介バスドライバーを登録し、VFIOグループに媒介マトリクスデバイスを追加および削除します</p></li>
+<li><p>媒介マトリクスデバイスを作成および破棄します</p></li>
+<li><p>AP媒介バスドライバーに媒介マトリクスデバイスを追加および削除します</p></li>
+<li><p>IOMMUグループに媒介マトリクスデバイスを追加および削除します</p></li>
+</ul>
+<p>次のハイレベルブロック図はVFIO AP媒介マトリクスデバイスドライバーの主なコンポーネントおよびインターフェースを示しています</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+-------------+
+|             |
+| +---------+ | mdev_register_driver() +--------------+
+| |  Mdev   | +&lt;-----------------------+              |
+| |  bus    | |                        | vfio_mdev.ko |
+| | driver  | +-----------------------&gt;+              |&lt;-&gt; VFIO user
+| +---------+ |    probe()/remove()    +--------------+    APIs
+|             |
+|  MDEV CORE  |
+|   MODULE    |
+|   mdev.ko   |
+| +---------+ | mdev_register_device() +--------------+
+| |Physical | +&lt;-----------------------+              |
+| | device  | |                        |  vfio_ap.ko  |&lt;-&gt; matrix
+| |interface| +-----------------------&gt;+              |    device
+| +---------+ |       callback         +--------------+
++-------------+
+</pre></div>
+</div>
+<p>vfio_apモジュールの初期化中に、matrixデバイスがmdev_parent_ops構造体に登録され、sysfs属性構造体、mdev関数およびコールバックインターフェースが媒介マトリクスデバイスの管理に使用されます</p>
+<ul>
+<li><p>sysfs属性構造:</p>
+<dl>
+<dt>supported_type_groups</dt><dd><p>VFIO媒体デバイスフレームワークは、ユーザー定義の媒体デバイスタイプの作成をサポートしています。これらの媒体デバイスタイプは、デバイスが媒体デバイスフレームワークに登録される際に'supported_type_groups'構造体を通じて指定されます。登録プロセスは、登録されているデバイスの'mdev_supported_types'サブディレクトリ内の各媒体デバイスタイプに対応するsysfs構造体を生成します。媒体デバイスタイプとともに、そのsysfs属性も提供されます。</p>
+<p>VFIO APデバイスドライバーは、透過デバイス用に1つの媒体デバイスタイプを登録します:</p>
+<blockquote>
+<div><p>/sys/devices/vfio_ap/matrix/mdev_supported_types/vfio_ap-passthrough</p>
+</div></blockquote>
+<p>VFIO mdevフレームワークが必要とする読み取り専用属性のみが提供されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>... name
+... device_api
+... available_instances
+... device_api
+</pre></div>
+</div>
+<p>以下では:</p>
+<blockquote>
+<div><ul class="simple">
+<li><dl class="simple">
+<dt>name:</dt><dd><p>媒体デバイスタイプの名前を指定します</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>device_api:</dt><dd><p>媒体デバイスタイプのAPI</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>available_instances:</dt><dd><p>作成可能な媒体マトリクス透過デバイスの数</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>device_api:</dt><dd><p>VFIO APIを指定します</p>
+</dd>
+</dl>
+</li>
+</ul>
+</div></blockquote>
+</dd>
+<dt>mdev_attr_groups</dt><dd><p>この属性グループは、媒体デバイスのユーザー定義sysfs属性を識別します。デバイスがVFIO媒体デバイスフレームワークに登録される際、'mdev_attr_groups'構造体で指定されたsysfs属性ファイルが、媒体マトリクスデバイスのディレクトリ内に作成されます。媒体マトリクスデバイスのsysfs属性は以下の通りです:</p>
+<dl class="simple">
+<dt>assign_adapter / unassign_adapter:</dt><dd><p>APアダプターを媒体マトリクスデバイスに割り当てたり解除したりするための書き込み専用属性。アダプターを割り当てたり解除したりするには、アダプターのAPIDを対応する属性ファイルにエコーバックします。</p>
+</dd>
+<dt>assign_domain / unassign_domain:</dt><dd><p>AP使用ドメインを媒体マトリクスデバイスに割り当てたり解除したりするための書き込み専用属性。ドメインを割り当てたり解除したりするには、使用ドメインのドメイン番号を対応する属性ファイルにエコーバックします。</p>
+</dd>
+<dt>matrix:</dt><dd><p>媒体マトリクスデバイスに割り当てられたアダプターおよびドメイン番号のクロス積から導出されるAPQNsを表示する読み取り専用ファイル。</p>
+</dd>
+<dt>assign_control_domain / unassign_control_domain:</dt><dd><p>AP制御ドメインを媒体マトリクスデバイスに割り当てたり解除したりするための書き込み専用属性。制御ドメインを割り当てたり解除したりするには、割り当てまたは解除するドメインIDを対応する属性ファイルにエコーバックします。</p>
+</dd>
+<dt>control_domains:</dt><dd><p>媒体マトリクスデバイスに割り当てられた制御ドメイン番号を表示する読み取り専用ファイル。</p>
+</dd>
+</dl>
+</dd>
+</dl>
+</li>
+<li><p>これは「識別子」ディレクティブの別名であり、非推奨です。</p>
+<dl class="simple">
+<dt>create:</dt><dd><p>vfio_apドライバーが使用するap_matrix_mdev構造体を割り当てます:</p>
+<ul class="simple">
+<li><p>ゲスト用のKVM構造体への参照をmdevを使用して保存します</p></li>
+<li><p>アダプタ、ドメイン、および制御ドメインのAPマトリクス構成を、対応するsysfs属性ファイルを介して割り当てられたアダプタ、ドメイン、および制御ドメインに対して保存します</p></li>
+</ul>
+</dd>
+<dt>remove:</dt><dd><p>mediated matrix deviceのap_matrix_mdev構造体を解放します。これは稼働中のゲストがmdevを使用していない場合にのみ許可されます</p>
+</dd>
+</dl>
+</li>
+<li><p>コールバックインターフェース</p>
+<dl class="simple">
+<dt>open:</dt><dd><p>vfio_apドライバーは、mdevマトリクスデバイスに対してVFIO_GROUP_NOTIFY_SET_KVMノティフィケーションコールバック関数を登録するためにこのコールバックを使用します。QEMUがmdevマトリクスデバイスのVFIO iommuグループをMDEVバスに接続するときにopenが呼び出されます。KVMゲストの設定に使用されるKVM構造体へのアクセスはこのコールバックを通じて提供されます。KVM構造体は、mediated matrix deviceのsysfs属性ファイルで定義されたAPマトリクスへのゲストのアクセスを設定するために使用されます</p>
+</dd>
+<dt>release:</dt><dd><p>mdevマトリクスデバイスのVFIO_GROUP_NOTIFY_SET_KVMノティフィケーションコールバック関数を解除し、ゲストのAPマトリクスをデコンフィギュアします</p>
+</dd>
+</dl>
+</li>
+</ul>
+</section>
+<section id="configure-the-apm-aqm-and-adm-in-the-crycb">
+<h3>CRYCBにおけるAPM、AQMおよびADMの設定<a class="headerlink" href="#configure-the-apm-aqm-and-adm-in-the-crycb" title="この見出しへのパーマリンク">¶</a></h3>
+<p>KVMゲストのAPマトリクスの設定は、VFIO_GROUP_NOTIFY_SET_KVMノティフィケーションコールバックが呼び出されるときに実行されます。ノティフィケーション関数はQEMUがKVMに接続するときに呼び出されます。ゲストのAPマトリクスは、そのCRYCBを介して設定されます</p>
+<ul class="simple">
+<li><p>mediated matrix deviceの「assign_adapter」インターフェースを介して割り当てられたAPIDに対応するAPMのビットを設定します</p></li>
+<li><p>mediated matrix deviceの「assign_domain」インターフェースを介して割り当てられたドメインに対応するAQMのビットを設定します</p></li>
+<li><p>mediated matrix deviceの「assign_control_domains」インターフェースを介して割り当てられたドメインdIDに対応するADMのビットを設定します</p></li>
+</ul>
+</section>
+<section id="the-cpu-model-features-for-ap">
+<h3>APのCPUモデル機能<a class="headerlink" href="#the-cpu-model-features-for-ap" title="この見出しへのパーマリンク">¶</a></h3>
+<p>APスタックはAP命令および2つのファシリティ、つまりAPファシリティテスト（APFT）ファシリティとAPクエリ構成情報（QCI）ファシリティの存在に依存しています。これらの機能/ファシリティは、以下のCPUモデル機能を通じてKVMゲストに提供されます</p>
+<ol class="arabic simple">
+<li><p>ap: ゲストにAP命令がインストールされているかどうかを示します。この機能はKVMがホストにAP命令がインストールされている場合にのみ有効になります</p></li>
+<li><p>apft: ゲストにAPFTファシリティが利用可能かどうかを示します。このファシリティはホストに存在する場合（つまりファシリティビット15が設定されている場合）にのみゲストに利用可能です</p></li>
+<li><p>apqci: ゲストにAP QCIファシリティが利用可能かどうかを示します。このファシリティはホストに存在する場合（つまりファシリティビット12が設定されている場合）にのみゲストに利用可能です</p></li>
+</ol>
+<p>注意: ユーザーがQEMUにホストモデル以外のCPUモデルを指定する場合、CPUモデルの機能や機能は明示的に有効にする必要があります。例えば:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/usr/bin/qemu-system-s390x ... -cpu z13,ap=on,apqci=on,apft=on
+</pre></div>
+</div>
+<p>ゲストがAP機能/機能を使用できないようにするには、明示的にそれらをオフにします。例えば:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/usr/bin/qemu-system-s390x ... -cpu host,ap=off,apqci=off,apft=off
+</pre></div>
+</div>
+<p>注意: ゲストでAPFT機能がオフにされている場合（apft=off）、ゲストはAPデバイスを認識できません。zcryptドライバがタイプ10以上（つまり、cex4cardおよびcex4queueドライバ）のAPデバイスを登録する場合、APFT機能が必要です。APFT機能がゲストにインストールされていない場合、ドライバのプローブが失敗します。これは、ゲストで使用可能なデバイスがタイプ10以上に限定されるためです。</p>
+</section>
+</section>
+<section id="example">
+<h2>例<a class="headerlink" href="#example" title="この見出しへのパーマリンク">¶</a></h2>
+<p>では、KVMゲストにAP機能へのアクセスを提供する方法を例示します。この例では、ゲストでlszcryptコマンドを実行した際の出力を以下のように設定する方法を示します:</p>
+<section id="guest1">
+<h3>ゲスト1<a class="headerlink" href="#guest1" title="この見出しへのパーマリンク">¶</a></h3>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 39%"/>
+<col style="width: 18%"/>
+<col style="width: 43%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>CARD.DOMAIN</p></th>
+<th class="head"><p>TYPE</p></th>
+<th class="head"><p>MODE</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>05</p></td>
+<td><p>CEX5C</p></td>
+<td><p>CCA-Coproc</p></td>
+</tr>
+<tr class="row-odd"><td><p>05.0004</p></td>
+<td><p>CEX5C</p></td>
+<td><p>CCA-Coproc</p></td>
+</tr>
+<tr class="row-even"><td><p>05.00ab</p></td>
+<td><p>CEX5C</p></td>
+<td><p>CCA-Coproc</p></td>
+</tr>
+<tr class="row-odd"><td><p>06</p></td>
+<td><p>CEX5A</p></td>
+<td><p>Accelerator</p></td>
+</tr>
+<tr class="row-even"><td><p>06.0004</p></td>
+<td><p>CEX5A</p></td>
+<td><p>Accelerator</p></td>
+</tr>
+<tr class="row-odd"><td><p>06.00ab</p></td>
+<td><p>CEX5C</p></td>
+<td><p>CCA-Coproc</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="guest2">
+<h3>ゲスト2<a class="headerlink" href="#guest2" title="この見出しへのパーマリンク">¶</a></h3>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 39%"/>
+<col style="width: 18%"/>
+<col style="width: 43%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>CARD.DOMAIN</p></th>
+<th class="head"><p>TYPE</p></th>
+<th class="head"><p>MODE</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>05</p></td>
+<td><p>CEX5A</p></td>
+<td><p>Accelerator</p></td>
+</tr>
+<tr class="row-odd"><td><p>05.0047</p></td>
+<td><p>CEX5A</p></td>
+<td><p>Accelerator</p></td>
+</tr>
+<tr class="row-even"><td><p>05.00ff</p></td>
+<td><p>CEX5A</p></td>
+<td><p>Accelerator</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="guest3">
+<h3>ゲスト3<a class="headerlink" href="#guest3" title="この見出しへのパーマリンク">¶</a></h3>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 39%"/>
+<col style="width: 18%"/>
+<col style="width: 43%"/>
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>CARD.DOMAIN</p></th>
+<th class="head"><p>TYPE</p></th>
+<th class="head"><p>MODE</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>06</p></td>
+<td><p>CEX5A</p></td>
+<td><p>Accelerator</p></td>
+</tr>
+<tr class="row-odd"><td><p>06.0047</p></td>
+<td><p>CEX5A</p></td>
+<td><p>Accelerator</p></td>
+</tr>
+<tr class="row-even"><td><p>06.00ff</p></td>
+<td><p>CEX5A</p></td>
+<td><p>Accelerator</p></td>
+</tr>
+</tbody>
+</table>
+<p>手順は以下の通りです:</p>
+<ol class="arabic">
+<li><p>Linuxホストにvfio_apモジュールをインストールします。vfio_apモジュールの依存関係チェーンは: * iommu * s390 * zcrypt * vfio * vfio_mdev * vfio_mdev_device * KVM</p>
+<p>vfio_apモジュールをビルドするには、カーネルビルドに以下のKconfig要素を選択する必要があります: * IOMMU_SUPPORT * S390 * ZCRYPT * S390_AP_IOMMU * VFIO * VFIO_MDEV * VFIO_MDEV_DEVICE * KVM</p>
+<p>make menuconfigを使用する場合、以下のオプションを選択してvfio_apモジュールをビルドします:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>-&gt; Device Drivers
+   -&gt; IOMMU Hardware Support
+      select S390 AP IOMMU Support
+   -&gt; VFIO Non-Privileged userspace driver framework
+      -&gt; Mediated device driver frramework
+         -&gt; VFIO driver for Mediated devices
+-&gt; I/O subsystem
+   -&gt; VFIO support for AP devices
+</pre></div>
+</div>
+</li>
+<li><p>3つのゲストで使用するAPキューをホストがアクセスできないようにします。キューを保護するには、2つのsysfsファイルが存在し、APQN範囲の一部を「デフォルトAPキュードライバのみで使用可能」または「デフォルトドライバで使用不可（vfio_apドライバで使用可能）」として指定します。sysfsファイルの場所は:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/bus/ap/apmask
+/sys/bus/ap/aqmask
+</pre></div>
+</div>
+<p>「apmask」は256ビットのマスクで、APアダプタID（APID）のセットを識別します。マスクの各ビット（左から右へ、つまりビッグエンディアン順の最上位ビットから最下位ビット）はAPID 0-255に対応します。ビットが設定されている場合、APIDはデフォルトAPキュードライバのみで使用可能とされます。そうでない場合、APIDはvfio_apドライバで使用可能とされます。</p>
+<p>「aqmask」は、APキューインデックス（APQI）のセットを識別する256ビットのマスクです。このマスクの各ビット（左から右へ、つまりビッグエンディアン順の最上位ビットから最下位ビット）は、APQI 0-255にそれぞれ対応します。ビットが設定されている場合、そのAPQIはデフォルトAPキュー割り当てドライバのみが使用可能とマークされます。そうでない場合、APQIはvfio_apドライバで使用可能です。</p>
+<p>例えば、以下のマスクを考えてみましょう:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>  0x7dffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+
+It indicates:
+
+  1, 2, 3, 4, 5, and 7-255 belong to the default drivers' pool, and 0 and 6
+  belong to the vfio_ap device driver's pool.
+</pre></div>
+</div>
+<p>Linuxホストに割り当てられた各APキュー割り当てデバイスのAPQNは、APバスがデフォルトAPキュー割り当てドライバのみで使用可能なAPQIとAPIDのクロス積から導かれるAPQNのセットと照合されます。一致が検出された場合、デフォルトAPキュー割り当てドライバのみがプローブされます。そうでない場合、vfio_apドライバがプローブされます。</p>
+<p>デフォルトでは、2つのマスクはデフォルトAPキュー割り当てドライバでの使用をすべてAPQNに予約します。デフォルトマスクを変更する方法は2通りあります:</p>
+<ol class="arabic">
+<li><p>sysfsのマスクファイルは、それぞれのsysfsマスクファイルに文字列をエコーバックすることで編集できます。フォーマットは次の2通りのいずれかです:</p>
+<ul>
+<li><p>0xで始まる絶対的な16進数文字列（例: 「0x12345678」）でマスクを設定します。指定された文字列がマスクよりも短い場合、右側に0で埋められます。例えば、マスク値を0x41と指定することは、以下の指定と同等です:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>0x4100000000000000000000000000000000000000000000000000000000000000
+</pre></div>
+</div>
+<p>マスクは左から右へ（つまりビッグエンディアン順の最上位ビットから最下位ビット）読み込まれるため、上記のマスクはデバイス番号1と7（01000001）を識別します。</p>
+<p>文字列がマスクよりも長い場合、操作はEINVALエラーで終了します。</p>
+</li>
+<li><p>マスクの個々のビットは、コンマ区切りのリストで指定するビット番号を指定することでオン/オフできます。各ビット番号文字列には、「+」（オン）または「-」（オフ）を先頭に付けて、対応するビットをオン/オフする指示を示します。有効な値の例は以下の通りです:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>「+0」はビット0をオンにします</p></li>
+<li><p>「-13」はビット13をオフにします</p></li>
+<li><p>「+0x41」はビット65をオンにします</p></li>
+<li><p>「-0xff」はビット255をオフにします</p></li>
+</ul>
+</div></blockquote>
+<p>以下の例:</p>
+<blockquote>
+<div><p>+0,-6,+0x47,-0xf0</p>
+</div></blockquote>
+<p>ビット0と71（0x47）をオンにします</p>
+<p>ビット6と240（0xf0）をオフにします</p>
+<p>リストに指定されていないビットは、操作前と同様の状態を維持します。</p>
+</li>
+</ul>
+</li>
+<li><p>マスクは、カーネルコマンドラインに設定されたパラメータを通じて起動時にも変更可能です。例えば:</p>
+<blockquote>
+<div><p>ap.apmask=0xffff ap.aqmask=0x40</p>
+<p>これにより、以下のマスクが作成されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>apmask:
+0xffff000000000000000000000000000000000000000000000000000000000000
+
+aqmask:
+0x4000000000000000000000000000000000000000000000000000000000000000
+</pre></div>
+</div>
+<p>これにより、以下の2つのプールが生成されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>default drivers pool:    adapter 0-15, domain 1
+alternate drivers pool:  adapter 16-255, domains 0, 2-255
+</pre></div>
+</div>
+</div></blockquote>
+</li>
+</ol>
+</li>
+</ol>
+</section>
+<section id="securing-the-apqns-for-our-example">
+<h3>私たちの例におけるAPQNのセキュリティを確保する<a class="headerlink" href="#securing-the-apqns-for-our-example" title="この見出しへのパーマリンク">¶</a></h3>
+<blockquote>
+<div><p>vfio_apデバイスドライバによる使用を確保するため、APキュー05.0004、05.0047、05.00ab、05.00ff、06.0004、06.0043、06.00ab、および06.00ffをセキュリティで保護するには、対応するAPQNsはデフォルトマスクから削除するか、以下のようにマスクを設定できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo -5,-6 &gt; /sys/bus/ap/apmask
+
+echo -4,-0x47,-0xab,-0xff &gt; /sys/bus/ap/aqmask
+</pre></div>
+</div>
+<p>または、マスクを以下のように設定することもできます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo 0xf9ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff \
+&gt; apmask
+
+echo 0xf7fffffffffffffffeffffffffffffffffffffffffeffffffffffffffffffffe \
+&gt; aqmask
+</pre></div>
+</div>
+<p>これにより、APキュー05.0004、05.0047、05.00ab、05.00ff、06.0004、06.0047、06.00ab、および06.00ffがvfio_apデバイスドライバにバインドされます。vfio_apデバイスドライバのsysfsディレクトリには、バインドされたAPキューデバイスへのシンボリックリンクが含まれるようになります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/bus/ap
+... [drivers]
+...... [vfio_ap]
+......... [05.0004]
+......... [05.0047]
+......... [05.00ab]
+......... [05.00ff]
+......... [06.0004]
+......... [06.0047]
+......... [06.00ab]
+......... [06.00ff]
+</pre></div>
+</div>
+<p>注意点として、vfio_apデバイスドライバにバインド可能なのはタイプ10以降のアダプター（つまりCEX4以降）のみです。これは、古いデバイスをサポートすることで設計を複雑にする必要がなく、近い将来にサービス停止するデバイスやテスト用システムが少ないためです。</p>
+<p>したがって、管理者はvfio_apデバイスドライバにバインド可能なAPキューのみをセキュリティで保護する必要があります。APキューデバイスのデバイスタイプは、親カードのsysfsディレクトリから読み取れます。例えば、キュー05.0004のハードウェアタイプを確認するには:</p>
+<blockquote>
+<div><p>cat /sys/bus/ap/devices/card05/hwtype</p>
+</div></blockquote>
+<p>hwtypeが10以上（CEX4以降）である必要があります。</p>
+</div></blockquote>
+<ol class="arabic" start="3">
+<li><p>3つのゲスト向けにAPマトリクスを構成し、ゲストがvfio_apドライバを使用できるインターフェースを提供するためのmediatedデバイスを構築します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/devices/vfio_ap/matrix/
+--- [mdev_supported_types]
+------ [vfio_ap-passthrough] (passthrough mediated matrix device type)
+--------- create
+--------- [devices]
+</pre></div>
+</div>
+<p>3つのゲスト用のmediatedデバイスを構築するには:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>uuidgen &gt; create
+uuidgen &gt; create
+uuidgen &gt; create
+
+or
+
+echo $uuid1 &gt; create
+echo $uuid2 &gt; create
+echo $uuid3 &gt; create
+</pre></div>
+</div>
+<p>これにより、[devices]サブディレクトリ内にcreate属性ファイルに書き込まれたUUIDに基づいて3つのmediatedデバイスが作成されます。これらを$uuid1、$uuid2、$uuid3と呼び、作成後のsysfsディレクトリ構造は以下の通りです:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/devices/vfio_ap/matrix/
+--- [mdev_supported_types]
+------ [vfio_ap-passthrough]
+--------- [devices]
+------------ [$uuid1]
+--------------- assign_adapter
+--------------- assign_control_domain
+--------------- assign_domain
+--------------- matrix
+--------------- unassign_adapter
+--------------- unassign_control_domain
+--------------- unassign_domain
+
+------------ [$uuid2]
+--------------- assign_adapter
+--------------- assign_control_domain
+--------------- assign_domain
+--------------- matrix
+--------------- unassign_adapter
+----------------unassign_control_domain
+----------------unassign_domain
+
+------------ [$uuid3]
+--------------- assign_adapter
+--------------- assign_control_domain
+--------------- assign_domain
+--------------- matrix
+--------------- unassign_adapter
+----------------unassign_control_domain
+----------------unassign_domain
+</pre></div>
+</div>
+</li>
+<li><p>管理者は、mediatedデバイス$uuid1（ゲスト1用）、$uuid2（ゲスト2用）、$uuid3（ゲスト3用）のマトリクスを構成する必要があります。</p>
+<p>ゲスト1のマトリクスは以下のように構成されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo 5 &gt; assign_adapter
+echo 6 &gt; assign_adapter
+echo 4 &gt; assign_domain
+echo 0xab &gt; assign_domain
+</pre></div>
+</div>
+<p>制御ドメインはassign_control_domain sysfsファイルを使用して同様に割り当てられます。</p>
+<p>アダプターやドメイン、制御ドメインの構成に誤りがある場合は、unassign_xxxファイルを使用してアダプター、ドメイン、または制御ドメインを解除できます。</p>
+<p>ゲスト1のマトリクス構成を表示するには:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>cat matrix
+</pre></div>
+</div>
+<p>ゲスト2のマトリクスは以下のように構成されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo 5 &gt; assign_adapter
+echo 0x47 &gt; assign_domain
+echo 0xff &gt; assign_domain
+</pre></div>
+</div>
+<p>ゲスト3のマトリクスは以下のように構成されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo 6 &gt; assign_adapter
+echo 0x47 &gt; assign_domain
+echo 0xff &gt; assign_domain
+</pre></div>
+</div>
+<p>アダプターを正しく割り当てるために</p>
+<ul>
+<li><p>指定されたアダプター番号は、システムで設定された最大アダプター番号までの0から値を表す必要があります。指定されたアダプター番号が最大を超える場合、操作はENODEVエラーで終了します。</p></li>
+<li><p>アダプターIDと以前に割り当てられたドメインIDから導出可能なすべてのAPQNはvfio_apデバイスドライバーにバインドする必要があります。まだドメインが割り当てられていない場合、指定されたAPIDを持つ少なくとも1つのAPQNがvfio_apドライバーにバインドされている必要があります。このようなAPQNがドライバーにバインドされていない場合、操作はEADDRNOTAVAILエラーで終了します。</p>
+<p>アダプターIDと以前に割り当てられたドメインIDから導出可能なAPQNは他のmediated matrixデバイスに割り当てられません。APQNが他のmediated matrixデバイスに割り当てられている場合、操作はEADDRINUSEエラーで終了します。</p>
+</li>
+</ul>
+<p>ドメインを正常に割り当てるために、</p>
+<ul>
+<li><p>指定されたドメイン番号は、システムで設定された最大ドメイン番号までの0から値を表す必要があります。指定されたドメイン番号が最大を超える場合、操作はENODEVエラーで終了します。</p></li>
+<li><p>ドメインIDと以前に割り当てられたアダプターIDから導出可能なすべてのAPQNはvfio_apデバイスドライバーにバインドする必要があります。まだドメインが割り当てられていない場合、指定されたAPQIを持つ少なくとも1つのAPQNがvfio_apドライバーにバインドされている必要があります。このようなAPQNがドライバーにバインドされていない場合、操作はEADDRNOTAVAILエラーで終了します。</p>
+<p>ドメインIDと以前に割り当てられたアダプターIDから導出可能なAPQNは他のmediated matrixデバイスに割り当てられません。APQNが他のmediated matrixデバイスに割り当てられている場合、操作はEADDRINUSEエラーで終了します。</p>
+</li>
+</ul>
+<p>制御ドメインを正常に割り当てるために、指定されたドメイン番号はシステムで設定された最大ドメイン番号までの0から値を表す必要があります。指定された制御ドメイン番号が最大を超える場合、操作はENODEVエラーで終了します。</p>
+</li>
+<li><p>ゲスト1を起動:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/usr/bin/qemu-system-s390x ... -cpu host,ap=on,apqci=on,apft=on \
+   -device vfio-ap,sysfsdev=/sys/devices/vfio_ap/matrix/$uuid1 ...
+</pre></div>
+</div>
+</li>
+</ol>
+<ol class="arabic" start="7">
+<li><p>ゲスト2を起動:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/usr/bin/qemu-system-s390x ... -cpu host,ap=on,apqci=on,apft=on \
+   -device vfio-ap,sysfsdev=/sys/devices/vfio_ap/matrix/$uuid2 ...
+</pre></div>
+</div>
+</li>
+</ol>
+<ol class="arabic" start="7">
+<li><p>ゲスト3を起動:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/usr/bin/qemu-system-s390x ... -cpu host,ap=on,apqci=on,apft=on \
+   -device vfio-ap,sysfsdev=/sys/devices/vfio_ap/matrix/$uuid3 ...
+</pre></div>
+</div>
+</li>
+</ol>
+<p>ゲストがシャットダウンされると、mediated matrixデバイスが削除される可能性があります。</p>
+<p>再度例を用いて、mediated matrixデバイス$uuid1を削除する場合:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/sys/devices/vfio_ap/matrix/
+   --- [mdev_supported_types]
+   ------ [vfio_ap-passthrough]
+   --------- [devices]
+   ------------ [$uuid1]
+   --------------- remove
+</pre></div>
+</div>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>echo 1 &gt; remove
+</pre></div>
+</div>
+<p>これにより、mdevマトリクスデバイスのsysfs構造体（mdevデバイスそのものを含む）がすべて削除されます。mdevマトリクスデバイスを再構成し直すには、ステップ3からすべての手順を再度実行する必要があります。注意点として、ゲストがまだ稼働している場合、削除操作は失敗します。</p>
+<p>mdevマトリクスデバイスを削除する必要はありませんが、Linuxホストの残りの寿命においてゲストが使用しない場合、削除することを検討するかもしれません。mdevマトリクスデバイスを削除した場合、デフォルトドライバーポールに予約されているアダプタとキューのプールを再構成することも検討するかもしれません。</p>
+</section>
+</section>
+<section id="limitations">
+<h2>制限<a class="headerlink" href="#limitations" title="この見出しへのパーマリンク">¶</a></h2>
+<ul class="simple">
+<li><p>KVM/カーネルインターフェースは、APQNをまだゲストによって使用されているmediatedデバイスに割り当てられたキューのデフォルトドライバーポールに戻すのを防ぐ方法を提供していません。管理者は、APQNが割り当てられたゲストによって使用されているmediatedデバイスがないことを確認する必要があります。そうしないと、ホストがAPキュー・デバイスのプライベートデータ（ゲストに特化して設定されたプライベートキーなど）にアクセスする可能性があります。</p></li>
+<li><p>稼働中のゲストのAPマトリクスを動的に変更する（APデバイスのホット（アン）プラグに相当）は、現在サポートされていません。</p></li>
+<li><p>APデバイスを使用するゲストのライブゲスト移動はサポートされていません。</p></li>
+</ul>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">s390アーキテクチャ</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="cds.html">S/390 および zSeries 用 Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="3270.html">IBM 3270 ディスプレイシステムのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="driver-model.html">S/390ドライバモデルインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="monreader.html">z/VM モニターレコードへの読み取りアクセス用 Linux API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="qeth.html">IBM s390 QDIO イーサネットドライバー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="s390dbf.html">S390 デバッグ機能</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">添付プロセッサ (AP) ファシリティ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vfio-ccw.html">vfio-ccw: 基本的なインフラストラクチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="zfcpdump.html">s390 SCSI ダンプツール (zfcpdump)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="common_io.html">S/390 共通 I/O レイヤー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pci.html">S/390 PCI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="text_files.html">IBM 3270 チェンジログ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="text_files.html#ibm-3270-config3270-sh">IBM 3270 config3270.sh</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">s390アーキテクチャ</a><ul>
+<li>前へ: <a href="s390dbf.html" title="前章">S390 デバッグ機能</a></li>
+<li>次へ: <a href="vfio-ccw.html" title="次章">vfio-ccw: 基本的なインフラストラクチャ</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/s390/vfio-ap.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

@@ -1,0 +1,414 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>バーチャルアクセラレータスイッチボード（VAS）ユーザースペースAPI — Linux Kernelドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="vcpudispatch_stats.html" rel="next" title="VCPU ディスパッチ統計"/>
+<link href="ultravisor.html" rel="prev" title="保護実行ファシリティ"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="virtual-accelerator-switchboard-vas-userspace-api">
+<span id="vas-api"></span><h1>仮想アクセラレータスイッチボード (VAS) ユーザースペース API<a class="headerlink" href="#virtual-accelerator-switchboard-vas-userspace-api" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="introduction">
+<h2>はじめに<a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Power9プロセッサはバーチャルアクセラレータスイッチボード（VAS）を導入し、ユーザー空間とカーネルがハードウェアアクセラレータ（ネストアクセラレータ（NX）と呼ばれるコプロセッサ）と通信できるようにしています。NXユニットは、842圧縮、GZIP圧縮、暗号化などの1つまたは複数のハードウェアエンジンまたはコプロセッサタイプから構成されます。Power9では、ユーザー空間アプリケーションはハードウェアでZLIBおよびGZIP圧縮アルゴリズムをサポートするGZIP圧縮エンジンにのみアクセス可能となります。</p>
+<p>NXと通信するには、カーネルがチャネルまたはウィンドウを確立し、その後カーネルの関与なしに直接リクエストを送信する必要があります。GZIPエンジンへのリクエストは、コプロセッサリクエストブロック（CRB）としてフォーマットされ、これらのCRBはCOPY/PASTE命令を使用してNXに送信され、エンジンのリクエストキューに関連するハードウェアアドレスにCRBがペーストされます。</p>
+<p>GZIPエンジンは2つの優先度レベルのリクエストを提供しています：通常と高優先度。現在はユーザー空間から通常リクエストのみがサポートされています。</p>
+<p>このドキュメントでは、カーネルと通信してチャネル/ウィンドウを設定し、直接NXアクセラレータに圧縮リクエストを送信できるようにするユーザースペースAPIについて説明します。</p>
+</section>
+<section id="overview">
+<h2>概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>GZIPエンジンへのアプリケーションアクセスは、VAS/NXデバイスドライバーによって実装された/dev/crypto/nx-gzipデバイスノードを通じて提供されます。アプリケーションは、/dev/crypto/nx-gzipデバイスを開いてファイルディスクリプタ（fd）を取得する必要があります。その後、このfdを使用してVAS_TX_WIN_OPEN ioctlを実行し、エンジンとの接続を確立します。これは、このプロセスに対してGZIPエンジンの送信ウィンドウが開かれたことを意味します。接続が確立されると、アプリケーションはmmap()システムコールを使用して、エンジンのリクエストキューのハードウェアアドレスをアプリケーションの仮想アドレス空間にマッピングする必要があります。</p>
+<p>アプリケーションは、copy/paste命令を使用して1つまたは複数のリクエストをエンジンに送信できます。この場合、mmap()によって返された仮想アドレス（つまりpaste_address）にCRBをペーストします。ユーザー空間は、ファイルディスクリプタを閉じる（close(fd)）ことにより確立した接続または送信ウィンドウを閉じることができます。または、プロセスの終了時に自動的に閉じます。</p>
+<p>アプリケーションは、同じウィンドウで複数のリクエストを送信したり、複数のウィンドウを確立したりできますが、各ファイルディスクリプタに対して1つのウィンドウのみが存在します。</p>
+<p>次のセクションでは、個々のステップに関する追加の詳細情報と参照が提供されています。</p>
+</section>
+<section id="nx-gzip-device-node">
+<h2>NX-GZIPデバイスノード<a class="headerlink" href="#nx-gzip-device-node" title="この見出しへのパーマリンク">¶</a></h2>
+<p>システムには1つの/dev/crypto/nx-gzipノードがあり、これはシステム内のすべてのGZIPエンジンへのアクセスを提供します。/dev/crypto/nx-gzipに対して有効な操作は以下の通りです。</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>読み取りと書き込みのためにデバイスを開きます。</p></li>
+<li><p>VAS_TX_WIN_OPEN ioctlを実行します。</p></li>
+<li><p>エンジンのリクエストキューをアプリケーションの仮想アドレス空間にmmap()して、コプロセッサエンジンのpaste_addressを取得します。</p></li>
+<li><p>デバイスノードを閉じます。</p></li>
+</ul>
+</div></blockquote>
+<p>このデバイスノードに対する他のファイル操作は未定義です。</p>
+<p>コピーおよびペースト操作はハードウェアに直接送信され、このデバイスを通じて行われません。詳細についてはCOPY/PASTEドキュメントを参照してください。</p>
+<p>システムには複数のNXコプロセッサエンジンのインスタンスがある場合があります（通常はP9チップごとに1つ）が、システム全体で1つの/dev/crypto/nx-gzipデバイスノードのみが存在します。nx-gzipデバイスノードを開くと、カーネルが適切なNXアクセラレータインスタンスの送信ウィンドウを開きます。実行中のユーザープロセスのCPUを特定し、そのCPUが属するチップに対応するNXインスタンスを決定します。</p>
+<p>アプリケーションは以下の説明に従って、VAS_TX_WIN_OPEN ioctlのvas_idフィールドを使用して特定のNXコプロセッサインスタンスを選択できます。</p>
+<p>ユーザー空間ライブラリlibnxzは以下にありますが、まだ開発中です：</p>
+<blockquote>
+<div><p><a class="reference external" href="https://github.com/abalib/power-gzip">https://github.com/abalib/power-gzip</a></p>
+</div></blockquote>
+<p>インフレート/デフロート呼び出しを使用するアプリケーションは、libzではなくlibnxzとリンクし、NX GZIP圧縮を使用できます。これにより、コードの変更は必要ありません。</p>
+</section>
+<section id="open-dev-crypto-nx-gzip">
+<h2>/dev/crypto/nx-gzipを開きます<a class="headerlink" href="#open-dev-crypto-nx-gzip" title="この見出しへのパーマリンク">¶</a></h2>
+<p>nx-gzipデバイスは読み取りと書き込みのために開く必要があります。デバイスを開くには特別な権限は必要ありません。各ウィンドウは1つのファイルディスクリプタに対応するため、ユーザー空間プロセスが複数のウィンドウが必要な場合は、複数のopen呼び出しが必要です。</p>
+<p>他の詳細（返却値、エラーコード、制限など）についてはopen(2)システムコールのmanページを参照してください。</p>
+</section>
+<section id="vas-tx-win-open-ioctl">
+<h2>VAS_TX_WIN_OPEN ioctl<a class="headerlink" href="#vas-tx-win-open-ioctl" title="この見出しへのパーマリンク">¶</a></h2>
+<p>NXコプロセッサエンジンと接続を確立するには、以下の通りVAS_TX_WIN_OPEN ioctlを使用してください。</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct vas_tx_win_open_attr {
+        __u32   version;
+        __s16   vas_id; /* specific instance of vas or -1
+                                for default */
+        __u16   reserved1;
+        __u64   flags;  /* For future use */
+        __u64   reserved2[6];
+};
+</pre></div>
+</div>
+<dl class="simple">
+<dt>バージョン:</dt><dd><p>バージョンフィールドは現在1に設定する必要があります。</p>
+</dd>
+<dt>vas_id:</dt><dd><p>'-1'を渡すと、カーネルがプロセスに最適なNXインスタンスをベストエフォートで割り当てます。特定のVASインスタンスを選択するには、「利用可能なVASエンジンの発見」セクションを参照してください。</p>
+</dd>
+</dl>
+<p>flags、reserved1およびreserved2[6]フィールドは今後の拡張用であり、0に設定する必要があります。</p>
+<p>VAS_TX_WIN_OPEN ioctlの属性attrは以下の通り定義されています：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#define VAS_MAGIC 'v'
+#define VAS_TX_WIN_OPEN _IOW(VAS_MAGIC, 1,
+                                struct vas_tx_win_open_attr)
+
+struct vas_tx_win_open_attr attr;
+rc = ioctl(fd, VAS_TX_WIN_OPEN, &amp;attr);
+</pre></div>
+</div>
+<p>VAS_TX_WIN_OPEN ioctlは成功時に0を返します。エラーの場合、-1を返し、errno変数にエラーを示します。</p>
+<p>エラー条件：</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 11%"/>
+<col style="width: 89%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>EINVAL</p></td>
+<td><p>fdが有効なVASデバイスを参照していません。</p></td>
+</tr>
+<tr class="row-even"><td><p>EINVAL</p></td>
+<td><p>無効なvas ID</p></td>
+</tr>
+<tr class="row-odd"><td><p>EINVAL</p></td>
+<td><p>バージョンが適切な値に設定されていません</p></td>
+</tr>
+<tr class="row-even"><td><p>EEXIST</p></td>
+<td><p>指定された fd に対してウィンドウがすでに開かれています</p></td>
+</tr>
+<tr class="row-odd"><td><p>ENOMEM</p></td>
+<td><p>メモリが不足してウィンドウの割り当てができません</p></td>
+</tr>
+<tr class="row-even"><td><p>ENOSPC</p></td>
+<td><p>システムにアクティブなウィンドウ（接続）が多すぎます</p></td>
+</tr>
+<tr class="row-odd"><td><p>EINVAL</p></td>
+<td><p>予約済みフィールドが 0 に設定されていません</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+<p>詳細情報やエラーコード、制限事項については ioctl(2) マニュアルページを参照してください</p>
+</div></blockquote>
+</section>
+<section id="mmap-nx-gzip-device">
+<h2>mmap() NX-GZIP デバイス<a class="headerlink" href="#mmap-nx-gzip-device" title="この見出しへのパーマリンク">¶</a></h2>
+<p>NX-GZIP デバイス fd の mmap() システムコールは、アプリケーションが CRB をハードウェアエンジンにコピー/ペーストするための paste_address を返します</p>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>paste_addr = mmap(addr, size, prot, flags, fd, offset);
+</pre></div>
+</div>
+<p>NX-GZIP デバイス fd における mmap() に関する制限は次の通りです:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>サイズは PAGE_SIZE にする必要があります</p></li>
+<li><p>オフセットパラメータは 0ULL にする必要があります</p></li>
+</ul>
+</div></blockquote>
+<p>mmap(2) マニュアルページを参照してください。mmap(2) マニュアルページに記載されているエラー条件に加えて、以下のエラーコードのいずれかで失敗する場合があります:</p>
+<blockquote>
+<div><table class="docutils align-default">
+<colgroup>
+<col style="width: 12%"/>
+<col style="width: 88%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>EINVAL</p></td>
+<td><p>fd が開いているウィンドウと関連付けられていない場合（つまり、VAS_TX_WIN_OPEN ioctl の成功した呼び出し後に mmap() が呼ばれていない場合）</p></td>
+</tr>
+<tr class="row-even"><td><p>EINVAL</p></td>
+<td><p>オフセットフィールドが 0ULL になっていない場合</p></td>
+</tr>
+</tbody>
+</table>
+</div></blockquote>
+</div></blockquote>
+</section>
+<section id="discovery-of-available-vas-engines">
+<h2>利用可能な VAS エンジンの検出<a class="headerlink" href="#discovery-of-available-vas-engines" title="この見出しへのパーマリンク">¶</a></h2>
+<p>システム内の各利用可能な VAS インスタンスは、/proc/device-tree/vas@* または /proc/device-tree/xscom@*/vas@* のようなデバイスツリーのノードを持っています。チップまたは VAS インスタンスを特定し、このノード内の対応する ibm,vas-id プロパティ値を使用して特定の VAS インスタンスを選択してください</p>
+</section>
+<section id="copy-paste-operations">
+<h2>コピー/ペースト操作<a class="headerlink" href="#copy-paste-operations" title="この見出しへのパーマリンク">¶</a></h2>
+<p>アプリケーションは、CRB を NX に送信するためにコピー/ペースト命令を使用する必要があります。PowerISA のセクション 4.4 を参照してください:
+<a class="reference external" href="https://openpowerfoundation.org/?resource_lib=power-isa-version-3-0">https://openpowerfoundation.org/?resource_lib=power-isa-version-3-0</a></p>
+</section>
+<section id="crb-specification-and-use-nx">
+<h2>CRB 指定と NX の使用<a class="headerlink" href="#crb-specification-and-use-nx" title="この見出しへのパーマリンク">¶</a></h2>
+<p>アプリケーションは、共処理機器にリクエストを送信する際、共処理機器リクエストブロック（CRB）を使用してフォーマットする必要があります。CRB の形式については NX-GZIP ユーザーマニュアルを参照し、ユーザー空間から NX を使用してリクエストを送信し、リクエストの状態を確認してください</p>
+</section>
+<section id="nx-fault-handling">
+<h2>NX フォールト処理<a class="headerlink" href="#nx-fault-handling" title="この見出しへのパーマリンク">¶</a></h2>
+<p>アプリケーションは NX にリクエストを送信し、共処理機器ステータスブロック（CSB）のフラグをポーリングしてステータスを待機します。NX は各リクエストの処理後に CSB にステータスを更新します。CSB の形式およびステータスフラグについては NX-GZIP ユーザーマニュアルを参照してください</p>
+<p>NX が CSB アドレスまたは任意のリクエストバッファで翻訳エラー（NX ページフォールトと呼ばれる）を検出すると、CPU に割り込みを発生させ、フォールトを処理します。アプリケーションが無効なアドレスを渡すか、リクエストバッファがメモリに存在しない場合、ページフォールトが発生します。オペレーティングシステムは、以下のデータで CSB を更新してフォールトを処理します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>csb.flags = CSB_V;
+csb.cc = CSB_CC_FAULT_ADDRESS;
+csb.ce = CSB_CE_TERMINATION;
+csb.address = fault_address;
+</pre></div>
+</div>
+<p>アプリケーションが翻訳エラーを受信した場合、フォールトアドレスを持つページにアクセスまたは操作することで、このページがメモリに存在するようにします。その後、アプリケーションはこのリクエストを NX に再送信できます</p>
+<p>OSが無効なCSBアドレスのためCSBを更新できなくなった場合、元のリクエストが送信された送信窓を開いたプロセスにSEGVシグナルを送信します。このシグナルは以下のsiginfo構造体と共に返されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>siginfo.si_signo = SIGSEGV;
+siginfo.si_errno = EFAULT;
+siginfo.si_code = SEGV_MAPERR;
+siginfo.si_addr = CSB adress;
+</pre></div>
+</div>
+<p>マルチスレッドアプリケーションの場合、NX送信窓はすべてのスレッド間で共有可能です。たとえば、子スレッドが送信窓を開いた場合でも、他のスレッドはこの窓を使用してNXにリクエストを送信できます。CSBアドレスが有効である限り、OSのハンドリングエラーでもリクエストは成功します。NXリクエストに無効なCSBアドレスが含まれる場合、シグナルは窓を開いた子スレッドに送信されます。ただし、スレッドが窓を閉じることなく終了し、この窓を使用してリクエストを発行した場合、シグナルはスレッドグループリーダー (tgid) に送信されます。これらのシグナルはアプリケーションが無視するか処理するかをアプリケーションが決定します。</p>
+<p>NX-GZIP ユーザーマニュアル:
+<a class="reference external" href="https://github.com/libnxz/power-gzip/blob/master/power_nx_gzip_um.pdf">https://github.com/libnxz/power-gzip/blob/master/power_nx_gzip_um.pdf</a></p>
+</section>
+<section id="simple-example">
+<h2>シンプルな例<a class="headerlink" href="#simple-example" title="この見出しへのパーマリンク">¶</a></h2>
+<blockquote>
+<div><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int use_nx_gzip()
+{
+        int rc, fd;
+        void *addr;
+        struct vas_setup_attr txattr;
+
+        fd = open("/dev/crypto/nx-gzip", O_RDWR);
+        if (fd &lt; 0) {
+                fprintf(stderr, "open nx-gzip failed\n");
+                return -1;
+        }
+        memset(&amp;txattr, 0, sizeof(txattr));
+        txattr.version = 1;
+        txattr.vas_id = -1
+        rc = ioctl(fd, VAS_TX_WIN_OPEN,
+                        (unsigned long)&amp;txattr);
+        if (rc &lt; 0) {
+                fprintf(stderr, "ioctl() n %d, error %d\n",
+                                rc, errno);
+                return rc;
+        }
+        addr = mmap(NULL, 4096, PROT_READ|PROT_WRITE,
+                        MAP_SHARED, fd, 0ULL);
+        if (addr == MAP_FAILED) {
+                fprintf(stderr, "mmap() failed, errno %d\n",
+                                errno);
+                return -errno;
+        }
+        do {
+                //Format CRB request with compression or
+                //uncompression
+                // Refer tests for vas_copy/vas_paste
+                vas_copy((&amp;crb, 0, 1);
+                vas_paste(addr, 0, 1);
+                // Poll on csb.flags with timeout
+                // csb address is listed in CRB
+        } while (true)
+        close(fd) or window can be closed upon process exit
+}
+</pre></div>
+</div>
+<p>参照 <a class="reference external" href="https://github.com/abalib/power-gzip">https://github.com/abalib/power-gzip</a> テストやより多くの使用例については</p>
+</div></blockquote>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">powerpc</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="booting.html">デバイスツリー起動</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bootwrapper.html">PowerPC ブート Wrapper</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cpu_families.html">CPU ファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cpu_features.html">CPU フィーチャ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cxl.html">コヒーレントアクセラレータインターフェース (CXL)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cxlflash.html">コヒーレントアクセラレータ (CXL) フラッシュ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dawr-power9.html">POWER9 上の DAWR に関する問題</a></li>
+<li class="toctree-l2"><a class="reference internal" href="dscr.html">DSCR (データストリーム制御レジスタ)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="eeh-pci-error-recovery.html">PCIバスEEHエラー回復</a></li>
+<li class="toctree-l2"><a class="reference internal" href="elfnote.html">ELF ノート PowerPC ネームスペース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="firmware-assisted-dump.html">ファームウェア支援ダンプ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hvcs.html">HVCS IBM 「ハイパーザーチャー仮想コンソールサーバー」インストールガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="imc.html">IMC (インメモリコレクションカウンタ)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="isa-versions.html">CPU と ISA バージョンマッピング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kaslr-booke32.html">Freescale BookE32 用 KASLR</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mpc52xx.html">Linux 2.6.x における MPC52xx ファミリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="papr_hcalls.html">ハイパーコール操作コード (hcalls)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pci_iov_resource_on_powernv.html">Powerenv 上の PCI Express I/O ビジュー化リソース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pmu-ebb.html">PMU イベントベースのブランチ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ptrace.html">Ptrace</a></li>
+<li class="toctree-l2"><a class="reference internal" href="qe_firmware.html">Freescale QUICC エンジンファームウェアのアップロード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="syscall64-abi.html">Power Architecture 64 ビット Linux システムコール ABI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="transactional_memory.html">トランザクショナルメモリのサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ultravisor.html">保護実行ファシリティ</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">仮想アクセラレータスイッチボード (VAS) ユーザースペース API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vcpudispatch_stats.html">VCPU ディスパッチ統計</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">powerpc</a><ul>
+<li>前へ: <a href="ultravisor.html" title="前章">保護実行ファシリティ</a></li>
+<li>次へ: <a href="vcpudispatch_stats.html" title="次章">VCPU ディスパッチ統計</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/powerpc/vas-api.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>
