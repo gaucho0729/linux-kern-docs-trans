@@ -1,0 +1,255 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>KVMハルトポーリングシステム — Linux Kernelドキュメンテーション</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="hypercalls.html" rel="next" title="Linux KVMハイパーコール"/>
+<link href="cpuid.html" rel="prev" title="KVM CPUIDビット"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="the-kvm-halt-polling-system">
+<h1>KVMハルトポーリングシステム<a class="headerlink" href="#the-kvm-halt-polling-system" title="この見出しへのパーマリンク">¶</a></h1>
+<p>KVMハルトポーリングシステムは、ゲストのレイテンシーが特定の状況で短縮される機能を提供します。これは、ゲストが実行を停止した後、ホストが一定期間ポーリングすることで達成されます。つまり、ゲストの仮想CPU（vcpu）が実行を停止した場合、またはPowerPCの場合には、単一の仮想コア（vcore）のすべてのvcpuが実行を停止した場合、ホストカーネルはスケジューラにCPUを渡す前に、ウェイクアップ条件をポーリングして他のタスクの実行を可能にします。</p>
+<p>ポーリングは、スケジューラを経由する必要がないことでレイテンシーの利点を提供します。通常、マイクロ秒単位の短時間ですが、パフォーマンスの向上は作業負荷に依存します。ポーリング期間中にウェイクアップソースが到達しなかった場合、またはランキューに実行可能な他のタスクがある場合、スケジューラが呼び出されます。したがって、非常に短いウェイクアップ期間を持つ作業負荷では、ハルトポーリングにより時間の節約が顕著になるため、この機能は特に有効です。</p>
+<p>一般的なハルトポーリングコードは以下のファイルに実装されています：</p>
+<blockquote>
+<div><p>virt/kvm/kvm_main.c: kvm_vcpu_block()</p>
+</div></blockquote>
+<p>PowerPC KVM-HVの特定ケースは以下のファイルに実装されています：</p>
+<blockquote>
+<div><p>arch/powerpc/kvm/book3s_hv.c: kvmppc_vcore_blocked()</p>
+</div></blockquote>
+<section id="halt-polling-interval">
+<h2>ハルトポーリングインターバル<a class="headerlink" href="#halt-polling-interval" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ポーリングを実行する最大時間（ハルトポーリングインターバル）は、ポーリングの有効性に基づいて増減され、無駄なポーリングを制限します。この値は、vcpu構造体に保存されています：</p>
+<blockquote>
+<div><p>kvm_vcpu-&gt;halt_poll_ns</p>
+</div></blockquote>
+<p>PowerPC KVM-HVの場合、vcore構造体に保存されています：</p>
+<blockquote>
+<div><p>kvmppc_vcore-&gt;halt_poll_ns</p>
+</div></blockquote>
+<p>したがって、これは各vcpu（またはvcore）ごとの値です。</p>
+<p>ポーリング中にハルトポーリングインターバル内にウェイクアップソースが到達した場合、インターバルは変更されません。ウェイクアップソースが到達しなかった場合（スケジューラが呼び出される）、2つの選択肢があります：1つは、ポーリングインターバルとブロック時間の合計がグローバル最大ポーリングインターバル（下記のモジュールパラメータを参照）よりも短かったこと、2つ目は、ブロック時間の合計がグローバル最大ポーリングインターバルよりも長かったことです。</p>
+<p>ポーリング間隔と総ブロック時間の両方がグローバル最大ポーリング間隔よりも短い場合、次のポーリング間隔を長くすることで、より長いポーリング間隔中にホストがポーリングしている間にウェイクアップソースを受信し、レイテンシのメリットを得られる可能性があります。ポーリング間隔はgrow_halt_poll_ns()関数内で拡大され、モジュールパラメータhalt_poll_ns_growとhalt_poll_ns_grow_startによって乗算されます。</p>
+<p>総ブロック時間がグローバル最大ポーリング間隔よりも長い場合、ホストはグローバル最大の制限により十分に長い時間ポーリングできないため、ポーリング間隔を縮小して無駄なポーリングを避けるのが適切です。ポーリング間隔はshrink_halt_poll_ns()関数内で縮小され、モジュールパラメータhalt_poll_ns_shrinkで除算されるか、halt_poll_ns_shrinkが0の場合は0に設定されます。</p>
+<p>調整プロセスは、ポーリング間隔が定常状態に近づくように試みていますが、ウェイクアップがほぼ一定の頻度で発生する場合にのみ有効です。そうでない場合、ポーリング間隔が常に調整されます。</p>
+<dl class="simple">
+<dt>[0] 総ブロック時間:</dt><dd><p>haltポーリング関数が呼び出され、ウェイクアップソースが受信されるまでの時間（その関数内でスケジューラが呼び出されるかどうかに関係なく）。</p>
+</dd>
+</dl>
+</section>
+<section id="module-parameters">
+<h2>モジュールパラメータ<a class="headerlink" href="#module-parameters" title="この見出しへのパーマリンク">¶</a></h2>
+<p>KVMモジュールには、グローバル最大ポーリング間隔を調整し、ポーリング間隔の拡大・縮小の速度を調整するための3つの調整可能なモジュールパラメータがあります。これらの変数はinclude/linux/kvm_host.hに定義されており、モジュールパラメータとしてvirt/kvm/kvm_main.cまたはarch/powerpc/kvm/book3s_hv.c（powerpc kvm-hvの場合）にあります。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 31%"/>
+<col style="width: 36%"/>
+<col style="width: 33%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>モジュールパラメータ</p></td>
+<td><p>説明</p></td>
+<td><p>デフォルト値</p></td>
+</tr>
+<tr class="row-even"><td><p>halt_poll_ns</p></td>
+<td><p>各vcpuのポーリング間隔の上限を定義するグローバル最大ポーリング間隔。</p></td>
+<td><p>KVM_HALT_POLL_NS_DEFAULT</p>
+<p>（アーキテクチャごとの値）</p>
+</td>
+</tr>
+<tr class="row-odd"><td><p>halt_poll_ns_grow</p></td>
+<td><p>grow_halt_poll_ns()関数でhalt ポーリング間隔が乗算される値。</p></td>
+<td><p>2</p></td>
+</tr>
+<tr class="row-even"><td><p>halt_poll_ns_grow_start</p></td>
+<td><p>grow_halt_poll_ns()関数でゼロから成長させる初期値。</p></td>
+<td><p>10000</p></td>
+</tr>
+<tr class="row-odd"><td><p>halt_poll_ns_shrink</p></td>
+<td><p>shrink_halt_poll_ns()関数でhalt ポーリング間隔が除算される値。</p></td>
+<td><p>0</p></td>
+</tr>
+</tbody>
+</table>
+<p>これらのモジュールパラメータは、以下のdebugfsファイルから設定できます:</p>
+<blockquote>
+<div><p>/sys/module/kvm/parameters/</p>
+</div></blockquote>
+<dl class="simple">
+<dt>注意: これらのモジュールパラメータはシステム全体の値であり、VMごとに調整することはできません。</dt><dd><p>VMごとに調整することはできません。</p>
+</dd>
+</dl>
+</section>
+<section id="further-notes">
+<h2>追加の注意点<a class="headerlink" href="#further-notes" title="この見出しへのパーマリンク">¶</a></h2>
+<ul class="simple">
+<li><p>halt_poll_nsモジュールパラメータを設定する際には注意が必要です。大きな値を設定すると、機械がほぼ完全にアイドル状態であるにもかかわらずCPU使用率が100%に達する可能性があります。これは、ゲストがウェイクアップ中にほとんど作業が行われず、またそれらが非常に間隔が開いている場合でも、期間がグローバルな最大ポーリングインターバル（halt_poll_ns）よりも短い場合、ホストがブロック時間全体をポーリングし続けるため、CPU利用率が100%になるからです。</p></li>
+<li><p>ハルトポーリングは、電力消費とレイテンシーのトレードオフを表しており、モジュールパラメータを使用してこの親和性を調整する必要があります。アイドル状態のCPU時間は、ホストカーネル時間に変換され、ゲストへの移行時のレイテンシーを減らすことを目的としています。</p></li>
+<li><p>ハルトポーリングは、そのCPU上で他のタスクが実行可能でない場合にのみホストによって行われます。他のタスクが実行可能である場合、ポーリングは即座に停止し、そのタスクの実行を許可するスケジューリングが呼び出されます。したがって、ゲストがCPUをサービス拒否（DoS）するのを防ぐことができます。</p></li>
+</ul>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linux 仮想化サポート</a><ul class="current">
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">KVM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../uml/user_mode_linux_howto_v2.html">UML ハウトゥー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../paravirt_ops.html">パラバーティロップス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../guest-halt-polling.html">ゲストハルトポーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ne_overview.html">Nitro エンクローブ</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linux 仮想化サポート</a><ul>
+<li><a href="index.html">KVM</a><ul>
+<li>前へ: <a href="cpuid.html" title="前章">KVM CPUIDビット</a></li>
+<li>次へ: <a href="hypercalls.html" title="次章">Linux KVMハイパーコール</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/virt/kvm/halt-polling.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

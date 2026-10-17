@@ -1,0 +1,380 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Kernel Samepage Merging — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="memory-model.html" rel="next" title="物理メモリモデル"/>
+<link href="hugetlbfs_reserv.html" rel="prev" title="Hugetlbfsの予約"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="kernel-samepage-merging">
+<span id="ksm"></span><h1>Kernel Samepage Merging<a class="headerlink" href="#kernel-samepage-merging" title="この見出しへのパーマリンク">¶</a></h1>
+<p>KSMはメモリ節約の重複データの削除機能で、CONFIG_KSM=yで有効化され、Linuxカーネルに2.6.32から導入されました。参照 <code class="docutils literal notranslate"><span class="pre">mm/ksm.c</span></code> その実装については、および <a class="reference external" href="http://lwn.net/Articles/306704/">http://lwn.net/Articles/306704/</a> および <a class="reference external" href="https://lwn.net/Articles/330589/">https://lwn.net/Articles/330589/</a></p>
+<p>KSMのユーザースペースインターフェースは以下に記載されています。 <a class="reference internal" href="../admin-guide/mm/ksm.html#admin-guide-ksm"><span class="std std-ref"><a class="reference internal" href="../admin-guide/mm/ksm.html"><span class="doc">Kernel Samepage Merging</span></a></span></a></p>
+<section id="design">
+<h2>設計<a class="headerlink" href="#design" title="この見出しへのパーマリンク">¶</a></h2>
+<section id="overview">
+<h3>概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h3>
+<p>以下に記載するKSMスキャンプロセスに関するいくつかの注意点は、以下のデータ構造を理解するのをより容易にするためです。</p>
+<p>過剰なスキャンを減らすために、KSMはメモリページをその内容でソートし、ページの位置へのポインタを保持するデータ構造に格納します。</p>
+<p>ページの内容はいつでも変化する可能性があるため、KSMは通常のソート済み木にページを単に挿入して何かを検索できるとは期待できません。そのため、KSMは2つのデータ構造、つまり安定木と不安定木を使用します。</p>
+<p>安定木は、内容でソートされたすべてのマージされたページ（KSMページ）へのポインタを保持します。このような各ページは書き込み保護されているため、この木での検索は常に動作します（ページがアンマップされている場合を除く）。そのため、この木は安定木と呼ばれます。</p>
+<p>安定木のノードには、KSMページからこのページをマッピングする仮想アドレスへの逆マッピングに必要な情報が含まれています。</p>
+<p>KSMページにおけるrmapウォークの大きなレイテンシーを避けるために、KSMは安定木に2種類のノードを維持します：</p>
+<ul class="simple">
+<li><p>通常のノード：逆マッピング構造をリンクリストで保持</p></li>
+<li><p>「チェーン」：同じ書き込み保護されたメモリコンテンツを表すノード（「dup」）をリンクし、各「dup」はそのコンテンツの異なるKSMページコピーに対応します</p></li>
+</ul>
+<p>内部的には、通常のノード、「dup」および「チェーン」は同じ構造で表されます <a class="reference internal" href="#c.stable_node" title="stable_node"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">stable_node</span></code></a> 何らかの理由で、木構造を配列形状ではなく木形状で描くと、平面的な表現を簡単に描くことができます:</p>
+<p>安定木に加えて、KSMは第二のデータ構造である不安定木を使用します。この木は、「一定期間変化していない」と判定されたページへのポインタを保持します。不安定木はこれらのページを内容でソートしますが、これらは書き込み保護されていないため、KSMは不安定木が正しく動作することを信頼できません。不安定木の内容が変更されると木が破損する可能性があるため、この木は不安定と呼ばれます。</p>
+<p>KSMはいくつかの技術を用いてこの問題を解決します：</p>
+<ol class="arabic simple">
+<li><p>KSMがすべてのメモリ領域をスキャンして完了するたびに不安定木がフラッシュされ、その後、木は再び最初から再構築されます。</p></li>
+<li><p>KSMは、すべてのメモリ領域をスキャンした前回のスキャン以来ハッシュ値が変化していないページのみを不安定木に挿入します。</p></li>
+<li><p>不安定木は赤黒木（RedBlack Tree）です。したがって、バランスはノードの色に基づいており、内容ではなく、木が「破損」してもバランスを崩さないため、スキャン時間は同じままです（また、赤黒木でのノードの検索と挿入には同じアルゴリズムが使用されるため、フラッシュして再構築する際のオーバーヘッドはありません）</p></li>
+<li><p>KSMは安定した木を常にフラッシュしません。つまり、不安定な木でページを検索するのに10回の試行が必要であっても、見つかったら安定した木に確実に固定されます。(新しいページをスキャンする際には、まず安定した木とその後不安定な木とを比較します。)</p></li>
+</ol>
+<p>merge_across_nodesの調整可能なパラメータが設定されていない場合、KSMは複数の安定した木と複数の不安定な木を維持します。それぞれのNUMAノードごとに1つの安定した木と1つの不安定な木を保持します。</p>
+</section>
+<section id="reverse-mapping">
+<h3>逆マッピング<a class="headerlink" href="#reverse-mapping" title="この見出しへのパーマリンク">¶</a></h3>
+<p>KSMは安定した木に含まれるKSMページの逆マッピング情報を保持します。</p>
+<p>KSMページがVMAsよりも少ない数で共有されている場合、 <code class="docutils literal notranslate"><span class="pre">max_page_sharing</span></code> そのKSMページを表す安定した木のノードは、 <a class="reference internal" href="#c.rmap_item" title="rmap_item"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">rmap_item</span></code></a> 2.5開発シリーズで導入された形式です。 <code class="docutils literal notranslate"><span class="pre">page-&gt;mapping</span></code> KSMページの逆マッピング情報は安定した木のノードを指します。</p>
+<p>共有がこの閾値を超えると、KSMは安定した木に2次元を追加します。木のノードは「チェーン」となり、1つまたは複数の「複製（dup）」をリンクします。各「dup」は、KSMページの逆マッピング情報を保持し、 <code class="docutils literal notranslate"><span class="pre">page-&gt;mapping</span></code> その「dup」を指しています。</p>
+<p>「チェーン」および「チェーン」にリンクされたすべての「dup」は、それらが同じ書き込み保護されたメモリコンテンツを表しているという不変性を保証します。各「dup」は、コンテンツの異なるKSMページコピーによって指される可能性があります。</p>
+<p>このように、安定した木の検索計算複雑度は、逆マッピングの一覧が無限である場合と同様に影響を受けません。安定した木自体にKSMページコンテンツの重複が存在しないという制約は依然として強制されます。</p>
+<p>重複削除制限は、 <code class="docutils literal notranslate"><span class="pre">max_page_sharing</span></code> を回避するために必要です。rmapウォークの計算複雑度はO(N)であり、Nはページを共有しているrmap_items（仮想マッピング）の数を表します。これはまた、 <code class="docutils literal notranslate"><span class="pre">max_page_sharing</span></code>によって制限されています。これにより、rmapウォークの線形O(N)計算複雑度が、異なるKSMページ間で分散されます。安定したノード「チェーン」のksmdウォークもO(N)ですが、Nは安定したノード「dup」の数であり、rmap_itemsの数ではありません。したがって、ksmdのパフォーマンスに大きな影響を与えません。実際には、最適な安定したノード「dup」候補が「dup」リストの先頭に保持され、検出されます。</p>
+<p>の高い値は、 <code class="docutils literal notranslate"><span class="pre">max_page_sharing</span></code> が速くなる（安定したノードdupが安定したノードチェーン→hlistにキューイングされる回数が減るため）と、重複削除率を高めますが、スワップ、コンパクション、NUMAバランス、ページ移動中に発生する可能性のある任意のKSMページのrmapウォークの最悪ケースの処理が遅くなるというトレードオフがあります。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">stable_node_dups/stable_node_chains</span></code> 比率はまた、
+<code class="docutils literal notranslate"><span class="pre">max_page_sharing</span></code> 調整可能なパラメータであり、高い比率はstable_nodeの複製におけるフラグメンテーションを示唆する可能性があります。これは、ksmdにフラグメンテーションアルゴリズムを導入して、rmap_itemsを別のstable_node複製に再配置することで解決できます。これにより、rmap_itemsが少ないstable_node複製の解放が可能ですが、ksmdのCPU使用率が増加し、アプリケーションのKSMページにおける読み取り専用計算の遅延を引き起こす可能性があります。</p>
+<p>stable_node「複製」のリストは、stable_node「チェーン」にリンクされており、定期的にスキャンされて古くなったstable_nodeが削除されます。このスキャンの頻度は
+<code class="docutils literal notranslate"><span class="pre">stable_node_chains_prune_millisecs</span></code> sysfsの調整可能なパラメータで定義されています。</p>
+</section>
+<section id="reference">
+<h3>参照<a class="headerlink" href="#reference" title="この見出しへのパーマリンク">¶</a></h3>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.mm_slot">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mm_slot</span></span></span><a class="headerlink" href="#c.mm_slot" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>スキャン対象のmmに関するksm情報</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct mm_slot {
+  struct hlist_node link;
+  struct list_head mm_list;
+  struct rmap_item *rmap_list;
+  struct mm_struct *mm;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">link</span></code></dt><dd><p>mm_slotsハッシュリストへのリンク</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mm_list</span></code></dt><dd><p>ksm_mm_headにルートを持つmm_slotsリストへのリンク</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">rmap_list</span></code></dt><dd><p>このmm_slotの単一リンクリストのrmap_itemsのヘッド</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mm</span></code></dt><dd><p>この情報が有効なmm</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.ksm_scan">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">ksm_scan</span></span></span><a class="headerlink" href="#c.ksm_scan" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>スキャンカーソル</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct ksm_scan {
+  struct mm_slot *mm_slot;
+  unsigned long address;
+  struct rmap_item **rmap_list;
+  unsigned long seqnr;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">mm_slot</span></code></dt><dd><p>現在スキャン中のmm_slot</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">address</span></code></dt><dd><p>そのmm_slot内で次にスキャンするアドレス</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">rmap_list</span></code></dt><dd><p>rmap_list内で次にスキャンするrmapへのリンク</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">seqnr</span></code></dt><dd><p>完了したフルスキャンのカウント（不安定ノードの削除時に必要）</p>
+</dd>
+</dl>
+<p><strong>説明</strong></p>
+<p>このカーソル構造体には、ただ1つのksm_scanインスタンスがあります。</p>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.stable_node">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">stable_node</span></span></span><a class="headerlink" href="#c.stable_node" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>stable rbtreeのノード</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct stable_node {
+  union {
+    struct rb_node node;
+    struct {
+      struct list_head *head;
+      struct {
+        struct hlist_node hlist_dup;
+        struct list_head list;
+      };
+    };
+  };
+  struct hlist_head hlist;
+  union {
+    unsigned long kpfn;
+    unsigned long chain_prune_time;
+  };
+#define STABLE_NODE_CHAIN -1024;
+  int rmap_hlist_len;
+#ifdef CONFIG_NUMA;
+  int nid;
+#endif;
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">{unnamed_union}</span></code></dt><dd><p>匿名</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">node</span></code></dt><dd><p>stableツリー内のこのksmページのrbノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">{unnamed_struct}</span></code></dt><dd><p>匿名</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">head</span></code></dt><dd><p>(親を上書き) <code class="xref c c-type docutils literal notranslate"><span class="pre">migrate_nodes</span></code> 一時的にそのリストに表示されていることを示す</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">{unnamed_struct}</span></code></dt><dd><p>匿名</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">hlist_dup</span></code></dt><dd><p>stable_node-&gt;hlistにstable_nodeチェーンでリンクされている</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">list</span></code></dt><dd><p>migrate_nodesにリンクされており、適切なノードツリーに配置を待っている</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">hlist</span></code></dt><dd><p>このksmページを使用するrmap_itemsのhlistヘッド</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">{unnamed_union}</span></code></dt><dd><p>匿名</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">kpfn</span></code></dt><dd><p>このksmページのページフレーム番号（一時的に誤ったnidに配置されている可能性あり）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">chain_prune_time</span></code></dt><dd><p>最後のフルガベージコレクションの時刻</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">rmap_hlist_len</span></code></dt><dd><p>hlistまたはSTABLE_NODE_CHAIN内のrmap_itemエントリ数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">nid</span></code></dt><dd><p>リンクされているstableツリーのNUMAノードID（kpfnと一致しない可能性あり）</p>
+</dd>
+</dl>
+<dl class="c struct">
+<dt class="sig sig-object c" id="c.rmap_item">
+<span class="k"><span class="pre">struct</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">rmap_item</span></span></span><a class="headerlink" href="#c.rmap_item" title="この定義へのパーマリンク">¶</a><br/></dt>
+<dd><p>仮想アドレスの逆参照項目</p>
+</dd></dl>
+<p><strong>定義</strong></p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct rmap_item {
+  struct rmap_item *rmap_list;
+  union {
+    struct anon_vma *anon_vma;
+#ifdef CONFIG_NUMA;
+    int nid;
+#endif;
+  };
+  struct mm_struct *mm;
+  unsigned long address;
+  unsigned int oldchecksum;
+  union {
+    struct rb_node node;
+    struct {
+      struct stable_node *head;
+      struct hlist_node hlist;
+    };
+  };
+};
+</pre></div>
+</div>
+<p><strong>メンバ</strong></p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">rmap_list</span></code></dt><dd><p>mm_slotの単一リンクリストrmap_list内の次のrmap_item</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">{unnamed_union}</span></code></dt><dd><p>匿名</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">anon_vma</span></code></dt><dd><p>stableツリー内でのこのmm、アドレスのanon_vmaへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">nid</span></code></dt><dd><p>リンクされている不安定ツリーのNUMAノードID（ページと一致しない可能性あり）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mm</span></code></dt><dd><p>このrmap_itemが指すメモリ構造</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">address</span></code></dt><dd><p>このrmap_itemが追跡する仮想アドレス（＋低位ビットのフラグ）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">oldchecksum</span></code></dt><dd><p>その仮想アドレスのページの前のチェックサム</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">{unnamed_union}</span></code></dt><dd><p>匿名</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">node</span></code></dt><dd><p>不安定ツリー内のこのrmap_itemのrbノード</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">{unnamed_struct}</span></code></dt><dd><p>匿名</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">head</span></code></dt><dd><p>stableツリー内のこのリストのstable_nodeへのポインタ</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">hlist</span></code></dt><dd><p>そのstable_nodeのhlist内のrmap_itemsへのリンク</p>
+</dd>
+</dl>
+<p>– Izik Eidus, Hugh Dickins, 2009年11月17日</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxメモリ管理ドキュメンテーション</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#user-guides-for-mm-features">MM機能用ユーザーガイド</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#kernel-developers-mm-documentation">カーネル開発者向けMMドキュメンテーション</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxメモリ管理ドキュメンテーション</a><ul>
+<li>前へ: <a href="hugetlbfs_reserv.html" title="前章">Hugetlbfsの予約</a></li>
+<li>次へ: <a href="memory-model.html" title="次章">物理メモリモデル</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/vm/ksm.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

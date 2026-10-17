@@ -1,0 +1,305 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>ユーザースペース通信プロトコル（コンネクタ経由） — The Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="masters/index.html" rel="next" title="1-wire マスタードライバ"/>
+<link href="w1-generic.html" rel="prev" title="1-Wire（w1）サブシステムの紹介"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="userspace-communication-protocol-over-connector">
+<h1>コネクタを介したユーザースペース通信プロトコル<a class="headerlink" href="#userspace-communication-protocol-over-connector" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="message-types">
+<h2>メッセージの種類<a class="headerlink" href="#message-types" title="この見出しへのパーマリンク">¶</a></h2>
+<p>w1コアとユーザースペース間で送信されるメッセージの種類は3つあります：</p>
+<ol class="arabic simple">
+<li><p>イベント。自動またはリクエストによる検索で新しいマスターデバイスまたはスレーブデバイスが検出されるたびに生成されます。</p></li>
+<li><p>ユーザースペースコマンド。</p></li>
+<li><p>ユーザースペースコマンドへの応答。</p></li>
+</ol>
+</section>
+<section id="protocol">
+<h2>プロトコル<a class="headerlink" href="#protocol" title="この見出しへのパーマリンク">¶</a></h2>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>[struct cn_msg] - connector header.
+      Its length field is equal to size of the attached data
+[struct w1_netlink_msg] - w1 netlink header.
+      __u8 type       - message type.
+                      W1_LIST_MASTERS
+                              list current bus masters
+                      W1_SLAVE_ADD/W1_SLAVE_REMOVE
+                              slave add/remove events
+                      W1_MASTER_ADD/W1_MASTER_REMOVE
+                              master add/remove events
+                      W1_MASTER_CMD
+                              userspace command for bus master
+                              device (search/alarm search)
+                      W1_SLAVE_CMD
+                              userspace command for slave device
+                              (read/write/touch)
+      __u8 status     - error indication from kernel
+      __u16 len       - size of data attached to this header data
+      union {
+              __u8 id[8];                      - slave unique device id
+              struct w1_mst {
+                      __u32           id;      - master's id
+                      __u32           res;     - reserved
+              } mst;
+      } id;
+
+[struct w1_netlink_cmd] - command for given master or slave device.
+      __u8 cmd        - command opcode.
+                      W1_CMD_READ     - read command
+                      W1_CMD_WRITE    - write command
+                      W1_CMD_SEARCH   - search command
+                      W1_CMD_ALARM_SEARCH - alarm search command
+                      W1_CMD_TOUCH    - touch command
+                              (write and sample data back to userspace)
+                      W1_CMD_RESET    - send bus reset
+                      W1_CMD_SLAVE_ADD        - add slave to kernel list
+                      W1_CMD_SLAVE_REMOVE     - remove slave from kernel list
+                      W1_CMD_LIST_SLAVES      - get slaves list from kernel
+      __u8 res        - reserved
+      __u16 len       - length of data for this command
+              For read command data must be allocated like for write command
+      __u8 data[0]    - data for this command
+</pre></div>
+</div>
+<p>各コンネクタメッセージには、ゼロ個以上の添付されたw1_netlink_cmdメッセージを含む1つ以上のw1_netlink_msgが含まれます。</p>
+<p>イベントメッセージの場合、w1_netlink_cmdの埋め込まれた構造体は存在せず、コンネクタヘッダーとw1_netlink_msg構造体のみが含まれます。この際、「len」フィールドはゼロに設定され、タイプ（イベントタイプの1つ）とID（8バイトのスレーブ固有ID（ホスト順）またはマスターID（バスマスターデバイスがw1コアに追加されたときに割り当てられる））が設定されます。</p>
+<p>現在、ユーザースペースコマンドへの応答は読み取りコマンドリクエストに対してのみ生成されます。1つのw1_netlink_cmd読み取りリクエストごとに1つの応答が生成され、応答送信時に結合されません。典型的な応答メッセージは以下のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>[cn_msg][w1_netlink_msg][w1_netlink_cmd]
+cn_msg.len = sizeof(struct w1_netlink_msg) +
+           sizeof(struct w1_netlink_cmd) +
+           cmd-&gt;len;
+w1_netlink_msg.len = sizeof(struct w1_netlink_cmd) + cmd-&gt;len;
+w1_netlink_cmd.len = cmd-&gt;len;
+</pre></div>
+</div>
+<p>W1_LIST_MASTERSへの応答は、すべての登録済みマスターデバイスIDを含むメッセージをユーザースペースに送信する必要があります。フォーマットは以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>cn_msg (CN_W1_IDX.CN_W1_VAL as id, len is equal to sizeof(struct
+w1_netlink_msg) plus number of masters multiplied by 4)
+w1_netlink_msg (type: W1_LIST_MASTERS, len is equal to
+        number of masters multiplied by 4 (u32 size))
+id0 ... idN
+</pre></div>
+</div>
+<p>各メッセージの最大サイズは4KBです。したがって、マスターデバイスの数がこのサイズを超える場合、複数のメッセージに分割されます。</p>
+<p>W1検索およびアラーム検索コマンド。</p>
+<p>リクエスト：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>[cn_msg]
+  [w1_netlink_msg type = W1_MASTER_CMD
+      id is equal to the bus master id to use for searching]
+  [w1_netlink_cmd cmd = W1_CMD_SEARCH or W1_CMD_ALARM_SEARCH]
+</pre></div>
+</div>
+<p>応答：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>[cn_msg, ack = 1 and increasing, 0 means the last message,
+      seq is equal to the request seq]
+[w1_netlink_msg type = W1_MASTER_CMD]
+[w1_netlink_cmd cmd = W1_CMD_SEARCH or W1_CMD_ALARM_SEARCH
+      len is equal to number of IDs multiplied by 8]
+[64bit-id0 ... 64bit-idN]
+</pre></div>
+</div>
+<p>各ヘッダー内の長さは、その背後にあるデータのサイズに対応します。したがって、w1_netlink_cmd-&gt;len = N * 8; となります。ここでNはこのメッセージ内のIDの数です。ゼロでも可能です。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>w1_netlink_msg-&gt;len = sizeof(struct w1_netlink_cmd) + N * 8;
+cn_msg-&gt;len = sizeof(struct w1_netlink_msg) +
+            sizeof(struct w1_netlink_cmd) +
+            N*8;
+</pre></div>
+</div>
+<p>W1リセットコマンド：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>[cn_msg]
+  [w1_netlink_msg type = W1_MASTER_CMD
+      id is equal to the bus master id to use for searching]
+  [w1_netlink_cmd cmd = W1_CMD_RESET]
+</pre></div>
+</div>
+</section>
+<section id="command-status-replies">
+<h2>コマンド状態応答<a class="headerlink" href="#command-status-replies" title="この見出しへのパーマリンク">¶</a></h2>
+<p>コマンド（ルート、マスター、スレーブ、またはw1_netlink_cmd構造体を含むか含まない）はすべてw1コアによって「確認」されます。応答の形式はリクエストメッセージと同じですが、長さパラメータはユーザーが要求したデータを考慮しません。つまり、読み取り/書き込み/タッチIOリクエストはデータを含まないため、w1_netlink_cmd.lenはゼロとなり、w1_netlink_msg.lenはw1_netlink_cmd構造体のサイズとなり、cn_msg.lenはsizeof(<a class="reference internal" href="../driver-api/w1.html#c.w1_netlink_msg" title="w1_netlink_msg"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">w1_netlink_msg</span></code></a>) と sizeof(<a class="reference internal" href="../driver-api/w1.html#c.w1_netlink_cmd" title="w1_netlink_cmd"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">w1_netlink_cmd</span></code></a>) の合計になります。マスターまたはルートコマンド（w1_netlink_cmdが添付されていない）に対する応答は、cn_msgとw1_netlink_msg構造体のみを含みます。</p>
+<p>w1_netlink_msg.statusフィールドには、正のエラーコード（例：EINVAL）または成功時のゼロが設定されます。</p>
+<p>すべての構造体の他のフィールドは、リクエストメッセージ内の同じパラメータを反映します（長さについては上記のように例外があります）。</p>
+<p>w1_netlink_msg内に埋め込まれたすべてのw1_netlink_cmdに対してステータス応答が生成されます。w1_netlink_cmd構造体が存在しない場合、w1_netlink_msgに対して応答が生成されます。</p>
+<p>すべてのw1_netlink_cmdコマンド構造体がw1_netlink_msgごとに処理されます。エラーがあっても、長さの不一致による割込みのみがメッセージ処理を中断します。</p>
+</section>
+<section id="operation-steps-in-w1-core-when-new-command-is-received">
+<h2>新しいコマンドが受信された際のw1コアの操作手順<a class="headerlink" href="#operation-steps-in-w1-core-when-new-command-is-received" title="この見出しへのパーマリンク">¶</a></h2>
+<p>新しいメッセージ(w1_netlink_msg)が受信されると、w1コアはw1_netlink_msg.typeフィールドに基づいてマスターまたはスレーブリクエストであるかを検出します。その後、対応するマスターまたはスレーブデバイスを検索します。見つかった場合、マスターデバイス（リクエストされたデバイスまたはスレーブデバイスが見つかった場所のデバイス）をロックします。スレーブコマンドがリクエストされた場合、指定されたデバイスを選択するためのリセット/セレクト手順を開始します。</p>
+<p>その後、w1_netlink_msgに記載されたすべての操作を順次実行します。コマンドが応答を必要とする場合（例：読み取りコマンド）、コマンド実行完了時に応答を送信します。</p>
+<p>すべてのコマンド(w1_netlink_cmd)が処理されると、マスターデバイスがアンロックされ、次のw1_netlink_msgヘッダー処理が開始されます。</p>
+</section>
+<section id="connector-1-specific-documentation">
+<h2>コネクタ [1] に関する特定のドキュメンテーション<a class="headerlink" href="#connector-1-specific-documentation" title="この見出しへのパーマリンク">¶</a></h2>
+<p>各コネクタメッセージには「address」として2つのu32フィールドが含まれます。w1はinclude/linux/connector.hヘッダーで定義されたCN_W1_IDXとCN_W1_VALを使用します。各メッセージにはシーケンス番号とアッケナント番号も含まれます。イベントメッセージのシーケンス番号は、このマスターを介して送信される各イベントメッセージごとに適切なバスマスターのシーケンス番号を増加させたものであり、ユーザースペースリクエストのシーケンス番号はユーザースペースアプリケーションによって設定されます。応答のシーケンス番号はリクエストのものと同一であり、アッケナント番号はseq+1に設定されます。</p>
+</section>
+<section id="additional-documentation-source-code-examples">
+<h2>追加のドキュメンテーション、ソースコードの例<a class="headerlink" href="#additional-documentation-source-code-examples" title="この見出しへのパーマリンク">¶</a></h2>
+<ol class="arabic">
+<li><p><a class="reference internal" href="../driver-api/connector.html"><span class="doc">カーネルコンネクタ</span></a></p></li>
+<li><p><a class="reference external" href="http://www.ioremap.net/archive/w1">http://www.ioremap.net/archive/w1</a></p>
+<p>このアーカイブには、バス上のすべてのマスター/スレーブデバイスに対して読み取り/書き込み/検索コマンドを使用するユーザースペースアプリケーションw1d.cが含まれています。</p>
+</li>
+</ol>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">1-Wireサブシステム</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="w1-generic.html">1-Wire（w1）サブシステムの紹介</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">コネクタを介したユーザースペース通信プロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="masters/index.html">1-wire マスタードライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="slaves/index.html">1-wire サーバードライバ</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">1-Wireサブシステム</a><ul>
+<li>前へ: <a href="w1-generic.html" title="前章">1-Wire（w1）サブシステムの紹介</a></li>
+<li>次へ: <a href="masters/index.html" title="次章">1-wire マスタードライバ</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/w1/w1-netlink.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

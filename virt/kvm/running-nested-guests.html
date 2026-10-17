@@ -1,0 +1,370 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>ネストゲストの実行 — Linux Kernel ドキュメンテーション</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="../uml/user_mode_linux_howto_v2.html" rel="next" title="UML ハウトゥー"/>
+<link href="devices/xive.html" rel="prev" title="POWER9 外部割込み仮想化エンジン (XIVE Gen1)"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="running-nested-guests-with-kvm">
+<h1>KVMを用いたネストゲストの実行<a class="headerlink" href="#running-nested-guests-with-kvm" title="この見出しへのパーマリンク">¶</a></h1>
+<p>ネストゲストとは、別のゲストの内部でゲストを実行できる機能であり（KVMベースでも異なるハイパーバイザでも可能）、単純な例はKVMゲストがKVMゲスト上で実行されるケースです（このドキュメントの残りの部分はこの例に基づいています）：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>        .----------------.  .----------------.
+        |                |  |                |
+        |      L2        |  |      L2        |
+        | (Nested Guest) |  | (Nested Guest) |
+        |                |  |                |
+        |----------------'--'----------------|
+        |                                    |
+        |       L1 (Guest Hypervisor)        |
+        |          KVM (/dev/kvm)            |
+        |                                    |
+.------------------------------------------------------.
+|                 L0 (Host Hypervisor)                 |
+|                    KVM (/dev/kvm)                    |
+|------------------------------------------------------|
+|        Hardware (with virtualization extensions)     |
+'------------------------------------------------------'
+</pre></div>
+</div>
+<p>用語:</p>
+<ul class="simple">
+<li><p>L0 – レベル0; バーメタルホスト、KVMを実行中</p></li>
+<li><p>L1 – レベル1ゲスト; L0上で実行される仮想マシン（VM）; また「ゲストハイパーバイザ」とも呼ばれる、自身でKVMを実行できる機能を持つものです。</p></li>
+<li><p>L2 – レベル2ゲスト; L1上で実行される仮想マシン、これは「ネストゲスト」と呼ばれます</p></li>
+</ul>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>上記の図はx86アーキテクチャに基づいてモデル化されています;s390x、ppc64などの他のアーキテクチャではネストの設計が異なる可能性があります。</p>
+<p>例えば、s390xでは常にバーメタル上でLPAR（Logical Partition）ハイパーバイザが実行され、これにより少なくとも4段階のネスト構成が生じます — L0（バーメタル、LPARハイパーバイザを実行中）、L1（ホストハイパーバイザ）、L2（ゲストハイパーバイザ）、L3（ネストゲスト）。</p>
+<p>このドキュメントではすべてのアーキテクチャで3段階の用語（L0、L1、L2）を使用し、主にx86に焦点を当てます。</p>
+</div>
+<section id="use-cases">
+<h2>使用例<a class="headerlink" href="#use-cases" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ネストKVMが役立つシナリオはいくつかあります、例を挙げると：</p>
+<ul class="simple">
+<li><p>開発者として、ソフトウェアをさまざまなOSでテストしたい場合。クラウドプロバイダーから複数の仮想マシンを借りる代わりに、ネストKVMを用いることで、十分な「ゲストハイパーバイザ」（レベル1ゲスト）を借りることができます。これにより、複数のネストゲスト（レベル2ゲスト）を構築し、異なるOSで開発・テストが可能になります。</p></li>
+<li><p>「ゲストハイパーバイザ」およびそのネストゲストのライブマイグレーション（負荷分散、災害復旧など）</p></li>
+<li><p>VMイメージ作成ツール（例： <code class="docutils literal notranslate"><span class="pre">virt-install</span></code>など）は通常自身のVMを実行し、ユーザーはこれらがVM内でも動作することを期待しています。</p></li>
+<li><p>一部のOSはセキュリティのため内部で仮想化を採用しています（例：アプリケーションを隔離して安全に実行するため）。</p></li>
+</ul>
+</section>
+<section id="enabling-nested-x86">
+<h2>「nested」の有効化 (x86)<a class="headerlink" href="#enabling-nested-x86" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Linuxカーネルv4.19以降、 <code class="docutils literal notranslate"><span class="pre">nested</span></code> KVMパラメータはIntelおよびAMDでデフォルトで有効になっています。（ただし、あなたのLinuxディストリビューションがこのデフォルトを上書きしている可能性があります。）</p>
+<p>カーネルがv4.19未満の場合、ネストを有効にするには、 <code class="docutils literal notranslate"><span class="pre">nested</span></code> KVMモジュールパラメータを <code class="docutils literal notranslate"><span class="pre">Y</span></code> または <code class="docutils literal notranslate"><span class="pre">1</span></code>に設定してください。再起動後に設定を維持するには、以下の通り設定ファイルに追加できます：</p>
+<ol class="arabic">
+<li><p>バーメタルホスト（L0）でカーネルモジュールを一覧表示し、KVMモジュールが含まれているか確認してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ lsmod | grep -i kvm
+kvm_intel             133627  0
+kvm                   435079  1 kvm_intel
+</pre></div>
+</div>
+</li>
+<li><p>モジュールに関する情報を表示するには、 <code class="docutils literal notranslate"><span class="pre">kvm_intel</span></code> コマンドを使用してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ modinfo kvm_intel | grep -i nested
+parm:           nested:bool
+</pre></div>
+</div>
+</li>
+<li><p>ネストKVMの設定を再起動後に維持するには、以下の内容を <code class="docutils literal notranslate"><span class="pre">/etc/modprobed/kvm_intel.conf</span></code> （ファイルが存在しない場合は作成してください）に追加してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ cat /etc/modprobe.d/kvm_intel.conf
+options kvm-intel nested=y
+</pre></div>
+</div>
+</li>
+<li><p>KVM Intelモジュールをアンロードして再ロードしてください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ sudo rmmod kvm-intel
+$ sudo modprobe kvm-intel
+</pre></div>
+</div>
+</li>
+<li><p>以下のコマンドで <code class="docutils literal notranslate"><span class="pre">nested</span></code> KVMのパラメータが有効になっています:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ cat /sys/module/kvm_intel/parameters/nested
+Y
+</pre></div>
+</div>
+</li>
+</ol>
+<p>AMDホストの場合、上記のプロセスは同じですが、モジュール名は <code class="docutils literal notranslate"><span class="pre">kvm-amd</span></code>.</p>
+</section>
+<section id="additional-nested-related-kernel-parameters-x86">
+<h2>ネスト関連のカーネルパラメータ (x86)<a class="headerlink" href="#additional-nested-related-kernel-parameters-x86" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ハードウェアが十分に進化している場合（Intel Haswellプロセッサまたはそれ以上のもので、新しいハードウェア仮想拡張機能を備えている場合）、以下の追加機能もデフォルトで有効になります: 「シャドウVMCS（仮想マシン制御構造）」、ホストのバーメタルホスト（L0）におけるAPIC仮想化。Intelホストのパラメータ:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ cat /sys/module/kvm_intel/parameters/enable_shadow_vmcs
+Y
+
+$ cat /sys/module/kvm_intel/parameters/enable_apicv
+Y
+
+$ cat /sys/module/kvm_intel/parameters/ept
+Y
+</pre></div>
+</div>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>L2（つまりネストゲスト）が遅く動作していると疑う場合は、上記のパラメータが有効になっていることを確認してください（特に
+<code class="docutils literal notranslate"><span class="pre">enable_shadow_vmcs</span></code> および <code class="docutils literal notranslate"><span class="pre">ept</span></code>).</p>
+</div>
+</section>
+<section id="starting-a-nested-guest-x86">
+<h2>ネストゲストの起動 (x86)<a class="headerlink" href="#starting-a-nested-guest-x86" title="この見出しへのパーマリンク">¶</a></h2>
+<p>バーメタルホスト（L0）がネスト設定に適応したら、以下の設定でL1ゲストを起動できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ qemu-kvm -cpu host [...]
+</pre></div>
+</div>
+<p>上記はホストCPUの機能をそのままゲストに渡しますが、ライブマイグレーションの互換性を高めるためには、QEMUでサポートされている名前付きCPUモデルを使用してください。例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ qemu-kvm -cpu Haswell-noTSX-IBRS,vmx=on
+</pre></div>
+</div>
+<p>これにより、ゲストハイパーバイザは加速されたKVMでネストゲストを実行できるようになります。</p>
+</section>
+<section id="enabling-nested-s390x">
+<h2>ネストの有効化 (s390x)<a class="headerlink" href="#enabling-nested-s390x" title="この見出しへのパーマリンク">¶</a></h2>
+<ol class="arabic">
+<li><p>ホストハイパーバイザ（L0）で、 <code class="docutils literal notranslate"><span class="pre">nested</span></code> パラメータをs390xで有効にしてください:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ rmmod kvm
+$ modprobe kvm nested=1
+</pre></div>
+</div>
+</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>s390xでは、カーネルパラメータ <code class="docutils literal notranslate"><span class="pre">hpage</span></code> は、 <code class="docutils literal notranslate"><span class="pre">nested</span></code> パラメータと競合します — つまり、
+<code class="docutils literal notranslate"><span class="pre">nested</span></code>and wakes up processes waiting on the timerfd. While iterating the <code class="docutils literal notranslate"><span class="pre">hpage</span></code> パラメータ <em>grace periodsを尊重しなければなりませんし、</em> を有効にするには、</p>
+</div>
+<ol class="arabic" start="2">
+<li><p>が無効化されている必要があります。 <code class="docutils literal notranslate"><span class="pre">sie</span></code> ゲストハイパーバイザ（L1）には、 <code class="docutils literal notranslate"><span class="pre">-cpu</span> <span class="pre">host</span></code>).</p></li>
+<li><p>CPU機能を提供する必要があります — QEMUでは、コマンドライン経由で「ホスト透過」を使用することで実現できます</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>$ modprobe kvm
+</pre></div>
+</div>
+</li>
+</ol>
+</section>
+<section id="live-migration-with-nested-kvm">
+<h2>ネストされたKVMを用いたライブマイグレーション<a class="headerlink" href="#live-migration-with-nested-kvm" title="この見出しへのパーマリンク">¶</a></h2>
+<p>これにより、L1（ゲストハイパーバイザ）でKVMモジュールをロードできます:  <em>live</em> ネストゲストを含むL1ゲストを別のバーメタルホストにマイグレーションする機能は、Linuxカーネル5.3およびQEMU 4.2.0からIntel x86システムで利用可能となり、s390xではより古いバージョンでも動作します。</p>
+<p>AMDシステムでは、L1ゲストがL2ゲストを起動した後、L1ゲストのマイグレーションや保存（QEMUドキュメンテーションの「savevm」/「loadvm」参照）はL2ゲストがシャットダウンするまで行うべきではありません。L2ゲストが動作している間、L1ゲストをマイグレーションまたは保存・読み込みしようとすると未定義の動作が発生します。このようなマイグレーションまたは読み込まれたL1ゲストは安定的またはセキュアとは見なされなくなり、再起動が必要です。L2ゲストを実行していない状態でネストをサポートするように設定されたL1ゲストをマイグレーションしても、AMDシステムでは通常動作しますが、ゲストが起動すると失敗する可能性があります。 <code class="docutils literal notranslate"><span class="pre">kernel</span> <span class="pre">BUG!</span></code> ネストゲスト（L2）のマイグレーションは常に成功するため、以下のすべてのシナリオはAMDシステムでも動作します: <code class="docutils literal notranslate"><span class="pre">dmesg</span></code>ネストゲスト（L2）を別のL1ゲストにマイグレーションする</p>
+<p>ネストゲスト（L2）を別のL1ゲストにマイグレーションする</p>
+<ul class="simple">
+<li><p>ネストゲスト（L2）を別のL1ゲストにマイグレーションする <em>同じ</em> バーメタルホスト上</p></li>
+<li><p>ネストゲスト（L2）を別のL1ゲストにマイグレーションする <em>異なる</em>
+バーメタルホスト上</p></li>
+<li><p>ネストゲスト（L2）をバーメタルホストにマイグレーションする</p></li>
+</ul>
+</section>
+<section id="reporting-bugs-from-nested-setups">
+<h2>ネストされた設定からのバグの報告<a class="headerlink" href="#reporting-bugs-from-nested-setups" title="この見出しへのパーマリンク">¶</a></h2>
+<p>「ネストされた」問題のデバッグには、L0、L1、L2のログファイルを確認する作業が含まれ、これにより、バグ報告者と修正者間で煩雑な往復が生じることがあります。</p>
+<ul class="simple">
+<li><p>「ネストされた」設定であることを明記してください。ネスト処理を行っている場合は、その旨を必ずお伝えください。残念ながら、バグ報告時にこの点を忘れてしまう人が多いので、明記する必要があります。
+<em>mention</em> ネストされた仮想化を実行していることを</p></li>
+<li><p>KVMがKVM上で実際に動作していることを確認してください。時折、ゲスト仮想マシン（L1）のKVMが有効になっていない場合があり、これにより純粋なエミュレーション（QEMUでは「TCG」と呼ばれる）で動作しているにもかかわらず、ネストされたKVMを実行していると誤認していることがあります。これにより、「ネストされた仮想化」（QEMU on KVMを含む）と「ネストされたKVM」（KVM on KVM）の区別が曖昧になることがあります。</p></li>
+</ul>
+<section id="information-to-collect-generic">
+<h3>収集すべき情報（一般的な情報）<a class="headerlink" href="#information-to-collect-generic" title="この見出しへのパーマリンク">¶</a></h3>
+<p>以下のリストは完全ではありませんが、非常に有用な出発点になります：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>L0からのカーネル、libvirt、およびQEMUのバージョン</p></li>
+<li><p>L1からのカーネル、libvirt、およびQEMUのバージョン</p></li>
+<li><p>L1のQEMUコマンドライン – libvirtを使用している場合、以下に確認できます：
+<code class="docutils literal notranslate"><span class="pre">/var/log/libvirt/qemu/instance.log</span></code></p></li>
+<li><p>L2のQEMUコマンドライン – 同様にlibvirtを使用している場合、以下のlibvirtが生成したQEMUコマンドラインを取得してください</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">cat</span> <span class="pre">/sys/cpuinfo</span></code> from L0</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">cat</span> <span class="pre">/sys/cpuinfo</span></code> from L1</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">lscpu</span></code> from L0</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">lscpu</span></code> from L1</p></li>
+<li><p>完全 <code class="docutils literal notranslate"><span class="pre">dmesg</span></code> L0からの出力</p></li>
+<li><p>完全 <code class="docutils literal notranslate"><span class="pre">dmesg</span></code> L1からの出力</p></li>
+</ul>
+</div></blockquote>
+</section>
+<section id="x86-specific-info-to-collect">
+<h3>x86固有の情報の収集<a class="headerlink" href="#x86-specific-info-to-collect" title="この見出しへのパーマリンク">¶</a></h3>
+<p>以下の両方のコマンドは、ほとんどのLinuxディストリビューションで同じ名前で利用可能です： <code class="docutils literal notranslate"><span class="pre">x86info</span></code> および <code class="docutils literal notranslate"><span class="pre">dmidecode</span></code>、</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>出力結果： <code class="docutils literal notranslate"><span class="pre">x86info</span> <span class="pre">-a</span></code> from L0</p></li>
+<li><p>出力結果： <code class="docutils literal notranslate"><span class="pre">x86info</span> <span class="pre">-a</span></code> from L1</p></li>
+<li><p>出力結果： <code class="docutils literal notranslate"><span class="pre">dmidecode</span></code> from L0</p></li>
+<li><p>出力結果： <code class="docutils literal notranslate"><span class="pre">dmidecode</span></code> from L1</p></li>
+</ul>
+</div></blockquote>
+</section>
+<section id="s390x-specific-info-to-collect">
+<h3>s390x固有の情報の収集<a class="headerlink" href="#s390x-specific-info-to-collect" title="この見出しへのパーマリンク">¶</a></h3>
+<p>前述の一般的な情報に加えて、以下の情報も推奨されます：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">/proc/sysinfo</span></code> L1からの出力；これはL0からの情報も含みます</p></li>
+</ul>
+</div></blockquote>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linux 仮想化サポート</a><ul class="current">
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">KVM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../uml/user_mode_linux_howto_v2.html">UML ハウトゥー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../paravirt_ops.html">パラバーティロップス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../guest-halt-polling.html">ゲストハルトポーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ne_overview.html">Nitro エンクローブ</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linux 仮想化サポート</a><ul>
+<li><a href="index.html">KVM</a><ul>
+<li>前へ: <a href="devices/xive.html" title="前章">POWER9 外部割込み仮想化エンジン (XIVE Gen1)</a></li>
+<li>次へ: <a href="../uml/user_mode_linux_howto_v2.html" title="次章">UML ハウトゥー</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/virt/kvm/running-nested-guests.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

@@ -1,0 +1,250 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Split page table lock — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="transhuge.html" rel="next" title="Transparent Hugepage Support"/>
+<link href="slub.html" rel="prev" title="SLUBの短いユーザーガイド"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="split-page-table-lock">
+<span id="id1"></span><h1>ページテーブルロックの分割<a class="headerlink" href="#split-page-table-lock" title="この見出しへのパーマリンク">¶</a></h1>
+<p>元々、mm-&gt;page_table_lock スピンロックは mm_struct のすべてのページテーブルを保護していました。しかし、このアプローチはマルチスレッドアプリケーションにおけるページフォールトのスケーラビリティに悪影響を及ぼし、ロックの競合が高いためです。スケーラビリティを改善するために、split page table lock が導入されました。</p>
+<p>split page table lock を使用すると、各テーブルごとに別個のロックを用いてテーブルへのアクセスをシリアル化します。現在は PTE および PMD テーブルに split lock を適用しており、より上位のテーブルへのアクセスは mm-&gt;page_table_lock で保護されています。</p>
+<p>テーブルのロック/アンロックやその他のアクセッサ関数のヘルパー関数があります:</p>
+<blockquote>
+<div><ul class="simple">
+<li><dl class="simple">
+<dt>pte_offset_map_lock()</dt><dd><p>pte をマップし、PTE テーブルロックを取得し、取得したロックのポインタを返します;</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>pte_unmap_unlock()</dt><dd><p>PTE テーブルをアンロックし、アンマップします;</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>pte_alloc_map_lock()</dt><dd><p>PTE テーブルを必要に応じて割当し、ロックを取得します。割当に失敗した場合は NULL を返します;</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>pte_lockptr()</dt><dd><p>PTE テーブルロックのポインタを返します;</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>pmd_lock()</dt><dd><p>PMD テーブルロックを取得し、取得したロックのポインタを返します;</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>pmd_lockptr()</dt><dd><p>PMD テーブルロックのポインタを返します;</p>
+</dd>
+</dl>
+</li>
+</ul>
+</div></blockquote>
+<p>PTE テーブル用の split page table lock は、CONFIG_SPLIT_PTLOCK_CPUS（通常は 4）が NR_CPUS 以下の場合、コンパイルタイムに有効になります。split lock が無効の場合、すべてのテーブルは mm-&gt;page_table_lock で保護されます。</p>
+<p>PMD テーブル用の split page table lock は、PTE テーブル用が有効で、アーキテクチャがサポートしている場合に有効になります（以下参照）。</p>
+<section id="hugetlb-and-split-page-table-lock">
+<h2>Hugetlb と split page table lock<a class="headerlink" href="#hugetlb-and-split-page-table-lock" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Hugetlb は複数のページサイズをサポートします。split lock は PMD レベルのみに使用し、PUD には使用しません。</p>
+<p>Hugetlb 専用のヘルパー関数:</p>
+<blockquote>
+<div><ul class="simple">
+<li><dl class="simple">
+<dt>huge_pte_lock()</dt><dd><p>PMD_SIZE ページ用の pmd split lock を取得し、それ以外は mm-&gt;page_table_lock を使用します;</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>huge_pte_lockptr()</dt><dd><p>テーブルロックのポインタを返します;</p>
+</dd>
+</dl>
+</li>
+</ul>
+</div></blockquote>
+</section>
+<section id="support-of-split-page-table-lock-by-an-architecture">
+<h2>アーキテクチャによる split page table lock のサポート<a class="headerlink" href="#support-of-split-page-table-lock-by-an-architecture" title="この見出しへのパーマリンク">¶</a></h2>
+<p>PTE split page table lock の特別な有効化は必要ありません。必要な処理は pgtable_pte_page_ctor() と pgtable_pte_page_dtor() によって行われ、PTE テーブルの割当/解放時にこれらを呼び出す必要があります。</p>
+<p>アーキテクチャがページテーブルの割当に slab allocator を使用しないようにしてください。slab は page-&gt;slab_cache を使用してページを管理します。このフィールドは page-&gt;ptl と共有しているストレージを使用します。</p>
+<p>PMD split lock は、ページテーブルレベルが 2 つ以上ある場合にのみ意味があります。</p>
+<p>PMD split lock の有効化には、PMD テーブルの割当時に pgtable_pmd_page_ctor() を呼び出し、解放時に pgtable_pmd_page_dtor() を呼び出す必要があります。</p>
+<p>割当は通常 pmd_alloc_one() で行われ、解放は pmd_free() と pmd_free_tlb() で行われます。ただし、すべての PMD テーブルの割当/解放パスをカバーしてください。例として X86_PAE では pgd_alloc() でいくつかの PMD を事前に割当てる必要があります。</p>
+<p>すべての設定が完了した場合、CONFIG_ARCH_ENABLE_SPLIT_PMD_PTLOCKを設定できます。</p>
+<p>注意: pgtable_pte_page_ctor()およびpgtable_pmd_page_ctor()は失敗する可能性があるため、適切に処理する必要があります。</p>
+</section>
+<section id="page-ptl">
+<h2>page-&gt;ptl<a class="headerlink" href="#page-ptl" title="この見出しへのパーマリンク">¶</a></h2>
+<p>page-&gt;ptlは、split page table lockにアクセスするために使用され、'page'はテーブルを含むstruct pageです。これはpage-&gt;privateといくつかの他のフィールドと共有されたメモリ領域を使用しています。</p>
+<p>struct pageのサイズを増やさずに最適なパフォーマンスを維持するため、以下のようなトリックを使用します:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>spinlock_tがlongに収まる場合、page-&gt;ptrをspinlockとして使用し、間接的なアクセスを回避してキャッシュラインを節約できます。</p></li>
+<li><p>spinlock_tのサイズがlongより大きい場合、page-&gt;ptlをspinlock_tへのポインタとして使用し、動的に割り当てます。これによりDEBUG_SPINLOCKまたはDEBUG_LOCK_ALLOCが有効なsplit lockの使用が可能ですが、間接的なアクセスにより1つのキャッシュライン分のコストが発生します;</p></li>
+</ul>
+</div></blockquote>
+<p>PTEテーブル用にpgtable_pte_page_ctor()で、PMDテーブル用にpgtable_pmd_page_ctor()でspinlock_tが割り当てられます。</p>
+<p>page-&gt;ptlを直接アクセスしないでください。適切なヘルパーを使用してください。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxメモリ管理ドキュメンテーション</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#user-guides-for-mm-features">MM機能用ユーザーガイド</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#kernel-developers-mm-documentation">カーネル開発者向けMMドキュメンテーション</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxメモリ管理ドキュメンテーション</a><ul>
+<li>前へ: <a href="slub.html" title="前章">SLUBの短いユーザーガイド</a></li>
+<li>次へ: <a href="transhuge.html" title="次章">Transparent Hugepage Support</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/vm/split_page_table_lock.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

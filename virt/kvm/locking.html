@@ -1,0 +1,431 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>KVM Lock Overview — The Linux Kernel documentation</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="mmu.html" rel="next" title="x86 KVM シャドウMMU"/>
+<link href="hypercalls.html" rel="prev" title="Linux KVMハイパーコール"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="kvm-lock-overview">
+<h1>KVMロック概要<a class="headerlink" href="#kvm-lock-overview" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="acquisition-orders">
+<h2>1. 取得注文<a class="headerlink" href="#acquisition-orders" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ミューテックスの取得順序は以下の通りです:</p>
+<ul class="simple">
+<li><p>kvm-&gt;lockはvcpu-&gt;mutexの外側で取得されます</p></li>
+<li><p>kvm-&gt;lockはkvm-&gt;slots_lockおよびkvm-&gt;irq_lockの外側で取得されます</p></li>
+<li><p>kvm-&gt;slots_lockはkvm-&gt;irq_lockの外側で取得されます。ただし、両方を同時に取得するケースは非常に稀です。</p></li>
+</ul>
+<p>x86では、vcpu-&gt;mutexはkvm-&gt;arch.hyperv.hv_lockの外側で取得されます</p>
+<p>その他はすべて葉ノードです: キリカセクション内では他のロックは取得されません。</p>
+</section>
+<section id="exception">
+<h2>2. 例外<a class="headerlink" href="#exception" title="この見出しへのパーマリンク">¶</a></h2>
+<p>高速ページフォールト:</p>
+<p>高速ページフォールトは、x86においてmmu-lockを外側でゲストのページフォールトを修正する高速パスです。現在、ページフォールトが高速になるケースは以下の2つの場合があります:</p>
+<ol class="arabic simple">
+<li><p>アクセストラッキング: SPTEは存在しないが、アクセストラッキング用に設定されている(i.e. SPTE_SPECIAL_MASKが設定されている)。これは保存されたR/Xビットを復元する必要があります。詳しくは後述します。</p></li>
+<li><p>書き込み保護: SPTEは存在し、フォールトは書き込み保護によって発生しています。これはspteのWビットを変更するだけで済みます。</p></li>
+</ol>
+<p>レースを回避するために使用するビットはspte上のSPTE_HOST_WRITEABLEビットとSPTE_MMU_WRITEABLEビットです:</p>
+<ul class="simple">
+<li><p>SPTE_HOST_WRITEABLEはホスト側でgfnが書き込み可能を示します。</p></li>
+<li><p>SPTE_MMU_WRITEABLEはMMU側でgfnが書き込み可能を示します。このビットはゲストMMUでgfnが書き込み可能であり、シャドウページ書き込み保護で保護されていないときに設定されます。</p></li>
+</ul>
+<p>高速ページフォールトパスでは、cmpxchgを用いてspteのWビットを原子的に設定します。条件はspte.SPTE_HOST_WRITEABLE=1かつspte.SPTE_WRITE_PROTECT=1の場合、またはVMX_EPT_TRACK_ACCESSマスクが設定されている場合、または両方です。これはcmpxchgでこれらのビットの変更を検出できるため安全です。</p>
+<p>ただし、以下のケースを慎重に確認する必要があります:</p>
+<ol class="arabic simple">
+<li><p>gfnからpfnへのマッピング</p></li>
+</ol>
+<p>gfnからpfnへのマッピングはcmpxchg中に変更される可能性があります。これはpfnが変更されないことを保証できるため、ABA問題が発生します。例えば以下のケースが発生します:</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 51%"/>
+<col style="width: 49%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td colspan="2"><p>開始時:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>gpte = gfn1
+gfn1 is mapped to pfn1 on host
+spte is the shadow page table entry corresponding with gpte and
+spte = pfn1
+</pre></div>
+</div>
+</td>
+</tr>
+<tr class="row-even"><td colspan="2"><p>高速ページフォールトパス:</p></td>
+</tr>
+<tr class="row-odd"><td><p>CPU 0:</p></td>
+<td><p>CPU 1:</p></td>
+</tr>
+<tr class="row-even"><td><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>old_spte = *spte;
+</pre></div>
+</div>
+</td>
+<td></td>
+</tr>
+<tr class="row-odd"><td></td>
+<td><p>pfn1がスワップアウト:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>spte = 0;
+</pre></div>
+</div>
+<p>pfn1がgfn2のために再割当:</p>
+<p>ゲストがgpteをgfn2にポインタを変更:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>spte = pfn1;
+</pre></div>
+</div>
+</td>
+</tr>
+<tr class="row-even"><td colspan="2"><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>if (cmpxchg(spte, old_spte, old_spte+W)
+    mark_page_dirty(vcpu-&gt;kvm, gfn1)
+         OOPS!!!
+</pre></div>
+</div>
+</td>
+</tr>
+</tbody>
+</table>
+<p>gfn1に対してdirty-logを記録するため、gfn2がdirty-bitmapで失われます。</p>
+<p>直接SPの場合、spteがgfnに固定されているため簡単に回避できます。間接SPの場合、簡潔さのため高速ページフォールトを無効化しています。</p>
+<p>間接SPに対する解決策として、cmpxchg前に関数kvm_vcpu_gfn_to_pfn_atomicを用いてgfnをピン留めする方法があります。ピン留め後:</p>
+<ul class="simple">
+<li><p>pfnのrefcountを保持しているため、pfnは解放されず他のgfnに再利用されません。</p></li>
+<li><p>pfnは書き込み可能であり、KSMによって異なるgfn間で共有されません。</p></li>
+</ul>
+<p>次に、ゲストフレーム番号(gfn)に対してDirtyビットマップが正しく設定されていることを確認できます。</p>
+<ol class="arabic simple" start="2">
+<li><p>Dirtyビットの追跡</p></li>
+</ol>
+<p>元のコードでは、spteが読み取り専用であり、Accessedビットがすでに設定されている場合、AccessedビットとDirtyビットが失われることはないため、spteは高速に更新（非原子的）できます。</p>
+<p>しかし、高速ページフォールト後ではこの状態は正しくありません。なぜなら、spteの読み取りと更新の間にspteが書き込み可能にマークされる可能性があるからです。以下のようなケースがあります：</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 51%"/>
+<col style="width: 49%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td colspan="2"><p>開始時:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>spte.W = 0
+spte.Accessed = 1
+</pre></div>
+</div>
+</td>
+</tr>
+<tr class="row-even"><td><p>CPU 0:</p></td>
+<td><p>CPU 1:</p></td>
+</tr>
+<tr class="row-odd"><td><p>mmu_spte_clear_track_bits()関数内では：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>old_spte = *spte;
+
+
+/* 'if' condition is satisfied. */
+if (old_spte.Accessed == 1 &amp;&amp;
+     old_spte.W == 0)
+   spte = 0ull;
+</pre></div>
+</div>
+</td>
+<td></td>
+</tr>
+<tr class="row-even"><td></td>
+<td><p>高速ページフォールトパスでは：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>spte.W = 1
+</pre></div>
+</div>
+<p>spteへのメモリ書き込み：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>spte.Dirty = 1
+</pre></div>
+</div>
+</td>
+</tr>
+<tr class="row-odd"><td><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>else
+  old_spte = xchg(spte, 0ull)
+if (old_spte.Accessed == 1)
+  kvm_set_pfn_accessed(spte.pfn);
+if (old_spte.Dirty == 1)
+  kvm_set_pfn_dirty(spte.pfn);
+  OOPS!!!
+</pre></div>
+</div>
+</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>この場合、Dirtyビットが失われます。</p>
+<p>このような問題を避けるため、mmu-lock外で更新される可能性があるspteは常に「volatile」と扱います（spte_has_volatile_bits()を参照）。つまり、この場合spteは常に原子的に行う更新が行われます。</p>
+<ol class="arabic simple" start="3">
+<li><p>spteの更新によりTLBのフラッシュ</p></li>
+</ol>
+<p>spteが書き込み可能から読み取り専用に更新された場合、すべてのTLBをフラッシュする必要があります。そうでないと、rmap_write_protectが読み取り専用のspteを検出してしまう可能性があります（CPUのTLBに書き込み可能なspteがキャッシュされている場合も）。</p>
+<p>前述の通り、高速ページフォールトパスではmmu-lock外でspteが書き込み可能に更新されることがあります。このパスを簡単に監査できるように、mmu_spte_update()関数内でこの理由によるTLBのフラッシュが必要かどうかを確認します。これはspte（存在状態→存在状態）を更新する一般的な関数です。</p>
+<p>spteがmmu-lock外で更新される場合、「volatile」とみなされるため、常に原子的に行う更新が行われます。これにより、高速ページフォールトによる競合が回避されます。spte_has_volatile_bits()およびmmu_spte_update()のコメントを参照してください。</p>
+<p>ロックレスアクセス追跡：</p>
+<p>これはEPTをサポートしていないIntel CPU向けの機能です。KVM MMU通知がページへのアクセスを追跡する際（kvm_mmu_notifier_clear_flush_youngを通じて）、PTEを非存在状態にし、RWXビットをクリアして元のR &amp; Xビットを無視されるビットに保存します。さらに、SPTE_SPECIAL_MASKもPTEに設定されます（無視されるビット62を使用）。VMが後でページにアクセスしようとすると、フォールトが発生し、上記の高速ページフォールトメカニズムが使用されてPTEが存在状態に戻されます。アクセス追跡中にWビットは保存されません。復元時にWビットは、アクセスが書き込みだったかどうかに応じて設定されます。書き込みでなかった場合、Wビットは書き込みが発生するまでクリアのままです。その際、上記のDirty追跡メカニズムを使用して設定されます。</p>
+</section>
+<section id="reference">
+<h2>3. 参照<a class="headerlink" href="#reference" title="この見出しへのパーマリンク">¶</a></h2>
+<dl class="field-list simple">
+<dt class="field-odd">名前</dt>
+<dd class="field-odd"><p>kvm_lock</p>
+</dd>
+<dt class="field-even">タイプ</dt>
+<dd class="field-even"><p>mutex</p>
+</dd>
+<dt class="field-odd">アーキテクチャ</dt>
+<dd class="field-odd"><p>any</p>
+</dd>
+<dt class="field-even">保護</dt>
+<dd class="field-even"><ul class="simple">
+<li><p>vm_list</p></li>
+</ul>
+</dd>
+<dt class="field-odd">名前</dt>
+<dd class="field-odd"><p>kvm_count_lock</p>
+</dd>
+<dt class="field-even">タイプ</dt>
+<dd class="field-even"><p>raw_spinlock_t</p>
+</dd>
+<dt class="field-odd">アーキテクチャ</dt>
+<dd class="field-odd"><p>any</p>
+</dd>
+<dt class="field-even">保護</dt>
+<dd class="field-even"><ul class="simple">
+<li><p>ハードウェア仮想化の有効/無効</p></li>
+</ul>
+</dd>
+<dt class="field-odd">コメント</dt>
+<dd class="field-odd"><p>「raw」は、ハードウェアの有効化/無効化がマイグレーションに対して原子的であるためです。</p>
+</dd>
+<dt class="field-even">名前</dt>
+<dd class="field-even"><p>kvm_arch::tsc_write_lock</p>
+</dd>
+<dt class="field-odd">タイプ</dt>
+<dd class="field-odd"><p>raw_spinlock</p>
+</dd>
+<dt class="field-even">アーキテクチャ</dt>
+<dd class="field-even"><p>x86</p>
+</dd>
+<dt class="field-odd">保護</dt>
+<dd class="field-odd"><ul class="simple">
+<li><p>kvm_arch::{last_tsc_write,last_tsc_nsec,last_tsc_offset}</p></li>
+<li><p>vmcb内のTSCオフセット</p></li>
+</ul>
+</dd>
+<dt class="field-even">コメント</dt>
+<dd class="field-even"><p>「raw」は、TSCオフセットの更新がプリエンプションされないためです。</p>
+</dd>
+<dt class="field-odd">名前</dt>
+<dd class="field-odd"><p>kvm-&gt;mmu_lock</p>
+</dd>
+<dt class="field-even">タイプ</dt>
+<dd class="field-even"><p>spinlock_t</p>
+</dd>
+<dt class="field-odd">アーキテクチャ</dt>
+<dd class="field-odd"><p>any</p>
+</dd>
+<dt class="field-even">保護</dt>
+<dd class="field-even"><p>-シャドウページ/シャドウTLBエントリ</p>
+</dd>
+<dt class="field-odd">コメント</dt>
+<dd class="field-odd"><p>MMU通知子で使用されるため、スピンロックです。</p>
+</dd>
+<dt class="field-even">名前</dt>
+<dd class="field-even"><p>kvm-&gt;srcu</p>
+</dd>
+<dt class="field-odd">タイプ</dt>
+<dd class="field-odd"><p>srcuロック</p>
+</dd>
+<dt class="field-even">アーキテクチャ</dt>
+<dd class="field-even"><p>any</p>
+</dd>
+<dt class="field-odd">保護</dt>
+<dd class="field-odd"><ul class="simple">
+<li><p>kvm-&gt;memslots</p></li>
+<li><p>kvm-&gt;buses</p></li>
+</ul>
+</dd>
+<dt class="field-even">コメント</dt>
+<dd class="field-even"><p>memslots（例：gfn_to_*関数を使用する際）や、カーネル内MMIO/PIOアドレス→デバイスマッピング（kvm-&gt;buses）へのアクセス中にsrcu読み取りロックを保持しなければなりません。複数の関数で必要とされる場合は、kvm_vcpu-&gt;srcu_idxでsrcuインデックスを各vcpuごとに保存できます。</p>
+</dd>
+<dt class="field-odd">名前</dt>
+<dd class="field-odd"><p>blocked_vcpu_on_cpu_lock</p>
+</dd>
+<dt class="field-even">タイプ</dt>
+<dd class="field-even"><p>spinlock_t</p>
+</dd>
+<dt class="field-odd">アーキテクチャ</dt>
+<dd class="field-odd"><p>x86</p>
+</dd>
+<dt class="field-even">保護</dt>
+<dd class="field-even"><p>blocked_vcpu_on_cpu</p>
+</dd>
+<dt class="field-odd">コメント</dt>
+<dd class="field-odd"><p>これはCPUごとのロックで、VT-dポスト割込みを処理するために使用されます。VT-dポスト割込みがサポートされ、VMにデバイスが割り当てられている場合、VT-dハードウェアがウェイクアップ通知イベントを発生させた際、外部割込みが発生したデバイスのvCPUをblocked_vcpu_on_cpu_lockで保護されたリストに追加します。その後、該当のvCPUをウェイクアップします。</p>
+</dd>
+</dl>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linux 仮想化サポート</a><ul class="current">
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">KVM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../uml/user_mode_linux_howto_v2.html">UML ハウトゥー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../paravirt_ops.html">パラバーティロップス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../guest-halt-polling.html">ゲストハルトポーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ne_overview.html">Nitro エンクローブ</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linux 仮想化サポート</a><ul>
+<li><a href="index.html">KVM</a><ul>
+<li>前へ: <a href="hypercalls.html" title="前章">Linux KVMハイパーコール</a></li>
+<li>次へ: <a href="mmu.html" title="次章">x86 KVM シャドウMMU</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/virt/kvm/locking.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

@@ -1,0 +1,240 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>透過的ヒューゲページサポート — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="unevictable-lru.html" rel="next" title="非奪取可能LRUインフラストラクチャ"/>
+<link href="split_page_table_lock.html" rel="prev" title="ページテーブルロックの分割"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="transparent-hugepage-support">
+<span id="transhuge"></span><h1>Transparent Hugepage Support<a class="headerlink" href="#transparent-hugepage-support" title="この見出しへのパーマリンク">¶</a></h1>
+<p>このドキュメントは、透明大ページ（THP）のサポートに関する設計原則と、メモリ管理システムの他の部分との相互作用について説明しています。</p>
+<section id="design-principles">
+<h2>設計原則<a class="headerlink" href="#design-principles" title="この見出しへのパーマリンク">¶</a></h2>
+<ul class="simple">
+<li><p>「graceful fallback（優雅なフェールバック）」：THPに関する知識を持たないmmコンポーネントは、大ページのpmdマッピングをpteテーブルに分割し、必要に応じて透明大ページを分割して、通常のページや通常のpteマッピングで継続的に動作できるようにします。</p></li>
+<li><p>メモリのフラグメンテーションにより大ページの割り当てが失敗した場合、通常のページを優雅に割り当てて同様のvmaに混在させ、ユーザー空間に失敗や大幅な遅延を通知することなく処理します。</p></li>
+<li><p>タスクが終了し、より多くの大ページが利用可能になった場合（即座にbuddy領域に出現するか、VMを通じて）、通常のページでバックエンドされたゲスト物理メモリはkhugepagedを通じて自動的に大ページに再配置されます。</p></li>
+<li><p>メモリの予約は必要とならず、逆に可能であれば常に大ページを使用します（ここでの唯一の予約はkernelcore=パラメータで、不動ページを避けてメモリ全体をフラグメンテーションから守るためのものです。ただし、この調整はTHPサポートに特有ではなく、カーネル内のすべての動的高オーダー割り当てに共通する機能です）。</p></li>
+</ul>
+</section>
+<section id="get-user-pages-and-follow-page">
+<h2>get_user_pagesおよびfollow_page<a class="headerlink" href="#get-user-pages-and-follow-page" title="この見出しへのパーマリンク">¶</a></h2>
+<p>get_user_pagesおよびfollow_pageが大ページを対象に実行されても、通常通りヘッドまたはテールページを返します（hugetlbfsでの挙動と同様です）。ほとんどのGUPユーザーはページの物理アドレスとI/O完了後の一時的なピン固定にのみ関心を持ち、ページが大ページであることに気づきません。ただし、ドライバがテールページのページ構造を操作する場合（例：page-&gt;mappingの確認やヘッドページに関連する他のビットの確認）、ヘッドページをチェックするようにコードを更新する必要があります。ヘッド/テールページへの参照取得は、ページが誰かによって分割されることを防ぎます。</p>
+<div class="admonition note">
+<p class="admonition-title">注意</p>
+<p>これらはGUP APIに新たな制約ではありませんし、hugetlbfsにも適用される同じ制約です。したがって、hugetlbfsでGUPを処理できるドライバは、透明大ページでバックエンドされるマッピングでも問題なく動作します。</p>
+</div>
+<p>follow_pageが返すcompoundページを処理できない場合、follow_pageにFOLL_SPLITビットをパラメータとして指定することで、返す前に大ページを分割します。</p>
+</section>
+<section id="graceful-fallback">
+<h2>Graceful fallback<a class="headerlink" href="#graceful-fallback" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ページテーブルを歩く際、巨大なpmd（ページディスクリプタ）の存在に無知なコードは、split_huge_pmd(vma, pmd, addr)を呼び出すことで透明なヒープページ対応を実現できます。pmd_offsetが返すpmdの位置にsplit_huge_pmdを追加するだけで、コードを透明なヒープページ対応に変換できます。これは、優雅なフェールバック設計のおかげで、1行の変更で複数数百から数千行に及ぶ複雑なコードを書く必要がなくなります。</p>
+<p>ページテーブルを歩くことなく、コード内でネイティブに処理できない物理的なヒープページに遭遇した場合、split_huge_page(page)を呼び出して分割できます。これはLinux VMがヒープページをスワップアウトする前に実行する処理の例です。split_huge_page()はページがピンされている場合に失敗する可能性があるため、正しい処理を実装する必要があります。</p>
+<p>mremap.cを透明なヒープページ対応にするためのワンライナーの変更例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>diff --git a/mm/mremap.c b/mm/mremap.c
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@ -41,6 +41,7 @@ static pmd_t *get_old_pmd(struct mm_stru
+                return NULL;
+
+        pmd = pmd_offset(pud, addr);
++       split_huge_pmd(vma, pmd, addr);
+        if (pmd_none_or_clear_bad(pmd))
+                return NULL;
+</pre></div>
+</div>
+</section>
+<section id="locking-in-hugepage-aware-code">
+<h2>透明なヒープページ対応コードにおけるロック<a class="headerlink" href="#locking-in-hugepage-aware-code" title="この見出しへのパーマリンク">¶</a></h2>
+<p>可能な限り多くのコードを透明なヒープページ対応にすることが望ましいです。split_huge_page()やsplit_huge_pmd()を呼び出すことはコストがかかるためです。</p>
+<p>ページテーブルを歩く際、巨大なpmdを対応させるには、pmd_offsetで取得したpmdに対してpmd_trans_huge()を呼び出すだけです。khugepagedが巨大なpmdを生成しないようにするため、mmap_lockを読み取り（または書き込み）モードで保持する必要があります（khugepagedはcollapse_huge_pageでmmap_lockを書き込みモードで取得します）。pmd_trans_hugeがfalseを返す場合、従来のコードパスにフェールバックします。pmd_trans_hugeがtrueを返す場合、ページテーブルロック（pmd_lock()）を取得し、再びpmd_trans_hugeを実行する必要があります。ページテーブルロックを取得することで、他のスレッドが巨大なpmdを通常のpmdに変換するのを防ぎます（split_huge_pmdはページテーブルウォークと並行して実行可能）。2回目のpmd_trans_hugeがfalseを返す場合、ページテーブルロックを解放して従来のコードにフェールバックします。それ以外の場合、巨大なpmdとヒープページをネイティブで処理できます。処理が終わったらページテーブルロックを解放してください。</p>
+</section>
+<section id="refcounts-and-transparent-huge-pages">
+<h2>参照カウントと透明なヒープページ<a class="headerlink" href="#refcounts-and-transparent-huge-pages" title="この見出しへのパーマリンク">¶</a></h2>
+<p>透明なヒープページ（THP）における参照カウントは、他の複合ページにおける参照カウントとほぼ一致しています:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>get_page()/put_page()およびGUPはヘッドページの-&gt;_refcountを操作します。</p></li>
+<li><p>-&gt;_refcountは末尾ページでは常にゼロです：get_page_unless_zero()は末尾ページで成功しません。</p></li>
+<li><p>複合ページのサブページにおけるPTEエントリの増減を伴うマッピング/アンマッピング -&gt;_mapcountの処理。</p></li>
+<li><p>複合ページ全体のマップ/アンマップは、compound_mapcount（最初のテールページに保存）で処理されます。ファイルのヒューゲンページの場合、すべてのサブページの-&gt;_mapcountもインクリメントし、サブページの最後のアンマップを競合条件を避けて検出できるようにします。</p></li>
+</ul>
+</div></blockquote>
+<p>PageDoubleMap()はページが <em>おそらく</em> PTEでマップされていることを示します。</p>
+<p>匿名ページの場合、PageDoubleMap()はすべてのサブページの-&gt;_mapcountが1つずつオフセットされることを示します。これにより、PMDとPTEの両方でマップされているサブページのアンマップを競合条件を避けて検出できるようになります。</p>
+<p>この最適化はサブページごとのmapcount追跡のオーバーヘッドを低減するために必要です。代替案は、複合ページ全体のマップ/アンマップごとにすべてのサブページの-&gt;_mapcountを変更することです。</p>
+<p>匿名ページの場合、ページのPMDが初めて分割されるときにPG_double_mapを設定しますが、まだPMDマッピングが存在する限り保持します。追加の参照は最後のcompound_mapcountとともに消えます。</p>
+<p>ファイルページでは、ページがPTEでマップされる最初のときにPG_double_mapが設定され、ページキャッシュから除外されるときに消えます。</p>
+<p>split_huge_pageは、ヘッドページの参照カウントをテールページに配分する必要があります。その後、ページ構造体のすべてのPG_head/tailビットをクリアします。ページテーブルエントリで取得した参照カウントについては簡単に処理できますが、get_user_pagesからの追加ピン（参照）の配分方法については情報が不足しています。split_huge_page()はピンされたヒューゲンページの分割を要求すると失敗します。page countはすべてのサブページのmapcountの合計＋1（split_huge_pageの呼び出し元がヘッドページの参照を保持している必要があります）に等しくなければなりません。</p>
+<p>split_huge_pageは匿名ページのpage-&gt;_refcountとpage-&gt;_mapcountを移動エントリを使って安定化します。ファイルページは単にアンマップされます。</p>
+<p>物理メモリスキャナーにも安全です。スキャナーがページに参照を取得する唯一の正当な方法はget_page_unless_zero()です。</p>
+<p>すべてのテールページはatomic_add()実行前まで-&gt;_refcountがゼロです。これにより、スキャナーがテールページに参照を取得するのを防ぎます。atomic_add()後は-&gt;_refcountの値には関心がありません。ヘッドページからどのくらいの参照が未払いであるかはすでに把握しています。</p>
+<p>ヘッドページではget_page_unless_zero()が成功し、気にすることはありません。split後の参照の行き先は明確です。すべての参照はヘッドページに残ります。</p>
+<p>split_huge_pmd()は参照カウントに関する制限がありません。PMDはいつでも分割可能で、失敗することはありません。</p>
+</section>
+<section id="partial-unmap-and-deferred-split-huge-page">
+<h2>部分アンマップとdeferred_split_huge_page()<a class="headerlink" href="#partial-unmap-and-deferred-split-huge-page" title="この見出しへのパーマリンク">¶</a></h2>
+<p>THP（Transparent Huge Pages）の一部をアンマップ（munmap() または他の方法で）しても、メモリはすぐに解放されません。代わりに、page_remove_rmap() で THP のサブページが使用されていないことを検出し、メモリ圧力が発生した際に THP を分割するようにキューイングします。分割によって未使用のサブページが解放されます。</p>
+<p>ロックコンテキストの制約により、即座にページを分割することはできません。また、多くの場合、THP が VMA バウンダリを越える際の exit(2) で部分的なアンマップが発生するため、逆効果になる可能性もあります。</p>
+<p>deferred_split_huge_page() 関数はページを分割するためのキューイングを行います。実際の分割は shrinker インターフェースを通じてメモリ圧力が発生した際に実行されます。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxメモリ管理ドキュメンテーション</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#user-guides-for-mm-features">MM機能用ユーザーガイド</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#kernel-developers-mm-documentation">カーネル開発者向けMMドキュメンテーション</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxメモリ管理ドキュメンテーション</a><ul>
+<li>前へ: <a href="split_page_table_lock.html" title="前章">ページテーブルロックの分割</a></li>
+<li>次へ: <a href="unevictable-lru.html" title="次章">非奪取可能LRUインフラストラクチャ</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/vm/transhuge.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

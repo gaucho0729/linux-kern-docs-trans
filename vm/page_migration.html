@@ -1,0 +1,278 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>ページマиграーشن — Linux Kernel ドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="page_frags.html" rel="next" title="ページフラグメント"/>
+<link href="overcommit-accounting.html" rel="prev" title="オーバーコミットアカウント"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="page-migration">
+<span id="id1"></span><h1>ページの移動<a class="headerlink" href="#page-migration" title="この見出しへのパーマリンク">¶</a></h1>
+<p>ページマиграーشنは、プロセスが実行されている間、NUMAシステム内のノード間でページの物理的な位置を移動させることを可能にします。これにより、プロセスが見ている仮想アドレスは変化しません。ただし、システムはこれらのページの物理的な位置を再配置します。</p>
+<p>以下の <a class="reference internal" href="hmm.html#hmm"><span class="std std-ref">異質メモリ管理（HMM）</span></a>
+デバイスプライベートメモリにページを移動するための</p>
+<p>ページマиграーشنの主な目的は、メモリアクセスのレイテンシーを減らすために、プロセスがそのメモリをアクセスしているプロセッサに近い場所にページを移動させることです。</p>
+<p>ページマиграーشنは、mbind()を通じて新しいメモリポリシーを設定しながら、MF_MOVE および MF_MOVE_ALL オプションを使用してプロセスがページを配置しているノードを手動で移動させることを可能にします。また、sys_migrate_pages() 関数呼び出しを使用して、他のプロセスからプロセスのページを移動させることもできます。migrate_pages() 関数呼び出しは、2つのノードセットを指定し、プロセスのページを from ノードから destination ノードへ移動します。ページマиграーشن関数は、Andi Kleen による numactl パッケージで提供されており（0.9.3 より新しいバージョンが必要です。取得は
+<a class="reference external" href="https://github.com/numactl/numactl.git">https://github.com/numactl/numactl.git</a>)。numactl は、ページマиграーشن用に他の NUMA 機能と似たインターフェースを提供する libnuma を提供します。cat <code class="docutils literal notranslate"><span class="pre">/proc/&lt;pid&gt;/numa_maps</span></code> プロセスのページが配置されている場所を簡単に確認できます。proc(5) マニュアルページの numa_maps ドキュメンテーションも参照してください。</p>
+<p>手動でのマиграーشنは、たとえばスケジューラがプロセスを遠くのノードにあるプロセッサに移動させた場合などに役立ちます。バッチスケジューラや管理者が状況を検出し、プロセスのページを新しいプロセッサに近づけることができます。カーネル自身は手動でのページマиграーشنをサポートしています。自動的なページマиграーشنは、ユーザー空間プロセスがページを移動させることが可能です。特別な関数呼び出し「move_pages」は、プロセス内の個々のページを移動させることができます。たとえば、NUMAプロファイラーは、頻繁なノード外アクセスを示すログを取得し、その結果をもとにページをより有利な場所に移動させることができます。</p>
+<p>大規模なインストールでは、通常 cpusets を使用してシステムをノードごとにセクションに分割します。Paul Jackson は cpusets にタスクが別の cpuset に移動したときにページを移動する機能を追加しました（参照
+<a class="reference internal" href="../admin-guide/cgroup-v1/cpusets.html#cpusets"><span class="std std-ref">CPUSETS</span></a>)。cpusets はプロセスのローカル性を自動化します。タスクが新しい cpuset に移動した場合、そのすべてのページも一緒に移動するため、プロセスのパフォーマンスが大幅に低下しません。また、cpuset 内のプロセスのページは、cpuset の許可メモリノードが変更されたときに移動されます。</p>
+<p>ページの移動は、プロセスを移動させても、ノード群内のページの相対的な位置関係を保持するためのメモリ割当パターンを維持するすべての移動技術において、メモリ遅延を保持するために必要です。移動後も同様のパフォーマンスでプロセスが実行されます。</p>
+<p>ページの移動は複数のステップで行われます。まず、カーネルからmigrate_pages()を使用するユーザー（ユーザースペースでの使用については上記のAndi Kleenのnumactlパッケージを参照）向けの高レベルな説明を示し、次に低レベルの詳細について説明します。</p>
+<section id="in-kernel-use-of-migrate-pages">
+<h2>カーネルでのmigrate_pages()の使用<a class="headerlink" href="#in-kernel-use-of-migrate-pages" title="この見出しへのパーマリンク">¶</a></h2>
+<ol class="arabic">
+<li><p>LRUからページを削除します。</p>
+<p>ページの移動リストは、ページをスキャンしてリストに移動させることで生成されます。これはisolate_lru_page()を呼び出すことで実現され、この関数はページの参照カウントを増加させることで、ページ移動中にページが消失しないようにします。また、スワッパーまたは他のスキャン処理がページに遭遇しないようにします。</p>
+</li>
+<li><p>migrate_pages()に渡すことができるnew_page_t型の関数が必要です。この関数は、古いページから正しい新しいページを割当てる方法を決定する必要があります。</p></li>
+<li><p>migrate_pages()関数が呼び出され、移動を試行します。各移動対象ページに対して新しいページを割当てる関数を呼び出します。</p></li>
+</ol>
+</section>
+<section id="how-migrate-pages-works">
+<h2>migrate_pages()の動作方法<a class="headerlink" href="#how-migrate-pages-works" title="この見出しへのパーマリンク">¶</a></h2>
+<p>migrate_pages()はページリストを複数回スキャンします。ページがすべての参照が移動時に除去可能である場合にのみ移動されます。ページは既にisolate_lru_page()によってLRUから削除されており、参照カウントが増加しているため、ページ移動中にページが解放されません。</p>
+<p>手順:</p>
+<ol class="arabic simple">
+<li><p>移動するページをロックします。</p></li>
+<li><p>Writebackが完了していることを確認します。</p></li>
+<li><p>移動先の新しいページをロックします。このページ（まだ最新でない）へのアクセスは、移動中に即座にブロックされます。</p></li>
+<li><p>ページのページテーブル参照はすべて移動エントリに変換されます。これによりページのマップカウントが減少します。結果のマップカウントがゼロでない場合、ページを移動しません。すべてのユーザースペースプロセスは、ページロックまたは移動ページテーブルエントリの削除を待つことになります。</p></li>
+<li><p>i_pagesロックを取得します。これにより、マッピングを通じてページにアクセスしようとするすべてのプロセスはスピンロックでブロックされます。</p></li>
+<li><p>ページの参照カウントを確認し、参照が残っている場合は戻ります。それ以外の場合、このページを参照しているのは自分だけであることがわかります。</p></li>
+<li><p>radix treeがチェックされ、このページへのポインタが含まれていない場合、他のプロセスがradix treeを変更したため、処理を戻します。</p></li>
+<li><p>新しいページは古いページの一部の設定を引き継ぎ、新しいページへのアクセスが正しい設定を持つページとして検出されるように準備されます。</p></li>
+<li><p>radix treeは新しいページへのポインタに変更されます。</p></li>
+<li><p>古いページの参照カウントはアドレス空間参照がなくなったため減少し、新しいページへの参照がアドレス空間によって設定されるため新しいページの参照カウントが増加します。</p></li>
+<li><p>i_pagesロックが解除され、マッピングの検索が再び可能になります。プロセスはロックを待つ状態から、新しいページのロックを待つ状態に移行します。</p></li>
+<li><p>ページの内容が新しいページにコピーされます。</p></li>
+<li><p>残りのページフラグが新しいページにコピーされます。</p></li>
+<li><p>古いページフラグがクリアされ、ページがもはや情報を提供しないことを示します。</p></li>
+<li><p>新しいページにキューイングされたWritebackがトリガーされます。</p></li>
+<li><p>ページテーブルにマиграーションエントリが挿入されていた場合、それらを実際のpteに置き換えます。これにより、既にページロックを待っているユーザー空間プロセス以外のプロセスがアクセス可能になります。</p></li>
+<li><p>古いページと新しいページのページロックが解除され、ページロックを待つプロセスはページフォールトを再実行し、新しいページに到達します。</p></li>
+<li><p>新しいページがLRUリストに移動し、swapperなどによるスキャンが再開されます。</p></li>
+</ol>
+</section>
+<section id="non-lru-page-migration">
+<h2>非LRUページのマиграーション<a class="headerlink" href="#non-lru-page-migration" title="この見出しへのパーマリンク">¶</a></h2>
+<p>マиграーションはもともとNUMAによるメモリアクセス遅延の削減を目的としていましたが、コンパクションもマиграーションを用いて高オーダーのページを生成するため使用しています。</p>
+<p>現在の実装の問題点は、ページのみをマиграーション可能に設計していることです。
+<em>LRU</em> しかし、ドライバなどでは潜在的に非LRUページをマиграーション可能にすることができます。例えば、zsmallocやvirtio-balloonページなどです。</p>
+<p>virtio-balloonページでは、マиграーションコードパスの一部にドライバ固有の処理を追加し、マиграーションロジックをインターセプトする関数を追加しています。しかし、ドライバ固有の処理が多すぎるため、他のドライバがページをマиграーション可能にするには、マиграーションパスに独自のハックを追加する必要があります。</p>
+<p>この問題を解決するため、VMは非LRUページのマиграーションをサポートし、マиграーションパスにドライバ固有のハックを含まず、非LRUマиграーション可能なページ用の汎用関数を提供します。</p>
+<p>ドライバがページをマиграーション可能にする場合、struct address_space_operationsの関数ポインタとして3つの関数を定義する必要があります。</p>
+<ol class="arabic">
+<li><p><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">(*isolate_page)</span> <span class="pre">(struct</span> <span class="pre">page</span> <span class="pre">*page,</span> <span class="pre">isolate_mode_t</span> <span class="pre">mode);</span></code></p>
+<p>ドライバのisolate_page()関数がVMに提供すべきことは、 <em>true</em>
+ドライバがページを成功裏に隔離した場合、trueを返すとVMがページをPG_isolatedとしてマークし、複数のCPUによる同時隔離処理はそのページを隔離対象から除外します。ドライバがページを隔離できなかった場合は、適切に返却してください <em>false</em>.</p>
+<p>ページが成功裏に隔離された後、VMはpage.lruフィールドを使用するため、ドライバはこれらのフィールドの値を保持する必要はありません</p>
+</li>
+</ol>
+<p>2. <code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">(*migratepage)</span> <span class="pre">(struct</span> <span class="pre">address_space</span> <span class="pre">*mapping,</span></code>
+|       <code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">page</span> <span class="pre">*newpage,</span> <span class="pre">struct</span> <span class="pre">page</span> <span class="pre">*oldpage,</span> <span class="pre">enum</span> <span class="pre">migrate_mode);</span></code></p>
+<blockquote>
+<div><p>隔離後、VMはドライバのmigratepage()関数を隔離されたページとともに呼び出します。migratepage()関数の役割は、古いページの内容を新しいページに移動し、struct page newpageのフィールドを設定することです。古いページを成功裏に移動させた場合、page_lockの下で__ClearPageMovable()を呼び出してVMに古いページがもはや移動可能でなくなったことを示す必要があります。ドライバが現在の時点でページを移動できなかった場合は-EAGAINを返却できます。-EAGAINを返却した場合、VMは短期間でページの再移動を試みます（VMは-EAGAINを「一時的な移動失敗」と解釈するため）。-E_NOWAIT以外のエラーを返却した場合、VMは再試行せずにページの移動を放棄します</p>
+<p>migratepage()関数内ではドライバはpage.lruフィールドを操作すべきではありません</p>
+</div></blockquote>
+<ol class="arabic" start="3">
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">(*putback_page)(struct</span> <span class="pre">page</span> <span class="pre">*);</span></code></p>
+<p>隔離されたページの移動が失敗した場合、VMは隔離されたページをドライバに返却し、putback_page()関数を呼び出します。この関数では、ドライバは隔離されたページを自身のデータ構造に戻す必要があります</p>
+</li>
+<li><p>非LRU可動ページフラグ</p>
+<p>非LRU可動ページをサポートするためのページフラグは2つあります</p>
+<ul>
+<li><p>PG_movable</p>
+<p>ドライバは以下の関数を使用してpage_lockの下でページを可動にする必要があります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void __SetPageMovable(struct page *page, struct address_space *mapping)
+</pre></div>
+</div>
+<p>移動ファミリ関数を登録する際にaddress_spaceの引数が必要です。厳密に言えば、PG_movableはstruct pageの実際のフラグではありません。代わりに、VMはpage-&gt;mappingの下位ビットを再利用して表現しています:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#define PAGE_MAPPING_MOVABLE 0x2
+page-&gt;mapping = page-&gt;mapping | PAGE_MAPPING_MOVABLE;
+</pre></div>
+</div>
+<p>そのため、ドライバはpage-&gt;mappingを直接アクセスすべきではありません。代わりに、page_mapping()関数を使用し、page_lockの下でpage-&gt;mappingの下位2ビットをマスクして正しい値を取得できます <a class="reference internal" href="../filesystems/api-summary.html#c.address_space" title="address_space"><code class="xref c c-struct docutils literal notranslate"><span class="pre">struct</span> <span class="pre">address_space</span></code></a>.</p>
+<p>非LRU可動ページのテストには、VMが__PageMovable()関数をサポートしています。しかし、この関数は非LRU可動ページを正確に識別する保証は提供しません。なぜなら、page-&gt;mappingフィールドはstruct page内の他の変数と統合されているためです。ドライバがVMによってページを隔離後に解放した場合、page-&gt;mappingには安定した値が含まれず、PAGE_MAPPING_MOVABLEが設定されているにもかかわらず（__ClearPageMovableを参照）、このフィールドは信頼性がありません。ただし、ページが隔離された後であれば、LRUページはpage-&gt;mappingにPAGE_MAPPING_MOVABLEを設定できないため、__PageMovable()は呼び出しコストが低く、LRUか非LRU可動ページかに関わらず呼び出せます。これは、lock_page()によるより高コストなチェックよりも先に、非LRU可動ページのテストに適しています。</p>
+<p>非LRU可動ページを保証するため、VMはPageMovable()関数を提供しています。__PageMovable()とは異なり、PageMovable()はlock_page()の下でpage-&gt;mappingとmapping-&gt;a_ops-&gt;isolate_pageを検証します。lock_page()はpage-&gt;mappingの突然の破壊を防ぎます。</p>
+<p>__SetPageMovable()を使用するドライバは、ページを解放する前にpage_lock()の下で__ClearMovablePage()を介してフラグをクリアする必要があります。</p>
+</li>
+<li><p>PG_isolated</p>
+<p>複数のCPU間での同時隔離を防ぐため、VMはlock_page()の下で隔離されたページをPG_isolatedにマークします。そのため、CPUがPG_isolatedの非LRU可動ページに遭遇した場合、それをスキップできます。ドライバはフラグを操作する必要がありません。なぜなら、VMが自動的にフラグを設定またはクリアするからです。注意点として、ドライバがPG_isolatedページを確認した場合、それはVMによって隔離されたページであるため、page.lruフィールドを操作してはいけません。PG_isolatedフラグはPG_reclaimフラグと同一のため、ドライバは自身の目的でPG_isolatedを使用してはいけません。</p>
+</li>
+</ul>
+</li>
+</ol>
+</section>
+<section id="monitoring-migration">
+<h2>移動の監視<a class="headerlink" href="#monitoring-migration" title="この見出しへのパーマリンク">¶</a></h2>
+<p>以下のイベント（カウンタ）を使用してページの移動を監視できます。</p>
+<ol class="arabic simple">
+<li><p>PGMIGRATE_SUCCESS: 正常なページ移動成功。各カウントはページが移動したことを示します。ページが非THPページだった場合、このカウントは1増加します。THPだった場合、このカウントはTHPのサブページ数だけ増加します。例えば、4KBサイズのベースページ（サブページ）を持つ単一の2MB THPの移動は、このカウントを512増加させます。</p></li>
+<li><p>PGMIGRATE_FAIL: 正常なページ移動失敗。PGMIGRATE_SUCCESSと同様のカウントルールが適用されます。THPだった場合、サブページ数だけカウントされます。</p></li>
+<li><p>THP_MIGRATION_SUCCESS: THPが分割せずに移動されました。</p></li>
+<li><p>THP_MIGRATION_FAIL: THPが移動できず、分割もできませんでした。</p></li>
+<li><p>THP_MIGRATION_SPLIT: THPが移行されたが、そのままで移行されなかった。まず、THPは分割する必要があった。分割後、サブページに対して移行再試行が行われた。</p></li>
+</ol>
+<p>THP_MIGRATION_*イベントは、適切なPGMIGRATE_SUCCESSまたはPGMIGRATE_FAILイベントを更新する。たとえば、THPの移行失敗は、THP_MIGRATION_FAILとPGMIGRATE_FAILの両方が増加する原因となる。</p>
+<p>Christoph Lameter, 2006年5月8日。Minchan Kim, 2016年3月28日。</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxメモリ管理ドキュメンテーション</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#user-guides-for-mm-features">MM機能用ユーザーガイド</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#kernel-developers-mm-documentation">カーネル開発者向けMMドキュメンテーション</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxメモリ管理ドキュメンテーション</a><ul>
+<li>前へ: <a href="overcommit-accounting.html" title="前章">オーバーコミットアカウント</a></li>
+<li>次へ: <a href="page_frags.html" title="次章">ページフラグメント</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/vm/page_migration.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

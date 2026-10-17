@@ -1,0 +1,424 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>汎用通知メカニズム — Linux Kernel ドキュメンテーション</title>
+<link href="_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="./" id="documentation_options" src="_static/documentation_options.js"></script>
+<script src="_static/jquery.js"></script>
+<script src="_static/underscore.js"></script>
+<script src="_static/doctools.js"></script>
+<link href="genindex.html" rel="index" title="インデックス"/>
+<link href="search.html" rel="search" title="検索"/>
+<link href="translations/index.html" rel="next" title="翻訳"/>
+<link href="staging/xz.html" rel="prev" title="LinuxにおけるXZデータ圧縮"/>
+<link href="_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="general-notification-mechanism">
+<h1>一般的な通知メカニズム<a class="headerlink" href="#general-notification-mechanism" title="この見出しへのパーマリンク">¶</a></h1>
+<p>汎用通知メカニズムは標準のパイプドライバーに基づいて構築されており、これによりカーネル内の通知メッセージがユーザー空間で開かれたパイプに有効にスプライスされます。これは以下の項目と併用可能です:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>* Key/keyring notifications
+</pre></div>
+</div>
+<p>通知バッファは以下の方法で有効化できます:</p>
+<blockquote>
+<div><p>「汎用設定」/「汎用通知キュー」(CONFIG_WATCH_QUEUE)</p>
+</div></blockquote>
+<p>このドキュメントには以下のセクションがあります:</p>
+<div class="contents local topic" id="contents">
+<ul class="simple">
+<li><p><a class="reference internal" href="#overview" id="id1">概要</a></p></li>
+<li><p><a class="reference internal" href="#message-structure" id="id2">メッセージ構造</a></p></li>
+<li><p><a class="reference internal" href="#watch-list-notification-source-api" id="id3">ウォッチリスト(通知ソース)API</a></p></li>
+<li><p><a class="reference internal" href="#watch-queue-notification-output-api" id="id4">ウォッチキュー(通知出力)API</a></p></li>
+<li><p><a class="reference internal" href="#watch-subscription-api" id="id5">ウォッチサブスクリプションAPI</a></p></li>
+<li><p><a class="reference internal" href="#notification-posting-api" id="id6">通知投稿API</a></p></li>
+<li><p><a class="reference internal" href="#watch-sources" id="id7">ウォッチソース</a></p></li>
+<li><p><a class="reference internal" href="#event-filtering" id="id8">イベントフィルタリング</a></p></li>
+<li><p><a class="reference internal" href="#userspace-code-example" id="id9">ユーザースペースコード例</a></p></li>
+</ul>
+</div>
+<section id="overview">
+<h2><a class="toc-backref" href="#id1">概要</a><a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>この機能は特別なモードで開かれたパイプとして現れます。パイプの内部リングバッファはカーネルが生成するメッセージを保持します。これらのメッセージはread()によって読み出されます。このようなパイプではスプライスや類似の操作が無効化されており、特定の状況下でリングへの追加を元に戻す必要があるため、通知メッセージと混在する可能性があるためです。</p>
+<p>パイプの所有者は、そのパイプを通じて監視したいソースをカーネルに指定する必要があります。接続されていないソースはパイプにメッセージを挿入しません。注意点として、1つのソースが複数のパイプにバインドされ、同時にすべてのパイプにメッセージを挿入することがあります。</p>
+<p>パイプにフィルタも設定可能です。関心のないソースタイプやサブイベントは無視されます。</p>
+<p>リングバッファに空きがない場合、または事前に割り当てられたメッセージバッファが利用できない場合、メッセージは破棄されます。このような場合、read()はバッファ内の最後のメッセージが読み出された後に、WATCH_META_LOSS_NOTIFICATIONメッセージを出力バッファに挿入します。</p>
+<p>通知を生成する際、カーネルは消費者が通知を収集するのを待たず、ただ進み続けます。これはスピンロックを保持しながら通知を生成できるようにし、ユーザー空間の障害によってカーネルが無限に待機することを防ぎます。</p>
+</section>
+<section id="message-structure">
+<h2><a class="toc-backref" href="#id2">メッセージ構造</a><a class="headerlink" href="#message-structure" title="この見出しへのパーマリンク">¶</a></h2>
+<p>通知メッセージは短いヘッダーで始まります:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct watch_notification {
+        __u32   type:24;
+        __u32   subtype:8;
+        __u32   info;
+};
+</pre></div>
+</div>
+<p>「type」は通知レコードのソースを示し、「subtype」はそのソースからのレコードタイプを示します（以下で説明するWatch Sourcesセクションを参照）。typeは「WATCH_TYPE_META」も可能で、これはwatchキュー自体が生成する特別なレコードタイプです。サブタイプは2種類あります:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>WATCH_META_REMOVAL_NOTIFICATION</p></li>
+<li><p>WATCH_META_LOSS_NOTIFICATION</p></li>
+</ul>
+</div></blockquote>
+<p>前者はウォッチが設定されたオブジェクトが削除または破壊されたことを示し、後者はいくつかのメッセージが失われたことを示します。</p>
+<p>「info」は以下の情報などを含みます:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>メッセージのバイト数（ヘッダーを含む）。これは、マスク処理をWATCH_INFO_LENGTHとシフト処理をWATCH_INFO_LENGTH__SHIFTで行い、レコードのサイズを示します。このサイズは8〜127バイトの間です。</p></li>
+<li><p>ウォッチID（マスク処理をWATCH_INFO_IDとシフト処理をWATCH_INFO_ID__SHIFTで行います）。これは、ウォッチの呼び出し元IDを示し、0〜255の間で設定可能です。複数のウォッチが同じキューを共有する場合があり、これにより区別を行います。</p></li>
+<li><p>タイプ固有のフィールド（WATCH_INFO_TYPE_INFO）。通知の生成元がこのフィールドを設定し、タイプとサブタイプに固有の意味を示します。</p></li>
+</ul>
+</div></blockquote>
+<p>infoの内容で長さを除くすべてはフィルタリングに使用可能です。</p>
+<p>ヘッダーの後には補足情報が続くことがあります。この情報のフォーマットはタイプとサブタイプによって定義されます。</p>
+</section>
+<section id="watch-list-notification-source-api">
+<h2><a class="toc-backref" href="#id3">ウォッチリスト(通知ソース)API</a><a class="headerlink" href="#watch-list-notification-source-api" title="この見出しへのパーマリンク">¶</a></h2>
+<p>「ウォッチリスト」は、通知のソースにサブスクライブしているウォッチャーのリストです。リストはオブジェクト（例えばキーまたはスーパーブロック）にアタッチされるか、グローバル（例えばデバイスイベント用）になることがあります。ユーザー空間から見ると、グローバルでないウォッチリストは、所属するオブジェクト（例えばKEYCTL_NOTIFYを使用してキーのシリアル番号を指定）を参照することで通常参照されます。</p>
+<p>ウォッチリストを管理するための関数は以下の通りです：</p>
+<blockquote>
+<div><ul>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void init_watch_list(struct watch_list *wlist,
+                     void (*release_watch)(struct watch *wlist));
+</pre></div>
+</div>
+<p>ウォッチリストを初期化します。もし <code class="docutils literal notranslate"><span class="pre">release_watch</span></code> がNULLでない場合、この関数はウォッチリストオブジェクトが破棄されるときに呼び出され、ウォッチリストが保持しているウォッチされたオブジェクトへの参照を解放します。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">remove_watch_list(struct</span> <span class="pre">watch_list</span> <span class="pre">*wlist);</span></code></p>
+<p>ウォッチリストにサブスクライブされているすべてのウォッチを削除し、それらを解放した後、ウォッチリストオブジェクト自体を破棄します。</p>
+</li>
+</ul>
+</div></blockquote>
+</section>
+<section id="watch-queue-notification-output-api">
+<h2><a class="toc-backref" href="#id4">ウォッチキュー(通知出力)API</a><a class="headerlink" href="#watch-queue-notification-output-api" title="この見出しへのパーマリンク">¶</a></h2>
+<p>「ウォッチキュー」は、通知レコードが書き込まれるバッファで、アプリケーションが割り当てます。この動作はパイプデバイスドライバー内部で完全に隠蔽されていますが、ウォッチを設定するにはこの参照を取得する必要があります。これらは以下の通り管理できます：</p>
+<blockquote>
+<div><ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">watch_queue</span> <span class="pre">*get_watch_queue(int</span> <span class="pre">fd);</span></code></p>
+<p>ウォッチキューは、バッファを実装するパイプのfdでカーネルに示されます。ユーザー空間では、システムコールを通じてこのfdを渡す必要があります。これにより、システムコールからウォッチキューへのオパケなポインタを検索できます。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">put_watch_queue(struct</span> <span class="pre">watch_queue</span> <span class="pre">*wqueue);</span></code></p>
+<p>から取得した参照を破棄します <code class="docutils literal notranslate"><span class="pre">get_watch_queue()</span></code>.</p>
+</li>
+</ul>
+</div></blockquote>
+</section>
+<section id="watch-subscription-api">
+<h2><a class="toc-backref" href="#id5">ウォッチサブスクリプションAPI</a><a class="headerlink" href="#watch-subscription-api" title="この見出しへのパーマリンク">¶</a></h2>
+<p>「ウォッチ」は、ウォッチリストへのサブスクライブであり、通知レコードが書き込まれるべきバッファ（ウォッチキュー）を示します。ウォッチキューオブジェクトは、ユーザー空間で設定されたフィルタリングルールも保持する場合があります。ウォッチ構造体の一部はドライバによって設定可能です：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct watch {
+        union {
+                u32             info_id;        /* ID to be OR'd in to info field */
+                ...
+        };
+        void                    *private;       /* Private data for the watched object */
+        u64                     id;             /* Internal identifier */
+        ...
+};
+</pre></div>
+</div>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">info_id</span></code> 値はユーザー空間から取得した8ビットの数値で、WATCH_INFO_ID__SHIFTでシフトされ、通知が関連するウォッチキュー・バッファに書き込まれるときに、struct watch_notification::infoのWATCH_INFO_IDフィールドにOR操作で組み込まれます。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">private</span></code> フィールドはドライバがウォッチリストに関連付けるデータで、 <code class="docutils literal notranslate"><span class="pre">watch_list::release_watch()</span></code> メソッドで報告する必要があります。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">id</span></code> フィールドはソースのIDです。異なるIDでポストされた通知は無視されます。</p>
+<p>以下の関数によりウォッチを管理できます:</p>
+<blockquote>
+<div><ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">init_watch(struct</span> <span class="pre">watch</span> <span class="pre">*watch,</span> <span class="pre">struct</span> <span class="pre">watch_queue</span> <span class="pre">*wqueue);</span></code></p>
+<p>ウォッチオブジェクトを初期化し、そのポインターをウォッチキューに設定します。ロックデップの警告を回避するため、適切なバリアリングを用います。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">add_watch_to_object(struct</span> <span class="pre">watch</span> <span class="pre">*watch,</span> <span class="pre">struct</span> <span class="pre">watch_list</span> <span class="pre">*wlist);</span></code></p>
+<p>ウォッチをウォッチリスト（通知ソース）にサブスクライブします。この関数を呼び出す前に、ウォッチ構造体のドライバで設定可能なフィールドが設定されている必要があります。</p>
+</li>
+<li><div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int remove_watch_from_object(struct watch_list *wlist,
+                             struct watch_queue *wqueue,
+                             u64 id, false);
+</pre></div>
+</div>
+<p>ウォッチリストからウォッチを削除します。このウォッチは指定されたウォッチキュー（<code class="docutils literal notranslate"><span class="pre">wqueue</span></code>) およびオブジェクト識別子（<code class="docutils literal notranslate"><span class="pre">id</span></code>) と一致する必要があります。ウォッチキューに通知（<code class="docutils literal notranslate"><span class="pre">WATCH_META_REMOVAL_NOTIFICATION</span></code>) が送られ、ウォッチが削除されたことを示します。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">remove_watch_from_object(struct</span> <span class="pre">watch_list</span> <span class="pre">*wlist,</span> <span class="pre">NULL,</span> <span class="pre">0,</span> <span class="pre">true);</span></code></p>
+<p>ウォッチリストからすべてのウォッチを削除します。これは破壊準備として呼び出されるものと想定され、この時点でウォッチリストは新しいウォッチからアクセスされないものとします。ウォッチキューの各サブスクライブウォッチに通知（<code class="docutils literal notranslate"><span class="pre">WATCH_META_REMOVAL_NOTIFICATION</span></code>) が送られ、ウォッチが削除されたことを示します。</p>
+</li>
+</ul>
+</div></blockquote>
+</section>
+<section id="notification-posting-api">
+<h2><a class="toc-backref" href="#id6">通知投稿API</a><a class="headerlink" href="#notification-posting-api" title="この見出しへのパーマリンク">¶</a></h2>
+<p>通知をウォッチリストにポストして、サブスクライブされたウォッチが確認できるようにするには、以下の関数を使用してください:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void post_watch_notification(struct watch_list *wlist,
+                             struct watch_notification *n,
+                             const struct cred *cred,
+                             u64 id);
+</pre></div>
+</div>
+<p>通知は事前にフォーマットされ、ヘッダー（<code class="docutils literal notranslate"><span class="pre">n</span></code>) へのポインターを渡してください。通知はこのサイズより大きく、バッファスロット単位のサイズは <code class="docutils literal notranslate"><span class="pre">n-&gt;info</span> <span class="pre">&amp;</span> <span class="pre">WATCH_INFO_LENGTH</span></code>.</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">cred</span></code> structはソース（サブジェクト）の資格情報を示し、SELinuxなどのLSMに渡され、各キュー（オブジェクト）の資格情報に基づいてノートの記録を許可または抑制するかどうかを決定します。</p>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">id</span></code> ソースオブジェクトのID（例: キーのシリアル番号）です。この通知を確認するには、ウォッチに同じIDが設定されている必要があります。</p>
+</section>
+<section id="watch-sources">
+<h2><a class="toc-backref" href="#id7">ウォッチソース</a><a class="headerlink" href="#watch-sources" title="この見出しへのパーマリンク">¶</a></h2>
+<p>任意のバッファは複数のソースから供給されることがあります。ソースには以下のものがあります:</p>
+<blockquote>
+<div><ul>
+<li><p>WATCH_TYPE_KEY_NOTIFY</p>
+<p>このタイプの通知は、キーやキーリングの変更を示します。キーリングの内容やキーパラメータの変更も含まれます。</p>
+<p>参照 <a class="reference internal" href="security/keys/core.html"><span class="doc">Kernel Key Retention Service</span></a> 詳しくは</p>
+</li>
+</ul>
+</div></blockquote>
+</section>
+<section id="event-filtering">
+<h2><a class="toc-backref" href="#id8">イベントフィルタリング</a><a class="headerlink" href="#event-filtering" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ウォッチキューが作成された後、以下の関数を使用してフィルタを適用して受信イベントを制限できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct watch_notification_filter filter = {
+        ...
+};
+ioctl(fd, IOC_WATCH_QUEUE_SET_FILTER, &amp;filter)
+</pre></div>
+</div>
+<p>フィルタの説明は次の型の変数です:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct watch_notification_filter {
+        __u32   nr_filters;
+        __u32   __reserved;
+        struct watch_notification_type_filter filters[];
+};
+</pre></div>
+</div>
+<p>ここで「nr_filters」はfilters[]内のフィルタ数で、「__reserved」は0にする必要があります。filters配列の要素は次の型を持ちます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct watch_notification_type_filter {
+        __u32   type;
+        __u32   info_filter;
+        __u32   info_mask;
+        __u32   subtype_filter[8];
+};
+</pre></div>
+</div>
+<p>以下では:</p>
+<blockquote>
+<div><ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">type</span></code> フィルタリングするイベントタイプで、"WATCH_TYPE_KEY_NOTIFY"のような形式になります。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">info_filter</span></code> および <code class="docutils literal notranslate"><span class="pre">info_mask</span></code> 通知レコードのinfoフィールドにフィルタとして機能します。通知がバッファに書き込まれるのは次の条件を満たす場合です:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>(watch.info &amp; info_mask) == info_filter
+</pre></div>
+</div>
+<p>たとえば、マウントツリー内の正確な監視ポイントでないイベントを無視するなど、このような用途に使用できます。</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">subtype_filter</span></code> 関心のあるサブタイプを示すビットマスクです。subtype_filter[0]のビット0はサブタイプ0に対応し、ビット1はサブタイプ1に対応します。といった具合です。</p></li>
+</ul>
+</div></blockquote>
+<p>ioctl()の引数がNULLの場合、フィルターが削除され、すべての監視ソースからのイベントが通過します。</p>
+</section>
+<section id="userspace-code-example">
+<h2><a class="toc-backref" href="#id9">ユーザースペースコード例</a><a class="headerlink" href="#userspace-code-example" title="この見出しへのパーマリンク">¶</a></h2>
+<p>バッファは次の例のように作成されます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>pipe2(fds, O_TMPFILE);
+ioctl(fds[1], IOC_WATCH_QUEUE_SET_SIZE, 256);
+</pre></div>
+</div>
+<p>その後、キーリング変更通知を受信するように設定できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>keyctl(KEYCTL_WATCH_KEY, KEY_SPEC_SESSION_KEYRING, fds[1], 0x01);
+</pre></div>
+</div>
+<p>通知は次の例のように処理できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>static void consumer(int rfd, struct watch_queue_buffer *buf)
+{
+        unsigned char buffer[128];
+        ssize_t buf_len;
+
+        while (buf_len = read(rfd, buffer, sizeof(buffer)),
+               buf_len &gt; 0
+               ) {
+                void *p = buffer;
+                void *end = buffer + buf_len;
+                while (p &lt; end) {
+                        union {
+                                struct watch_notification n;
+                                unsigned char buf1[128];
+                        } n;
+                        size_t largest, len;
+
+                        largest = end - p;
+                        if (largest &gt; 128)
+                                largest = 128;
+                        memcpy(&amp;n, p, largest);
+
+                        len = (n-&gt;info &amp; WATCH_INFO_LENGTH) &gt;&gt;
+                                WATCH_INFO_LENGTH__SHIFT;
+                        if (len == 0 || len &gt; largest)
+                                return;
+
+                        switch (n.n.type) {
+                        case WATCH_TYPE_META:
+                                got_meta(&amp;n.n);
+                        case WATCH_TYPE_KEY_NOTIFY:
+                                saw_key_change(&amp;n.n);
+                                break;
+                        }
+
+                        p += len;
+                }
+        }
+}
+</pre></div>
+</div>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">一般的な通知メカニズム</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#overview">概要</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#message-structure">メッセージ構造</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#watch-list-notification-source-api">ウォッチリスト(通知ソース)API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#watch-queue-notification-output-api">ウォッチキュー(通知出力)API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#watch-subscription-api">ウォッチサブスクリプションAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#notification-posting-api">通知投稿API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#watch-sources">ウォッチソース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#event-filtering">イベントフィルタリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#userspace-code-example">ユーザースペースコード例</a></li>
+</ul>
+</li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="index.html">ドキュメンテーション概覧</a><ul>
+<li>前へ: <a href="staging/xz.html" title="前章">LinuxにおけるXZデータ圧縮</a></li>
+<li>次へ: <a href="translations/index.html" title="次章">翻訳</a></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="_sources/watch_queue.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

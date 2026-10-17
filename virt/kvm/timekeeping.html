@@ -1,0 +1,497 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>X86ベースのアーキテクチャにおける時間管理仮想化 — Linux Kernelドキュメンテーション</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="vcpu-requests.html" rel="next" title="KVM VCPUリクエスト"/>
+<link href="s390-pv-boot.html" rel="prev" title="s390（IBM Z）保護仮想マシンのブート/IPL"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="timekeeping-virtualization-for-x86-based-architectures">
+<h1>X86ベースアーキテクチャ向けタイムキープ仮想化<a class="headerlink" href="#timekeeping-virtualization-for-x86-based-architectures" title="この見出しへのパーマリンク">¶</a></h1>
+<dl class="field-list simple">
+<dt class="field-odd">著者</dt>
+<dd class="field-odd"><p>Zachary Amsden &lt;<a class="reference external" href="mailto:zamsden%40redhat.com">zamsden<span>@</span>redhat<span>.</span>com</a>&gt;</p>
+</dd>
+<dt class="field-even">著作権</dt>
+<dd class="field-even"><ol class="loweralpha simple" start="3">
+<li><p>2010, Red Hat. すべての権利は保有されています。</p></li>
+</ol>
+</dd>
+</dl>
+<section id="overview">
+<h2>1. 概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>X86プラットフォームの最も複雑な部分の一つであり、特にこのプラットフォームの仮想化においては、利用可能なタイミングデバイスの多様性とそれらのデバイスをエミュレートする複雑さが挙げられます。さらに、時間の仮想化はゲストCPUの制御を超えた多重化された時間の分割を導入するため、新たな課題を生じます。</p>
+<p>まず、利用可能なさまざまな時間管理ハードウェアについて説明し、それに関連する問題と解決策を紹介します。特定のKVMゲストのクラスに対する具体的な推奨事項も提示します。</p>
+<p>このドキュメントの目的は、他の場所では見つからない時間管理に関するデータや情報を収集することです。特に、KVMおよびハードウェアベースの仮想化に関する情報が含まれます。</p>
+</section>
+<section id="timing-devices">
+<h2>2. タイミングデバイス<a class="headerlink" href="#timing-devices" title="この見出しへのパーマリンク">¶</a></h2>
+<p>まず、利用可能な基本的なハードウェアデバイスについて説明します。TSCおよび関連するKVMクロックは特別なため、詳細な説明が行われます。次の節で説明します。</p>
+<section id="i8254-pit">
+<h3>2.1. i8254 - PIT<a class="headerlink" href="#i8254-pit" title="この見出しへのパーマリンク">¶</a></h3>
+<p>最初のタイマーデバイスの一つはプログラマブル割込みタイマ（PIT）です。PITは固定周波数1.193182 MHzのベースクロックを持ち、3つのチャネルがあり、それらは周期的な割込みまたはワンショット割込みを生成するためにプログラミング可能です。これらの3つのチャネルは異なるモードで構成され、個別にカウンターを持ちます。オリジナルのIBM PCではチャネル1と2は一般用途では利用できず、歴史的にRAMリフレッシュ制御とPCスピーカーの制御に接続されていました。現在ではPITはエミュレートされたチップセットの一部として統合され、個別の物理的なPITは使用されません。</p>
+<p>PITはI/Oポート0x40〜0x43を使用します。16ビットカウンターへのアクセスは、I/Oポートへの単一バイトまたは複数バイトのアクセスで行われます。利用可能なモードは6つありますが、すべてのタイマに対して利用可能なわけではなく、タイマ2のみがゲート入力に接続されており、モード1および5に必要です。ゲートラインはポート61h、ビット0で制御され、次の図に示されています：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>--------------             ----------------
+|            |           |                |
+|  1.1932 MHz|----------&gt;| CLOCK      OUT | ---------&gt; IRQ 0
+|    Clock   |   |       |                |
+--------------   |    +-&gt;| GATE  TIMER 0  |
+                 |        ----------------
+                 |
+                 |        ----------------
+                 |       |                |
+                 |------&gt;| CLOCK      OUT | ---------&gt; 66.3 KHZ DRAM
+                 |       |                |            (aka /dev/null)
+                 |    +-&gt;| GATE  TIMER 1  |
+                 |        ----------------
+                 |
+                 |        ----------------
+                 |       |                |
+                 |------&gt;| CLOCK      OUT | ---------&gt; Port 61h, bit 5
+                         |                |      |
+Port 61h, bit 0 --------&gt;| GATE  TIMER 2  |       \_.----   ____
+                          ----------------         _|    )--|LPF|---Speaker
+                                                  / *----   \___/
+Port 61h, bit 1 ---------------------------------/
+</pre></div>
+</div>
+<p>タイマーモードを以下に説明します。</p>
+<dl class="simple">
+<dt>モード0: シングルタイムアウト。</dt><dd><p>これはゲートが高信号（タイマ0および1では常に真）のときにカウントダウンするワンショットソフトウェアタイムアウトです。カウントがゼロになると出力が高信号になります。</p>
+</dd>
+<dt>モード1: トリガーされたワンショット。</dt><dd><p>出力は最初にハイに設定されます。ゲートラインがハイに設定されると、カウントダウンが開始されます（ゲートがローに設定されても停止しません）。このカウントダウン中、出力はローに設定されます。カウントがゼロになると、出力がハイになります。</p>
+</dd>
+<dt>モード2: レートジェネレータ</dt><dd><p>出力は最初にハイに設定されます。カウントダウンが1に達すると、出力は1つのカウント分ローになり、その後ハイに戻ります。値が再ロードされ、カウントダウンは自動的に再開します。ゲートラインがローになると、カウントが停止します。ゲートがローに設定されたときに出力がローだった場合、出力は自動的にハイになります（これはタイマ2にのみ影響します）。</p>
+</dd>
+<dt>モード3: 正方形波</dt><dd><p>これはハイ／ローの正方形波を生成します。カウントがゼロになるたびにパルスの長さが決まり、ハイとローが交互になります。ゲートがハイのときにのみカウントが進行し、ゼロに達したときに自動的に再ロードされます。各クロックごとにカウントが2回減算され、フルなハイ／ローのサイクルが生成されます。カウントが偶数の場合、クロックはN/2回ハイになり、N/2回ローになります。カウントが奇数の場合、クロックは（N+1）/2回ハイになり、（N-1）/2回ローになります。カウンターは偶数値のみキャッシュされるため、奇数値は読み取り時に観測されません。これはタイマ2の意図したモードであり、正方形波出力のローパスフィルタリングによってサイン波のような音を生成します。</p>
+</dd>
+<dt>モード4: ソフトウェアストローブ</dt><dd><p>このモードをプログラミングし、カウンターをロードした後、出力はカウンターがゼロになるまでハイのままです。その後、出力は1クロックサイクルローになり、再びハイに戻ります。カウンターは再ロードされません。ゲートがハイのときにのみカウントが行われます。</p>
+</dd>
+<dt>モード5: ハードウェアストローブ</dt><dd><p>このモードをプログラミングし、カウンターをロードした後、出力はハイのままです。ゲートがローに設定されたときにカウントダウンが開始されます（ゲートがローに設定されても停止しません）。カウンターがゼロになると、出力は1クロックサイクルローになり、再びハイに戻ります。カウンターは再ロードされません。</p>
+</dd>
+</dl>
+<p>通常の2進カウントに加えて、PITはBCDカウントをサポートしています。コマンドポート0x43を使用して、3つのタイマそれぞれのカウンターとモードを設定します。</p>
+<p>ポート0x43に送信されるPITコマンドは、以下のビット符号を使用します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Bit 7-4: Command (See table below)
+Bit 3-1: Mode (000 = Mode 0, 101 = Mode 5, 11X = undefined)
+Bit 0  : Binary (0) / BCD (1)
+</pre></div>
+</div>
+<p>コマンド表:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>0000 - Latch Timer 0 count for port 0x40
+      sample and hold the count to be read in port 0x40;
+      additional commands ignored until counter is read;
+      mode bits ignored.
+
+0001 - Set Timer 0 LSB mode for port 0x40
+      set timer to read LSB only and force MSB to zero;
+      mode bits set timer mode
+
+0010 - Set Timer 0 MSB mode for port 0x40
+      set timer to read MSB only and force LSB to zero;
+      mode bits set timer mode
+
+0011 - Set Timer 0 16-bit mode for port 0x40
+      set timer to read / write LSB first, then MSB;
+      mode bits set timer mode
+
+0100 - Latch Timer 1 count for port 0x41 - as described above
+0101 - Set Timer 1 LSB mode for port 0x41 - as described above
+0110 - Set Timer 1 MSB mode for port 0x41 - as described above
+0111 - Set Timer 1 16-bit mode for port 0x41 - as described above
+
+1000 - Latch Timer 2 count for port 0x42 - as described above
+1001 - Set Timer 2 LSB mode for port 0x42 - as described above
+1010 - Set Timer 2 MSB mode for port 0x42 - as described above
+1011 - Set Timer 2 16-bit mode for port 0x42 as described above
+
+1101 - General counter latch
+      Latch combination of counters into corresponding ports
+      Bit 3 = Counter 2
+      Bit 2 = Counter 1
+      Bit 1 = Counter 0
+      Bit 0 = Unused
+
+1110 - Latch timer status
+      Latch combination of counter mode into corresponding ports
+      Bit 3 = Counter 2
+      Bit 2 = Counter 1
+      Bit 1 = Counter 0
+
+      The output of ports 0x40-0x42 following this command will be:
+
+      Bit 7 = Output pin
+      Bit 6 = Count loaded (0 if timer has expired)
+      Bit 5-4 = Read / Write mode
+          01 = MSB only
+          10 = LSB only
+          11 = LSB / MSB (16-bit)
+      Bit 3-1 = Mode
+      Bit 0 = Binary (0) / BCD mode (1)
+</pre></div>
+</div>
+</section>
+<section id="rtc">
+<h3>2.2. RTC<a class="headerlink" href="#rtc" title="この見出しへのパーマリンク">¶</a></h3>
+<p>元のPCで利用可能な2番目のデバイスはMC146818リアルタイムクロックでした。元のデバイスは現在は非推奨であり、通常システムチップセットによってエミュレートされ、一部のHPETやフランケンスティンIRQルーティングによってもエミュレートされます。</p>
+<p>RTCはCMOS変数を通じてアクセスされ、インデックスレジスタを使用して読み込むバイトを制御します。インデックスレジスタは1つしか存在しないため、CMOSの読み込みとRTCの読み込みにはロック保護が必要です（さらに、hwclockなどのユーザースペースユーティリティにRTCへの直接アクセスを許可すると危険です。これらはカーネルがCMOSメモリを読み書きする際にデータ破損を引き起こす可能性があるためです）。</p>
+<p>RTCは通常IRQ 8にルーティングされる割り込みを生成します。この割り込みは周期的なタイマーや1日1回のアラームとして機能し、MC146818がCMOSレジスタを更新した後にも割り込みを発生させることができます。割り込みの種類はRTCステータスレジスタで通知されます。</p>
+<p>システムがオフになってもバッテリー電源でRTCは現在時刻フィールドを更新します。ステータスレジスタで示されるように、更新が進行中は現在時刻フィールドを読み込mayらないでください。</p>
+<p>時計は32.768kHzのクリスタルを使用するため、RTCが秒をカウントするにはレジスタAのビット6〜4に32kHzのディバイダーを設定する必要があります。</p>
+<p>これは元々RTC/CMOS用に使用されていたRAMマップです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>Location    Size    Description
+------------------------------------------
+00h         byte    Current second (BCD)
+01h         byte    Seconds alarm (BCD)
+02h         byte    Current minute (BCD)
+03h         byte    Minutes alarm (BCD)
+04h         byte    Current hour (BCD)
+05h         byte    Hours alarm (BCD)
+06h         byte    Current day of week (BCD)
+07h         byte    Current day of month (BCD)
+08h         byte    Current month (BCD)
+09h         byte    Current year (BCD)
+0Ah         byte    Register A
+                     bit 7   = Update in progress
+                     bit 6-4 = Divider for clock
+                                000 = 4.194 MHz
+                                001 = 1.049 MHz
+                                010 = 32 kHz
+                                10X = test modes
+                                110 = reset / disable
+                                111 = reset / disable
+                     bit 3-0 = Rate selection for periodic interrupt
+                                000 = periodic timer disabled
+                                001 = 3.90625 uS
+                                010 = 7.8125 uS
+                                011 = .122070 mS
+                                100 = .244141 mS
+                                   ...
+                               1101 = 125 mS
+                               1110 = 250 mS
+                               1111 = 500 mS
+0Bh         byte    Register B
+                     bit 7   = Run (0) / Halt (1)
+                     bit 6   = Periodic interrupt enable
+                     bit 5   = Alarm interrupt enable
+                     bit 4   = Update-ended interrupt enable
+                     bit 3   = Square wave interrupt enable
+                     bit 2   = BCD calendar (0) / Binary (1)
+                     bit 1   = 12-hour mode (0) / 24-hour mode (1)
+                     bit 0   = 0 (DST off) / 1 (DST enabled)
+OCh         byte    Register C (read only)
+                     bit 7   = interrupt request flag (IRQF)
+                     bit 6   = periodic interrupt flag (PF)
+                     bit 5   = alarm interrupt flag (AF)
+                     bit 4   = update interrupt flag (UF)
+                     bit 3-0 = reserved
+ODh         byte    Register D (read only)
+                     bit 7   = RTC has power
+                     bit 6-0 = reserved
+32h         byte    Current century BCD (*)
+(*) location vendor specific and now determined from ACPI global tables
+</pre></div>
+</div>
+</section>
+<section id="apic">
+<h3>2.3. APIC<a class="headerlink" href="#apic" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ピュニウム以降のプロセッサでは、各CPUがAdvanced Programmable Interrupt Controllerの一部としてオンボードタイマを備えています。APICはメモリマップレジスタを通じてアクセスされ、各CPUに割り込みサービスを提供し、IPI（Inter-Processor Interrupt）やローカルタイマ割り込みに使用されます。</p>
+<p>理論上APICはローカル割り込みの安全で安定したソースですが、実際にはAPICのCPUローカルメモリマップハードウェアの特殊性により多くのバグやノイズが発生しています。CPUのエラタがAPICの使用に影響を与える可能性があるため注意が必要です。また、いくつかの対処法は仮想化に特有の制約を生じるため、メモリマップI/Oの追加読み込みによるオーバーヘッドや、より計算コストが高い実装が必要となる場合があります。</p>
+<p>IntelおよびAMDマニュアルでAPICが十分に記載されているため、ここでは詳細を繰り返しません。APICタイマはLVT（Local Vector Timer）レジスタを通じてプログラミングされ、ワンショットまたは周期的な動作が可能で、バスクロックをプログラマブルディバイダーレジスタで割り下げたものに基づいています。</p>
+</section>
+<section id="hpet">
+<h3>2.4. HPET<a class="headerlink" href="#hpet" title="この見出しへのパーマリンク">¶</a></h3>
+<p>HPETは非常に複雑で、もともとはX86 PCのPIT/RTCサポートを置き換えることを目的としていました。その目的が果たされるかどうかは今後を見守る必要があります。PCハードウェアの事実上の標準は、これらの古いデバイスをエミュレートすることです。一部のシステムでは、レガシーフリーステキルとして指定されているものの、ハードウェアタイマとしてのみHPETをサポートしている可能性があります。</p>
+<p>HPET仕様はやや曖昧で、少なくとも3つのハードウェアタイマをサポートする必要がありますが、実装には自由度があり、多くのタイマをサポートすることも可能です。また、タイマ周波数に固定されたレートを課していませんが、周波数、誤差、スレーブの極値には制限を設けています。</p>
+<p>一般的に、HPETはPIT/RTCと比較して高精度で、ローカルな変動に依存しない時間源として推奨されます（システム内にHPETは1つしか存在しないため）。また、HPETはメモリマップされており、BIOSはACPIテーブルを通じてその存在を示します。</p>
+<p>HPETの詳細な仕様は本ドキュメントの範囲外であり、他の場所でも十分に記載されています。</p>
+</section>
+<section id="offboard-timers">
+<h3>2.5. オフボードタイマ<a class="headerlink" href="#offboard-timers" title="この見出しへのパーマリンク">¶</a></h3>
+<p>いくつかのカード（専用機器であるウォッチドッグボードや一般的なe1000を含む）には、カーネルやユーザードライバからアクセス可能なレジスタを持つタイミングチップが搭載されています。著者の知識では、Linuxや他のカーネルでこのようなチップをクロックソースとして使用する試みはまだ行われていません。一般的に、これは合意されたルールに従っておらず、不採用されています。このようなタイマデバイスは適切に仮想化するための追加サポートが必要ですが、現在は重要度が低く、どのOSもこれを実装していないためです。</p>
+</section>
+</section>
+<section id="tsc-hardware">
+<h2>3. TSCハードウェア<a class="headerlink" href="#tsc-hardware" title="この見出しへのパーマリンク">¶</a></h2>
+<p>TSC（タイムスタンプカウンター）は理論上は比較的単純で、プロセッサが発行する指令サイクルをカウントし、時間の測定に利用できます。しかし、実際にはいくつかの問題により、TSCは最も複雑な時刻管理デバイスとされています。</p>
+<p>TSCは内部的に64ビットのMSRとして表現され、RDMSR、RDTSC、またはRDTSCP（利用可能場合）命令で読み取れます。過去にはハードウェアの制限によりTSCを書き込むことが可能でしたが、古いハードウェアでは64ビットカウンターの下位32ビットのみを書き込み可能で、上位3、TSC MSRの書き込みがアーキテクチャ上の保証ではありません。</p>
+<p>TSCはCPL-0からアクセス可能であり、CPL &gt; 0のソフトウェアではCR4.TSDビットを介して条件付きでアクセス可能ですが、このビットが有効になるとCPL &gt; 0のTSCアクセスが無効になります。</p>
+<p>一部のベンダーでは、RDTSCPという追加の命令を実装しており、これはTSCだけでなく、プロセッサ番号に対応するインジケーターをアトミックに返します。これにより、SMPシステムにおいてTSCが同期されていない場合に、TSC変数の配列をインデックスしてオフセット情報を取得できます。この命令の存在はCPUID機能ビットを確認する必要があります。</p>
+<p>VMXとSVMは、仮想化ハードウェア内でゲストに見えるTSCに定数を加算してオフセットを許容する拡張フィールドを提供します。新しい実装ではTSCをさらにスケーリングを可能にするとも言及されていますが、このハードウェアはまだ広く利用されていません。</p>
+<section id="tsc-synchronization">
+<h3>3.1. TSC同期<a class="headerlink" href="#tsc-synchronization" title="この見出しへのパーマリンク">¶</a></h3>
+<p>TSCはほとんどの実装においてCPUローカルのクロックです。これはSMPプラットフォームでは、CPUごとのTSCが起動タイミングによって異なる可能性があることを意味します。同じダイス上のCPUは同じクロックを共有しますが、常にそのようにはなりません。</p>
+<p>BIOSは電源投入時のプロセスでTSCを再同期しようと試みることがあり、オペレーティングシステムやその他のシステムソフトウェアも同様に試みます。いくつかのハードウェア制限により問題が悪化します。TSCの64ビット全体を書き込めない場合、新たに到着したCPUのTSCをシステムの他の部分と一致させることが不可能になり、TSCが同期されません。これはBIOSやシステムソフトウェアによって行われるかもしれませんが、すべての値が同じクロックから読み取れる場合にのみ完全な同期が可能で、これは一般的に単一ソケットシステムや特殊なハードウェアサポートを持つシステムでのみ可能です。</p>
+</section>
+<section id="tsc-and-cpu-hotplug">
+<h3>3.2. TSCとCPUホットプラグ<a class="headerlink" href="#tsc-and-cpu-hotplug" title="この見出しへのパーマリンク">¶</a></h3>
+<p>すでに触れたように、システム起動時間より後で到着したCPUは、システムの他の部分と同期していないTSC値を持つ可能性があります。システムソフトウェア、BIOS、またはSMMコードが実際にTSCをシステム全体と一致する値に設定しようと試みるかもしれませんが、完全な一致は保証されません。これにより、システムがTSC同期の状態から、TSC同期の不完全さがOSや仮想環境に露出する状態に戻る可能性があります。</p>
+</section>
+<section id="tsc-and-multi-socket-numa">
+<h3>3.3. TSCとマルチソケット / NUMA<a class="headerlink" href="#tsc-and-multi-socket-numa" title="この見出しへのパーマリンク">¶</a></h3>
+<p>マルチソケットシステム、特に大規模なマルチソケットシステムでは、個々のクロックソースを持つ可能性が高く、単一の全領域にわたるクロックを採用している可能性は低い。これらのクロックは異なるクリスタルで駆動されるため、完全に一致した周波数を持たず、温度や電気的変動によってCPUクロック、つまりTSC（Time Stamp Counter）が時間とともにずれることになる。クロックおよびバス設計によっては、このずれが絶対的な誤差として修正される場合もあれば、修正されない場合もある。また、時間とともにずれが蓄積する可能性もある。</p>
+<p>さらに、非常に大規模なシステムでは、個々のコアのクロックを意図的にずらす技術が採用されることがある。この技術は「スプレッドスペクトルクロッキング」と呼ばれ、クロック周波数およびそのハーモニクスにおけるEMI（電磁干渉）を低減し、通信機器やコンピュータ機器のFCC規格を満たすために必要となる。</p>
+<p>これらの理由により、NUMAまたは複数ソケットシステムにおいてTSCが同期を保つとは信頼できないと推奨される。</p>
+</section>
+<section id="tsc-and-c-states">
+<h3>3.4. TSCとC-states<a class="headerlink" href="#tsc-and-c-states" title="この見出しへのパーマリンク">¶</a></h3>
+<p>C-states（プロセッサのアイドル状態）、特にC1Eやより深いスリープ状態は、TSCにも問題を引き起こす可能性がある。このような状態ではTSCが進まなくなるため、実行再開時に他のCPUと比べてTSCが遅れることになる。このようなCPUは、CPUおよびチップセットの識別情報を基に、オペレーティングシステムが検出・フラグ付けする必要がある。</p>
+<p>このような場合、TSCは外部クロックソースと同期させて補正される。</p>
+</section>
+<section id="tsc-frequency-change-p-states">
+<h3>3.5. TSCの周波数変化 / P-states<a class="headerlink" href="#tsc-frequency-change-p-states" title="この見出しへのパーマリンク">¶</a></h3>
+<p>さらに複雑な点として、一部のCPUでは周波数が変化することがある。TSCが同じレートで動作するか否かはCPUにより異なるが、周波数変化が段階的に行われる場合やずらされる場合、ある時間点ではTSCのレートが特定の範囲内であるのみが分かることになる。このような場合、TSCは安定した時間源ではなく、外部の安定したクロックを基に校正しなければ利用できない。</p>
+<p>TSCがP-stateに応じて一定のレートで動作するか否かはモデルに依存し、CPUID、チップセットまたはベンダー固有のMSRフィールドを確認する必要がある。</p>
+<p>さらに、一部のベンダーでは、通常の動作中ではP-stateが正しく補正されるが、プロセッサが非アクティブな状態になると、他のプロセッサからのキャッシュミスを処理するために一時的にP-stateが上昇するというバグが確認されている。このような場合、停止中のCPUのTSCは非停止CPUのそれより速く進む可能性がある。AMD Turionプロセッサはこの問題を有している。</p>
+</section>
+<section id="tsc-and-stpclk-t-states">
+<h3>3.6. TSCとSTPCLK / T-states<a class="headerlink" href="#tsc-and-stpclk-t-states" title="この見出しへのパーマリンク">¶</a></h3>
+<p>プロセッサに与えられる外部信号は、TSCを停止させる効果を持つ場合もあります。これは熱的緊急電源制御のために行われ、過熱状態を防ぐためで、通常、この状態が発生したかどうかを検出する方法はありません。</p>
+</section>
+<section id="tsc-virtualization-vmx">
+<h3>3.7. TSC仮想化 - VMX<a class="headerlink" href="#tsc-virtualization-vmx" title="この見出しへのパーマリンク">¶</a></h3>
+<p>VMXはRDTSC、RDMSR、WRMSRおよびRDTSCP命令の条件付きトラッピングを提供し、これによりTSCの完全な仮想化が可能になります。さらに、VMXはホストTSCに加えて、VMCSで指定された追加のTSC_OFFSETフィールドを透過的に処理します。VMCSフィールドの読み書きには特別な命令を使用する必要があります。</p>
+</section>
+<section id="tsc-virtualization-svm">
+<h3>3.8. TSC仮想化 - SVM<a class="headerlink" href="#tsc-virtualization-svm" title="この見出しへのパーマリンク">¶</a></h3>
+<p>SVMはRDTSC、RDMSR、WRMSRおよびRDTSCP命令の条件付きトラッピングを提供し、これによりTSCの完全な仮想化が可能になります。さらに、SVMはホストTSCに加えて、SVM制御ブロックで指定された追加のオフセットフィールドを透過的に処理します。</p>
+</section>
+<section id="tsc-feature-bits-in-linux">
+<h3>3.9. LinuxにおけるTSC機能ビット<a class="headerlink" href="#tsc-feature-bits-in-linux" title="この見出しへのパーマリンク">¶</a></h3>
+<p>要約すると、アーキテクチャが明示的に保証しない限り、TSCが完全に同期を保つことはできません。その場合でも、マルチソケットまたはNUMAシステムにおけるTSCはローカルで一貫しているものの、依然として独立して動作する可能性があります。</p>
+<p>以下の機能ビットはLinuxがTSCの属性を信号として使用しますが、これらはUPまたは単一ノードシステムでのみ意味を持つとされます。</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 39%"/>
+<col style="width: 61%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>X86_FEATURE_TSC</p></td>
+<td><p>ハードウェアでTSCが利用可能</p></td>
+</tr>
+<tr class="row-even"><td><p>X86_FEATURE_RDTSCP</p></td>
+<td><p>RDTSCP命令が利用可能</p></td>
+</tr>
+<tr class="row-odd"><td><p>X86_FEATURE_CONSTANT_TSC</p></td>
+<td><p>P-statesでTSCのレートは変化しない</p></td>
+</tr>
+<tr class="row-even"><td><p>X86_FEATURE_NONSTOP_TSC</p></td>
+<td><p>C-statesでTSCは停止しない</p></td>
+</tr>
+<tr class="row-odd"><td><p>X86_FEATURE_TSC_RELIABLE</p></td>
+<td><p>TSC同期チェックはスキップされる（VMware）</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="virtualization-problems">
+<h2>4. バーチャル化の問題<a class="headerlink" href="#virtualization-problems" title="この見出しへのパーマリンク">¶</a></h2>
+<p>仮想化において時刻管理は特に問題になります。なぜなら、いくつかの課題が生じるからです。最も明らかな問題は、時刻がホストと、潜在的に複数の仮想マシン間で共有されるためです。そのため、仮想オペレーティングシステムはCPUの100%使用率で動作しないにもかかわらず、その前提を仮定している場合があります。中断ソースが無効になっても、非常に正確な制限内で動作すると期待しているかもしれませんが、実際にはその仮想中断ソースが無効になっており、マシンはいつでもプリエンプションされる可能性があります。これにより、リアルタイムの経過、マシン中断の注入および関連するクロックソースがリアルタイムと完全に同期しなくなる問題が生じます。</p>
+<p>この問題は、ネイティブハードウェアでもある程度発生します。SMMモードがBIOSによって使用される際、X86システムの自然な動作でサイクルを盗む可能性があるためです。ただし、極端な状況には至りません。しかし、SMMモードが仮想化と同様の問題を引き起こす可能性があるため、これをバーチャルマシンなしの環境で解決する正当な理由となります。</p>
+<section id="interrupt-clocking">
+<h3>4.1. 割り込みによる時刻同期<a class="headerlink" href="#interrupt-clocking" title="この見出しへのパーマリンク">¶</a></h3>
+<p>レガシーオペレーティングシステムで最も即座に発生する問題の一つは、システムの時刻管理ルーチンが定期的な割り込みをカウントして時刻を追跡する設計になっていることです。これらの割り込みはPITやRTCから来ることがありますが、問題は同じです：ホスト仮想化エンジンが1秒あたり適切な数の割り込みを送信できず、ゲストの時刻が遅れてしまう可能性があります。これは特に1000 Hzという高い割り込みレートが選択された場合に深刻になり、多くのLinuxゲストでこれがデフォルトとなっています。</p>
+<p>この問題を解決するための3つのアプローチがあります。まず、無視するという選択肢もあります。壁時計や現実時間のトラッキングに別途の時刻ソースを持つゲストは、中断の調整を必要とせず正しい時刻を維持できます。これは十分でない場合、ゲストに追加の割り込みを注入して有効な割り込みレートを上げる必要があります。このアプローチは極端な状況では複雑さを伴いますが、ホスト負荷やゲストの遅れが補償できないほど大きい場合、別の解決策が登場しました：ゲストがロスト・ティックを認識し内部で補正する必要があります。理論上は有望ですが、Linuxでのこのポリシーの実装は非常にエラーが多いため、多くの一般的なLinuxシステムで不完全なロスト・ティック補正のバグが存在しています。</p>
+<p>Windowsは内部の時刻管理に周期的なRTC時計を使用しており、正しい時刻を維持するために割り込みのスリーブを必要とします。ただし、使用するレートが十分に低いため（ed: 18.2 Hz？）、実際には問題になっていません。</p>
+</section>
+<section id="tsc-sampling-and-serialization">
+<h3>4.2. TSCサンプリングとシリアル化<a class="headerlink" href="#tsc-sampling-and-serialization" title="この見出しへのパーマリンク">¶</a></h3>
+<p>CPUのサイクルカウンターは、利用可能な最高精度の時間源として注目を集めています。上記のように説明した通り、このタイマーは、ローカルであり、潜在的に不安定で同期していない源としての性質により、多くの特有の問題があります。TSCに特有ではないものの、その非常に高い精度により際立つ問題として挙げられるのがサンプリング遅延です。定義上、カウンターは読み取った時点で既に古い値です。しかし、結果の実際の使用よりも先にカウンターを読み取ることも可能です。これは、命令ストリームのスーパースケーラー実行により、命令が順序を崩して実行されるためです。このような実行は「非シリアル化された実行」と呼ばれます。TSCによる正確な測定にはシリアル化された実行を強制する必要があります。これにはCPUIDやMSR読み取りなどのシリアル化命令が必要です。</p>
+<p>CPUIDは実際にトラップとエミュレート機構によって仮想化される可能性があるため、このシリアル化はハードウェア仮想化においてパフォーマンスへの影響を及ぼす可能性があります。したがって、正確なタイムスタンプカウンターレッドは常に利用可能とは限りません。また、他のCPUから見たTSCの「逆方向の読み込み」を防ぐため、実装側で対策を講じる必要があります。これは、他のCPUとの同期が完全に保たれているシステムでも同様です。</p>
+</section>
+<section id="timespec-aliasing">
+<h3>4.3. タイムスペックのアリアシング<a class="headerlink" href="#timespec-aliasing" title="この見出しへのパーマリンク">¶</a></h3>
+<p>さらに、TSCから生じるこのシリアル化の欠如は、TSCの結果を他の時間源と比較する際に別の課題を引き起こします。TSCははるかに高精度であるため、他のクロックが同じ値を示している間にも、TSCの多くの可能な値が読み取られる可能性があります。</p>
+<p>つまり、外部クロックCが同じ値を示している間にも、(T, T+10)を読み取る可能性があります。非シリアル化された読み取りにより、実際には(T-1.. T+10)という変動する範囲に至る可能性があります。したがって、外部の値と校正されたTSCによる時間計算値は、有効な値の範囲を持つ可能性があります。この計算を再校正すると、校正後の時間計算値が校正前の時間計算値よりも逆方向に進む可能性があります。</p>
+<p>この問題は、Linuxにおける内部時間源であるカーネル時間で特に顕著です。カーネル時間は理論的に高解像度のタイムスペックで表現されていますが、実際にはジャiffiesの粒度間隔で進み、キャッチアップモードではさらに大きなステップで進むことがあります。</p>
+<p>このアリアシングにより、kvmclockやTSC計算から導かれる他の値（TSCの仮想化自体を含む）の計算と再校正には注意が必要です。</p>
+</section>
+<section id="migration">
+<h3>4.4. マイグレーション<a class="headerlink" href="#migration" title="この見出しへのパーマリンク">¶</a></h3>
+<p>仮想マシンの移動は、時間管理において2つの方法で問題を引き起こします。まず、移動自体に時間がかかるため、その間は割込みが届けられず、その後はゲスト時間の補正が必要になることがあります。NTPは、通常この補正がNTPで補正可能な窓内に収まるため、ある程度の補正を可能にするかもしれません。</p>
+<p>もう一つの懸念は、TSC（またはraw bus clockが公開されている場合のHPET）に基づくタイマが異なる速度で動作する可能性があり、ホスト仮想化環境でこれらのタイマを仮想化して補正する必要があります。また、より速いマシンに移動すると、パストスルーTSCの使用が不可能になる可能性があります。なぜなら、ゲストに速いクロックを表示するには、通常の時間より早く進む可能性があるからです。一方で、遅いクロックは問題になりにくいです。なぜなら、常に元の速度に合わせる事が可能だからです。KVMクロックは、ゲストがTSCのマルチプライヤーとオフセットを元にナノ秒精度の値に変換できるようにすることで、これらの問題を回避しています。</p>
+</section>
+<section id="scheduling">
+<h3>4.5. スケジューリング<a class="headerlink" href="#scheduling" title="この見出しへのパーマリンク">¶</a></h3>
+<p>スケジューリングは正確なタイミングと割込みの発生に基づいているため、仮想化によってオペレーティングシステムのスケジューリングアルゴリズムが悪影響を受ける可能性があります。理論上はランダムで、全般的に均等に分布すると考えられますが、意図的に作られたシナリオや現実のシナリオ（ゲストデバイスアクセス、仮想化の退出原因、コンテキストスイッチなど）では常にそのようにはならない場合があります。この影響については十分に研究されていません。</p>
+<p>これを回避するため、いくつかの実装ではパラバーチャライズドスケジューラクロックを提供しており、仮想マシンが稼働している間の真のCPU時間量を明らかにしています。</p>
+</section>
+<section id="watchdogs">
+<h3>4.6. ウォッチドッグ<a class="headerlink" href="#watchdogs" title="この見出しへのパーマリンク">¶</a></h3>
+<p>Linuxのロック検出機能などのウォッチドッグタイマは、ハードウェア仮想化下でタイマ割込みが遅延したり、リアルタイムの経過を誤解したりすることで誤って作動する可能性があります。通常、これらの警告は偽 positives であり無視できますが、一部の状況ではこのような検出を無効にする必要があります。</p>
+</section>
+<section id="delays-and-precision-timing">
+<h3>4.7. 遅延と正確なタイミング<a class="headerlink" href="#delays-and-precision-timing" title="この見出しへのパーマリンク">¶</a></h3>
+<p>仮想化されたシステムでは正確なタイミングや遅延が実現できない場合があります。これはシステムが物理デバイスを制御している場合や、デバイスへの遅延を補償するために遅延を発生させる場合に起きます。前者の問題は一般的に解決できません。ハードウェア制御ソフトウェアを十分に仮想化するには、リアルタイムOSが必要であり、それにはリアルタイムを意識した仮想化プラットフォームが必要です。</p>
+<p>第二の問題はパフォーマンスの問題を引き起こす可能性がありますが、これは重大な問題にはならない可能性が低いです。多くの場合、設定やパラバーチャライゼーションを通じてこれらの遅延は解消される可能性があります。</p>
+</section>
+<section id="covert-channels-and-leaks">
+<h3>4.8. 隠蔽チャネルと漏洩<a class="headerlink" href="#covert-channels-and-leaks" title="この見出しへのパーマリンク">¶</a></h3>
+<p>上記の問題に加えて、仮想化された時間の完全な実装以外では、ホストに関する時間情報がゲストに漏洩してしまうことが避けられません。これにより、ゲストがハイパーバイザの存在（レッドピル型の検出のように）を推測する可能性があり、またCPU利用率そのものを信号チャネルとして利用してゲスト間で情報漏洩を引き起こす可能性もあります。このような問題を防ぐには、現実時間の追跡をしなくなる完全に隔離された仮想時間が必要ですが、特定のセキュリティやQAの文脈では役立つかもしれません。ただし、一般的には現実世界での展開シナリオには推奨されていません。</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linux 仮想化サポート</a><ul class="current">
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">KVM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../uml/user_mode_linux_howto_v2.html">UML ハウトゥー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../paravirt_ops.html">パラバーティロップス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../guest-halt-polling.html">ゲストハルトポーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ne_overview.html">Nitro エンクローブ</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linux 仮想化サポート</a><ul>
+<li><a href="index.html">KVM</a><ul>
+<li>前へ: <a href="s390-pv-boot.html" title="前章">s390（IBM Z）保護仮想マシンのブート/IPL</a></li>
+<li>次へ: <a href="vcpu-requests.html" title="次章">KVM VCPUリクエスト</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/virt/kvm/timekeeping.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

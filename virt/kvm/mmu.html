@@ -1,0 +1,519 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>x86 kvm shadow MMU — The Linux Kernel documentation</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="msr.html" rel="next" title="KVM固有のMSR"/>
+<link href="locking.html" rel="prev" title="KVMロック概要"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="the-x86-kvm-shadow-mmu">
+<h1>x86 KVM シャドウMMU<a class="headerlink" href="#the-x86-kvm-shadow-mmu" title="この見出しへのパーマリンク">¶</a></h1>
+<p>MMU（arch/x86/kvm ディレクトリ内の mmu.[ch] および paging_tmpl.h ファイル）は、ゲストに標準的な x86 MMU を提供しつつ、ゲストの物理アドレスをホストの物理アドレスに変換する責任を担っています。</p>
+<p>MMU コードは以下の要件を満たすように試みています：</p>
+<ul class="simple">
+<li><dl class="simple">
+<dt>正確性：</dt><dd><p>ゲストは、タイミングを除いて、エミュレートされた MMU であることを特定できないようにする（仕様に準拠するよう努めるが、特定の実装の特性（TLB サイズなど）をエミュレートするのではなくする）</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>セキュリティ：</dt><dd><p>ゲストがホストメモリを操作できないようにする（割り当てられていないメモリにアクセスできないようにする）</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>パフォーマンス：</dt><dd><p>MMU によって課されるパフォーマンスのペナルティを最小限に抑える</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>スケーラビリティ：</dt><dd><p>大容量メモリおよび大規模な vcpu ゲストへのスケーラビリティを確保する</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>ハードウェア：</dt><dd><p>x86 ビジテーションハードウェアの全範囲をサポートする</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>統合：</dt><dd><p>Linux メモリ管理コードがゲストメモリを制御する必要があり、スワップ、ページ移動、ページマージング、透過的ヒューゲページなどの機能が変更なしに動作する</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>汚染トラッキング：</dt><dd><p>ゲストメモリへの書き込みを報告し、ライブマイグレーションおよびフレームバッファベースのディスプレイを可能にする</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>フットプリント：</dt><dd><p>固定されたカーネルメモリの量を低く保つ（ほとんどのメモリは縮小可能であるべきである）</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>信頼性：</dt><dd><p>多ページまたは GFP_ATOMIC の割当を避ける</p>
+</dd>
+</dl>
+</li>
+</ul>
+<section id="acronyms">
+<h2>略語<a class="headerlink" href="#acronyms" title="この見出しへのパーマリンク">¶</a></h2>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 6%"/>
+<col style="width: 94%"/>
+</colgroup>
+<tbody>
+<tr class="row-odd"><td><p>pfn</p></td>
+<td><p>ホストページフレーム番号</p></td>
+</tr>
+<tr class="row-even"><td><p>hpa</p></td>
+<td><p>ホスト物理アドレス</p></td>
+</tr>
+<tr class="row-odd"><td><p>hva</p></td>
+<td><p>ホスト仮想アドレス</p></td>
+</tr>
+<tr class="row-even"><td><p>gfn</p></td>
+<td><p>ゲストフレーム番号</p></td>
+</tr>
+<tr class="row-odd"><td><p>gpa</p></td>
+<td><p>ゲスト物理アドレス</p></td>
+</tr>
+<tr class="row-even"><td><p>gva</p></td>
+<td><p>ゲスト仮想アドレス</p></td>
+</tr>
+<tr class="row-odd"><td><p>ngpa</p></td>
+<td><p>ネストゲスト物理アドレス</p></td>
+</tr>
+<tr class="row-even"><td><p>ngva</p></td>
+<td><p>ネストゲスト仮想アドレス</p></td>
+</tr>
+<tr class="row-odd"><td><p>pte</p></td>
+<td><p>ページテーブルエントリ（ページング構造エントリを一般的に指す場合にも使用）</p></td>
+</tr>
+<tr class="row-even"><td><p>gpte</p></td>
+<td><p>ゲストpte（gfns を指す）</p></td>
+</tr>
+<tr class="row-odd"><td><p>spte</p></td>
+<td><p>shadow pte (ページフレーム番号を指す)</p></td>
+</tr>
+<tr class="row-even"><td><p>tdp</p></td>
+<td><p>2次元ページング (NPTおよびEPTのベンダーニュートラル用語)</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="virtual-and-real-hardware-supported">
+<h2>サポートされる仮想および実際のハードウェア<a class="headerlink" href="#virtual-and-real-hardware-supported" title="この見出しへのパーマリンク">¶</a></h2>
+<p>MMUは、ゲストの入力時に現在のページングモードおよびCR3のアトミックな切り替えを許可し、2次元ページング (AMDのNPTおよびIntelのEPT) をサポートする1世代目のMMUハードウェアをサポートしています。エミュレートされるハードウェアは伝統的な2/3/4レベルx86 MMUであり、グローバルページ、PAE、PSE、PSE36、CR0.WP、1GBページのサポートがあります。エミュレートされたハードウェアはNPTをサポートするホストでNPTをサポートするハードウェアをエクスポーズすることも可能です。</p>
+</section>
+<section id="translation">
+<h2>翻訳<a class="headerlink" href="#translation" title="この見出しへのパーマリンク">¶</a></h2>
+<p>MMUの主な役割は、プロセッサのMMUをプログラミングしてゲストのアドレスを翻訳することです。異なるタイミングで異なる翻訳が必要です:</p>
+<ul class="simple">
+<li><p>ゲストページングが無効な場合、ゲスト物理アドレスをホスト物理アドレスに翻訳します (GPA→HPA)</p></li>
+<li><p>ゲストページングが有効な場合、ゲスト仮想アドレスをゲスト物理アドレスに、さらにホスト物理アドレスに翻訳します (GVA→GPA→HPA)</p></li>
+<li><p>ゲストが自身のゲストを起動する場合、ネストゲスト仮想アドレスをネストゲスト物理アドレスに、ゲスト物理アドレスに、ホスト物理アドレスに翻訳します (NGVA→NGPA→GPA→HPA)</p></li>
+</ul>
+<p>主な課題は、1〜3つの翻訳をハードウェアがサポートする1つの翻訳 (伝統的) または2つの翻訳 (TDP) にエンコードすることです。必要な翻訳数がハードウェアのサポート数に一致する場合、MMUは直接モードで動作します。それ以外の場合はシャドウモードで動作します (以下参照)</p>
+</section>
+<section id="memory">
+<h2>メモリ<a class="headerlink" href="#memory" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ゲストメモリ (GPA) は、KVMを使用するプロセスのユーザーアドレス空間の一部です。ユーザー空間はゲストアドレスとユーザーアドレスの間の翻訳を定義します (GPA→HVA)。複数のGPAが同じHVAをアリアス化する可能性がありますが、逆はできません。</p>
+<p>これらのHVAは、ホストが利用可能な任意のメソッドでバックされることがあります: アノニマスメモリ、ファイルバックドメモリ、デバイスマメモリ。ホストはいつでもメモリをページングする可能性があります。</p>
+</section>
+<section id="events">
+<h2>イベント<a class="headerlink" href="#events" title="この見出しへのパーマリンク">¶</a></h2>
+<p>MMUはイベントによって駆動され、一部はゲストから、一部はホストから発生します。</p>
+<p>ゲスト生成イベント:</p>
+<ul class="simple">
+<li><p>制御レジスタへの書き込み (特にCR3)</p></li>
+<li><p>invlpg/invlpga命令の実行</p></li>
+<li><p>欠落または保護された翻訳へのアクセス</p></li>
+</ul>
+<p>ホスト生成イベント:</p>
+<ul class="simple">
+<li><p>GPA→HPAの翻訳の変化 (GPA→HVAの変化またはHVA→HPAの変化を通じて)</p></li>
+<li><p>メモリ圧力 (shrinking)</p></li>
+</ul>
+</section>
+<section id="shadow-pages">
+<h2>Shadow pages<a class="headerlink" href="#shadow-pages" title="この見出しへのパーマリンク">¶</a></h2>
+<p>主なデータ構造はシャドウページで、'struct kvm_mmu_page'です。シャドウページは512個のSPTESを含み、これらは葉ノードまたは非葉ノードのSPTESのいずれかです。シャドウページには葉ノードと非葉ノードのSPTESの混合が含まれることがあります。</p>
+<p>非葉spteはハードウェアMMUが葉ページに到達できるようにし、直接の翻訳とは無関係です。これは他のシャドウページを指します。</p>
+<p>葉spteは、1つのページング構造エントリにエンコードされた1つまたは2つの翻訳に対応します。これらは常に翻訳スタックの最低レベルであり、NPT/EPTによって上位レベルの翻訳は処理されます。葉pteはゲストページを指します。</p>
+<p>以下の表は、葉pteによってエンコードされた翻訳を示しており、上位レベルの翻訳は括弧内に表示しています:</p>
+<blockquote>
+<div><p>非ネストゲスト:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>nonpaging:     gpa-&gt;hpa
+paging:        gva-&gt;gpa-&gt;hpa
+paging, tdp:   (gva-&gt;)gpa-&gt;hpa
+</pre></div>
+</div>
+<p>ネストゲスト:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>non-tdp:       ngva-&gt;gpa-&gt;hpa  (*)
+tdp:           (ngva-&gt;)ngpa-&gt;gpa-&gt;hpa
+
+(*) the guest hypervisor will encode the ngva-&gt;gpa translation into its page
+    tables if npt is not present
+</pre></div>
+</div>
+</div></blockquote>
+<dl class="simple">
+<dt>シャドウページには以下の情報が含まれます:</dt><dd><dl class="simple">
+<dt>role.level:</dt><dd><p>このシャドウページが属するシャドウページング階層のレベル。1=4k sptes, 2=2M sptes, 3=1G sptes, など。</p>
+</dd>
+<dt>role.direct:</dt><dd><p>設定されている場合、このページから到達可能な葉sptesは線形範囲を表します。例としてリアルモードの翻訳、小さなホストページでサポートされる大きなゲストページ、およびNPTまたはEPTが有効な場合のgpa-&gt;hpaの翻訳があります。線形範囲は(gfn &lt;&lt; PAGE_SHIFT)から開始し、role.levelによってサイズが決定されます（1レベル目は2MB、2レベル目は1GB、3レベル目は0.5TB、4レベル目は256TB）。設定されていない場合、このページはgfnフィールドで示されるゲストページテーブルに対応します。</p>
+</dd>
+<dt>role.quadrant:</dt><dd><p>role.gpte_is_8_bytes=0の場合、ゲストは32ビットのgpteを使用し、ホストは64ビットのspteを使用します。これによりゲストページテーブルにはホストより多くのpteが含まれるため、複数のシャドウページが必要になります。1レベル目のシャドウページでは、role.quadrantは0または1であり、ゲストページテーブル内の最初または2番目の512-gpteブロックを示します。2レベル目のページテーブルでは、各32ビットgpteが2つの64ビットspteに変換されるため（各1レベル目のゲストページが2つの1レベル目のシャドウページでシャドウされる）、role.quadrantの値は0..3の範囲になります。各クォーラントは1GBの仮想アドレス空間をマッピングします。</p>
+</dd>
+<dt>role.access:</dt><dd><p>親pteから継承されたゲストアクセス許可（uwxの形式）。実行許可は肯定的です。</p>
+</dd>
+<dt>role.invalid:</dt><dd><p>このページは無効であり使用できません。これは現在ピン留めされているルートページ（CPUハードウェアレジスタが指している）であり、ピン留めが解除されると破棄されます。</p>
+</dd>
+<dt>role.gpte_is_8_bytes:</dt><dd><p>このページが有効なゲストPTEのサイズを示します。64ビットgpteが使用されている場合は'1'、32ビットgpteが使用されている場合は'0'です。</p>
+</dd>
+<dt>role.nxe:</dt><dd><p>このページが有効なefer.nxeの値を含みます。</p>
+</dd>
+<dt>role.cr0_wp:</dt><dd><p>このページが有効なcr0.wpの値を含みます。</p>
+</dd>
+<dt>role.smep_andnot_wp:</dt><dd><p>有効なページのcr4.smep &amp;&amp; !cr0.wpの値を含みます（この条件が真となるページは他のページとは異なります；cr0.wp=0の処理については下記を参照してください）。</p>
+</dd>
+<dt>role.smap_andnot_wp:</dt><dd><p>有効なページのcr4.smap &amp;&amp; !cr0.wpの値を含みます（この条件が真となるページは他のページとは異なります；cr0.wp=0の処理については下記を参照してください）。</p>
+</dd>
+<dt>role.ept_sp:</dt><dd><p>シャドウされたネストされたEPTページを示す仮想フラグです。ept_spは「cr0_wp &amp;&amp; smap_andnot_wp」が真の場合にのみ有効で、それ以外は無効な組み合わせです。</p>
+</dd>
+<dt>role.smm:</dt><dd><p>システム管理モードで有効なページの場合、1になります。このフィールドは、このシャドウページを構築するために使用されたkvm_memslots配列のどの要素かを決定し、またstruct kvm_mmu_pageからmemslotへの逆参照にも使用されます（kvm_memslots_for_spte_roleマクロと__gfn_to_memslotを通じて）。</p>
+</dd>
+<dt>role.ad_disabled:</dt><dd><p>MMUインスタンスがA/Dビットを使用できない場合、1になります。EPTはハスウェル以前にはA/Dビットを持っておらず、L1ハイパフォーマンスがそれらを有効にしていない場合、シャドウEPTページテーブルもA/Dビットを使用できません。</p>
+</dd>
+<dt>gfn:</dt><dd><p>このページによってシャドウされた翻訳を含むゲストページテーブル、または線形翻訳のベースページフレームです。role.directを参照してください。</p>
+</dd>
+<dt>spt:</dt><dd><p>このページの翻訳を含む64ビットのspteのページです。kvmとハードウェア双方によって参照されます。sptが指すページのpage-&gt;privateはシャドウページ構造に逆指します。spt内のspteはゲストページまたは下位のシャドウページを指します。具体的には、sp1とsp2がシャドウページである場合、sp1-&gt;spt[n]は__pa(sp2-&gt;spt)を指す可能性があり、sp2はparent_pteを通じてsp1に逆指します。spt配列はシャドウページをノードとし、ゲストページを葉とするDAG構造を形成します。</p>
+</dd>
+<dt>gfns:</dt><dd><p>512個のゲストフレーム番号を含む配列で、各現存するpteに対応します。pteからgfnへの逆マッピングに使用されます。role.directが設定されている場合、この配列はgfnフィールドから計算可能で、この場合配列は割り当てられません。role.directとgfnを参照してください。</p>
+</dd>
+<dt>root_count:</dt><dd><p>ハードウェアレジスタ（ゲストcr3またはpdptrs）が現在このページを指している数を記録するカウンターです。このカウンターがゼロでない間、ページは破壊できません。role.invalidを参照してください。</p>
+</dd>
+<dt>parent_ptes:</dt><dd><p>このページのsptを指しているpte/ptesの逆マッピングです。parent_ptesのビット0がゼロの場合、このページを指すspteは1つだけ存在し、parent_ptesはその単一のspteを指します。それ以外の場合、複数のspteがこのページを指しており、(parent_ptes &amp; ~0x1)はその親spteの一覧を持つデータ構造を指します。</p>
+</dd>
+<dt>unsync:</dt><dd><p>trueの場合、このページの翻訳はゲストの翻訳と一致しない可能性があります。これは、pteが変更されたがtlbエントリがフラッシュされる前の状態と同等です。したがって、ゲストがinvlpgを実行するか、他の手段でtlbをフラッシュするときに、非同期pteが同期されます。葉ページに有効です。</p>
+</dd>
+<dt>unsync_children:</dt><dd><p>ページ内に非同期（または非同期の子を持つ）ページを指しているspteの数。</p>
+</dd>
+<dt>unsync_child_bitmap:</dt><dd><p>spteが直接または間接的に非同期ページを指していることを示すビットマップ。指定されたページから到達可能なすべての非同期ページを迅速に特定するために使用します。</p>
+</dd>
+<dt>clear_spte_count:</dt><dd><p>32ビットホストでのみ存在し、64ビットspteは原子的に書けません。読み取り者はMMUロックを解放しながら進行中の更新を検出し、書き込み者が完了するまで再試行します。</p>
+</dd>
+<dt>write_flooding_count:</dt><dd><p>ゲストがページテーブルに何度も書き込むと、ページが書き込み保護されている場合に多くのエミュレーションが発生します（以下「同期および非同期ページ」を参照）。葉ページは非同期にすることで頻繁なエミュレーションを回避できますが、非葉ページではできません。このフィールドは、ページテーブルが実際に使用された最後の時から経過したエミュレーション回数をカウントし、このページでエミュレーションが頻繁に発生する場合、KVMはページをマップ解除して今後のエミュレーションを回避します。</p>
+</dd>
+</dl>
+</dd>
+</dl>
+</section>
+<section id="reverse-map">
+<h2>Reverse map<a class="headerlink" href="#reverse-map" title="この見出しへのパーマリンク">¶</a></h2>
+<p>MMUは逆マッピングを維持しており、gfnからすべてのpteを辿ることができます。これはページのスワップアウトなどに使用されます。</p>
+</section>
+<section id="synchronized-and-unsynchronized-pages">
+<h2>同期化されたページと同期化されていないページ<a class="headerlink" href="#synchronized-and-unsynchronized-pages" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ゲストはtlbの同期に2つのイベントを使用します：tlbフラッシュとページ無効化（invlpg）。</p>
+<p>tlbフラッシュとは、ゲストのcr3から到達可能なすべてのspteを同期する必要があります。これはコストがかかるため、すべてのゲストページテーブルを書き込み保護し、gpteが書き込まれるときにspteをgpteに同期します。</p>
+<p>特別なケースとして、ゲストページテーブルが現在のゲストcr3から到達可能な場合があります。この場合、ゲストはページ翻訳を使用する前にinvlpg指令を実行する必要があります。これを活用して、ゲストページの書き込み保護を解除し、ゲストが自由に変更できるようにします。ゲストがinvlpgを実行するときに変更されたgpteを同期します。これにより、ゲストが複数のgpteを変更する場合や、ゲストページがもはやページテーブルとして使用されなくなりランダムなゲストデータとして使用される場合のエミュレーション量を減らします。</p>
+<p>tlbフラッシュにより、すべての到達可能な非同期シャドウページを再同期する必要がある副作用があります。</p>
+</section>
+<section id="reaction-to-events">
+<h2>イベントへの反応<a class="headerlink" href="#reaction-to-events" title="この見出しへのパーマリンク">¶</a></h2>
+<ul class="simple">
+<li><p>ゲストページフォールト（またはNPTページフォールト、またはEPT違反）</p></li>
+</ul>
+<p>これは最も複雑なイベントです。ページフォールトの原因は次の通りです：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>真のゲストフォールト（ゲストの翻訳がアクセスを許可しない）(*)</p></li>
+<li><p>翻訳が存在しないメモリへのアクセス</p></li>
+<li><p>保護された翻訳へのアクセス - ディリートページをログする際、メモリは書き込み保護される - 同期されたシャドウページは書き込み保護される(*)</p></li>
+<li><p>翻訳できないメモリ（MMIO）へのアクセス</p></li>
+</ul>
+<p>(*) ディレクトモードでは適用不可</p>
+</div></blockquote>
+<p>ページフォールトの処理は以下の手順で行われます：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>エラーコードのRSVビットが設定されている場合、ページフォールトはゲストがMMIOにアクセスした結果であり、キャッシュされたMMIO情報が利用可能です。</p>
+<ul>
+<li><p>シャドウページテーブルをトラバースする</p></li>
+<li><p>spteの有効な生成番号を確認する（以下「MMIO spteの高速無効化」を参照）</p></li>
+<li><p>情報をvcpu-&gt;arch.mmio_gva、vcpu-&gt;arch.mmio_access、vcpu-&gt;arch.mmio_gfnにキャッシュし、エミュレータを呼び出す</p></li>
+</ul>
+</li>
+<li><p>エラーコードのPビットとR/Wビットがともに設定されている場合、これは「高速ページフォールト」（MMUロックを取得せずに修正可能）として処理される可能性があります。以下の説明を参照してください <a class="reference internal" href="locking.html"><span class="doc">KVMロック概要</span></a>.</p></li>
+<li><p>必要に応じて、ゲストページテーブルをトラバースしてゲストの翻訳（gva-&gt;gpaまたはngpa-&gt;gpa）を決定する</p>
+<ul>
+<li><p>アクセス権が不十分な場合、ゲストにフォールトを反映する</p></li>
+</ul>
+</li>
+<li><p>ホストページを決定する</p>
+<ul>
+<li><p>これはMMIOリクエストの場合、ホストページは存在しません。情報をvcpu-&gt;arch.mmio_gva、vcpu-&gt;arch.mmio_access、vcpu-&gt;arch.mmio_gfnにキャッシュする</p></li>
+</ul>
+</li>
+<li><p>翻訳するためのspteをシャドウページテーブルで検索し、必要な場合に中間ページテーブルをインスタンス化する</p>
+<ul>
+<li><p>これはMMIOリクエストの場合、spteにMMIO情報をキャッシュし、spteにいくつかの予約ビットを設定する（kvm_mmu_set_mmio_spte_maskの呼び出し元を参照）</p></li>
+</ul>
+</li>
+<li><p>ページをアンシンクロナイズするように試みる</p>
+<ul>
+<li><p>成功した場合、ゲストが継続し、gpteを変更できるようにする</p></li>
+</ul>
+</li>
+<li><p>インストラクションをエミュレートする</p>
+<ul>
+<li><p>失敗した場合、ページをアンシャドウし、ゲストが継続する</p></li>
+</ul>
+</li>
+<li><p>インストラクションによって変更されたすべての翻訳を更新する</p></li>
+</ul>
+</div></blockquote>
+<p>invlpg処理：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>シャドウページ階層をトラバースし、影響を受けた翻訳を削除する</p></li>
+<li><p>ゲストが近々使用する可能性のある翻訳を再インスタンス化するように試みる</p></li>
+</ul>
+</div></blockquote>
+<p>ゲスト制御レジスタの更新：</p>
+<ul class="simple">
+<li><p>mov to cr3</p>
+<ul>
+<li><p>新しいシャドウルートを検索する</p></li>
+<li><p>新たに到達可能なシャドウページを同期する</p></li>
+</ul>
+</li>
+<li><p>mov to cr0/cr4/efer</p>
+<ul>
+<li><p>新しいページングモード用のMMUコンテキストを設定する</p></li>
+<li><p>新しいシャドウルートを検索する</p></li>
+<li><p>新たに到達可能なシャドウページを同期する</p></li>
+</ul>
+</li>
+</ul>
+<p>ホスト翻訳の更新：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>更新されたhvaを持つMMU通知子が呼び出される</p></li>
+<li><p>逆マップを通じて影響を受けたspteを検索する</p></li>
+<li><p>翻訳を削除（または更新）する</p></li>
+</ul>
+</div></blockquote>
+</section>
+<section id="emulating-cr0-wp">
+<h2>cr0.wpのエミュレーション<a class="headerlink" href="#emulating-cr0-wp" title="この見出しへのパーマリンク">¶</a></h2>
+<p>TDPが有効でない場合、ホストはcr0.wp=1を維持する必要があります。これによりゲストカーネルのページ書き込み保護が機能し、ゲストのユーザースペースには適用されません。ゲストのcr0.wp=1の場合、問題は生じません。しかし、ゲストのcr0.wp=0の場合、gpte.u=1、gpte.w=0のパーミッションをどのspteにもマッピングすることはできません（セマンティクス上、ゲストカーネルへのアクセスを許可し、ユーザーレッドアクセスを許可する必要があります）。</p>
+<p>これを処理するために、フォールトタイプに応じてパーミッションを2つの可能なspteにマッピングします。</p>
+<ul class="simple">
+<li><p>カーネル書き込みエラー: spte.u=0、spte.w=1（カーネルへの完全なアクセスを許可し、ユーザーアクセスを拒否）</p></li>
+<li><p>読み取りエラー: spte.u=1、spte.w=0（完全な読み取りアクセスを許可し、カーネル書き込みアクセスを拒否）</p></li>
+</ul>
+<p>(ユーザーライティングエラーは#PFを生成します)</p>
+<p>最初の場合には2つの追加の複雑さがあります:</p>
+<ul class="simple">
+<li><p>CR4.SMEPが有効の場合: ページをカーネルページに変換したため、カーネルがこれを実行できる可能性があります。これを処理するためにspte.nxも設定します。ユーザーフェッチまたは読み取りエラーが発生した場合、spte.u=1およびspte.nx=gpte.nxに戻します。この処理が機能するため、KVMはシャドウページングが使用されているときにEFER.NXを1に強制します。</p></li>
+<li><p>CR4.SMAPが無効の場合: ページがカーネルページに変換されたため、CR4.SMAPが有効になったときに再利用できません。CR4.SMAP &amp;&amp; !CR0.WPをシャドウページのロールに設定してこのケースを回避します。注意: ここではCR4.SMAPが有効なケースには関心がありません。KVMは、パーミッションチェック失敗によりゲストに直接#PFを注入するためです。</p></li>
+</ul>
+<p>cr0.wp=0でカーネルページに変換されたspteが、cr0.wpが1に変更された後にカーネルによって書き込まれることを防ぐため、cr0.wpの値をページロールに含めます。これにより、cr0.wpの値が異なる場合、spteは使用できず、シャドウページ検索コードによって無視されます。同様の問題は、cr0.wp=0かつcr4.smep=0で作成されたspteがcr4.smepを1に変更した後に使用される場合にも発生します。これを回避するため、!cr0.wp &amp;&amp; cr4.smepの値もページロールに含めます。</p>
+</section>
+<section id="large-pages">
+<h2>大ページ<a class="headerlink" href="#large-pages" title="この見出しへのパーマリンク">¶</a></h2>
+<p>MMUは、大規模なゲストとホストページのすべての組み合わせをサポートします。サポートされるページサイズには4k、2M、4M、1Gが含まれます。4Mページは、MMUが常にPAEページングを使用するため、ゲストとホストの両方で2つの別個の2Mページとして扱われます。</p>
+<p>大規模なspteをインスタンス化するには4つの制約を満たす必要があります:</p>
+<ul class="simple">
+<li><p>spteは大規模なホストページを指さなければなりません</p></li>
+<li><p>ゲストpteは同等以上のサイズの大きなpteでなければなりません（TDPが有効な場合、ゲストpteは存在せず、この条件は満たされます）</p></li>
+<li><p>spteが書き込み可能である場合、大規模なページフレームはどの書き込み保護ページとも重複してはなりません</p></li>
+<li><p>ゲストページは単一のメモリスロット内に完全に収容される必要があります</p></li>
+</ul>
+<p>MMUは、各メモリスロットと大ページサイズごとに-&gt;disallow_lpageという配列を保持して、最後の2つの条件を確認します。書き込み保護されたページはその-&gt;disallow_lpageをインクリメントし、大スプテのインスタンス化を防ぎます。未アライメントメモリスロットの最後のフレームは、人工的に-&gt;disallow_lpagesが膨らんでいるため、決してインスタンス化されません</p>
+</section>
+<section id="fast-invalidation-of-mmio-sptes">
+<h2>MMIO sptesの高速無効化<a class="headerlink" href="#fast-invalidation-of-mmio-sptes" title="この見出しへのパーマリンク">¶</a></h2>
+<p>上記の「イベントへの反応」で述べた通り、KVMは葉スプテにMMIO情報をキャッシュします。新しいメモリスロットが追加されたり、既存のメモリスロットが変更されたりすると、この情報が古くなり無効化される可能性があります。また、シャドウページをウォーキングする際にはMMUロックを保持する必要があります。類似の技術によりスケーラビリティが向上しています</p>
+<p>MMIOスプテにはいくつかの余分なビットがあり、これらは生成番号を保存するために使用されます。グローバル生成番号はkvm_memslots(kvm)-&gt;generationに保存され、ゲストメモリ情報が変化するたびに増加します</p>
+<p>KVMがMMIOスプテを見つけた場合、そのスプテの生成番号を確認します。スプテの生成番号がグローバル生成番号と一致しない場合、キャッシュされたMMIO情報を無視し、遅いパスを通じてページフォールトを処理します</p>
+<p>MMIOスプテに生成番号を保存するために18ビットしか使用できないため、オーバーフローが発生するとすべてのページが破棄されます</p>
+<p>残念ながら、単一のメモリアクセスがkvm_memslots(kvm)を複数回アクセスする可能性があり、最後のアクセスは生成番号が取得されスプテに保存されるタイミングです。そのため、MMIOスプテが古い情報に基づいて作成される可能性がありますが、生成番号は最新です</p>
+<p>これを避けるため、synchronize_srcuが返る後で生成番号を再インクリメントします。これにより、メモリスロット更新中に、kvm_memslots(kvm)-&gt;generationのビット63が1に設定されるのは更新中だけです。一部のSRCUリーダーが古いコピーを使用している可能性があります。奇数の生成番号で作成されたMMIOスプテは使用しないようにします。MMIOスプテには「更新中」ビットは保存されず、生成番号がスプテから抽出される際には自動的にゼロとみなされます。KVMが更新中にMMIOスプテを作成した場合、次のスプテアクセスは常にキャッシュミスになります。たとえば、更新ウィンドウ中の後続アクセスは更新中フラグの差異によりキャッシュミスとなり、更新ウィンドウが閉じた後のアクセスはスプテよりも高い生成番号を持つためキャッシュミスになります</p>
+</section>
+<section id="further-reading">
+<h2>さらに読む<a class="headerlink" href="#further-reading" title="この見出しへのパーマリンク">¶</a></h2>
+<ul class="simple">
+<li><p>NPTに関するプレゼンテーション（KVMフォーラム2008からの）
+<a class="reference external" href="https://www.linux-kvm.org/images/c/c8/KvmForum2008%24kdf2008_21.pdf">https://www.linux-kvm.org/images/c/c8/KvmForum2008%24kdf2008_21.pdf</a></p></li>
+</ul>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linux 仮想化サポート</a><ul class="current">
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">KVM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../uml/user_mode_linux_howto_v2.html">UML ハウトゥー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../paravirt_ops.html">パラバーティロップス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../guest-halt-polling.html">ゲストハルトポーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ne_overview.html">Nitro エンクローブ</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linux 仮想化サポート</a><ul>
+<li><a href="index.html">KVM</a><ul>
+<li>前へ: <a href="locking.html" title="前章">KVMロック概要</a></li>
+<li>次へ: <a href="msr.html" title="次章">KVM固有のMSR</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/virt/kvm/mmu.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

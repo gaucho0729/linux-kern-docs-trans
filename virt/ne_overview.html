@@ -1,0 +1,198 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Nitro Enclaves — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="../input/index.html" rel="next" title="Linux インプットドキュメンテーション"/>
+<link href="guest-halt-polling.html" rel="prev" title="ゲストハルトポーリング"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="nitro-enclaves">
+<h1>Nitro エンクローブ<a class="headerlink" href="#nitro-enclaves" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="overview">
+<h2>概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Nitro Enclaves (NE)は、顧客がEC2インスタンス内で孤立したコンピューティング環境を切り出すことを可能にする、新たなAmazon Elastic Compute Cloud (EC2)の機能です[1]。</p>
+<p>たとえば、敏感なデータを処理するアプリケーションが仮想マシン（VM）で実行されている場合、他の同じVMで実行されているアプリケーションから分離されることが可能です。このアプリケーションは、主VMとは別のVMで実行され、これをエネクレーブと呼びます。</p>
+<p>エネクレーブは、生成したVMと並行して動作します。この設定は低遅延アプリケーションの要件に合致しています。エネクレーブに割り当てられるリソース（メモリやCPUなど）は、主VMから分離され、それぞれのエネクレーブは主VMで実行されるプロセスにマッピングされ、NEドライバーとioctlインターフェースを通じて通信します。</p>
+<p>この意味では、2つのコンポーネントがあります：</p>
+<p>1. エネクレーブ抽象化プロセス - ユーザースペースプロセスで、主VMゲスト内で実行され、NEドライバーの提供されたioctlインターフェースを使用してエネクレーブVM（以下の2）を生成します。</p>
+<p>主VMに接続されたNEエミュレートPCIデバイスがあります。この新しいPCIデバイスのドライバーはNEドライバーに含まれています。</p>
+<p>ioctlロジックはPCIデバイスコマンドにマッピングされます。たとえば、NE_START_ENCLAVE ioctlはエネクレーブ起動PCIコマンドにマッピングされます。PCIデバイスコマンドは、ハイパーバイザーサイドで実行されるアクションに変換されます。これは、主VMが実行されているホストで動作するNitroハイパーバイザーサイドです。NitroハイパーバイザはコアKVM技術に基づいています。</p>
+<p>2. エネクレーブ自身 - 主VMが生成したホストと同じホスト上で実行されるVMです。メモリとCPUは主VMから分離され、エネクレーブVM専用に割り当てられます。エネクレーブには永続的なストレージが接続されません。</p>
+<p>主VMから分離されエネクレーブに割り当てられたメモリ領域は、2 MiB / 1 GiBの物理的に連続したメモリ領域（またはその倍数、たとえば8 MiBなど）に整列する必要があります。メモリはユーザー空間からhugetlbfsを使用して割り当てられます[2][3]。エネクレーブのメモリサイズは少なくとも64 MiB以上でなければなりません。エネクレーブのメモリとCPUは同じNUMAノードから取得する必要があります。</p>
+<p>エネクレーブは専用コア上で動作します。CPU 0とそのCPUの兄弟は主VMに利用可能に保つ必要があります。NEの目的で、管理者権限を持つユーザーがCPUプールを設定する必要があります。カーネルドキュメンテーションのcpuリストセクション[4]を参照してください。CPUプールのフォーマットはどのように見えるかを確認できます。</p>
+<p>エンクラーブは、virtio-vsock [5] を使用したローカル通信チャネルを介してプライマリVMと通信します。プライマリVMはvirtio-pci vsockエミュレートデバイスを持ち、エンクラーブVMはvirtio-mmio vsockエミュレートデバイスを持っています。vsockデバイスはeventfdを用いてシグナルを送信します。エンクラーブVMは、virtio-vsockデバイスから割り込みを取得するために通常のインターフェース - ローカルAPICおよびIOAPIC - を見ます。virtio-mmioデバイスは通常の4GiB以下のメモリに配置されます。</p>
+<p>エンクラーブ内で実行されるアプリケーションは、エンクラーブVMで実行されるOS（例：カーネル、ramdisk、init）とともにエンクラーブイメージにパッケージ化する必要があります。エンクラーブVMは独自のカーネルを持ち、標準的なLinuxブートプロトコル [6] を従います。</p>
+<p>カーネルbzImage、カーネルコマンドライン、ramdisk（複数可）はエンクラーブイメージ形式（EIF）の一部であり、マジックナンバー、eifバージョン、イメージサイズ、CRCなどのメタデータを含むEIFヘッダーも含まれます。</p>
+<p>エンクラーブイメージ（EIF）、カーネル、ramdisk（複数可）の全体に対するハッシュ値が計算されます。これは、エンクラーブVMにロードされたエンクラーブイメージが意図されたものであることを確認するために使用されます。</p>
+<p>これらの暗号測定値は、Nitro Hypervisorによって生成された署名済み検証書に含まれており、エンクラーブのアイデンティティを証明するために使用されます。KMSはNEが統合されているサービスの例であり、検証書を検証します。</p>
+<p>エンクラーブイメージ（EIF）はエンクラーブメモリのオフセット8MiBにロードされます。エンクラーブ内のinitプロセスはプライマリVMのvsock CIDと予め定義されたポート - 9000 - に接続し、ハートビート値 - 0xb7 - を送信します。このメカニズムは、プライマリVMがエンクラーブが起動したことを確認するために使用されます。プライマリVMのCIDは3です。</p>
+<p>エンクラーブVMがクラッシュしたり、正常に終了した場合、NEドライバーは割り込みイベントを受信します。このイベントは、プライマリVMで実行されているユーザー空間エンクラーブプロセスにポール通知メカニズムを介して送信されます。その後、ユーザー空間エンクラーブプロセスは終了できます。</p>
+<p>[1] <a class="reference external" href="https://aws.amazon.com/ec2/nitro/nitro-enclaves/">https://aws.amazon.com/ec2/nitro/nitro-enclaves/</a>
+[2] <a class="reference external" href="https://www.kernel.org/doc/html/latest/admin-guide/mm/hugetlbpage.html">https://www.kernel.org/doc/html/latest/admin-guide/mm/hugetlbpage.html</a>
+[3] <a class="reference external" href="https://lwn.net/Articles/807108/">https://lwn.net/Articles/807108/</a>
+[4] <a class="reference external" href="https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html">https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html</a>
+[5] <a class="reference external" href="https://man7.org/linux/man-pages/man7/vsock.7.html">https://man7.org/linux/man-pages/man7/vsock.7.html</a>
+[6] <a class="reference external" href="https://www.kernel.org/doc/html/latest/x86/boot.html">https://www.kernel.org/doc/html/latest/x86/boot.html</a></p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linux 仮想化サポート</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="kvm/index.html">KVM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="uml/user_mode_linux_howto_v2.html">UML ハウトゥー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="paravirt_ops.html">パラバーティロップス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="guest-halt-polling.html">ゲストハルトポーリング</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Nitro エンクローブ</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linux 仮想化サポート</a><ul>
+<li>前へ: <a href="guest-halt-polling.html" title="前章">ゲストハルトポーリング</a></li>
+<li>次へ: <a href="../input/index.html" title="次章">Linux インプットドキュメンテーション</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/virt/ne_overview.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

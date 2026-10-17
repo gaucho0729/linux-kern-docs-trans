@@ -1,0 +1,406 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Hugetlbfsの予約 — Linuxカーネルドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="ksm.html" rel="next" title="Kernel Samepage Merging"/>
+<link href="hwpoison.html" rel="prev" title="hwpoison"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="hugetlbfs-reservation">
+<span id="hugetlbfs-reserve"></span><h1>Hugetlbfsの予約<a class="headerlink" href="#hugetlbfs-reservation" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="overview">
+<h2>概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>説明されているように、ヒープーアドレス空間は <a class="reference internal" href="../admin-guide/mm/hugetlbpage.html#hugetlbpage"><span class="std std-ref">HugeTLB Pages</span></a> 通常、アプリケーションの使用のために事前に割り当てられます。これらのヒープーアドレス空間は、VMAがヒープーアドレス空間の使用を示している場合、ページフォールトのタイミングでタスクのアドレス空間にインスタンス化されます。ページフォールトのタイミングでヒープーアドレス空間が存在しない場合、タスクはSIGBUSを送られ、多くの場合、不運な死を遂げます。ヒープーアドレス空間のサポートが追加された直後に、mmap()のタイミングでヒープーアドレス空間の不足を検出する方が良いと判断されました。その考え方は、ヒープーアドレス空間がマッピングをカバーする量が十分でなければmmap()が失敗するようにすることです。これは最初、mmap()のタイミングで単純なチェックをコードに追加することで実現されました。カーネルの他の機能同様、コードは時間とともに進化してきましたが、基本的な考え方は、mmap()のタイミングでヒープーアドレス空間を「予約」することによって、そのマッピングでのページフォールト時にヒープーアドレス空間が利用可能になるようにすることでした。以下の説明は、v4.10カーネルでのヒープーアドレス空間予約処理の仕組みを説明しています。</p>
+</section>
+<section id="audience">
+<h2>対象読者<a class="headerlink" href="#audience" title="この見出しへのパーマリンク">¶</a></h2>
+<p>この説明は、hugetlbfsコードを修正しているカーネル開発者を主な対象としています。</p>
+</section>
+<section id="the-data-structures">
+<h2>データ構造<a class="headerlink" href="#the-data-structures" title="この見出しへのパーマリンク">¶</a></h2>
+<dl>
+<dt>resv_huge_pages</dt><dd><p>これは、グローバルな（per-hstate）予約されたヒープーアドレス空間のカウントです。予約されたヒープーアドレス空間は、予約したタスクのみが利用可能です。したがって、利用可能なヒープーアドレス空間の数は、（<code class="docutils literal notranslate"><span class="pre">free_huge_pages</span> <span class="pre">-</span> <span class="pre">resv_huge_pages</span></code>).</p>
+</dd>
+<dt>予約マップ</dt><dd><p>予約マップは、以下の構造で説明されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct resv_map {
+        struct kref refs;
+        spinlock_t lock;
+        struct list_head regions;
+        long adds_in_progress;
+        struct list_head region_cache;
+        long region_cache_count;
+};
+</pre></div>
+</div>
+<p>システム内の各ヒープーアドレス空間マッピングには、1つの予約マップがあります。resv_map内の領域リストは、マッピング内の領域を記述します。領域は以下の通りです：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct file_region {
+        struct list_head link;
+        long from;
+        long to;
+};
+</pre></div>
+</div>
+<p>ファイル領域構造体の「from」および「to」フィールドは、マッピング内のヒープーアドレス空間インデックスです。マッピングの種類に応じて、reserv_map内の領域は範囲に予約が存在するか、存在しないかを示します。</p>
+</dd>
+<dt>MAP_PRIVATE予約のフラグ</dt><dd><p>これらは、予約マップポインタの下位ビットに格納されます。</p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">#define</span> <span class="pre">HPAGE_RESV_OWNER</span>    <span class="pre">(1UL</span> <span class="pre">&lt;&lt;</span> <span class="pre">0)</span></code></dt><dd><p>このタスクがマッピングに関連する予約の所有者であることを示します。</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">#define</span> <span class="pre">HPAGE_RESV_UNMAPPED</span> <span class="pre">(1UL</span> <span class="pre">&lt;&lt;</span> <span class="pre">1)</span></code></dt><dd><p>元々この範囲をマッピングし（予約を作成した）タスクが、失敗したCOWによりこのタスク（子タスク）からページをアンマップしたことを示します。</p>
+</dd>
+</dl>
+</dd>
+<dt>ページフラグ</dt><dd><p>PagePrivateページフラグは、ヒープーアドレス空間が解放されるときにヒープーアドレス空間予約を復元する必要があることを示します。詳細については、「ヒープーアドレス空間の解放」セクションで説明します。</p>
+</dd>
+</dl>
+</section>
+<section id="reservation-map-location-private-or-shared">
+<h2>予約マップの位置（プライベートまたは共有）<a class="headerlink" href="#reservation-map-location-private-or-shared" title="この見出しへのパーマリンク">¶</a></h2>
+<p>大ページマッピングまたはセグメントは、プライベートか共有のいずれかです。プライベートの場合、通常は単一のアドレス空間（タスク）のみに利用可能です。共有の場合、複数のアドレス空間（タスク）にマッピング可能です。予約マップの位置とセマンティクスは、この2種類のマッピングでは大きく異なります。位置の違いは以下の通りです。</p>
+<ul class="simple">
+<li><p>プライベートマッピングでは、予約マップはVMA構造体に接続されています。具体的には、vma-&gt;vm_private_dataです。この予約マップは、マッピング（mmap(MAP_PRIVATE)）が作成されるときに生成されます。</p></li>
+<li><p>共有マッピングでは、予約マップはinodeに接続されています。具体的には、inode-&gt;i_mapping-&gt;private_dataです。共有マッピングは常にhugetlbfsファイルシステム内のファイルでバックアップされるため、hugetlbfsコードは各inodeに予約マップを含むことを保証します。その結果、inodeが作成されるときに予約マップが割り当てられます。</p></li>
+</ul>
+</section>
+<section id="creating-reservations">
+<h2>予約の作成<a class="headerlink" href="#creating-reservations" title="この見出しへのパーマリンク">¶</a></h2>
+<p>大ページバックエンドの共有メモリセグメントが作成されるとき（shmget(SHM_HUGETLB)）またはマッピングが作成されるとき（mmap(MAP_HUGETLB)）に予約が作成されます。これらの操作は、hugetlb_reserve_pages()というルーチンを呼び出します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>int hugetlb_reserve_pages(struct inode *inode,
+                          long from, long to,
+                          struct vm_area_struct *vma,
+                          vm_flags_t vm_flags)
+</pre></div>
+</div>
+<p>hugetlb_reserve_pages()の最初の動作は、shmget()またはmmap()呼び出しでNORESERVEフラグが指定されているかを確認します。NORESERVEが指定されている場合、このルーチンは即座に終了し、予約は作成されません。</p>
+<p>引数'from'と'to'は、マッピングまたは下位ファイル内の巨大ページのインデックスです。shmget()の場合、'from'は常に0で、'to'はセグメント/マッピングの長さに対応します。mmap()の場合、オフセット引数を用いて下位ファイル内のオフセットを指定できるため、'from'と'to'引数はこのオフセットによって調整されています。</p>
+<p>プライベートと共有マッピングの大きな違いの一つは、予約マップ内で予約がどのように表現されるかです。</p>
+<ul class="simple">
+<li><p>共有マッピングでは、予約マップのエントリは、対応するページに予約が存在または存在したことを示します。予約が消費されるとき、予約マップは変更されません。</p></li>
+<li><p>プライベートマッピングでは、予約マップにエントリが存在しないことは、対応するページに予約があることを示します。予約が消費されるとき、エントリが予約マップに追加されます。したがって、予約マップはどの予約が消費されたかを確認するための手段としても利用可能です。</p></li>
+</ul>
+<p>プライベートマッピングでは、hugetlb_reserve_pages()は予約マップを作成し、VMA構造体に接続します。さらに、HPAGE_RESV_OWNERフラグが設定され、このVMAが予約を所有することを示します。</p>
+<p>現在のマッピング/セグメントに必要なヒープページの予約数を決定するために、予約マップが参照されます。プライベートマッピングの場合、これは常に「to - from」の値です。しかし、共有マッピングの場合、範囲「to - from」内に既に予約が存在している可能性があります。詳しくは次のセクションを参照してください。 <a class="reference internal" href="#resv-map-modifications"><span class="std std-ref">予約マップの変更</span></a>
+この処理の詳細については、</p>
+<p>マッピングがサブプールに関連付けられている場合、サブプールを確認してマッピングに十分なスペースがあるかを確認します。サブプールが予約を確保している可能性があります。詳しくは次のセクションを参照してください。 <a class="reference internal" href="#sub-pool-resv"><span class="std std-ref">サブプールの予約</span></a> 詳細についてはこちら。</p>
+<p>予約マップとサブプールを確認した後、必要な新しい予約数が判明します。hugetlb_acct_memory()というルーチンが呼び出され、必要な数の予約を確認および取得します。hugetlb_acct_memory()は、ヒープページの割当や余剰ページ数の調整を行うルーチンを呼び出します。ただし、これらのルーチン内でコードは、予約に必要な空きヒープページが十分にあるかを確認するだけです。十分な空きヒープページがある場合、グローバル予約カウントresv_huge_pagesは以下のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>if (resv_needed &lt;= (resv_huge_pages - free_huge_pages))
+        resv_huge_pages += resv_needed;
+</pre></div>
+</div>
+<p>これらのカウンターを確認および調整する際には、グローバルロックhugetlb_lockが保持されています。</p>
+<p>十分な空きヒープページがあり、グローバルカウントresv_huge_pagesが調整された場合、マッピングに関連する予約マップが変更され、予約が反映されます。共有マッピングの場合、範囲「from」〜「to」を含むfile_regionが存在します。プライベートマッピングの場合、予約マップには変更が行われません。なぜなら、エントリの存在がないことは予約が存在することを示すからです。</p>
+<p>hugetlb_reserve_pages()が成功した場合、マッピングに関連するグローバル予約カウントおよび予約マップが調整され、範囲「from」〜「to」に予約が存在することを保証します。</p>
+</section>
+<section id="consuming-reservations-allocating-a-huge-page">
+<span id="consume-resv"></span><h2>予約の消費/ヒープページの割当<a class="headerlink" href="#consuming-reservations-allocating-a-huge-page" title="この見出しへのパーマリンク">¶</a></h2>
+<p>予約が消費されるのは、予約に関連するヒープページが対応するマッピングに割り当てられ、インスタンス化されるときです。この割り当ては、alloc_huge_page()というルーチン内で行われます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct page *alloc_huge_page(struct vm_area_struct *vma,
+                             unsigned long addr, int avoid_reserve)
+</pre></div>
+</div>
+<p>alloc_huge_page には VMA ポインタと仮想アドレスが渡されるため、予約マップを参照して予約が存在するかどうかを確認できます。さらに、alloc_huge_page は avoid_reserve という引数を受取り、指定されたアドレスに予約が設定されているように見えても、予約を使用しないように指示します。avoid_reserve 引数は、コピーオンライトやページ移動などの場合に最もよく使用されます。その際、既存のページの追加コピーが割り当てられます。</p>
+<p>予約がアドレスに存在するかどうかを確認するため、補助ルーチン vma_needs_reservation() が呼び出されます。このルーチンは、マッピング（vma）内のアドレスについて予約が存在するかどうかを判定します。詳しくは以下のセクションを参照してください。
+<a class="reference internal" href="#resv-map-helpers"><span class="std std-ref">予約マップの補助ルーチン</span></a> このルーチンが行う処理についての詳細情報はここに記載されています。vma_needs_reservation() が返す値は一般的に 0 または 1 です。0 はアドレスに予約が存在することを示し、1 は予約が存在しないことを示します。予約が存在しない場合、マッピングに関連するサブプールが存在する場合は、そのサブプールを参照して予約が含まれているか確認します。サブプールに予約が含まれている場合、その予約をこの割り当てに使用できます。ただし、すべてのケースにおいて avoid_reserve 引数が予約の使用を上書きします。予約が存在し、使用可能な場合を確認した後、dequeue_huge_page_vma() ルーチンが呼び出されます。このルーチンは、予約に関する2つの引数を受取ります：</p>
+<ul class="simple">
+<li><p>avoid_reserve、これは alloc_huge_page() に渡された同じ値/引数です。</p></li>
+<li><p>chg、この引数は long 型ですが、dequeue_huge_page_vma() に渡される値は 0 または 1 のみです。値が 0 の場合、予約が存在することを示します（「メモリポリシーと予約」セクションで可能となる問題について参照してください）。値が 1 の場合、予約が存在せず、可能であればグローバルなフリープールからページを取得する必要があります。</p></li>
+</ul>
+<p>VMA のメモリポリシーに関連するフリーリストから空きページを検索します。ページが見つかった場合、そのページをフリーリストから削除する際、free_huge_pages の値が減算されます。ページに予約が関連していた場合、以下の調整が行われます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>SetPagePrivate(page);   /* Indicates allocating this page consumed
+                         * a reservation, and if an error is
+                         * encountered such that the page must be
+                         * freed, the reservation will be restored. */
+resv_huge_pages--;      /* Decrement the global reservation count */
+</pre></div>
+</div>
+<p>注意：VMA のメモリポリシーに合致するヒューゲンページが見つからない場合、buddy アロケータを使用して1つ割り当てようとします。これにより、余剰ヒューゲンページとオーバーコミットの問題が生じますが、これは予約の範囲を超える話題です。余剰ページが割り当てられたとしても、上記の予約に基づく調整（SetPagePrivate(page) と resv_huge_pages–）が行われます。</p>
+<p>新しいヒープページを取得した後、(page)-&gt;privateは、そのページに関連するサブプールの値に設定されます（存在する場合）。この値は、ページが解放されるときにサブプールの会計に使用されます。</p>
+<p>次に、vma_commit_reservation()というルーチンが呼び出され、予約消費に基づいて予約マップを調整します。一般的には、このページが領域マップのfile_region構造体内で表されていることを確認します。共有マッピングで予約が存在する場合、予約マップに既にエントリが存在しているため変更はありません。ただし、共有マッピングで予約が存在しない場合やプライベートマッピングの場合には、新しいエントリを作成する必要があります。</p>
+<p>vma_needs_reservation()がalloc_huge_page()の開始時に呼び出された後、ページが割り当てられた後にvma_commit_reservation()が呼び出される間に、予約マップが変更される可能性があります。これは、共有マッピングで同じページに対してhugetlb_reserve_pagesが呼び出された場合に起こります。このような場合、予約カウントとサブプールの空きページカウントが1ずつずれることになります。このレアな状態は、vma_needs_reservation()とvma_commit_reservation()の戻り値を比較することで識別できます。このような競合が検出された場合、サブプールとグローバル予約カウントを調整して補正します。詳しくは
+<a class="reference internal" href="#resv-map-helpers"><span class="std std-ref">予約マップの補助ルーチン</span></a> のセクションをご参照ください。</p>
+</section>
+<section id="instantiate-huge-pages">
+<h2>ヒープページのインスタンス化<a class="headerlink" href="#instantiate-huge-pages" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ヒープページの割り当て後、ページは通常、割り当てタスクのページテーブルに追加されます。この前には、共有マッピングのページはページキャッシュに追加され、プライベートマッピングのページは匿名逆マッピングに追加されます。いずれの場合もPagePrivateフラグはクリアされます。したがって、インスタンス化されたヒープページが解放される際には、グローバル予約カウント（resv_huge_pages）への調整は行われません。</p>
+</section>
+<section id="freeing-huge-pages">
+<h2>ヒープページの解放<a class="headerlink" href="#freeing-huge-pages" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ヒープページの解放はfree_huge_page()というルーチンによって行われます。このルーチンはhugetlbfsのコンパウンドページのデストラクタです。そのため、ページ構造体へのポインタのみが渡されます。ヒープページが解放される際には、予約会計の処理が必要になる場合があります。これは、ページが予約を含むサブプールに関連付けられていた場合、またはエラー経路でグローバル予約カウントを復元する必要がある場合に起きます。</p>
+<p>page-&gt;privateフィールドは、ページに関連するサブプールを指します。PagePrivateフラグが設定されている場合、グローバル予約カウントを調整する必要があります（詳しくは
+<a class="reference internal" href="#consume-resv"><span class="std std-ref">予約の消費/ヒープページの割当</span></a>
+のセクションをご参照ください）。</p>
+<p>このルーチンはまず、ページに対してhugepage_subpool_put_pages()を呼び出します。このルーチンが0を返す場合（渡された値1とは異なる値）、サブプールに予約が関連付けられており、この新たに解放されたページはサブプールの予約数が最小サイズを下回らないようにするため使用される必要があります。そのため、この場合、グローバルなresv_huge_pagesカウンターがインクリメントされます。</p>
+<p>ページにPagePrivateフラグが設定されていた場合、グローバルなresv_huge_pagesカウンターは常にインクリメントされます。</p>
+</section>
+<section id="subpool-reservations">
+<span id="sub-pool-resv"></span><h2>サブプールの予約<a class="headerlink" href="#subpool-reservations" title="この見出しへのパーマリンク">¶</a></h2>
+<p>各ヒューゲページサイズにはstruct hstateが関連付けられています。hstateは指定されたサイズのすべてのヒューゲページを追跡します。サブプールは、マウントされたhugetlbfsファイルシステムに関連付けられたhstate内のページのサブセットを表します。</p>
+<p>hugetlbfsファイルシステムがマウントされる際、min_sizeオプションを指定できます。これはファイルシステムが要求するヒューゲページの最小数を示します。このオプションが指定されている場合、min_sizeに応じたヒューゲページ数がファイルシステムの使用に予約されます。この数はstruct hugepage_subpoolのmin_hpagesフィールドで追跡され、マウント時にhugetlb_acct_memory(min_hpages)が呼び出されて指定されたヒューゲページ数を予約します。予約ができない場合、マウントは失敗します。</p>
+<p>ページをサブプールから取得するか、サブプールに戻すときにhugepage_subpool_get/put_pages()ルーチンが呼び出されます。これらはすべてのサブプールの会計処理を行い、サブプールに関連する予約を追跡します。hugepage_subpool_get/put_pages()には、サブプールの「使用ページ」カウントを調整するヒューゲページ数を渡します（getでは減らし、putでは増やす）。通常、これらは渡された値と同じ値を返しますが、サブプール内のページが不足している場合、エラーを返します。</p>
+<p>ただし、サブプールに関連する予約がある場合、渡された値より小さい値が返される可能性があります。この返却値は、グローバルプールの調整が必要な追加ページ数を示します。たとえば、サブプールに3つの予約ヒューゲページがあり、誰かが5ページを要求した場合、サブプールの3つの予約ページは要求の一部を満たすことができますが、2ページはグローバルプールから取得する必要があります。この情報を呼び出し元に伝達するため、値2が返されます。呼び出し元はその後、この2つの追加ページをグローバルプールから取得する責任があります。</p>
+</section>
+<section id="cow-and-reservations">
+<h2>COWと予約<a class="headerlink" href="#cow-and-reservations" title="この見出しへのパーマリンク">¶</a></h2>
+<p>共有マッピングはすべて同じ下層ページを指しており、COW（Copy-on-Write）における最大の懸念はプライベートマッピングです。この場合、2つのタスクが同じ以前に割り当てられたページを指している可能性があります。一方のタスクがページに書き込みを行うと、新しいページを割り当てて各タスクがそれぞれのページを指す必要があります。</p>
+<p>ページが最初に割り当てられた際、そのページの予約は消費されました。COWの結果、新しいページの割り当てが試行される際、空きヒューゲページが存在しない可能性があり、割り当てが失敗する場合があります。</p>
+<p>プライベートマッピングが最初に作成された際、マッピングの所有者を特定するために、所有者の予約マップへのポインタにHPAGE_RESV_OWNERビットを設定しました。所有者がマッピングを作成したため、所有者はそのマッピングに関連するすべての予約を所有します。したがって、書き込みエラーが発生し、ページが利用不可な場合、予約の所有者と非所有者に対して異なる処理が行われます。</p>
+<p>エラーが発生したタスクが所有者でない場合、エラーは失敗し、タスクは通常SIGBUSを受信します。</p>
+<p>所有者がエラーを発生させたタスクである場合、成功させたいです。なぜなら、所有者が元の予約を所有しているからです。これを実現するため、非所有タスクからページをマップ解除します。これにより、参照は所有タスクのみになります。さらに、非所有タスクの予約マップポインタにHPAGE_RESV_UNMAPPEDビットが設定されます。非所有タスクが後に非存在ページにアクセスしてエラーを発生させた場合、SIGBUSを受信する可能性があります。ただし、マッピング/予約の元の所有者は予想通りの動作を行います。</p>
+</section>
+<section id="reservation-map-modifications">
+<span id="resv-map-modifications"></span><h2>予約マップの変更<a class="headerlink" href="#reservation-map-modifications" title="この見出しへのパーマリンク">¶</a></h2>
+<p>予約マップの変更には以下の低レベルのルーチンが使用されます。通常、これらのルーチンは直接呼び出されません。代わりに、予約マップの補助ルーチンが呼び出され、そのルーチンがこれらの低レベルルーチンのいずれかを呼び出します。これらの低レベルルーチンは、ソースコード（mm/hugetlb.c）に詳しく記述されています。これらのルーチンは以下の通りです。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long region_chg(struct resv_map *resv, long f, long t);
+long region_add(struct resv_map *resv, long f, long t);
+void region_abort(struct resv_map *resv, long f, long t);
+long region_count(struct resv_map *resv, long f, long t);
+</pre></div>
+</div>
+<p>予約マップへの操作は通常、2つの操作を含みます。</p>
+<ol class="arabic">
+<li><p>region_chg()は予約マップを調べ、指定された範囲[f, t)に現在表示されていないページの数を確認します。</p>
+<p>呼び出しコードはグローバルなチェックと割り当てを行い、操作が成功するための十分なヒューゲページがあるかどうかを判断します。</p>
+</li>
+<li><ol class="loweralpha simple">
+<li><p>操作が成功可能である場合、region_add()が呼び出され、以前にregion_chg()に渡された同じ範囲[f, t)に対して予約マップを実際に変更します。</p></li>
+<li><p>操作が成功しない場合、同じ範囲 [f, t) に対して region_abort が呼び出され、操作を中止します。</p></li>
+</ol>
+</li>
+</ol>
+<p>この処理は2段階のプロセスであり、region_chg() の呼び出しが行われた同じ範囲に対して region_add() および region_abort() が成功することが保証されています。region_chg() は、以降の操作（特に region_add()）が成功するように必要なデータ構造を事前に確保する責任があります。</p>
+<p>上記のように、region_chg() は、マップに現在表示されていない範囲のページ数を決定します。この数値は呼び出し元に返されます。region_add() は、マップに追加されたページ数を返します。通常は region_add() の戻り値は region_chg() の戻り値と一致しますが、共有マッピングの場合は、region_chg() と region_add() の呼び出しの間に予約マップの変更が発生する可能性があります。その場合、region_add() の戻り値は region_chg() の戻り値と一致しなくなり、このような場合はグローバルなカウントやサブプールの会計情報が不正確になる可能性があります。呼び出し元はこの状態を確認し、必要な調整を行う責任があります。</p>
+<p>region_del() は、予約マップから領域を削除するために呼び出されます。この関数は通常、以下の状況で呼び出されます：</p>
+<ul class="simple">
+<li><p>hugetlbfs ファイルシステム内のファイルが削除される場合、インノードが解放され、予約マップが解放されます。予約マップを解放する前に、すべての file_region 構造体が解放される必要があります。この場合、region_del には範囲 [0, LONG_MAX) が渡されます。</p></li>
+<li><p>hugetlbfs ファイルがトリムされる場合、新しいファイルサイズ後のすべての割り当てられたページが解放される必要があります。さらに、予約マップ内の新しいファイル末尾を超えた file_region エントリは削除されます。この場合、region_del には範囲 [new_end_of_file, LONG_MAK) が渡されます。</p></li>
+<li><p>hugetlbfs ファイルに穴を開ける場合、 huge ページはファイルの中間から1つずつ削除されます。ページが削除されるたびに、region_del() が予約マップから対応するエントリを削除するために呼び出されます。この場合、region_del には範囲 [page_idx, page_idx + 1) が渡されます。</p></li>
+</ul>
+<p>すべてのケースにおいて、region_del()は予約マップから削除されたページ数を返します。非常にまれなケースでは、region_del()が失敗する可能性があります。これは穴あけ処理のケースにおいてのみ発生します。このケースでは既存のfile_regionエントリを分割する必要があり、新しい構造体を割り当てることができないためです。このようなエラーの場合、region_del()は-ENOMEMを返します。問題は、予約マップがページに予約があることを示しているにもかかわらず、サブプールおよびグローバル予約カウントが予約を反映していないことです。このような状況を処理するため、hugetlb_fix_reserve_counts()という関数が呼び出され、カウンターが予約マップのエントリと一致するよう調整されます。</p>
+<p>region_count()はプライベートなヒューゲンページマッピングをアンマッピングする際に呼び出されます。プライベートマッピングでは、予約マップにエントリがないことは予約が存在することを示します。したがって、予約マップのエントリ数を数えることで、どれだけの予約が消費され、どれだけが未処理か（未処理 = (end - start) - region_count(resv, start, end)）を把握できます。マッピングがなくなるため、サブプールおよびグローバル予約カウントは未処理の予約数分だけ減算されます。</p>
+</section>
+<section id="reservation-map-helper-routines">
+<span id="resv-map-helpers"></span><h2>予約マップの補助ルーチン<a class="headerlink" href="#reservation-map-helper-routines" title="この見出しへのパーマリンク">¶</a></h2>
+<p>いくつかの補助関数が予約マップを照会および変更するために存在します。これらの関数は特定のヒューゲンページの予約にのみ関心を持ち、そのためアドレスを渡すだけで範囲を指定しません。さらに、関連するVMA（Virtual Memory Area）も渡します。VMAから、マッピングの種類（プライベートまたは共有）および予約マップの位置（inodeまたはVMA）を特定できます。これらの関数は「予約マップの変更」セクションで説明した下位関数を単純に呼び出します。ただし、プライベートマッピングと共有マッピングにおける予約マップエントリの意味が逆になる点を考慮し、呼び出し元にはこの詳細を隠しています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long vma_needs_reservation(struct hstate *h,
+                           struct vm_area_struct *vma,
+                           unsigned long addr)
+</pre></div>
+</div>
+<p>この関数は指定されたページに対してregion_chg()を呼び出します。予約が存在しない場合は1を返し、予約が存在する場合は0を返します。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long vma_commit_reservation(struct hstate *h,
+                            struct vm_area_struct *vma,
+                            unsigned long addr)
+</pre></div>
+</div>
+<p>この関数は指定されたページに対してregion_add()を呼び出します。region_chgおよびregion_addの場合と同様に、この関数はvma_needs_reservationへの前の呼び出し後に呼び出されるべきです。この関数はページに対して予約エントリを追加します。予約が追加された場合は1を、追加されなかった場合は0を返します。返却値はvma_needs_reservationへの前の呼び出しの返却値と比較する必要があります。予期せぬ違いがある場合、予約マップが呼び出し間で変更された可能性があります。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>void vma_end_reservation(struct hstate *h,
+                         struct vm_area_struct *vma,
+                         unsigned long addr)
+</pre></div>
+</div>
+<p>指定されたページに対して region_abort() を呼び出します。region_chg および region_abort の場合と同様に、このルーチンは vma_needs_reservation の前の呼び出し後に呼び出される必要があります。これは進行中の予約追加操作を中止/終了します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>long vma_add_reservation(struct hstate *h,
+                         struct vm_area_struct *vma,
+                         unsigned long addr)
+</pre></div>
+</div>
+<p>エラー処理時の予約クリーンアップを容易にする特別なラッパー関数です。この関数は restore_reserve_on_error() ルーチンからのみ呼び出されます。vma_needs_reservation と併用して予約マップに予約を追加しようとする際に使用されます。プライベートマッピングと共有マッピングの予約マップのセマンティクスの違いを考慮しています。したがって、共有マッピングには region_add が呼び出され（マップにエントリがあることは予約を示す）、プライベートマッピングには region_del が呼び出されます（マップにエントリがないことは予約を示す）。エラー処理時の詳細な手順については「エラー処理時の予約クリーンアップ」セクションを参照してください。</p>
+</section>
+<section id="reservation-cleanup-in-error-paths">
+<h2>エラー処理時の予約クリーンアップ<a class="headerlink" href="#reservation-cleanup-in-error-paths" title="この見出しへのパーマリンク">¶</a></h2>
+<p>セクション「エラー処理時の予約クリーンアップ」で説明されているように、
+<a class="reference internal" href="#resv-map-helpers"><span class="std std-ref">予約マップの補助ルーチン</span></a>予約マップの変更は2段階で行われます。まずページが割り当てられる前に vma_needs_reservation が呼び出されます。割り当てが成功した場合、vma_commit_reservation が呼び出されます。失敗した場合は vma_end_reservation が呼び出されます。操作の成功または失敗に基づきグローバルおよびサブプールの予約カウントが調整され、すべてが正常に進みます。</p>
+<p>さらに、ヒューゲンページがインスタンス化された後、PagePrivate フラグがクリアされるため、ページが最終的に解放される際のアカウント処理が正しいようになります。</p>
+<p>しかし、ヒューゲンページが割り当てられた後でもインスタンス化される前でもエラーが発生する場合があります。この場合、ページ割り当ては予約を消費し、適切なサブプール、予約マップ、グローバルカウントの調整を行います。この時点でページが解放された場合（インスタンス化と PagePrivate フラグのクリアの前）、free_huge_page はグローバル予約カウントをインクリメントします。しかし、予約マップは予約が消費されたことを示しています。この結果生じる不整合な状態により、予約されたヒューゲンページの「リーク」が発生します。グローバル予約カウントが正しくなく、事前に割り当てられたページの割り当てを妨げる可能性があります。</p>
+<p>restore_reserve_on_error() ルーチンはこの状況を処理しようとしています。これは比較的よく記載されています。このルーチンの目的は、ページ割り当て前の予約マップの状態に戻すことです。このようにして、ページが解放された後の予約マップの状態がグローバル予約カウントと一致します。</p>
+<p>エラー処理中のrestore_reserve_on_error自体も、予約マップのエントリを復元する際にエラーを発生させる可能性があります。その場合、ページのPagePrivateフラグを単にクリアします。このようにして、ページが解放される際にはグローバルな予約カウントがインクリメントされません。ただし、予約マップは予約が消費されたかのように表示され続けるため、アドレスにページが割り当てられることには変わりありませんが、もともと意図したように予約されたページを使用しなくなります。</p>
+<p>一部のコード（特にuserfaultfd）はrestore_reserve_on_errorを呼び出すことができません。その場合、huge pageが解放される際に予約がリークしないようにPagePrivateを変更します。</p>
+</section>
+<section id="reservations-and-memory-policy">
+<h2>予約とメモリポリシー<a class="headerlink" href="#reservations-and-memory-policy" title="この見出しへのパーマリンク">¶</a></h2>
+<p>struct hstateにおいては、gitがLinuxコードを管理される初期にはノードごとのhuge pageリストが存在していました。予約の概念はそれより後に追加されました。予約が追加された際には、メモリポリシーを考慮する試みは行われませんでした。cpusetsはメモリポリシーとは正確には同じではありませんが、hugetlb_acct_memoryのコメントは予約とcpusets/メモリポリシーの相互作用を要約しています。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>/*
+ * When cpuset is configured, it breaks the strict hugetlb page
+ * reservation as the accounting is done on a global variable. Such
+ * reservation is completely rubbish in the presence of cpuset because
+ * the reservation is not checked against page availability for the
+ * current cpuset. Application can still potentially OOM'ed by kernel
+ * with lack of free htlb page in cpuset that the task is in.
+ * Attempt to enforce strict accounting with cpuset is almost
+ * impossible (or too ugly) because cpuset is too fluid that
+ * task or memory node can be dynamically moved between cpusets.
+ *
+ * The change of semantics for shared hugetlb mapping with cpuset is
+ * undesirable. However, in order to preserve some of the semantics,
+ * we fall back to check against current free page availability as
+ * a best attempt and hopefully to minimize the impact of changing
+ * semantics that cpuset has.
+ */
+</pre></div>
+</div>
+<p>huge page予約は、ページフォールト時に予期せぬページ割当失敗（OOM）を防ぐために追加されました。しかし、アプリケーションがcpusetsやメモリポリシーを使用している場合、必要なノードにhuge pageが利用可能であることを保証することができません。これは、グローバルな予約が十分にある場合でも同様です。</p>
+</section>
+<section id="hugetlbfs-regression-testing">
+<h2>Hugetlbfsのリグレッションテスト<a class="headerlink" href="#hugetlbfs-regression-testing" title="この見出しへのパーマリンク">¶</a></h2>
+<p>最も完全なHugetlbテストはlibhugetlbfsリポジトリにあります。Hugetlb関連のコードを変更する場合は、libhugetlbfsテストスイートを使用してリグレッションを確認してください。さらに、新しいHugetlb機能を追加する場合は、libhugetットに適切なテストを追加してください。</p>
+<p>マイク・クラーベッツ、2017年4月7日</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxメモリ管理ドキュメンテーション</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#user-guides-for-mm-features">MM機能用ユーザーガイド</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#kernel-developers-mm-documentation">カーネル開発者向けMMドキュメンテーション</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxメモリ管理ドキュメンテーション</a><ul>
+<li>前へ: <a href="hwpoison.html" title="前章">hwpoison</a></li>
+<li>次へ: <a href="ksm.html" title="次章">Kernel Samepage Merging</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/vm/hugetlbfs_reserv.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

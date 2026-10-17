@@ -1,0 +1,321 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>旧ウォッチドッグドライバーをウォッチドッグフレームワークに変換 — Linux Kernel ドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="../virt/index.html" rel="next" title="Linux 仮想化サポート"/>
+<link href="wdt.html" rel="prev" title="Linux オペレーティングシステム用WDTワッチドッグタイマーアプリケーションプログラミングインターフェース"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="converting-old-watchdog-drivers-to-the-watchdog-framework">
+<h1>旧ワッチドッグドライバをワッチドッグフレームワークに移行する方法<a class="headerlink" href="#converting-old-watchdog-drivers-to-the-watchdog-framework" title="この見出しへのパーマリンク">¶</a></h1>
+<p>by Wolfram Sang &lt;<a class="reference external" href="mailto:wsa%40kernel.org">wsa<span>@</span>kernel<span>.</span>org</a>&gt;</p>
+<p>ウォッチドッグフレームワークがカーネルに導入される前は、すべてのドライバーが独自にAPIを実装していました。現在ではフレームワークが共通部品を分離し、それらのドライバーはフレームワークのユーザーとして軽量化されています。このドキュメントではこの作業の手順を説明し、必要なステップや注意すべき点を記載しています。</p>
+<section id="remove-the-file-operations-struct">
+<h2>file_operations構造体を削除する<a class="headerlink" href="#remove-the-file-operations-struct" title="この見出しへのパーマリンク">¶</a></h2>
+<p>旧ドライバーはopen()やwrite()などの操作用に独自のfile_operationsを定義していました。これらは現在フレームワークが処理し、必要に応じてドライバーを呼び出します。したがって、一般的には「file_operations」構造体と関連する関数は不要となり、わずかなドライバースペシフィックな詳細を他の関数に移す必要があります。以下に関数と必要なアクションの概要を示します：</p>
+<ul>
+<li><p>open: リソース管理（ファイルオープンチェック、マジッククローズの準備など）はすべて削除可能です。デバイス固有の処理はドライバースペシフィックなstart関数に移す必要があります。一部のドライバーではstart関数がping関数としても使用されることがあります。その場合、start/stopのバランス（クロックなど）が必要な場合は、別途start関数を再構築する方が良いでしょう。</p></li>
+<li><p>close: openと同様の注意点が適用されます。</p></li>
+<li><p>write: すべての動作はフレームワークが処理するため、削除可能です。つまり、write時のpingとマジック文字（'V'）の処理もフレームワークが担当します。</p></li>
+<li><p>ioctl: ドライバーはIOCTLインターフェースに拡張を加えることが許可されていますが、最も一般的な機能はフレームワークが処理し、ドライバーの支援によって実現されます：</p>
+<blockquote>
+<div><dl class="simple">
+<dt>WDIOC_GETSUPPORT:</dt><dd><p>ドライバーから必須のwatchdog_info構造体を返します</p>
+</dd>
+<dt>WDIOC_GETSTATUS:</dt><dd><p>status-callbackが定義されている必要があります。それ以外は0を返します</p>
+</dd>
+<dt>WDIOC_GETBOOTSTATUS:</dt><dd><p>bootstatusメンバが適切に設定されている必要があります。さらにサポートがない場合は0にしてください！</p>
+</dd>
+<dt>WDIOC_SETOPTIONS:</dt><dd><p>特別な準備は必要ありません</p>
+</dd>
+<dt>WDIOC_KEEPALIVE:</dt><dd><p>必要であればwatchdog_infoのオプションにWDIOF_KEEPALIVEPINGを設定してください</p>
+</dd>
+<dt>WDIOC_SETTIMEOUT:</dt><dd><p>watchdog_infoのオプションにWDIOF_SETTIMEOUTを設定し、set_timeout-callbackを定義する必要があります。コアはmin_timeoutとmax_timeoutが設定されている場合、制限チェックも行います。すべてオプションです。</p>
+</dd>
+<dt>WDIOC_GETTIMEOUT:</dt><dd><p>特別な準備は必要ありません</p>
+</dd>
+<dt>WDIOC_GETTIMELEFT:</dt><dd><p>get_timeleft() callbackを定義する必要があります。それ以外はEOPNOTSUPPを返します</p>
+</dd>
+</dl>
+</div></blockquote>
+<p>他のIOCTLはioctl-callbackを使用して処理できます。注意点として、これは主に旧ドライバの移植に使用することを目的としており、新しいドライバではプライベートなIOCTLを新たに作成すべきではありません。プライベートなIOCTLは優先的に処理されます。callbackが-ENOIOCTLCMDを返す場合、フレームワークのIOCTLも試行されます。他のエラーはユーザーに直接返されます。</p>
+</li>
+</ul>
+<p>例としての変換:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>-static const struct file_operations s3c2410wdt_fops = {
+-       .owner          = THIS_MODULE,
+-       .llseek         = no_llseek,
+-       .write          = s3c2410wdt_write,
+-       .unlocked_ioctl = s3c2410wdt_ioctl,
+-       .open           = s3c2410wdt_open,
+-       .release        = s3c2410wdt_release,
+-};
+</pre></div>
+</div>
+<p>デバイス固有の処理を行う関数を確認し、後でリファクタリングのために残しておきます。それ以外のコードは削除してください。</p>
+</section>
+<section id="remove-the-miscdevice">
+<h2>miscdeviceを削除する<a class="headerlink" href="#remove-the-miscdevice" title="この見出しへのパーマリンク">¶</a></h2>
+<p>file_operationsがなくなったため、'struct miscdevice'も削除できます。フレームワークはwatchdog_dev_register()が呼ばれた際に自動的に作成します。watchdog_register_device()によって呼び出されます：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>-static struct miscdevice s3c2410wdt_miscdev = {
+-       .minor          = WATCHDOG_MINOR,
+-       .name           = "watchdog",
+-       .fops           = &amp;s3c2410wdt_fops,
+-};
+</pre></div>
+</div>
+</section>
+<section id="remove-obsolete-includes-and-defines">
+<h2>非推奨のインクルードと定義を削除する<a class="headerlink" href="#remove-obsolete-includes-and-defines" title="この見出しへのパーマリンク">¶</a></h2>
+<p>簡略化により、いくつかの定義はおそらく使用されなくなりました。それらを削除してください。インクルードも同様に削除可能です。例えば：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>- #include &lt;linux/fs.h&gt;
+- #include &lt;linux/miscdevice.h&gt; (if MODULE_ALIAS_MISCDEV is not used)
+- #include &lt;linux/uaccess.h&gt; (if no custom IOCTLs are used)
+</pre></div>
+</div>
+</section>
+<section id="add-the-watchdog-operations">
+<h2>watchdog操作を追加する<a class="headerlink" href="#add-the-watchdog-operations" title="この見出しへのパーマリンク">¶</a></h2>
+<p>すべての可能コールバックは'struct watchdog_ops'に定義されています。このディレクトリ内の'watchdog-kernel-api.txt'で詳しく説明されています。 <a class="reference internal" href="../networking/ieee802154.html#c.start" title="start"><code class="xref c c-func docutils literal notranslate"><span class="pre">start()</span></code></a> ownerは必ず設定する必要がありますが、それ以外はオプションです。古いドライバで対応する関数は簡単に見つけることができます。注意点として、これらの関数に渡されるパラメータとしてwatchdog_deviceへのポインタが渡されるため、関数ヘッダを変更する必要があります。他の変更は必要ないでしょう。ここでは単純にハードウェアへの直接アクセスが行われるためです。上記のステップで残ったデバイス固有のコードは、これらのコールバックにリファクタリングする必要があります。</p>
+<p>ここに簡単な例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+static struct watchdog_ops s3c2410wdt_ops = {
++       .owner = THIS_MODULE,
++       .start = s3c2410wdt_start,
++       .stop = s3c2410wdt_stop,
++       .ping = s3c2410wdt_keepalive,
++       .set_timeout = s3c2410wdt_set_heartbeat,
++};
+</pre></div>
+</div>
+<p>典型的な関数ヘッダの変更例は以下の通り:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>-static void s3c2410wdt_keepalive(void)
++static int s3c2410wdt_keepalive(struct watchdog_device *wdd)
+ {
+...
++
++       return 0;
+ }
+
+...
+
+-       s3c2410wdt_keepalive();
++       s3c2410wdt_keepalive(&amp;s3c2410_wdd);
+</pre></div>
+</div>
+</section>
+<section id="add-the-watchdog-device">
+<h2>watchdogデバイスを追加する<a class="headerlink" href="#add-the-watchdog-device" title="この見出しへのパーマリンク">¶</a></h2>
+<p>今後、'struct watchdog_device'を作成し、フレームワークに必要な情報を埋め込む必要があります。この構造体についても、このディレクトリ内の'watchdog-kernel-api.txt'で詳しく説明されています。必須のwatchdog_info構造体と新たに作成したwatchdog_opsを渡します。多くの古いドライバでは、bootstatusやtimeoutなどの情報に静的変数を使用していましたが、これらはwatchdog_deviceのメンバに変換する必要があります。注意点として、timeout値はunsigned intです。一部のドライバではsigned intを使用しているため、こちらも変換する必要があります。</p>
+<p>ここに簡単なwatchdogデバイスの例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>+static struct watchdog_device s3c2410_wdd = {
++       .info = &amp;s3c2410_wdt_ident,
++       .ops = &amp;s3c2410wdt_ops,
++};
+</pre></div>
+</div>
+</section>
+<section id="handle-the-nowayout-feature">
+<h2>「nowayout」機能の処理<a class="headerlink" href="#handle-the-nowayout-feature" title="この見出しへのパーマリンク">¶</a></h2>
+<p>いくつかのドライバではnowayoutを静的に使用しており、モジュールパラメータが存在せず、CONFIG_WATCHDOG_NOWAYOUTによって機能が有効かどうかが決まります。この処理は、watchdog_deviceのstatus変数を以下のように初期化することで変換する必要があります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>.status = WATCHDOG_NOWAYOUT_INIT_STATUS,
+</pre></div>
+</div>
+<p>ほとんどのドライバーは、nowayoutのランタイム設定を許可しており、通常はモジュールパラメータを追加することで実現されます。この変換は次のようになります：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>watchdog_set_nowayout(&amp;s3c2410_wdd, nowayout);
+</pre></div>
+</div>
+<p>モジュールパラメータ自体は残しておき、nowayoutに関連する他のすべての処理は削除できます。これはopen()、close()、またはwrite()などの関数内にコードが含まれている可能性があります。</p>
+</section>
+<section id="register-the-watchdog-device">
+<h2>ウォッチドッグデバイスを登録する<a class="headerlink" href="#register-the-watchdog-device" title="この見出しへのパーマリンク">¶</a></h2>
+<p>misc_register(&amp;miscdev)をwatchdog_register_device(&amp;watchdog_dev)に置き換えてください。返却値の確認と、エラーが発生した場合のメッセージが依然として適切であることを確認してください。また、アンレジストレーションのケースも変換してください：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>-       ret = misc_register(&amp;s3c2410wdt_miscdev);
++       ret = watchdog_register_device(&amp;s3c2410_wdd);
+
+...
+
+-       misc_deregister(&amp;s3c2410wdt_miscdev);
++       watchdog_unregister_device(&amp;s3c2410_wdd);
+</pre></div>
+</div>
+</section>
+<section id="update-the-kconfig-entry">
+<h2>Kconfigエントリを更新する<a class="headerlink" href="#update-the-kconfig-entry" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ドライバーのエントリは現在、WATCHDOG_COREを選択する必要があります：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>select WATCHDOG_CORE</p></li>
+</ul>
+</div></blockquote>
+</section>
+<section id="create-a-patch-and-send-it-to-upstream">
+<h2>パッチを作成し、アップストリームに送信する<a class="headerlink" href="#create-a-patch-and-send-it-to-upstream" title="この見出しへのパーマリンク">¶</a></h2>
+<p>理解したことを確認してください <a class="reference internal" href="../process/submitting-patches.html"><span class="doc">パッチの送信: コードをカーネルに取り込むためのエッセンシャルガイド</span></a> そして、あなたのパッチを送信してください
+<a class="reference external" href="mailto:linux-watchdog%40vger.kernel.org">linux-watchdog<span>@</span>vger<span>.</span>kernel<span>.</span>org</a>. お待ちしています :)</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linux ワッチドッグサポート</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="hpwdt.html">HPE iLO NMI ワッチドッグドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mlx-wdt.html">Mellanox ワッチドッグドライバ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pcwd-watchdog.html">Berkshire Products PC ワッチドッグカード</a></li>
+<li class="toctree-l2"><a class="reference internal" href="watchdog-api.html">Linux ワッチドッグドライバAPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="watchdog-kernel-api.html">Linux ワッチドッグタイマーパワーマネジメントガイド</a></li>
+<li class="toctree-l2"><a class="reference internal" href="watchdog-parameters.html">WatchDog Module Parameters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="watchdog-pm.html">Linux オペレーティングシステム用WDTワッチドッグタイマーアプリケーションプログラミングインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="wdt.html">Linux オペレーティングシステム用WDTワッチドッグタイマーアプリケーションプログラミングインターフェース</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">旧ワッチドッグドライバをワッチドッグフレームワークに移行する方法</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linux ワッチドッグサポート</a><ul>
+<li>前へ: <a href="wdt.html" title="前章">Linux オペレーティングシステム用WDTワッチドッグタイマーアプリケーションプログラミングインターフェース</a></li>
+<li>次へ: <a href="../virt/index.html" title="次章">Linux 仮想化サポート</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/watchdog/convert_drivers_to_kernel_api.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

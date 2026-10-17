@@ -1,0 +1,264 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>Cleancache — Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="free_page_reporting.html" rel="next" title="Free Page Reporting"/>
+<link href="balance.html" rel="prev" title="Memory Balancing"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="cleancache">
+<span id="id1"></span><h1>Cleancache<a class="headerlink" href="#cleancache" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="motivation">
+<h2>動機<a class="headerlink" href="#motivation" title="この見出しへのパーマリンク">¶</a></h2>
+<p>Cleancache は、VFS レイヤーが提供する新しいオプション機能で、多くの環境において多くのワークロードでページキャッシュの効果を大幅に向上させる可能性があり、コストはほぼ無視できるほどです。</p>
+<p>Cleancache は、カーネルのページフレーム置換アルゴリズム（PFRA）が保持しておきたいが、メモリが足りないため保持できないクリーンページのページ単位のvictimキャッシュとみなせます。PFRA が「ページを追い出す」際には、まず cleancache のコードを使用してそのページに含まれるデータを「超越メモリ」と呼ばれる、カーネルが直接アクセスまたはアドレス指定できない未知のサイズ（時間とともに変化する可能性がある）のメモリに保存しようとします。</p>
+<p>後述の cleancache を有効にしたファイルシステムがディスク上のファイルのページをアクセスしようとする際には、まず cleancache にそのページが既にあるかを確認します。既にある場合は、データページをカーネルにコピーし、ディスクアクセスを回避します。</p>
+<p>Cleancache の超越メモリ「ドライバ」は現在、Xen（ハイパーバイザメモリを使用）と zcache（カーネル内での圧縮メモリを使用）で実装されており、他の実装も開発中です。</p>
+<p><a class="reference internal" href="#faq"><span class="std std-ref">FAQ</span></a> は以下に含まれています。</p>
+</section>
+<section id="implementation-overview">
+<h2>実装概要<a class="headerlink" href="#implementation-overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>cleancache の「バックエンド」は、カーネルの cleancache 「フロントエンド」に登録するために cleancache_register_ops を呼び出し、cleancache_ops 構造体へのポインタを渡します。この構造体には適切に設定された関数が含まれます。提供される関数は特定のセマンティクスに従う必要があります。</p>
+<p>最も重要なのは、cleancache は「一時的」です。コピーされたページはカーネルが完全に把握できない不定期な寿命を持ち、いつでも cleancache に存在しているかは不明です。したがって、その名前からも分かるように、cleancache は汚れたページには不適です。cleancache はどのページを保持し、どのページを破棄するか、いつ破棄するかについて完全な裁量を持ちます。</p>
+<p>cleancacheを有効にしたファイルシステムをマウントする際には、「init_fs」を呼び出してプールIDを取得する必要があります。取得したプールIDが正数であれば、ファイルシステムのスーパーブロックに保存する必要があります。負数の戻り値は失敗を示します。「put_page」は、(おそらくエビクションされる)ページをcleancacheにコピーし、プールID、ファイルキー、およびファイル内のページインデックスと関連付ける操作です。(プールID、ファイルキー、インデックスの組み合わせは「ハンドル」と呼ばれることがあります。)「get_page」は、cleancacheからページを内蔵メモリにコピーします。また、「invalidate_page」はページをcleancacheから削除し、「invalidate_inode」は指定されたファイルに関連するすべてのページを無効化します。ファイルシステムがアンマウントされる際には、「invalidate_fs」が呼び出され、指定されたプールIDに関連するすべてのファイルのページが無効化され、プールIDが返却されます。</p>
+<p>「init_shared_fs」は「init_fs」と同様にプールIDを取得しますが、cleancacheにプールを共有扱いと指示するため、128ビットのUUIDをキーとして使用します。複数のカーネルが動作するシステム(ハードパーティションや仮想化されたシステムなど)でクラスターファイルシステムを共有する場合、cleancacheがそのカーネル間で共有される可能性があるため、同じUUIDを指定した「init_shared_fs」呼び出しは同じプールIDを取得します。これにより、ページが共有可能になります。注意点として、セキュリティ要件はカーネルの外側で実施する必要があります(例: cleancacheを制御する「tools」など)。あるいは、cleancacheの実装は共有初期化を常に負数を返すことで無効化することも可能です。</p>
+<p>非共有プールで「get_page」が成功した場合、ページは無効化され(これによりcleancacheは「排他キャッシュ」となります)、共有プールでは成功した「get_page」でもページは無効化されず、他の共有者にアクセス可能のままにします。カーネルはcleancache(共有または非共有を問わず)、ページキャッシュ、ファイルシステム間の整合性を保証する責任があり、必要に応じてcleancacheの無効化操作を使用します。</p>
+<p>cleancacheはput-put-get整合性およびget-get整合性を強制する必要があります。前者の場合、同じハンドルに対して異なるデータ(例: 1番目のputでAAA、2番目のputでBBB)が2回書き込まれた場合、その後のgetは常に古データ(AAA)を返さない必要があります。get-get整合性では、あるハンドルのgetが失敗した場合、そのハンドルの後続のgetは成功しません。ただし、そのハンドルの成功したputが事前に実行された場合を除きます。</p>
+<p>最後に、cleancacheはSMPのシリアル化保証を提供しません。異なるLinuxスレッドが同じハンドルでページをプット（書き込み）および無効化している場合、結果は不確実です。呼び出し元はページをロックしてシリアルな動作を保証する必要があります。</p>
+</section>
+<section id="cleancache-performance-metrics">
+<h2>Cleancacheパフォーマンスメトリクス<a class="headerlink" href="#cleancache-performance-metrics" title="この見出しへのパーマリンク">¶</a></h2>
+<p>適切に設定されている場合、cleancacheのモニタリングは以下のディレクトリにあるdebugfsを介して行われます。 <cite>/sys/kernel/debug/cleancache</cite> ディレクトリ。cleancacheの有効性（全ファイルシステムを対象に）は以下の指標で測定できます：</p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">succ_gets</span></code></dt><dd><p>成功した取得の数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">failed_gets</span></code></dt><dd><p>失敗した取得の数</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">puts</span></code></dt><dd><p>試行されたプットの数（すべて「成功」）</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">invalidates</span></code></dt><dd><p>試行された無効化の数</p>
+</dd>
+</dl>
+<p>バックエンド実装は追加のメトリクスを提供する場合があります。</p>
+</section>
+<section id="faq">
+<span id="id2"></span><h2>よくある質問<a class="headerlink" href="#faq" title="この見出しへのパーマリンク">¶</a></h2>
+<ul class="simple">
+<li><p>価値はどこにあるのか？（Andrew Morton）</p></li>
+</ul>
+<p>cleancacheは、ページキャッシュの効率を向上させることで、多くの環境での多くのワークロードに大幅なパフォーマンスの向上をもたらします。その際のオーバーヘッドは極めて小さく、クリーンなページキャッシュページはトランスケンデントメモリ（カーネルが直接アドレス指定できないRAM）に保存されます。後でそのページをフェッチすることで、「再フォールト」を回避し、ディスク読み込みを防ぎます。</p>
+<p>cleancache（およびその姉妹コード「frontswap」）は、トランスケンデントメモリ（通称「tmem」）のインターフェースを提供します。このtmemは概念的に高速なカーネル直接アドレス指定RAMと遅いDMA/非同期デバイスの間にあるとされます。データが別の形式やサイズに変換される（圧縮など）場合や、秘密裏に移動される（一部のRAMのようなデバイスの書き込みバランスに有用な場合）場合は、カーネルやユーザーランドからの直接の読み書きを禁止するのが理想的です。追い出されたページキャッシュページ（およびスワップページ）は、RAMより遅くディスクより速いトランスケンデントメモリの用途に適しています。cleancache（およびfrontswap）の「ページオブジェクト指向」仕様は、ページの読み書き（間接的に「名前」をつけることも可能）に適切な方法を提供します。</p>
+<p>仮想環境において、仮想化の本質的な目的は、複数の仮想マシンの変動する要件に応じて物理リソースを統計的に多重化することです。RAMを用いてこれを実現するのは非常に困難で、カーネルの変更なしにこれをうまく行う試みはほぼ失敗しています（一部の特例的なワークロードを除く）。cleancacheとfrontswapは、カーネルへの影響が比較的小さいながら、より動的で柔軟なRAM多重化に大きな柔軟性を提供します。具体的には、Xen Transcendent Memoryバックエンドにより、通常は「未使用」なハイパーバイザー所有のRAMは、複数の仮想マシン間で「時間共有」されるだけでなく、ページを圧縮・重複除去してRAM利用率を最適化することが可能です。また、ゲストOSが過剰に使用していないRAMを放棄させる（例：「自己バルロニング」による）と、ページキャッシュページが最初に削除され、cleancacheは全体的なホストシステムメモリ状態が許す限り、これらのページを保存・再取得することが可能です。</p>
+<p>cleancacheに用いられるインターフェースは、物理システムでも同様に利用可能です。zcacheドライバーは、データページを圧縮状態で保存するメモリを大量に消費するデバイスとして動作します。また、提案された「RAMster」ドライバーは複数の物理システム間でRAMを共有します。</p>
+<ul class="simple">
+<li><p>cleancacheがファイルシステムやVFSに深く介入している理由は何ですか？（Andrew MortonおよびChristoph Hellwig）</p></li>
+</ul>
+<p>cleancacheのVFSにおけるコアハックは、ほとんどの場合1行程度で、必要最小限のハックはcleancache、ページキャッシュ、ディスク間の整合性（cleancache_invalidate操作を通じて）を維持するための適切な場所に配置されています。cleancacheが無効化されている場合、すべてのハックは無効となり、有効化されているがバックエンドがOPS関数を主張していない場合は関数ポインタとNULLの比較となり、バックエンドがOPS関数を主張しているがファイルシステムがcleancacheを有効にしていない場合は、構造体要素と負数の比較になります。</p>
+<p>一部のファイルシステムはVFSに完全に依存しており、VFS内のハンドルが十分であるため、「init_fs」ハンドルは必要としないため、cleancacheの初期実装ではこのハンドルは提供されていません。しかし、一部のファイルシステム（例：btrfs）ではVFSのハンドルが不完全であり、fs固有のコード内の1つ以上のハンドルが必要です。また、tmpfsなどの他のファイルシステムではcleancacheが逆効果になる可能性があります。そのため、cleancacheの利用をファイルシステムが「オプトイン」する必要があると考えられ、各ファイルシステムにハンドルを追加する必要があります。cleancacheがサポートされていないファイルシステムはすべてテストされていないためです。既存のセットは概念検証に十分で、オプトインアプローチにより未テストのファイルシステムは影響を受けず、既存ファイルシステムのハンドルは今後他のファイルシステムを追加するのに非常に簡単です。</p>
+<p>既存のfsおよびmmファイルへのハンドルの影響は、コメントや空行を除いて約40行程度です。</p>
+<ul class="simple">
+<li><p>cleancacheを非同期かつバッチ処理で実装すれば、DMAを用いたリアルデバイスとより簡単にインターフェースできるのでは？（Minchan Kim）</p></li>
+</ul>
+<p>1ページずつコピーするセマンティクスは、フロントエンドとバックエンドの実装を簡素化し、バックエンドがページ圧縮やページ重複削除などのリアルタイム処理を実行できるようにします。また、cleancacheのget/putコールが返る前にデータが「消去」（ページフレーム内にコピーされる）ため、競合条件やコヒーレンシー問題が大幅に回避されます。このインターフェースは「リアルデバイス」やリアルカーネルアドレス可能なRAMには不自然に感じられるかもしれませんが、トランスセンデントメモリには完璧に合います。</p>
+<ul class="simple">
+<li><p>非共有cleancacheが「排他」なのはなぜですか？また、「get」後にページはどこで「無効化」されますか？（Minchan Kim）</p></li>
+</ul>
+<p>主な理由はトランスセンデントメモリ内の空き容量を確保し、不要なcleancache_invalidateコールを避けるためです。インクルーシブな場合、ページは「get」直後に「put」できます。インクルーシブな「put-after-get」が一般的になる場合、インターフェースを簡単に拡張して「get_no_invalidate」コールを追加できるでしょう。</p>
+<p>無効化はcleancacheバックエンド実装によって行われます。</p>
+<ul class="simple">
+<li><p>パフォーマンスへの影響はどのくらいですか？</p></li>
+</ul>
+<p>OLS’09およびLCA’10でパフォーマンス分析が提示されています。要約すると、ほとんどのワークロードで大幅なパフォーマンス向上が可能です（特にメモリの負荷が高い場合、例えば仮想ワークロードでRAMが過剰に割り当てられた場合）。また、hooksは主にディスクの読み書きの代わりまたは補助として呼び出されるため、最悪のワークロードでもオーバーヘッドはほぼ無視できるほどです。基本的にcleancacheはI/O操作をメモリコピーとCPUオーバーヘッドに置き換えています。古いシングルコアシステムでメモリコピー速度が遅い場合、cleancacheの価値は低く、しかし新しいマルチコアマシン、特にコンソリデーション/仮想化されたマシンでは非常に高い価値があります。</p>
+<ul class="simple">
+<li><p>ファイルシステムXでcleancacheのサポートを追加するにはどうすればよいですか？（Boaz Harrash）</p></li>
+</ul>
+<p>動作が適切で特定の制限に準拠しているファイルシステムは、マウント時にcleancache_init_fsを呼び出すことでcleancacheを簡単に利用できます。ただし、不適切な、異常な、またはレイヤー構造が悪いファイルシステムは、追加のhooksを追加するか、または広範な追加テストを行うか、あるいはオプションのcleancacheを有効化しないのが望ましいです。</p>
+<p>ファイルシステムが考慮すべきポイント:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>FSはブロックデバイスベースである必要があります（例：tmpfsなどのRAMベースのFSはcleancacheを有効化すべきではありません）</p></li>
+<li><p>整合性/正しさを確保するため、FSはすべてのファイル削除またはトリミング操作がVFSを通じて行われるか、同等のcleancache「無効化」操作を行うhooksを追加する必要があります</p></li>
+<li><p>整合性/正しさを確保するため、ディスク上のファイルのライフタイム全体でインODE番号が一意である必要があります、またはFSは「encode_fh」関数を提供する必要があります</p></li>
+<li><p>FSはVFSスーパーブロックの割当および非アクティブ化ルーチンを呼び出す必要があります、または同等のcleancache呼び出しを行うhooksを追加する必要があります</p></li>
+<li><p>パフォーマンスを最大化するため、FSから取得したすべてのページはdo_mpag_readpageルーチンを通じて取得する必要があります、またはFSは同等の操作を行うhooksを追加する必要があります（例：btrfs）</p></li>
+<li><p>現在、FSのブロックサイズはPAGESIZEと同じでなければなりません。これはアーキテクチャの制限ではなく、現在のバックエンドでサポートされているのはこのみです</p></li>
+<li><p>クラスターファイルシステムは「shared_init_fs」cleancache hookを呼び出すことで、一部のバックエンドでの最適なパフォーマンスを実現できます</p></li>
+</ul>
+</div></blockquote>
+<ul class="simple">
+<li><p>インODEのKVAをキーとして使用しないのはなぜですか？（Christoph Hellwig）</p></li>
+</ul>
+<p>cleancacheがinodeの仮想アドレスではなくinode/filehandleを使用していた場合、プールIDは不要になるかもしれません。しかし、これは機能しません。なぜなら、cleancacheはinodeがinode未使用リストから削除された後でもページキャッシュデータページを永続的に保持し、ファイルが削除/トリミングされた場合のみデータページを無効化するからです。したがって、cleancacheがinode kvaを使用していた場合、inode kvaが別のファイルのために再利用される際に整合性の問題が生じる可能性があります。代わりに、inode kvaが解放されるときにページを無効化する場合、cleancacheのキャッシュされたページはカーネルのページキャッシュよりもはるかに大きく、ページがinodeキャッシュの削除後に生き残る場合に最も有用ですが、その価値が大幅に失われるでしょう。</p>
+<ul class="simple">
+<li><p>グローバル変数が必要な理由は何ですか？</p></li>
+</ul>
+<p>cleancache_enabledフラグは、よく使用されるcleancacheのフックすべてでチェックされます。代替案は静的変数をチェックする関数呼び出しです。cleancacheは実行時動的に有効化されるため、cleancacheを有効化しないシステムでは毎秒数万回の不要な関数呼び出しが発生します。したがって、グローバル変数により、コンパイル時にcleancacheをデフォルトで有効化できる一方、実行時にcleancacheを無効にした場合でもパフォーマンスへの影響は最小限に抑えられます。</p>
+<ul class="simple">
+<li><p>cleancacheはKVMと併用可能ですか？</p></li>
+</ul>
+<p>KVMのメモリモデルは十分に異なり、cleancacheのバックエンドがKVMに対してはるかに少ない価値を持つ可能性があります。これは特にオーバーコミットされたシステムにおいてテストが必要です。</p>
+<ul class="simple">
+<li><p>cleanc,cacheはユーザー空間で動作しますか？ウェブブラウザなどのメモリを多く消費するキャッシュに利用すると役立ちそうです。(Jamie Lokier)</p></li>
+</ul>
+<p>まだ計画はありませんが、少なくともO_DIRECTなどのページキャッシュをバイパスするアプリケーションには役立ちそうだと同意しています。</p>
+<p>最終更新: ダン・マゲナーマイマー、2011年4月13日</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxメモリ管理ドキュメンテーション</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#user-guides-for-mm-features">MM機能用ユーザーガイド</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#kernel-developers-mm-documentation">カーネル開発者向けMMドキュメンテーション</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxメモリ管理ドキュメンテーション</a><ul>
+<li>前へ: <a href="balance.html" title="前章">Memory Balancing</a></li>
+<li>次へ: <a href="free_page_reporting.html" title="次章">Free Page Reporting</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/vm/cleancache.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

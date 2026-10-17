@@ -1,0 +1,418 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>不回収LRUインフラストラクチャ — Linuxカーネルドキュメンテーション</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="z3fold.html" rel="next" title="z3fold"/>
+<link href="transhuge.html" rel="prev" title="Transparent Hugepage Support"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="unevictable-lru-infrastructure">
+<span id="unevictable-lru"></span><h1>非奪取可能LRUインフラストラクチャ<a class="headerlink" href="#unevictable-lru-infrastructure" title="この見出しへのパーマリンク">¶</a></h1>
+<div class="contents local topic" id="contents">
+<ul class="simple">
+<li><p><a class="reference internal" href="#introduction" id="id1">はじめに</a></p></li>
+<li><p><a class="reference internal" href="#the-unevictable-lru" id="id2">不回収LRU</a></p>
+<ul>
+<li><p><a class="reference internal" href="#the-unevictable-page-list" id="id3">不回収ページリスト</a></p></li>
+<li><p><a class="reference internal" href="#memory-control-group-interaction" id="id4">メモリ制御グループの相互作用</a></p></li>
+<li><p><a class="reference internal" href="#marking-address-spaces-unevictable" id="id5">アドレス空間の不回収化</a></p></li>
+<li><p><a class="reference internal" href="#detecting-unevictable-pages" id="id6">不回収ページの検出</a></p></li>
+<li><p><a class="reference internal" href="#vmscan-s-handling-of-unevictable-pages" id="id7">VMSCANが不回収ページを処理する方法</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#mlocked-pages" id="id8">MLOCKEDページ</a></p>
+<ul>
+<li><p><a class="reference internal" href="#history" id="id9">履歴</a></p></li>
+<li><p><a class="reference internal" href="#basic-management" id="id10">基本的な管理</a></p></li>
+<li><p><a class="reference internal" href="#mlock-mlockall-system-call-handling" id="id11">mlock()/mlockall()システムコールの処理</a></p></li>
+<li><p><a class="reference internal" href="#filtering-special-vmas" id="id12">特殊なVMAsのフィルタリング</a></p></li>
+<li><p><a class="reference internal" href="#munlock-munlockall-system-call-handling" id="id13">munlock()/munlockall()システムコールの処理</a></p></li>
+<li><p><a class="reference internal" href="#migrating-mlocked-pages" id="id14">MLOCKEDページの移動</a></p></li>
+<li><p><a class="reference internal" href="#compacting-mlocked-pages" id="id15">MLOCKEDページのコンパクション</a></p></li>
+<li><p><a class="reference internal" href="#mlocking-transparent-huge-pages" id="id16">透過的大ページのMLOCKING</a></p></li>
+<li><p><a class="reference internal" href="#mmap-map-locked-system-call-handling" id="id17">mmap(MAP_LOCKED)システムコールの処理</a></p></li>
+<li><p><a class="reference internal" href="#munmap-exit-exec-system-call-handling" id="id18">munmap()/exit()/exec()システムコールの処理</a></p></li>
+<li><p><a class="reference internal" href="#try-to-unmap" id="id19">try_to_unmap()</a></p></li>
+<li><p><a class="reference internal" href="#try-to-munlock-reverse-map-scan" id="id20">try_to_munlock()逆マップスキャン</a></p></li>
+<li><p><a class="reference internal" href="#page-reclaim-in-shrink-list" id="id21">shrink_*_list()でのページ回収</a></p></li>
+</ul>
+</li>
+</ul>
+</div>
+<section id="introduction">
+<h2><a class="toc-backref" href="#id1">はじめに</a><a class="headerlink" href="#introduction" title="この見出しへのパーマリンク">¶</a></h2>
+<p>このドキュメントでは、Linuxメモリマネージャーの「不回収LRU」インフラストラクチャと、このインフラストラクチャを用いて複数の「不回収」ページを管理する方法について説明します。</p>
+<p>このドキュメントでは、このメカニズムの全体的な根拠と、いくつかの設計決定の根拠について説明を試みています。後者の設計根拠については実装説明の中で論じられます。実装詳細（「これは何をするのか？」）についてはコードを読むことで得られます。以下の説明が「なぜこうしているのか？」という問いに答え、価値を提供することを願っています。</p>
+</section>
+<section id="the-unevictable-lru">
+<h2><a class="toc-backref" href="#id2">不回収LRU</a><a class="headerlink" href="#the-unevictable-lru" title="この見出しへのパーマリンク">¶</a></h2>
+<p>不回収LRU機能は、不回収ページを追跡し、vmscanからこれらのページを隠すための追加のLRUリストを追加します。このメカニズムは、Red HatのLarry WoodmanがLinuxのページ回収におけるスケーラビリティ問題を解決するために提出したパッチに基づいています。これらの問題は、大容量メモリのx86_64システムで顧客サイトで観測されています。</p>
+<p>例を挙げて説明します。128GBの主記憶を備えた非NUMA x86_64プラットフォームでは、単一ゾーンに4Kページが3200万以上存在します。これらのページの大きな割合が何らかの理由で回収不可能である場合（以下参照）、vmscanはLRUリストをスキャンして回収可能なページを見つけるのに多くの時間を費やすことになります。これにより、すべてのCPUが何時間も何日もvmscanで100%の時間を過ごし、システムが完全に応答しなくなる状況が生じることがあります。</p>
+<p>不回収リストは以下のクラスの不回収ページを処理します：</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>ramfsに所有されるページ。</p></li>
+<li><p>SHM_LOCK’d共有メモリ領域にマップされたページ。</p></li>
+<li><p>VM_LOCKED [mlock()された] VMAsにマップされたページ。</p></li>
+</ul>
+</div></blockquote>
+<p>今後、定義上または状況上不回収になるページの他の条件も、このインフラストラクチャで処理できる可能性があります。</p>
+<section id="the-unevictable-page-list">
+<h3><a class="toc-backref" href="#id3">不回収ページリスト</a><a class="headerlink" href="#the-unevictable-page-list" title="この見出しへのパーマリンク">¶</a></h3>
+<p>Unevictable LRUインフラストラクチャは、ゾーンごとの追加のLRUリストである「unevictable」リストと、ページがunevictableリストで管理されていることを示すページフラグPG_unevictableを含みます。</p>
+<p>PG_unevictableフラグは、PG_activeフラグと同様の役割を果たし、排他的に使用されるフラグです。これは、PG_lruが設定されているときにページがどのLRUリストに属しているかを示します。</p>
+<p>Unevictable LRUインフラストラクチャは、以下の理由で追加のLRUリストにunevictableページを保持します：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>「unevictableページをシステム内の他のページと同じように扱うことができ、同じコードで操作でき、隔離（移動など）でき、統計を追跡できること」[Rik van Riel]</p></li>
+<li><p>メモリのデフラグメント化、ワークロード管理、メモリホットプラグのために、unevictableページをノード間で移動させたいです。LinuxカーネルはLRUリストからページを成功裏に隔離できる場合にのみページを移動できます。もしLRUリスト以外の場所にページを保持していた場合、isolate_lru_page()で検出できず、移動が不可能になります（migrationコードを再構築しない限り）。</p></li>
+</ol>
+</div></blockquote>
+<p>unevictableリストは、ファイルバックドと匿名（スワップバックド）ページの区別をしません。この区別は、ページが実際に追い出せる場合にのみ重要です。</p>
+<p>unevictableリストは、Christoph Lameterが提案したゾーンごとのLRUリストと統計の「配列化」（arrayification）から恩恵を受けています。</p>
+<p>unevictableリストはLRU pagevecメカニズムを使用しません。代わりに、ページのゾーンのunevictableリストに直接配置します。これは、あるタスクがLRUからページを隔離している間、他のタスクがページの「追い出せる状態」を変更しているときにページがunevictableリストに残らないようにするためです。</p>
+</section>
+<section id="memory-control-group-interaction">
+<h3><a class="toc-backref" href="#id4">メモリ制御グループの相互作用</a><a class="headerlink" href="#memory-control-group-interaction" title="この見出しへのパーマリンク">¶</a></h3>
+<p>unevictable LRU機能は、メモリ制御グループ（memory control group; memory controller）と相互運用します。[参照] <a class="reference internal" href="../admin-guide/cgroup-v1/memory.html"><span class="doc">メモリリソースコンテラー</span></a>lru_list enumを拡張することで実現されます。</p>
+<p>メモリ制御データ構造は、ゾーンごとのLRUリストの「配列化」により、lru_list enum要素ごとに1つずつゾーンごとのunevictableリストを自動的に取得します。メモリ制御は、ページがunevictableリストに移動する際の動きを追跡します。</p>
+<p>メモリ制御グループがメモリ圧力にさらされた場合、制御はunevictableリスト上のページの回収を試みません。これはいくつかの影響を及ぼします：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>ページが「非表示」に設定されているため、回収プロセスがより効率的になり、回収可能な可能性のあるページのみを処理できます。</p></li>
+<li><p>一方で、制御グループに属するページのうち、非破棄可能なページが過剰になると、制御グループ内のタスクの作業セットの破棄可能な部分が利用可能なメモリに収まらなくなる可能性があります。これにより、制御グループがスワップアウト（thrashing）を起こすか、OOMキル（Out-Of-Memory kill）を実行する可能性があります。</p></li>
+</ol>
+</div></blockquote>
+</section>
+<section id="marking-address-spaces-unevictable">
+<span id="mark-addr-space-unevict"></span><h3><a class="toc-backref" href="#id5">アドレス空間の不回収化</a><a class="headerlink" href="#marking-address-spaces-unevictable" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ramfsなどの機能では、アドレス空間に属するすべてのページが破棄不可能である場合があります。このようなページの破棄を防ぐために、AS_UNEVICTABLEアドレス空間フラグが提供され、ファイルシステムは複数のラッパー関数を使用してこのフラグを操作できます:</p>
+<blockquote>
+<div><ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">mapping_set_unevictable(struct</span> <span class="pre">address_space</span> <span class="pre">*mapping);</span></code></p>
+<blockquote>
+<div><p>アドレス空間を完全に破棄不可能にマークする。</p>
+</div></blockquote>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">mapping_clear_unevictable(struct</span> <span class="pre">address_space</span> <span class="pre">*mapping);</span></code></p>
+<blockquote>
+<div><p>アドレス空間を破棄可能にマークする。</p>
+</div></blockquote>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">mapping_unevictable(struct</span> <span class="pre">address_space</span> <span class="pre">*mapping);</span></code></p>
+<blockquote>
+<div><p>アドレス空間を照会し、完全に破棄不可能である場合はtrueを返す。</p>
+</div></blockquote>
+</li>
+</ul>
+</div></blockquote>
+<p>これらは現在、カーネル内で以下の3か所で使用されています:</p>
+<blockquote>
+<div><ol class="arabic">
+<li><p>ramfsがinodeが作成されるときにアドレス空間を破棄不可能にマークし、このマークはinodeの寿命にわたって有効です。</p></li>
+<li><p>SYSV SHMがSHM_LOCKされたアドレス空間をSHM_UNLOCKが呼ばれるまで破棄不可能にマークします。</p>
+<p>SHM_LOCKがページをスワップアウトしている場合でも、ページをインプットする必要はありません。アプリケーションがメモリにページを確保したい場合は、手動でページにアクセスする必要があります。</p>
+</li>
+<li><p>i915ドライバがピン付けされたアドレス空間を破棄不可能にマークし、解除されるまで有効です。i915ドライバが破棄不可能にマークするメモリ量は、debugfs/dri/0/i915_gem_objectsで制限されたオブジェクトサイズにほぼ等しいです。</p></li>
+</ol>
+</div></blockquote>
+</section>
+<section id="detecting-unevictable-pages">
+<h3><a class="toc-backref" href="#id6">不回収ページの検出</a><a class="headerlink" href="#detecting-unevictable-pages" title="この見出しへのパーマリンク">¶</a></h3>
+<p>vmscan.c内のpage_evictable()関数は、上述の照会関数（[セクション
+<a class="reference internal" href="#mark-addr-space-unevict"><span class="std std-ref">アドレス空間を非破棄可能にマークする</span></a>]を参照）を使用してAS_UNEVICTABLEフラグを確認し、ページが破棄可能かどうかを判定します。</p>
+<p>アドレス空間がポピュレーション後に破棄不可能にマークされた場合（SHM領域など）、ロック操作（例: SHM_LOCK）はラズリー（lazy）で行え、ページテーブルのポピュレーションはmlock()のように必要ありません。また、SHM_LOCKされた領域のページを破棄不可能リストに追加する必要もありません。代わりに、vmscanが回収スキャン中にページに遭遇したときにこれを自動的に実行します。</p>
+<p>アンロック操作（例: SHM_UNLOCK）では、アンロッカー（例: shmctl()）が領域内のページをスキャンし、他の条件がなければ破棄不可能リストから「救出」する必要があります。破棄不可能領域が破棄される場合、ページは解放プロセス中に破棄不可能リストから「救出」されます。</p>
+<p>page_evictable()は、さらにページフラグPG_mlocked（PageMlocked()でラップされる）をテストすることで、mlockedページも確認します。このフラグは、ページがVM_LOCKED vmaにフォールトインした場合、またはVM_LOCKED vmaに含まれている場合に設定されます。</p>
+</section>
+<section id="vmscan-s-handling-of-unevictable-pages">
+<h3><a class="toc-backref" href="#id7">VMSCANが不回収ページを処理する方法</a><a class="headerlink" href="#vmscan-s-handling-of-unevictable-pages" title="この見出しへのパーマリンク">¶</a></h3>
+<p>フォールトパスでunevictableページが削除されたり、mlock()やmmap()のタイミングでunevictableリストに移動されたりすると、vmscanはページが再びevictableになるまで（munlock()などによって）遭遇しません。ただし、効率のため、unevictableページを通常のアクティブ/非アクティブLRUリストのいずれかに残す場合もあります。vmscanはshrinking_active|inactive|page_list()関数すべてでこのようなページを検出し、「削除」します。つまり、vmscanはそのページをスキャン中のゾーンのunevictableリストに移動させます。</p>
+<p>ページがVM_LOCKED VMAにマップされているがPG_mlockedフラグが設定されていないケースもあります。このようなページはshrinking_page_list()に到達し、vmscanがreverse mapを歩くtry_to_unmap()で検出されます。try_to_unmap()がSWAP_MLOCKを返す場合、shrinking_page_list()はその時点でページを削除します。</p>
+<p>unevictableページを「削除」する際、vmscanはページロックを解除した後、putback_lru_page()を呼び出してLRUリストに戻します（isolate_lru_page()の逆操作）。ページがアンロックされた後、そのページがunevictableになる条件が変化する可能性があるため、putback_lru_page()はunevictableリストに追加する際、ページのunevictable状態を再確認します。ページがunevictableになった場合、putback_lru_page()はリストから削除し、再度試行します（ページ_unevictable()テストを含む）。このような競合状態はまれで、ページがunevictableリストに移動するケースもまれなので、putback_lru_page()の大部分の呼び出しではこのような削除チェックは発生しません。</p>
+</section>
+</section>
+<section id="mlocked-pages">
+<h2><a class="toc-backref" href="#id8">MLOCKEDページ</a><a class="headerlink" href="#mlocked-pages" title="この見出しへのパーマリンク">¶</a></h2>
+<p>unevictableページリストはmlock()にも利用可能です。ramfsおよびSYSV SHMにも同様に適用されます。注意点として、mlock()はCONFIG_MMU=yの環境でのみ利用可能です。NOMMU環境ではすべてのマッピングが効果的にmlockedされます。</p>
+<section id="history">
+<h3><a class="toc-backref" href="#id9">履歴</a><a class="headerlink" href="#history" title="この見出しへのパーマリンク">¶</a></h3>
+<p>「非削除可能mlockedページ」インフラストラクチャは、Nick Pigginが投稿したRFCパッチ『mm: mlocked pages off LRU』に基づいています。NickはChristoph Lameterが投稿したパッチの代替案としてこのパッチを投稿しました。両方とも同じ目的を達成するため、vmscanからmlockedページを隠すことを目的としています。</p>
+<p>ニックのパッチでは、struct page LRUリストのリンクフィールドの一つを、ページをマッピングしているVM_LOCKED VMAのカウントとして使用していました。このリンクフィールドの使用によりカウントが行われたため、LRUリスト上のページの管理ができず、mlockedページはisolate_lru_page()が見つけることができず、移動不可能となりました。また、LRUリストのリンクフィールドは移動サブシステムに利用できませんでした。</p>
+<p>ニックは、mlockedページをLRUリストに戻してからそれらを分離する試みをすることで、VM_LOCKED VMAのカウントを放棄しました。ニックのパッチがUnevictable LRU作業と統合された際には、逆マップを歩くことで、ページをマッピングしているVM_LOCKED VMAが存在するかを確認するようになりました。以下で詳しく説明します。</p>
+</section>
+<section id="basic-management">
+<h3><a class="toc-backref" href="#id10">基本的な管理</a><a class="headerlink" href="#basic-management" title="この見出しへのパーマリンク">¶</a></h3>
+<p>mlockedページ - VM_LOCKED VMAにマッピングされたページ - は非回収可能なページの一種です。このようなページがメモリ管理サブシステムによって「認識」されると、PG_mlockedフラグが設定されます。これはPageMlocked()関数を使用して操作可能です。</p>
+<p>PG_mlockedページは、LRUリストに追加される際に非回収リストに配置されます。このようなページは、メモリ管理が以下の場所で「認識」できます：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>mlock()/mlockall()システムコールハンドラ内;</p></li>
+<li><p>mmap()システムコールハンドラ内で、MAP_LOCKEDフラグを持つ領域をマッピングする際;</p></li>
+<li><p>mlockall()でMCL_FUTUREフラグを指定したタスク内で領域をマッピングする際</p></li>
+<li><p>フォールトパスでmlockedページがフォールトパスで「削除」されたり、VM_LOCKEDスタックセグメントが拡張される際に;</p></li>
+<li><p>上記のように、vmscan:shrink_page_list()でVM_LOCKED VMAのページを回収しようとする際、try_to_unmap()経由で。</p></li>
+</ol>
+</div></blockquote>
+<p>これらすべての状況は、VM_LOCKEDフラグが設定されていない場合、VMAにそのフラグを設定します。</p>
+<p>mlockedページは以下の状況で非回収リストから解放され、非回収状態から抜け出します：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>munlock()/munlockall()システムコールで非ロック状態にマッピングされる際;</p></li>
+<li><p>ページをマッピングしている最後のVM_LOCKED VMAからmunmap()される際、タスク終了時のマッピング解除も含む;</p></li>
+<li><p>マップされたファイルの最後のVM_LOCKED VMAからページがトリムされる際; または</p></li>
+<li><p>VM_LOCKED VMA内でページがCOW（Copy-On-Write）される前に。</p></li>
+</ol>
+</div></blockquote>
+</section>
+<section id="mlock-mlockall-system-call-handling">
+<h3><a class="toc-backref" href="#id11">mlock()/mlockall()システムコールの処理</a><a class="headerlink" href="#mlock-mlockall-system-call-handling" title="この見出しへのパーマリンク">¶</a></h3>
+<p>[do_]mlock()および[do_]mlockall()システムコールハンドラは、呼び出しの指定範囲内の各VMAに対してmlock_fixup()を呼び出します。mlockall()の場合は、タスクのアクティブなアドレス空間全体が対象です。注意点として、mlock_fixup()はメモリのロックとアンロックの両方の処理に使用されます。既にVM_LOCKED VMAである領域にmlock()を呼び出したり、VM_LOCKEDでないVMAにmunlock()を呼び出す場合、無効な操作とみなされ、mlock_fixup()は単に返します。</p>
+<p>VMAが「Filtering Special Vmas」の下記で説明するフィルタリングを通過した場合、mlock_fixup()は、範囲がVMA全体をカバーしない場合は、そのVMAを隣接するVMAとマージするか、またはVMAの一部を分離して分割する試みを行います。VMAがマージまたは分割された後、mlock_fixup()はpopulate_vma_page_range()を呼び出して、get_user_pages()を通じてページをフォールトインし、mlock_vma_page()を通じてページをmlocked（ロック済み）としてマークします。</p>
+<p>注意点として、mlockedされるVMAがPROT_NONEでマップされている可能性があります。その場合、get_user_pages()はページをフォールトインできず、これは問題ではありません。もしページが最終的にこのVM_LOCKED VMAにフォールトインした場合、フォールトパスまたはvmscan処理で対応します。</p>
+<p>また、get_user_pages()で返されたページは、mlock処理中にtruncateされたり、他のタスクによって移動されたりする可能性があります。このような状況を検出するために、populate_vma_page_range()はページロックを取得した後、page_mapping()を確認します。ページがまだマッピングされている場合、mlock_vma_page()を呼び出します。マッピングがなくなった場合は、ページロックを解除して処理を進みます。最悪の場合、VM_LOCKED VMAにマップされたページが通常のLRUリストに残り、PageMlocked()されない可能性があります。このようなページはvmscanが検出し、削除します。</p>
+<p>mlock_vma_page()は、get_user_pages()で返された各ページに対してTestSetPageMlocked()を呼び出します。TestSetPageMlocked()を使用する理由は、他のタスク/VMAによってすでにmlockedされている可能性があり、不要な作業を避けるためです。統計情報でmlockedページを複数回カウントしないようにするため、特に重要です。ページがすでにmlockedされている場合、mlock_vma_PF()はさらに処理を行いません。</p>
+<p>ページがすでにmlockedされていない場合、mlock_vma_page()はそのページをLRUから分離しようとします。その時点では適切なアクティブまたは非アクティブリストに位置している可能性が高いからです。isolate_lru_page()が成功した場合、mlock_vma_page()はputback_l-r_page()を呼び出してページを戻し、ページがmlockedになったことを検知してゾーンのunevictableリストにページを移動します。mlock_vma_page()がLRUからページを分離できなかった場合、vmscanがページを回収しようとした際に後で処理します。</p>
+</section>
+<section id="filtering-special-vmas">
+<h3><a class="toc-backref" href="#id12">特殊なVMAsのフィルタリング</a><a class="headerlink" href="#filtering-special-vmas" title="この見出しへのパーマリンク">¶</a></h3>
+<p>mlock_fixup()はいくつかの「特殊な」VMAクラスをフィルタリングします：</p>
+<ol class="arabic simple">
+<li><p>VM_IOまたはVM_PFNMAPが設定されたVMAsは完全にスキップされます。これらのマッピングの背後にあるページは本来固定されているため、mlockedとしてマークする必要がありません。また、ほとんどのページにはstruct pageが存在しないため、get_user_pages()はこれらのVMAsで失敗します。そのため、これらを訪問する意味はありません。</p></li>
+<li><p>hugetlbfsページをマッピングしているVMAsはすでにメモリに効果的に固定されています。これらのページをmlock()する必要もありません。ただし、mlock()の以前の挙動（unevictable/mlockの変更前）を維持するため、mlock_fixup()はhugetlbfs VMA範囲でmake_pages_present()を呼び出して、ヒューゲページを割り当ててptesを埋め込みます。</p></li>
+<li><p>VM_DONTEXPANDが設定されたVMAsは、通常、カーネルページのユーザースペースマッピング（VDSOページ、レレーチャンネルページなど）です。これらのページは本来解消不可能であり、LRUリストで管理されません。mlock_fixup()はこれらのVMAsをhugetlbfs VMAsと同じように扱い、make_pages_present()を呼び出してptesを埋め込みます。</p></li>
+</ol>
+<p>これらの特殊なVMAsについては、mlock_fixup()はVM_LOCKEDフラグを設定しません。そのため、後続のmunlock()、munmap()、タスク終了処理でこれらのVMAsを扱う必要がありません。また、mlock_fix,up()はこれらのVMAsをタスクの「locked_vm」にカウントしません。</p>
+</section>
+<section id="munlock-munlockall-system-call-handling">
+<span id="munlock-munlockall-handling"></span><h3><a class="toc-backref" href="#id13">munlock()/munlockall()システムコールの処理</a><a class="headerlink" href="#munlock-munlockall-system-call-handling" title="この見出しへのパーマリンク">¶</a></h3>
+<p>munlock()とmunlockall()システムコールは、mlock()とmlockall()のシステムコールと同じ関数do_mlock[all]()で処理され、引数によってアンロック操作が指定されます。したがって、これらのシステムコールもmlock_fixup()で処理されます。すでにmunlockedされているVMAに対して呼び出された場合、mlock_fixup()は単に返します。上記のVMAフィルタリングにより、どの「特殊」なVMAにもVM_LOCKEDが設定されません。そのため、これらのVMAはmunlock()で無視されます。</p>
+<p>VMAがVM_LOCKEDの場合、mlock_fixup()は指定された範囲を再びマージまたは分割しようとします。その後、populate_vma_page_range()関数を呼び出してこの範囲をmunlockします。これはmlockを適用するための同じ関数で、munlock操作を示すフラグを渡します。</p>
+<p>ページをフォールトインしてmlockした後、VMAのアクセス保護がPROT_NONEに変更された場合、get_user_pages()はmunlock処理のためにこれらのページを訪問する際の信頼性が低下していました。ページをmlockしたまま残したくないため、get_user_pages()はページを取得する際の権限を無視するフラグを受け取るよう拡張されました。すべてのページは以前のmlockによってresidentになっているはずです。</p>
+<p>munlock()関数では、populate_vma_page_range()がmunlock_vma_page()を呼び出して個々のページをアンロックします。munlock_vma_page()はTestClearPageMlocked()を用いてPG_mlockedフラグを無条件でクリアします。mlock_vma_page()と同様に、munlock_vma_page()もTest*PageMlocked()関数を使用して、他のタスクによってすでにアンロックされている可能性のあるページの処理を行います。ページがmlockされていた場合、munlock_vma_page()はmlockされたページ数に関するゾーン統計情報を更新します。ただし、この時点で他のVM_LOCKED VMAsによってページがマップされているかどうかを確認していませんので注意が必要です。</p>
+<p>try_to_munlock()関数を呼び出す前に、ページをLRUリストから分離する必要があります。try_to_munlock()はtry_to_unmap()の変種であり、ページがLRUリストに含まれていないことが前提です[以下で詳しく説明します]。しかし、isolate_lru_page()の呼び出しが失敗する可能性があり、その場合try_to_munlock()を呼び出すことはできません。そのため、最初にPG_mlockedフラグをクリアする方が安全です。ページを成功裏に分離できた場合、try_to_munlock()を呼び出します。この関数はPG_mlockedフラグを再設定し、他のVMAがページをmlockしている場合にゾーンのページ統計情報を更新します。ページの分離に失敗した場合、LRUリストにmlockされたページが残る可能性がありますが、これは問題ではありません。vmscanがページを回収しようとした際に後で検出できるからです。このような状況は比較的まれです。</p>
+</section>
+<section id="migrating-mlocked-pages">
+<h3><a class="toc-backref" href="#id14">MLOCKEDページの移動</a><a class="headerlink" href="#migrating-mlocked-pages" title="この見出しへのパーマリンク">¶</a></h3>
+<p>移動中のページはLRUリストから分離され、ページのアンマッピング、アドレス空間エントリの更新、コンテンツと状態のコピーが完了するまでロックされています。ページテーブルエントリが新しいページへの参照に置き換えられるまで、このロックが保持されます。Linuxはmlockされたページや非回収可能ページの移動をサポートしており、これは単にPG_mlockedとPG_unevictableの状態を古いページから新しいページへ移動するだけです。</p>
+<p>ページの移動が同じページのmlockまたはmunlockと競合する可能性があることに注意してください。これは上記のセクションでmlock/munlockの観点からすでに議論されています。移動とm[un]lockの両プロセスはページをロックして実行します。これは最初の同期レベルを提供します。ページの移動では、アンロックする前に古いページのpage_mappingをゼロにします。これにより、m[un]lockはページロックの下でpage_mappingをテストしてこれらのページをスキップできます。</p>
+<p>ページの移行を完了するため、ページロックを解除した後、新しいページと古いページをLRUリストに戻します。『不要な』ページ（成功時は古いページ、失敗時は新しいページ）は、移行プロセスが保持する参照カウントが解放されるときに解放されます。munlockと移行の間の競合によってLRUリストにページが残らないようにするため、ページ移行はmigrated pagesをLRUリストに戻すputback_lru_page()関数を使用します。</p>
+</section>
+<section id="compacting-mlocked-pages">
+<h3><a class="toc-backref" href="#id15">MLOCKEDページのコンパクション</a><a class="headerlink" href="#compacting-mlocked-pages" title="この見出しへのパーマリンク">¶</a></h3>
+<p>unevictable LRUリストはコンパクション可能な領域のスキャンが可能です。その挙動は/proc/sys/vm/compact_unevict,allowedで制御されます（参照 <a class="reference internal" href="../admin-guide/sysctl/vm.html"><span class="doc">/proc/sys/vm/に関するドキュメンテーション</span></a>）。unevictable LRUリストのスキャンが有効になると、コンパクションの作業は主にページ移行コードによって処理され、MIGRATING MLOCKED PAGESで説明したワークフローが適用されます。</p>
+</section>
+<section id="mlocking-transparent-huge-pages">
+<h3><a class="toc-backref" href="#id16">透過的大ページのMLOCKING</a><a class="headerlink" href="#mlocking-transparent-huge-pages" title="この見出しへのパーマリンク">¶</a></h3>
+<p>透過的ヒューゲンページはLRUリスト上の単一のエントリで表されます。そのため、個々のサブページではなく、全体のコンパウンドページをunevictableに設定できます。</p>
+<p>ユーザーがヒューゲンページの一部をmlock()しようとすると、そのページの残りは回収可能にする必要があります。</p>
+<p>部分的なmlock()でページを分割することはできません。split_huge_page()が失敗する可能性があり、システムコールの新しい失敗モードは望ましくありません。</p>
+<p>これを処理するために、PTEマップされたヒューゲンページは通常のLRUリストに保持されます。VM_LOCKED VMAの境界にあるPMDはPTEテーブルに分割されます。</p>
+<p>このようにして、ヒューゲンページはvmscanによってアクセス可能になります。メモリ圧力下ではページが分割され、VM_LOCKED VMAに属するサブページはunevictable LRUリストに移動し、残りは回収可能です。</p>
+<p>follow_trans_huge_pmd()のコメントも参照してください。</p>
+</section>
+<section id="mmap-map-locked-system-call-handling">
+<h3><a class="toc-backref" href="#id17">mmap(MAP_LOCKED)システムコールの処理</a><a class="headerlink" href="#mmap-map-locked-system-call-handling" title="この見出しへのパーマリンク">¶</a></h3>
+<p>さらにmlock()/mlockall()システムコールに加え、アプリケーションはmmap()呼び出し時にMAP_LOCKEDフラグを指定してメモリ領域をmlockするようにリクエストできます。ただし重要な違いがあります。mmap() + mlock()はメモリがフェッチできない場合（例: mm_populate失敗）に失敗しENOMEMを返しますが、mmap(MAP_LOCKED)は失敗しません。mmaped領域はロックされた領域の性質を保持し（ページがスワップされない）、ただしメモリをフェッチするための重大なページフォールトは発生する可能性があります。</p>
+<p>さらに、mlockall()でMCL_FUTUREフラグを指定したタスクがheapを拡張するmmap()またはbrk()呼び出しは、新たにマップされたメモリがmlockされるようになります。unevictable/mlockの変更以前は、カーネルはmake_pages_present()を呼び出してページを割り当て、ページテーブルを埋め込みました。</p>
+<p>unevictable/mlockインフラストラクチャの下でメモリ範囲をmlockするには、mmap()ハンドラおよびタスクアドレス空間拡張関数が、mlockするメモリ範囲を指定してpopulate_vma_page_range()を呼び出します。</p>
+<p>populate_vma_page_range()を呼び出す関数は、すでにタスクの「locked_vm」にmlockするメモリ範囲を追加しています。フィルタリングされたVMAsを考慮するために、populate_vma_page_range()はmlockされなかったページ数を返します。すべての呼び出し元は、タスクのlocked_vmからこの非負の戻り値を減算します。負の戻り値はエラーを示します（例：get_user_pages()がPROT_NONEアクセスを持つVMAをフォールトインしようとした場合）。この場合、メモリ範囲はlocked_vmとして計上され続けます。保護は後で変更可能であり、その領域にページが割り当てられる可能性があるためです。</p>
+</section>
+<section id="munmap-exit-exec-system-call-handling">
+<h3><a class="toc-backref" href="#id18">munmap()/exit()/exec()システムコールの処理</a><a class="headerlink" href="#munmap-exit-exec-system-call-handling" title="この見出しへのパーマリンク">¶</a></h3>
+<p>mlockedなメモリ範囲をアンマップする際（munmap()の明示的な呼び出しやexit()またはexec()処理中の内部アンマップを含む）、最後のVM_LOCKED VMAがページをマップしている場合、munlockする必要があります。変更前のunevictable/mlockでは、mlockingはページをどのようにマークもしなかったため、アンマップは処理不要でした。</p>
+<p>unevictable/mlockインフラストラクチャの下でメモリ範囲をmunlockするには、munmap()ハンドラおよびタスクアドレス空間の teardown 関数がmunlock_vma_pages_all()を呼び出します。この関数名は、munlock処理中に領域のアンマップ時に常に全体のVMA範囲を指定するという観察に基づいています。mlocking処理時のVMAフィルタリングにより、実際にmlockedページを含む「通常の」VMAのみがmunlock_vma_pages_all()に渡されます。</p>
+<p>munlock_vma_pages_all()はVM_LOCKED VMAフラグをクリアし、munlockの場合のmlock_fixup()と同様に、__munlock_vma_pages_range()を呼び出してVMAのメモリ範囲のページテーブルを走査し、VMAでマップされた各residentページをmunlock_vma_page()でmunlockします。これは、このページをマップしている最後のVM_LOCKED VMAである場合にのみ有効です。</p>
+</section>
+<section id="try-to-unmap">
+<h3><a class="toc-backref" href="#id19">try_to_unmap()</a><a class="headerlink" href="#try-to-unmap" title="この見出しへのパーマリンク">¶</a></h3>
+<p>ページは、もちろん複数のVMAsにマッピングされることがあります。これらのVMAsの一部にはVM_LOCKEDフラグが設定されている可能性があります。ページが1つ以上のVM_LOCKED VMAにマッピングされているにもかかわらず、PG_mlockedフラグが設定されていない場合があり、その結果としてアクティブまたは非アクティブのLRUリストのいずれかに存在する可能性があります。これはたとえば、プロセス内のタスクがページのmunlock処理中で、ページをLRUから分離できなかった場合などに発生する可能性があります。このような状況を処理するために、vmscan/shrink_page_list()はセクション「vmscanのunevictableページの処理」で説明されているように、このようなページに遭遇する可能性があります。この状況を処理するために、try_to_unmap()はページの逆マッピングを辿る際、VM_LOCKED VMAをチェックします。</p>
+<p>reclaim処理またはページ移動のためにvmscanが呼び出すtry_to_unmap()は、常にページがロックされ、LRUから分離されている状態で呼び出されます。匿名ページ、マップされたファイルページ、KSMページはそれぞれ異なる逆マッピング検索メカニズムとロック処理を持つため、別個の関数で処理されます。それぞれの場合、rmap_walk_anon()、rmap_walk_file()、rmapのksm()を呼び出すたびに、ページを含む可能性のあるすべてのVMAに対してtry_to_unmap_one()を呼び出します。</p>
+<p>reclaim処理中にtry_to_unmap_one()がページをVM_LOCKED VMA内に見つけた場合、そのページをmlock_vma_page()を介してmlock処理を行い、ページをアンマッピングせずに処理します。この結果、SWAP_MLOCKを返してページがunevictableであることを示し、スキャンはここで終了します。</p>
+<p>mlock_vma_page()はページテーブルのロックを保持しながら（ページロックとrmapロックに加えて）、同時にmlockやmunlock、munmapシステムコール、mmの teardown（munlock_vma_pages_all）、reclaim、holepunching、ファイルページとその匿名COWedページのtruncate処理などと競合を防ぐため呼び出されます。</p>
+</section>
+<section id="try-to-munlock-reverse-map-scan">
+<h3><a class="toc-backref" href="#id20">try_to_munlock()逆マップスキャン</a><a class="headerlink" href="#try-to-munlock-reverse-map-scan" title="この見出しへのパーマリンク">¶</a></h3>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p>[!] TODO/FIXME: より適切な名前としてはpage_mlocked()が考えられるかもしれません。page_referenced()の逆マッピングウォーカーに類似しています。</p>
+</div>
+<p>munlock_vma_page() [セクション <a class="reference internal" href="#munlock-munlockall-handling"><span class="std std-ref">munlock()/munlockall()システムコールの処理</span></a> 上記を参照]がページをmunlockしようとする際、実際にすべてのPTEをページから解除せずに、そのページがどのVM_LOCKED VMAによってマッピングされているかを判定する必要があります。このため、unevictable/mlockインフラストラクチャはtry_to_unmap()の変種であるtry_to_munlock()を導入しました。</p>
+<p>try_to_munlock()は、匿名メモリやマップ済みファイル、KSMページの逆マップを走査し、VM_LOCKED VMAsを検出する処理として、try_to_unmap()と同じ関数を呼び出します。この関数は、VM_LOCKED VMAsが見つかった場合、mlock_vma_page()を介してページをmlockし、SWAP_MLOCKを返します。これは、munlock_vma_page()によって行われたページのPG_mlockedの初期化を解除します。</p>
+<p>try_to_munlock()の逆マップ走査では、ページがどのVM_LOCKED VMAにもマップされていないことを確認するために、そのページの逆マップ内のすべてのVMAを訪問する必要があります。ただし、VM_LOCKED VMAに遭遇した時点でスキャンは終了します。munlock_vma_page()が呼び出される回数は、大規模な領域のmunlockやmlockallによるアドレス空間の破壊時に多くなる可能性がありますが、全体としては比較的レアなイベントです。</p>
+</section>
+<section id="page-reclaim-in-shrink-list">
+<h3><a class="toc-backref" href="#id21">shrink_*_list()でのページ回収</a><a class="headerlink" href="#page-reclaim-in-shrink-list" title="この見出しへのパーマリンク">¶</a></h3>
+<p>shrink_active_list()は、明らかに不揮発なページ（!page_evictable(page））を除くページを、不揮発リストに移動します。ただし、shrink_active_list()は、アクティブ/非アクティブLRUリストに登録された不揮発ページのみを確認します。注意点として、これらのページはPageUnevictableが設定されていないため、不揮発リストに登録されていないのです。</p>
+<p>LRUリストに存在する不揮発ページの例は以下の通りです：</p>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>最初に割り当てられた際にLRUリストに配置されたramfsページ。</p></li>
+<li><p>SHM_LOCKされた共有メモリページ。shmctl(SHM_LOCK)は、共有メモリ領域のページを割り当てたり、フォールトインしたりはしません。これは、SHM_LOCKをかけたセグメントのページを初めてアクセスした際に発生します。</p></li>
+<li><p>mlock_vma_page()によって不揮発リストに移動できず、LRUリストに残ったmlockedページ。</p></li>
+</ol>
+</div></blockquote>
+<p>shrink_inactive_list()は、非アクティブリストに存在する不揮発ページを、適切なゾーンの不揮発リストに移動します。</p>
+<p>shrink_inactive_list()は、shrink_active_list()が非アクティブリストに移動した後にSHM_LOCKされたページ、またはmunlock_vma_page()がLRUから分離できなかったVM_LOCKED VMAsにマップされたページを処理します。後者のページは検出されませんが、shrink_page_list()に渡されます。</p>
+<p>shrink_page_list()は、shrink_inactive_list()と同様の理由で明らかに追い出せないページを再び切り捨てます。VM_LOCKED VMAsにマップされているがPG_mlockedが設定されていないページは、try_to_unmap()に到達します。try_to_unmap()がSWAP_MLOCKを返すと、shrink_page_list()はそれらを追い出せないリストに振り分けます。</p>
+</section>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxメモリ管理ドキュメンテーション</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#user-guides-for-mm-features">MM機能用ユーザーガイド</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#kernel-developers-mm-documentation">カーネル開発者向けMMドキュメンテーション</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxメモリ管理ドキュメンテーション</a><ul>
+<li>前へ: <a href="transhuge.html" title="前章">Transparent Hugepage Support</a></li>
+<li>次へ: <a href="z3fold.html" title="次章">z3fold</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/vm/unevictable-lru.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

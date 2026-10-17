@@ -1,0 +1,369 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>セキュア暗号化仮想化（SEV）— The Linux Kernel documentation</title>
+<link href="../../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+<script src="../../_static/jquery.js"></script>
+<script src="../../_static/underscore.js"></script>
+<script src="../../_static/doctools.js"></script>
+<link href="../../genindex.html" rel="index" title="インデックス"/>
+<link href="../../search.html" rel="search" title="検索"/>
+<link href="cpuid.html" rel="next" title="KVM CPUIDビット"/>
+<link href="api.html" rel="prev" title="KVM（Kernel-based Virtual Machine）APIドキュメンテーション（完全版）"/>
+<link href="../../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="secure-encrypted-virtualization-sev">
+<h1>セキュア暗号化仮想化（SEV）<a class="headerlink" href="#secure-encrypted-virtualization-sev" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="overview">
+<h2>概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>セキュア暗号化仮想化（SEV）は、AMD プロセッサに搭載されている機能です。</p>
+<p>SEV は AMD-V アーキテクチャの拡張機能であり、ハイパーバイザーの制御下で仮想マシン（VM）を実行することをサポートします。有効化された場合、VM のメモリ内容はその VM に固有の鍵で透明性を保ちながら暗号化されます。</p>
+<p>ハイパーバイザーは CPUID 命令を通じて SEV のサポートを確認できます。CPUID 関数 0x8000001f は SEV に関する情報を報告します:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>0x8000001f[eax]:
+                Bit[1]  indicates support for SEV
+    ...
+          [ecx]:
+                Bits[31:0]  Number of encrypted guests supported simultaneously
+</pre></div>
+</div>
+<p>SEV のサポートがある場合、MSR 0xc001_0010（MSR_K8_SYSCFG）および MSR 0xc001_0015（MSR_K7_HWCR）を使用して、有効化が可能かどうかを確認できます:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>0xc001_0010:
+        Bit[23]    1 = memory encryption can be enabled
+                   0 = memory encryption can not be enabled
+
+0xc001_0015:
+        Bit[0]     1 = memory encryption can be enabled
+                   0 = memory encryption can not be enabled
+</pre></div>
+</div>
+<p>SEV のサポートが利用可能な場合、VMRUN を実行する前にその VM で SEV ビットを設定することで、特定の VM で有効化できます。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>VMCB[0x90]:
+        Bit[1]      1 = SEV is enabled
+                    0 = SEV is disabled
+</pre></div>
+</div>
+<p>SEV ハードウェアは ASID を使って VM とメモリ暗号化鍵を関連付けるため、SEV が有効なゲストの ASID は CPUID 0x8000001f[ecx] フィールドで定義された最大値以下の 1 〜最大値の範囲内でなければなりません。</p>
+</section>
+<section id="sev-key-management">
+<h2>SEV キー管理<a class="headerlink" href="#sev-key-management" title="この見出しへのパーマリンク">¶</a></h2>
+<p>SEV ゲストのキー管理は、AMD セキュアプロセッサ（AMD-SP）と呼ばれる別個のプロセッサによって処理されます。AMD-SP 内で実行されるファームウェアは、ハイパーバイザーの一般的な操作（ブートストラップコードの暗号化、スナップショット、ゲストの移動およびデバッグ）を安全に実行するためのキーマネジメントインターフェースを提供します。詳細については、SEV キー管理仕様を参照してください。 <a class="reference internal" href="#api-spec" id="id1"><span>[api-spec]</span></a></p>
+<p>SEV にアクセスする主な ioctl は KVM_MEMORY_ENCRYPT_OP です。KVM_MEMORY_ENCRYPT_OP の引数が NULL の場合、SEV が有効であれば ioctl は 0 を返します。 <code class="docutils literal notranslate"><span class="pre">ENOTTY`</span> <span class="pre">if</span> <span class="pre">it</span> <span class="pre">is</span> <span class="pre">disabled</span> <span class="pre">(on</span> <span class="pre">some</span> <span class="pre">older</span> <span class="pre">versions</span> <span class="pre">of</span> <span class="pre">Linux,</span>
+<span class="pre">the</span> <span class="pre">ioctl</span> <span class="pre">runs</span> <span class="pre">normally</span> <span class="pre">even</span> <span class="pre">with</span> <span class="pre">a</span> <span class="pre">NULL</span> <span class="pre">argument,</span> <span class="pre">and</span> <span class="pre">therefore</span> <span class="pre">will</span>
+<span class="pre">likely</span> <span class="pre">return</span> <span class="pre">``EFAULT</span></code>NULL でない場合、KVM_MEMORY_ENCRYPT_OP の引数は struct kvm_sev_cmd でなければなりません:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct kvm_sev_cmd {
+        __u32 id;
+        __u64 data;
+        __u32 error;
+        __u32 sev_fd;
+};
+</pre></div>
+</div>
+<p>以下の <code class="docutils literal notranslate"><span class="pre">id</span></code> フィールドにはサブコマンドが含まれ、 <code class="docutils literal notranslate"><span class="pre">data</span></code> フィールドはコマンドに固有の引数を含む別の struct へのポインタを指します。 <code class="docutils literal notranslate"><span class="pre">sev_fd</span></code>
+必要に応じて、デバイスに開かれたファイルディスクリプタへのポインタを指す必要があります（個々のコマンドを参照してください）。 <code class="docutils literal notranslate"><span class="pre">/dev/sev</span></code>
+出力では、</p>
+<p>成功時は 0、エラーの場合はエラーコードになります。エラーコードは <code class="docutils literal notranslate"><span class="pre">error</span></code> で定義されています。 <code class="docutils literal notranslate"><span class="pre">&lt;linux/psp-dev.h&gt;</span></code>.</p>
+<p>KVM は SEV ゲストの一般的なライフサイクルイベント（起動、実行、スナップショット、移動、退役）をサポートするため、以下のコマンドを実装しています。</p>
+<section id="kvm-sev-init">
+<h3>1. KVM_SEV_INIT<a class="headerlink" href="#kvm-sev-init" title="この見出しへのパーマリンク">¶</a></h3>
+<p>KVM_SEV_INIT コマンドはハイパーバイザーが SEV プラットフォームコンテキストを初期化するために使用されます。通常のワークフローでは、このコマンドが最初に実行されるべきです。</p>
+<p>戻り値: 成功時は 0、エラー時は -負の値</p>
+</section>
+<section id="kvm-sev-launch-start">
+<h3>2. KVM_SEV_LAUNCH_START<a class="headerlink" href="#kvm-sev-launch-start" title="この見出しへのパーマリンク">¶</a></h3>
+<p>KVM_SEV_LAUNCH_START コマンドはメモリ暗号化コンテキストの作成に使用されます。暗号化コンテキストを作成するには、ユーザーがゲストポリシー、所有者の公開 Diffie-Hellman（PDH）鍵、およびセッション情報を提供する必要があります。</p>
+<p>パラメータ: struct kvm_sev_launch_start (入出力)</p>
+<p>戻り値: 成功時は 0、エラー時は -負の値</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct kvm_sev_launch_start {
+        __u32 handle;           /* if zero then firmware creates a new handle */
+        __u32 policy;           /* guest's policy */
+
+        __u64 dh_uaddr;         /* userspace address pointing to the guest owner's PDH key */
+        __u32 dh_len;
+
+        __u64 session_addr;     /* userspace address which points to the guest session information */
+        __u32 session_len;
+};
+</pre></div>
+</div>
+<p>成功した場合、'handle' フィールドには新しいハンドルが含まれ、エラーの場合は負の値が返されます。</p>
+<p>KVM_SEV_LAUNCH_START は、フィールドが有効であることを要します。 <code class="docutils literal notranslate"><span class="pre">sev_fd</span></code> フィールドが有効である必要があります。</p>
+<p>詳細については、SEV データ仕様のセクション 6.2 を参照してください。</p>
+</section>
+<section id="kvm-sev-launch-update-data">
+<h3>3. KVM_SEV_LAUNCH_UPDATE_DATA<a class="headerlink" href="#kvm-sev-launch-update-data" title="この見出しへのパーマリンク">¶</a></h3>
+<p>KVM_SEV_LAUNCH_UPDATE_DATA はメモリ領域を暗号化するためのコマンドであり、メモリの内容の測定も行います。この測定はメモリ内容の署名であり、ファームウェアが暗号化を正しく実行したことをゲスト所有者に attest するための情報として送信できます。</p>
+<p>パラメータ (入力): struct kvm_sev_launch_update_data</p>
+<p>戻り値: 成功時は 0、エラー時は -負の値</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct kvm_sev_launch_update {
+        __u64 uaddr;    /* userspace address to be encrypted (must be 16-byte aligned) */
+        __u32 len;      /* length of the data to be encrypted (must be 16-byte aligned) */
+};
+</pre></div>
+</div>
+<p>詳細については、SEV データ仕様のセクション 6.3 を参照してください。</p>
+</section>
+<section id="kvm-sev-launch-measure">
+<h3>4. KVM_SEV_LAUNCH_MEASURE<a class="headerlink" href="#kvm-sev-launch-measure" title="この見出しへのパーマリンク">¶</a></h3>
+<p>KVM_SEV_LAUNCH_MEASURE コマンドは、KVM_SEV_LAUNCH_UPDATE_DATA コマンドで暗号化されたデータの測定を取得するために使用されます。ゲスト所有者は、測定を確認できるまで、ゲストに機密情報を提供を控えることができます。ゲスト所有者は起動時にゲストの初期内容を知っているため、測定をゲスト所有者が予期する内容と比較することで確認できます。</p>
+<p>パラメータ (入力): struct kvm_sev_launch_measure</p>
+<p>戻り値: 成功時は 0、エラー時は -負の値</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct kvm_sev_launch_measure {
+        __u64 uaddr;    /* where to copy the measurement */
+        __u32 len;      /* length of measurement blob */
+};
+</pre></div>
+</div>
+<p>測定確認フローについての詳細は、SEV データ仕様のセクション 6.4 を参照してください。</p>
+</section>
+<section id="kvm-sev-launch-finish">
+<h3>5. KVM_SEV_LAUNCH_FINISH<a class="headerlink" href="#kvm-sev-launch-finish" title="この見出しへのパーマリンク">¶</a></h3>
+<p>起動フローが完了した後、KVM_SEV_LAUNCH_FINISH コマンドを実行してゲストの実行準備をします。</p>
+<p>戻り値: 成功時は 0、エラー時は -負の値</p>
+</section>
+<section id="kvm-sev-guest-status">
+<h3>6. KVM_SEV_GUEST_STATUS<a class="headerlink" href="#kvm-sev-guest-status" title="この見出しへのパーマリンク">¶</a></h3>
+<p>KVM_SEV_GUEST_STATUS コマンドは、SEV 有効化されたゲストの状態情報を取得するために使用されます。</p>
+<p>パラメータ (出力): struct kvm_sev_guest_status</p>
+<p>戻り値: 成功時は 0、エラー時は -負の値</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct kvm_sev_guest_status {
+        __u32 handle;   /* guest handle */
+        __u32 policy;   /* guest policy */
+        __u8 state;     /* guest state (see enum below) */
+};
+</pre></div>
+</div>
+<p>SEV ゲスト状態:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>enum {
+SEV_STATE_INVALID = 0;
+SEV_STATE_LAUNCHING,    /* guest is currently being launched */
+SEV_STATE_SECRET,       /* guest is being launched and ready to accept the ciphertext data */
+SEV_STATE_RUNNING,      /* guest is fully launched and running */
+SEV_STATE_RECEIVING,    /* guest is being migrated in from another SEV machine */
+SEV_STATE_SENDING       /* guest is getting migrated out to another SEV machine */
+};
+</pre></div>
+</div>
+</section>
+<section id="kvm-sev-dbg-decrypt">
+<h3>7. KVM_SEV_DBG_DECRYPT<a class="headerlink" href="#kvm-sev-dbg-decrypt" title="この見出しへのパーマリンク">¶</a></h3>
+<p>KVM_SEV_DEBUG_DECRYPT コマンドは、ハイパーバイザーが指定されたメモリ領域のデータをファームウェアに暗号化を依頼するためのコマンドです。</p>
+<p>パラメータ (入力): struct kvm_sev_dbg</p>
+<p>戻り値: 成功時は 0、エラー時は -負の値</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct kvm_sev_dbg {
+        __u64 src_uaddr;        /* userspace address of data to decrypt */
+        __u64 dst_uaddr;        /* userspace address of destination */
+        __u32 len;              /* length of memory region to decrypt */
+};
+</pre></div>
+</div>
+<p>ゲストポリシーがデバッグを許可しない場合、このコマンドはエラーを返します。</p>
+</section>
+<section id="kvm-sev-dbg-encrypt">
+<h3>8. KVM_SEV_DBG_ENCRYPT<a class="headerlink" href="#kvm-sev-dbg-encrypt" title="この見出しへのパーマリンク">¶</a></h3>
+<p>KVM_SEV_DEBUG_ENCRYPT コマンドは、ハイパーバイザーが指定されたメモリ領域のデータをファームウェアに暗号化を依頼するためのコマンドです。</p>
+<p>パラメータ (入力): struct kvm_sev_dbg</p>
+<p>戻り値: 成功時は 0、エラー時は -負の値</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct kvm_sev_dbg {
+        __u64 src_uaddr;        /* userspace address of data to encrypt */
+        __u64 dst_uaddr;        /* userspace address of destination */
+        __u32 len;              /* length of memory region to encrypt */
+};
+</pre></div>
+</div>
+<p>ゲストポリシーがデバッグを許可しない場合、このコマンドはエラーを返します。</p>
+</section>
+<section id="kvm-sev-launch-secret">
+<h3>9. KVM_SEV_LAUNCH_SECRET<a class="headerlink" href="#kvm-sev-launch-secret" title="この見出しへのパーマリンク">¶</a></h3>
+<p>KVM_SEV_LAUNCH_SECRET コマンドは、ゲスト所有者が測定を確認した後、ハイパーバイザーがシークレットデータを注入するためのコマンドです。</p>
+<p>パラメータ (入力): struct kvm_sev_launch_secret</p>
+<p>戻り値: 成功時は 0、エラー時は -負の値</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>struct kvm_sev_launch_secret {
+        __u64 hdr_uaddr;        /* userspace address containing the packet header */
+        __u32 hdr_len;
+
+        __u64 guest_uaddr;      /* the guest memory region where the secret should be injected */
+        __u32 guest_len;
+
+        __u64 trans_uaddr;      /* the hypervisor memory region which contains the secret */
+        __u32 trans_len;
+};
+</pre></div>
+</div>
+</section>
+</section>
+<section id="references">
+<h2>参考文献<a class="headerlink" href="#references" title="この見出しへのパーマリンク">¶</a></h2>
+<p>参照 <a class="reference internal" href="#white-paper" id="id2"><span>[white-paper]</span></a>, <a class="reference internal" href="#api-spec" id="id3"><span>[api-spec]</span></a>, <a class="reference internal" href="#amd-apm" id="id4"><span>[amd-apm]</span></a> および <a class="reference internal" href="#kvm-forum" id="id5"><span>[kvm-forum]</span></a> を参照してください。</p>
+<dl class="citation">
+<dt class="label" id="white-paper"><span class="brackets"><a class="fn-backref" href="#id2">white-paper</a></span></dt>
+<dd><p><a class="reference external" href="http://amd-dev.wpengine.netdna-cdn.com/wordpress/media/2013/12/AMD_Memory_Encryption_Whitepaper_v7-Public.pdf">http://amd-dev.wpengine.netdna-cdn.com/wordpress/media/2013/12/AMD_Memory_Encryption_Whitepaper_v7-Public.pdf</a></p>
+</dd>
+<dt class="label" id="api-spec"><span class="brackets">api-spec</span><span class="fn-backref">(<a href="#id1">1</a>,<a href="#id3">2</a>)</span></dt>
+<dd><p><a class="reference external" href="https://support.amd.com/TechDocs/55766_SEV-KM_API_Specification.pdf">https://support.amd.com/TechDocs/55766_SEV-KM_API_Specification.pdf</a></p>
+</dd>
+<dt class="label" id="amd-apm"><span class="brackets"><a class="fn-backref" href="#id4">amd-apm</a></span></dt>
+<dd><p><a class="reference external" href="https://support.amd.com/TechDocs/24593.pdf">https://support.amd.com/TechDocs/24593.pdf</a> (セクション 15.34)</p>
+</dd>
+<dt class="label" id="kvm-forum"><span class="brackets"><a class="fn-backref" href="#id5">kvm-forum</a></span></dt>
+<dd><p><a class="reference external" href="https://www.linux-kvm.org/images/7/74/02x08A-Thomas_Lendacky-AMDs_Virtualizatoin_Memory_Encryption_Technology.pdf">https://www.linux-kvm.org/images/7/74/02x08A-Thomas_Lendacky-AMDs_Virtualizatoin_Memory_Encryption_Technology.pdf</a></p>
+</dd>
+</dl>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">Linux 仮想化サポート</a><ul class="current">
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">KVM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../uml/user_mode_linux_howto_v2.html">UML ハウトゥー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../paravirt_ops.html">パラバーティロップス</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../guest-halt-polling.html">ゲストハルトポーリング</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ne_overview.html">Nitro エンクローブ</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="../index.html">Linux 仮想化サポート</a><ul>
+<li><a href="index.html">KVM</a><ul>
+<li>前へ: <a href="api.html" title="前章">KVM（Kernel-based Virtual Machine）APIドキュメンテーション（完全版）</a></li>
+<li>次へ: <a href="cpuid.html" title="次章">KVM CPUIDビット</a></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../../_sources/virt/kvm/amd-memory-encryption.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

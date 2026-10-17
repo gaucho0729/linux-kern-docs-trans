@@ -1,0 +1,303 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>hwpoison — The Linux Kernel documentation</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="hugetlbfs_reserv.html" rel="next" title="Hugetlbfsの予約"/>
+<link href="hmm.html" rel="prev" title="異質メモリ管理（HMM）"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="hwpoison">
+<h1>hwpoison<a class="headerlink" href="#hwpoison" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="what-is-hwpoison">
+<h2>hwpoison とは？<a class="headerlink" href="#what-is-hwpoison" title="この見出しへのパーマリンク">¶</a></h2>
+<p>今後のインテルCPUは、一部のメモリエラーからの回復をサポートしています（<code class="docutils literal notranslate"><span class="pre">MCA</span> <span class="pre">recovery</span></code>）。これにより、OSがページを「毒された」と宣言し、関連するプロセスを終了させ、今後は使用しないようにする必要があります。</p>
+<p>このパッチキットは、VM内での必要なインフラストラクチャを実装しています。</p>
+<p>概要コメントを引用します：</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>High level machine check handler. Handles pages reported by the
+hardware as being corrupted usually due to a 2bit ECC memory or cache
+failure.
+
+This focusses on pages detected as corrupted in the background.
+When the current CPU tries to consume corruption the currently
+running process can just be killed directly instead. This implies
+that if the error cannot be handled for some reason it's safe to
+just ignore it because no corruption has been consumed yet. Instead
+when that happens another machine check will happen.
+
+Handles page cache pages in various states. The tricky part
+here is that we can access any page asynchronous to other VM
+users, because memory failures could happen anytime and anywhere,
+possibly violating some of their assumptions. This is why this code
+has to be extremely careful. Generally it tries to use normal locking
+rules, as in get the standard locks, even if that means the
+error handling takes potentially a long time.
+
+Some of the operations here are somewhat inefficient and have non
+linear algorithmic complexity, because the data structures have not
+been optimized for this case. This is in particular the case
+for the mapping from a vma to a process. Since this case is expected
+to be rare we hope we can get away with this.
+</pre></div>
+</div>
+<p>コードは、mm/memory-failure.cにある高レベルハンドラ、新しいページ毒ビット、およびVM内での毒されたページを処理するためのさまざまなチェックから構成されています。</p>
+<p>現在の主な対象はKVMゲストですが、すべてのアプリケーションにも適用可能です。KVMサポートには最近のqemu-kvmリリースが必要です。</p>
+<p>KVM利用には、KVMがゲストに機械チェックを注入する際に適切なアドレスを指定できる新しいシグナルタイプが必要でした。理論上、他のアプリケーションもメモリエラーを処理できるようになります。ただし、ほぼすべてのアプリケーションはこれを実行しないと考えられますが、一部の特殊なアプリケーションでは可能かもしれません。</p>
+</section>
+<section id="failure-recovery-modes">
+<h2>失敗回復モード<a class="headerlink" href="#failure-recovery-modes" title="この見出しへのパーマリンク">¶</a></h2>
+<p>メモリエラーリカバリは、次の2つの（実際には3つの）モードで行われます：</p>
+<dl class="simple">
+<dt>vm.memory_failure_recovery sysctlがゼロに設定されている場合：</dt><dd><p>すべてのメモリエラーはパニックを引き起こします。回復を試みません。（x86では、これはMCEサブシステムの許容レベルにも影響されます）</p>
+</dd>
+<dt>早期終了</dt><dd><p>（グローバルおよびプロセスごとに制御可能）エラーが検出された直ちにアプリケーションにSIGBUSを送信します。これにより、メモリエラーを穏やかに処理できるアプリケーション（例：影響を受けたオブジェクトを削除）が利用可能です。これはKVM qemuが使用するモードです。</p>
+</dd>
+<dt>遅延終了</dt><dd><p>アプリケーションが破損ページにアクセスした際にSIGBUSを送信します。これはメモリエラーを認識していないアプリケーションにとって最適で、デフォルトです。注意：一部のページは常に遅延終了として扱われます。</p>
+</dd>
+</dl>
+</section>
+<section id="user-control">
+<h2>ユーザー制御<a class="headerlink" href="#user-control" title="この見出しへのパーマリンク">¶</a></h2>
+<dl>
+<dt>vm.memory_failure_recovery</dt><dd><p>sysctl.txt を参照</p>
+</dd>
+<dt>vm.memory_failure_early_kill</dt><dd><p>早期終了モードをグローバルで有効化</p>
+</dd>
+<dt>PR_MCE_KILL</dt><dd><p>早期/遅延終了モードを設定またはシステムデフォルトに戻す</p>
+<dl>
+<dt>arg1: PR_MCE_KILL_CLEAR:</dt><dd><p>システムデフォルトに戻す</p>
+</dd>
+<dt>arg1: PR_MCE_KILL_SET:</dt><dd><p>arg2でスレッド固有のモードを定義</p>
+<dl class="simple">
+<dt>PR_MCE_KILL_EARLY:</dt><dd><p>早期終了</p>
+</dd>
+<dt>PR_MCE_KILL_LATE:</dt><dd><p>遅延終了</p>
+</dd>
+<dt>PR_MCE_KILL_DEFAULT</dt><dd><p>システムグローバルデフォルトを使用</p>
+</dd>
+</dl>
+</dd>
+</dl>
+<p>プロセスのSIGBUS(BUS_MCEERR_AO)を担当する専用スレッドを設置したい場合、その指定されたスレッドでprctl(PR_MCE_KILL_EARLY)を呼び出す必要があります。それ以外の場合、SIGBUSはメインスレッドに送信されます。</p>
+</dd>
+<dt>PR_MCE_KILL_GET</dt><dd><p>現在のモードを返す</p>
+</dd>
+</dl>
+</section>
+<section id="testing">
+<h2>テスト<a class="headerlink" href="#testing" title="この見出しへのパーマリンク">¶</a></h2>
+<ul>
+<li><p>madvise(MADV_HWPOISON, ….)（root権限で） - テストのためにプロセス内のページを毒化する</p></li>
+<li><p>debugfsを通じたhwpoison-injectモジュール <code class="docutils literal notranslate"><span class="pre">/sys/kernel/debug/hwpoison/</span></code></p>
+<dl class="simple">
+<dt>corrupt-pfn</dt><dd><p>このファイルにエコーされたPFNでhwpoisonのエラーを注入します。テストスイートで意図しない破損ページを避けるため、早期のフィルタリングを行います。</p>
+</dd>
+<dt>unpoison-pfn</dt><dd><p>このファイルにエコーされたPFNでソフトウェアでunpoisonページを設定します。これによりページが再利用可能になります。これはLinuxで注入されたエラー専用の機能であり、実際のメモリエラーには対応しません。</p>
+</dd>
+</dl>
+<p>これらの注入インターフェースは安定していません。カーネルバージョンによって変更される可能性があります</p>
+<dl>
+<dt>corrupt-filter-dev-major, corrupt-filter-dev-minor</dt><dd><p>ブロックデバイスのメジャーマイナーマスクで定義されたファイルシステムに関連するページのメモリエラーのみを処理します。-1Uはワイルドカード値です。これは人工的な注入でのテスト専用に使用するべきです。</p>
+</dd>
+<dt>corrupt-filter-memcg</dt><dd><p>memgroupに所属するページのみに注入を制限します。memcgのinode番号で指定します。</p>
+<p>例:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>mkdir /sys/fs/cgroup/mem/hwpoison
+
+usemem -m 100 -s 1000 &amp;
+echo `jobs -p` &gt; /sys/fs/cgroup/mem/hwpoison/tasks
+
+memcg_ino=$(ls -id /sys/fs/cgroup/mem/hwpoison | cut -f1 -d' ')
+echo $memcg_ino &gt; /debug/hwpoison/corrupt-filter-memcg
+
+page-types -p `pidof init`   --hwpoison  # shall do nothing
+page-types -p `pidof usemem` --hwpoison  # poison its pages
+</pre></div>
+</div>
+</dd>
+<dt>corrupt-filter-flags-mask, corrupt-filter-flags-value</dt><dd><p>指定された場合、((page_flags &amp; mask) == value)の条件を満たすページのみをpoisonします。これにより、さまざまな種類のページのストレステストが可能です。page_flagsは/proc/kpageflagsと同一です。フラグビットはinclude/linux/kernel-page-flags.hに定義され、ドキュメントは <a class="reference internal" href="../admin-guide/mm/pagemap.html"><span class="doc">プロセスページテーブルの検証</span></a></p>
+</dd>
+</dl>
+</li>
+<li><p>アーキテクチャ固有のMCEインジェクター</p>
+<p>x86にはmce-inject、mce-testがあります</p>
+<p>mce-test内にportableなhwpoisonテストプログラムがあります。以下を参照してください。</p>
+</li>
+</ul>
+</section>
+<section id="references">
+<h2>参考文献<a class="headerlink" href="#references" title="この見出しへのパーマリンク">¶</a></h2>
+<dl class="simple">
+<dt><a class="reference external" href="http://halobates.de/mce-lc09-2.pdf">http://halobates.de/mce-lc09-2.pdf</a></dt><dd><p>LinuxCon 09からの概要プレゼンテーション</p>
+</dd>
+<dt>git://git.kernel.org/pub/scm/utils/cpu/mce/mce-test.git</dt><dd><p>テストスイート (hwpoison専用のportableテストはtsrcにあります)</p>
+</dd>
+<dt>git://git.kernel.org/pub/scm/utils/cpu/mce/mce-inject.git</dt><dd><p>x86専用インジェクター</p>
+</dd>
+</dl>
+</section>
+<section id="limitations">
+<h2>制限<a class="headerlink" href="#limitations" title="この見出しへのパーマリンク">¶</a></h2>
+<ul class="simple">
+<li><p>すべてのページタイプがサポートされていませんし、今後もサポートされません。ほとんどのカーネル内部オブジェクトは回復できません。現在はLRUページのみが対象です。</p></li>
+<li><p>現在、hugepageのサポートは不足しています。</p></li>
+</ul>
+<p>— Andi Kleen, 2009年10月</p>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Linuxメモリ管理ドキュメンテーション</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#user-guides-for-mm-features">MM機能用ユーザーガイド</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#kernel-developers-mm-documentation">カーネル開発者向けMMドキュメンテーション</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../x86/index.html">x86固有のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">Linuxメモリ管理ドキュメンテーション</a><ul>
+<li>前へ: <a href="hmm.html" title="前章">異質メモリ管理（HMM）</a></li>
+<li>次へ: <a href="hugetlbfs_reserv.html" title="次章">Hugetlbfsの予約</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/vm/hwpoison.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>

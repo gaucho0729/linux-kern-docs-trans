@@ -1,0 +1,281 @@
+
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="Docutils 0.17.1: http://docutils.sourceforge.net/" name="generator"/>
+<title>17. ページテーブルの隔離（PTI） — Linux Kernel ドキュメント</title>
+<link href="../_static/theme_overrides.css" rel="stylesheet" type="text/css"/>
+<script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+<script src="../_static/jquery.js"></script>
+<script src="../_static/underscore.js"></script>
+<script src="../_static/doctools.js"></script>
+<link href="../genindex.html" rel="index" title="インデックス"/>
+<link href="../search.html" rel="search" title="検索"/>
+<link href="mds.html" rel="next" title="18. マイクロアーキテクチャデータサンプリング(MDS)の緩和"/>
+<link href="amd-memory-encryption.html" rel="prev" title="16. AMDメモリ暗号化"/>
+<link href="../_static/custom.css" rel="stylesheet" type="text/css"/>
+<meta content="width=device-width, initial-scale=0.9, maximum-scale=0.9" name="viewport"/>
+</head><body>
+<div class="document">
+<div class="documentwrapper">
+<div class="bodywrapper">
+<div class="body" role="main">
+<section id="page-table-isolation-pti">
+<h1><span class="section-number">17. </span>ページテーブル隔離（PTI）<a class="headerlink" href="#page-table-isolation-pti" title="この見出しへのパーマリンク">¶</a></h1>
+<section id="overview">
+<h2><span class="section-number">17.1. </span>概要<a class="headerlink" href="#overview" title="この見出しへのパーマリンク">¶</a></h2>
+<p>ページテーブルの隔離（pti、以前はKAISERと呼ばれていた <a class="footnote-reference brackets" href="#id3" id="id1">1</a>) は、共有されたユーザー/カーネルアドレス空間への攻撃（例：『Meltdown』アプローチなど）に対する対策です <a class="footnote-reference brackets" href="#id4" id="id2">2</a>.</p>
+<p>このクラスの攻撃を緩和するため、ユーザー空間アプリケーションのみで使用する独立したページテーブルセットを作成します。カーネルがシステムコールや割込み、例外経由で実行される際には、ページテーブルが「カーネル」コピーに切り替えられます。システムがユーザーモードに戻る際には、ユーザー用のコピーが再び使用されます</p>
+<p>ユーザー空間のページテーブルには、カーネルに入る/出る際に必要な最小限のデータのみ含まれます。これはエントリ/エクスイット関数自体や割込みディスクリプタテーブル（IDT）などです。一部の厳密には不要な項目もマッピングされることがあります（pti.cのコメントを参照）</p>
+<p>このアプローチにより、PTIが有効な状態でページング構造を活用したサイドチャネル攻撃が機能しなくなることを保証します。コンパイル時に CONFIG_PAGE_TABLE_ISOLATION=y を設定することで有効化できます。コンパイル時に有効化した後は、起動時に 'nopti' または 'pti=' カーネルパラメータで無効化可能です（kernel-parameters.txt を参照）</p>
+</section>
+<section id="page-table-management">
+<h2><span class="section-number">17.2. </span>ページテーブル管理<a class="headerlink" href="#page-table-management" title="この見出しへのパーマリンク">¶</a></h2>
+<p>PTIが有効な場合、カーネルは2セットのページテーブルを管理します。1セットはPTIを搭載していないカーネルとほぼ同じで、copy_to_user() などの処理に使用可能なユーザー空間の完全なマッピングを含みます</p>
+<p>ユーザー領域のカーネルページテーブルは、上位レベルでNXビットを設定することで制限されています。これにより、カーネル→ユーザーのCR3スイッチをミスった場合、ユーザー空間が最初の指令を実行する直ちにクラッシュします</p>
+<p>ユーザー空間のページテーブルは、カーネルに入る/出る際に必要なカーネルデータのみをマッピングします。このデータはすべて「struct cpu_entry_area」構造体に含まれており、fixmapを通じて各CPUのコピーにコンパイル時固定の仮想アドレスが割り当てられます</p>
+<p>新しいユーザー空間マッピングについては、カーネルのページテーブルに通常通りエントリを作成します。違いはカーネルが上位レベル（PGD）でエントリを作成する際です。主なカーネルPGDにエントリを設定するだけでなく、ユーザー空間ページテーブルのPGDにもそのコピーを作成します</p>
+<p>PGDレベルでの共有は、ページテーブルの下位レイヤーも自動的に共有します。これにより、ユーザー空間のページテーブルを1セットのみで管理する必要があります。1つのPTEをロックし、アクセス済みビット、汚染ビットなど1セットのフラグを管理するだけです。</p>
+</section>
+<section id="overhead">
+<h2><span class="section-number">17.3. </span>オーバーヘッド<a class="headerlink" href="#overhead" title="この見出しへのパーマリンク">¶</a></h2>
+<p>サイドチャネル攻撃に対する保護は重要ですが、この保護にはコストが伴います：</p>
+<ol class="arabic simple">
+<li><p>メモリ使用量の増加</p></li>
+</ol>
+<blockquote>
+<div><ol class="loweralpha simple">
+<li><p>各プロセスは以前のorder-0からorder-1のPGDを必要とします。(プロセスごとに追加で4KBを消費します)</p></li>
+<li><p>「cpu_entry_area」構造体は2MBのサイズで2MBアライメントされる必要があります。これにより、単一のPMDエントリを設定するだけでマッピング可能です。カーネルが展開された時点でほぼ2MBのRAMを消費しますが、カーネルイメージ自体にはスペースは必要ありません。</p></li>
+</ol>
+</div></blockquote>
+<ol class="arabic simple" start="2">
+<li><p>ランタイムコスト</p></li>
+</ol>
+<blockquote>
+<div><ol class="loweralpha simple">
+<li><p>ページテーブルのコピー間でのCR3操作は、割込み、システムコール、例外のエントリとエクスイット時に実行する必要があります（カーネルが割込まれる際はスキップ可能です）。CR3への移動は数百サイクル程度かかり、すべてのエントリとエクスイット時に実行されます。</p></li>
+<li><p>SYSCALLエントリには「トランスポール」を使用する必要があります。このトランスポールは非PTIのSYSCALLエントリコードに比べて少ないリソースに依存するため、ユーザー空間ページテーブルにマッピングする項目が少なくなります。ただし、スタックの切り替えはエントリ時に必要になります。</p></li>
+<li><p>カーネル構造体のすべてにグローバルページが無効化されます。これはMMUの機能で、異なるプロセスがカーネルのTLBエントリを共有できるようにします。この機能を失うと、コンテキストスイッチ後にTLBミスが増加しますが、実際のパフォーマンス低下は極めて小さく、1%を越えることはありません。</p></li>
+<li><p>プロセスコンテキストID（PCID）はCPUの機能で、ページテーブルを切り替える際、CR3に特別なビットを設定することで全体のTLBをフラッシュせずにスイッチできます。これにより、コンテキストスイッチやカーネルエントリ/エクスイット時のページテーブル切り替えが安価になります。ただし、PCIDをサポートするシステムでは、コンテキストスイッチコードはユーザーとカーネルのTLBエントリをすべてフラッシュしなければなりません。ユーザーPCIDのTLBフラッシュはユーザー空間への戻る際まで遅延され、コストを最小限に抑えます。intel.com/sdmでPCID/INVPCIDの詳細を確認してください。</p></li>
+<li><p>ユーザー空間のページテーブルは各新しいプロセスごとに作成する必要があります。PTIなしでも、共有されたカーネルマッピングはトップレベル（PGD）エントリを各プロセスにコピーすることで作成されます。しかし、PTIを導入した現在では、 <em>two</em> カーネルマッピングは、カーネルページテーブルにマップされるものと、エントリ/エクスイット構造体用のものがあります。fork()ではこれらをコピーする必要があります。</p></li>
+<li><p>fork()のタイミングでのコピーに加えて、ユーザー空間のPGDを更新する必要があります。PGDがユーザー空間をマッピングするために使用されるたびにset_pgd()が実行されるたびに、ユーザー空間のPGDを更新することで、カーネルとユーザー空間のコピーが常に同じユーザー空間メモリをマッピングすることを保証します。</p></li>
+<li><p>PCIDサポートがないシステムでは、各CR3の書き込みがTLB全体をフラッシュします。つまり、各システムコール、割込み、または例外がTLBをフラッシュします。</p></li>
+<li><p>INVPCIDはTLBフラッシュ指令であり、非現在PCIDのTLBエントリをフラッシュする機能を持ちます。一部のシステムはPCIDをサポートしていますが、INVPCIDをサポートしていません。このようなシステムでは、TLBからアドレスをフラッシュする際には現在のPCIDのみが対象になります。カーネルアドレスをフラッシュする際にはすべてのPCIDをフラッシュする必要がありますので、カーネルアドレスのフラッシュは次のPCIDの使用時にTLBフラッシュ用のCR3書き込みが必要になります。</p></li>
+</ol>
+</div></blockquote>
+</section>
+<section id="possible-future-work">
+<h2><span class="section-number">17.4. </span>将来の可能性のある作業<a class="headerlink" href="#possible-future-work" title="この見出しへのパーマリンク">¶</a></h2>
+<ol class="arabic simple">
+<li><p>CR3に実際に書き込むのは、値が実際に変更された場合のみ行うようにより注意深くする必要があります。</p></li>
+<li><p>起動時だけでなく、実行時にもPTIの有効化/無効化を可能にする必要があります。</p></li>
+</ol>
+</section>
+<section id="testing">
+<h2><span class="section-number">17.5. </span>テスト<a class="headerlink" href="#testing" title="この見出しへのパーマリンク">¶</a></h2>
+<p>PTIの安定性をテストするためには、以下のテスト手順を推奨します（できればすべて並行して実行してください）：</p>
+<ol class="arabic">
+<li><p>CONFIG_DEBUG_ENTRY=yを設定してください</p></li>
+<li><p>複数のCPUで複数のコピーを実行し、数分間複数のCPUでtools/testing/selftests/x86/のテスト（MPXとprotection_keysを除く）をループして実行してください。これらのテストは、カーネルのエントリコードのコーナーケースを頻繁に暴きます。古いカーネルではこれらのテスト自体がクラッシュすることがありますが、カーネル自体はクラッシュしてはいけません。</p></li>
+<li><p>perfツールをtopモードまたはrecordモードで実行し、多くの頻繁なパフォーマンスモニタリングの非マスク可能割込み（/proc/interruptsの「NMI」を参照）を生成します。これにより、NMIエントリ/エクスイットコードがテストされ、予期せぬ割込みを受けるコードパスでバグを引き起こす可能性があります。'-c'オプションはNMIの発生率を上げ、2つの'-c'オプションで別々のカウンターを使用するとネストしたNMIを促進し、より非決定的な挙動を引き起こします。</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>while true; do perf record -c 10000 -e instructions,cycles -a sleep 10; done
+</pre></div>
+</div>
+</li>
+<li><p>KVM仮想マシンを起動してください。</p></li>
+<li><p>SYSCALL指令をサポートするシステムで32ビットバイナリを実行してください。これは軽くテストされたコードパスであり、追加の検証が必要です。</p></li>
+</ol>
+</section>
+<section id="debugging">
+<h2><span class="section-number">17.6. </span>デバッグ<a class="headerlink" href="#debugging" title="この見出しへのパーマリンク">¶</a></h2>
+<p>PTIのバグはいくつかのクラッシュのサインを引き起こします。ここに記載します。</p>
+<blockquote>
+<div><ul class="simple">
+<li><p>selftests/x86コードの失敗。通常はentry_64.Sのより複雑なコーナーのバグが原因です。</p></li>
+<li><p>早期起動時のクラッシュ、特にCPUの起動周辺。トランスポールコードやマッピングのバグが原因です。</p></li>
+<li><p>最初の割込み時のクラッシュ。entry_64.Sのバグ（ページテーブルの切り替えミス）や、IRQハンドラのエントリコードの不適切なマッピングが原因です。</p></li>
+<li><p>最初のNMIでクラッシュします。NMIコードはメインの割り込みハンドラとは別にあり、通常の割り込みに影響を与えないバグを持つ可能性があります。また、NMIコードの不正確なマッピングによっても発生します。エントリーコードを割り込むNMIは非常に注意が必要で、perfを実行中にクラッシュを引き起こす原因となることがあります。</p></li>
+<li><p>最初のユーザー空間への戻り処理でカーネルがクラッシュします。entry_64.Sのバグ、または一部の戻り処理コードをマッピングしていないことが原因です。</p></li>
+<li><p>ユーザー空間を割り込む最初の割り込みでクラッシュします。entry_64.S内のユーザー空間に戻るパスは、カーネルに戻るパスとは別に場合があります。</p></li>
+<li><p>ダブルフォールト: ページフォールトの連続によってカーネルスタックがオーバーフローします。エントリーコードで非PTIマッピングデータにアクセスする、またはPTIマッピングされていないC関数を呼び出す前にカーネルCR3に切り替わっていないことが原因です。</p></li>
+<li><p>起動初期のユーザー空間でセグフォが発生し、場合によってはmount(8)がルートファイルシステムのマウントに失敗します。これらは一般的にTLB無効化の問題です。通常は誤ったPCIDを無効化している、または無効化を忘れていることが原因です。</p></li>
+</ul>
+</div></blockquote>
+<dl class="footnote brackets">
+<dt class="label" id="id3"><span class="brackets"><a class="fn-backref" href="#id1">1</a></span></dt>
+<dd><p><a class="reference external" href="https://gruss.cc/files/kaiser.pdf">https://gruss.cc/files/kaiser.pdf</a></p>
+</dd>
+<dt class="label" id="id4"><span class="brackets"><a class="fn-backref" href="#id2">2</a></span></dt>
+<dd><p><a class="reference external" href="https://meltdownattack.com/meltdown.pdf">https://meltdownattack.com/meltdown.pdf</a></p>
+</dd>
+</dl>
+</section>
+</section>
+</div>
+</div>
+</div>
+<div aria-label="メインナビゲーション" class="sphinxsidebar" role="navigation">
+<div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Linuxカーネル</a></h1>
+<h3>ナビゲーション</h3>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../admin-guide/index.html">Linuxカーネルユーザーおよび管理者のガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kbuild/index.html">カーネルビルドシステム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../firmware-guide/index.html">Linuxカーネルファームウェアガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../devicetree/index.html">オープンファームウェアとデバイスツリー</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userspace-api/index.html">Linuxカーネルユーザー空間APIガイド</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../process/index.html">カーネル開発コミュニティとの協働</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../dev-tools/index.html">カーネル用の開発ツール</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../doc-guide/index.html">カーネルドキュメントの作成方法</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel-hacking/index.html">カーネルハッキングガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">Linuxトレーシング技術</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../maintainer/index.html">カーネルメンテナーハンドブック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fault-injection/index.html">fault-injection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../livepatch/index.html">カーネルライブパッチ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../driver-api/index.html">Linuxドライバ実装者向けAPIガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core-api/index.html">コアAPIドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">ロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../accounting/index.html">アカウント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../block/index.html">ブロック</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cdrom/index.html">cdrom</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu-freq/index.html">Linux(TM)カーネル内のCPU周波数および電圧スケーリングコード（Linux CPUFreq）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ide/index.html">統合ドライブエレクトロニクス（IDE）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fb/index.html">フレームバッファ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../fpga/index.html">fpga</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hid/index.html">ヒューマンインターフェースデバイス（HID）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../i2c/index.html">I2C/SMBusサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../iio/index.html">産業用I/O</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../isdn/index.html">ISDN</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../infiniband/index.html">InfiniBand</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../leds/index.html">LED</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../netlabel/index.html">NetLabel</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../networking/index.html">Linuxネットワーキングドキュメント</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pcmcia/index.html">pcmcia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../power/index.html">電源管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../target/index.html">TCM仮想デバイス</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../timers/index.html">タイマ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../spi/index.html">シリアルペリフェラルインターフェース（SPI）</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../w1/index.html">1-Wireサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watchdog/index.html">Linux ワッチドッグサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../virt/index.html">Linux 仮想化サポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../input/index.html">Linux インプットドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../hwmon/index.html">Linux ハードウェアモニタリング</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpu/index.html">Linux GPUドライバ開発者ガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../security/index.html">セキュリティドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sound/index.html">Linux サウンドサブシステムドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../crypto/index.html">Linuxカーネル暗号API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/index.html">Linuxカーネル内のファイルシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../vm/index.html">Linuxメモリ管理ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../bpf/index.html">BPFドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../usb/index.html">USBサポート</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../PCI/index.html">Linux PCIバスサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scsi/index.html">Linux SCSIサブシステム</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../misc-devices/index.html">多様な雑多デバイスドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../scheduler/index.html">Linuxスケジューラ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mhi/index.html">MHI</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../asm-annotations.html">アセンブリ注釈</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../arm/index.html">ARMアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../arm64/index.html">ARM64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ia64/index.html">IA-64アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../m68k/index.html">m68kアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mips/index.html">MIPS固有ドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nios2/nios2.html">Nios IIアーキテクチャにおけるLinux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../openrisc/index.html">OpenRISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../parisc/index.html">PA-RISCアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../powerpc/index.html">powerpc</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../riscv/index.html">RISC-Vアーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../s390/index.html">s390アーキテクチャ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sh/index.html">SuperH インターフェースガイド</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sparc/index.html">Sparc アーキテクチャ</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">x86固有のドキュメンテーション</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="boot.html">1. Linux/x86 ブートプロトコル</a></li>
+<li class="toctree-l2"><a class="reference internal" href="booting-dt.html">2. DeviceTree ブート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cpuinfo.html">3. x86 フィーチャーフラグ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="topology.html">4. x86 ティポロジー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="exception-tables.html">5. カーネルレベル例外処理</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kernel-stacks.html">6. カーネルスタック</a></li>
+<li class="toctree-l2"><a class="reference internal" href="entry_64.html">7. カーネルエントリ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="earlyprintk.html">8. エアリープリンク</a></li>
+<li class="toctree-l2"><a class="reference internal" href="orc-unwinder.html">9. ORC アンワインダー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="zero-page.html">10. ゼロページ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tlb.html">11. TLB</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mtrr.html">12. MTRR (Memory Type Range Register)制御</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pat.html">13. PAT (Page Attribute Table)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="intel-iommu.html">14. Linux IOMMUサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="intel_txt.html">15. Intel(R) TXT概要</a></li>
+<li class="toctree-l2"><a class="reference internal" href="amd-memory-encryption.html">16. AMDメモリ暗号化</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">17. ページテーブル隔離(PTI)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mds.html">18. マイクロアーキテクチャデータサンプリング(MDS)の緩和</a></li>
+<li class="toctree-l2"><a class="reference internal" href="microcode.html">19. Linuxマイクロコードロー�ーダー</a></li>
+<li class="toctree-l2"><a class="reference internal" href="resctrl_ui.html">20. リソース制御機能のユーザーインターフェース</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tsx_async_abort.html">21. TSXアシンクロナスアブート(TAA)の緩和</a></li>
+<li class="toctree-l2"><a class="reference internal" href="usb-legacy-support.html">22. USBレガシーサポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="i386/index.html">23. i386サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="x86_64/index.html">24. x86_64サポート</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sva.html">25. ENQCMDによる共有仮想アドレス(SVA)</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../xtensa/index.html">Xtensa アーキテクチャ</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../filesystems/ext4/index.html">ext4 データ構造とアルゴリズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html">未整理のドキュメンテーション</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-types">アトム型</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#atomic-bitops">アトミックビット操作</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../staging/index.html#memory-barriers">メモリバリア</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../watch_queue.html">一般的な通知メカニズム</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../translations/index.html">翻訳</a></li>
+</ul>
+<div class="relations">
+<h3>関連トピック</h3>
+<ul>
+<li><a href="../index.html">ドキュメンテーション概覧</a><ul>
+<li><a href="index.html">x86固有のドキュメンテーション</a><ul>
+<li>前へ: <a href="amd-memory-encryption.html" title="前章"><span class="section-number">16. </span>AMDメモリ暗号化</a></li>
+<li>次へ: <a href="mds.html" title="次章"><span class="section-number">18. </span>マイクロアーキテクチャデータサンプリング（MDS）の緩和策</a></li>
+</ul></li>
+</ul></li>
+</ul>
+</div>
+<div id="searchbox" role="search" style="display: none">
+<h3 id="searchlabel">クイックサーチ</h3>
+<div class="searchformwrapper">
+<form action="../search.html" class="search" method="get">
+<input aria-labelledby="searchlabel" autocapitalize="off" autocomplete="off" autocorrect="off" name="q" spellcheck="false" type="text"/>
+<input type="submit" value="移動"/>
+</form>
+</div>
+</div>
+<script>$('#searchbox').show(0);</script>
+</div>
+</div>
+<div class="clearer"></div>
+</div>
+<div class="footer">
+      ©カーネル開発コミュニティ。 | パワードバイ <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/x86/pti.rst.txt" rel="nofollow">ページソース</a>
+</div>
+</body>
+</html>
